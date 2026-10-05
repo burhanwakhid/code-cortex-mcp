@@ -20,6 +20,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #define PL_NSEC_PER_SEC 1000000000LL
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
+#include "pipeline/branch_slots.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/worker_pool.h"
@@ -144,6 +145,13 @@ struct cbm_pipeline {
      * carried over when recomputing it would be too slow (see
      * pipeline_refresh_session_brief). */
     char *saved_brief;
+
+    /* Per-branch databases (branch_slots.h). branch_keep < 1 disables
+     * parking; the outcome of this run's switch is reported back. */
+    int branch_keep;
+    cbm_branch_switch_t branch_action;
+    char branch_from[CBM_SZ_256]; /* slug the database was built for; "" unknown */
+    int files_reparsed;           /* source files extracted this run; -1 unknown */
 };
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
@@ -365,6 +373,12 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->persistence = false;
     p->committed_nodes = -1;
     p->committed_edges = -1;
+    p->files_reparsed = -1;
+    /* Default on; CBM_BRANCH_INDEX=0 is the process-wide off switch for the
+     * paths that never consult the config store (in-process fallbacks). */
+    char bi_env[CBM_SZ_32] = "";
+    cbm_safe_getenv("CBM_BRANCH_INDEX", bi_env, sizeof(bi_env), NULL);
+    p->branch_keep = strcmp(bi_env, "0") == 0 ? 0 : CBM_BRANCH_SLOTS_DEFAULT_KEEP;
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -540,6 +554,34 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) 
     if (p) {
         p->committed_nodes = nodes;
         p->committed_edges = edges;
+    }
+}
+
+void cbm_pipeline_set_files_reparsed(cbm_pipeline_t *p, int count) {
+    if (p) {
+        p->files_reparsed = count;
+    }
+}
+
+void cbm_pipeline_set_branch_keep(cbm_pipeline_t *p, int keep) {
+    if (p) {
+        p->branch_keep = keep;
+    }
+}
+
+void cbm_pipeline_get_branch_switch(const cbm_pipeline_t *p, const char **action, const char **from,
+                                    const char **to, int *files_reparsed) {
+    if (action) {
+        *action = cbm_branch_switch_str(p ? p->branch_action : CBM_BRANCH_SWITCH_NONE);
+    }
+    if (from) {
+        *from = p && p->branch_from[0] ? p->branch_from : NULL;
+    }
+    if (to) {
+        *to = p && p->git_ctx.is_git ? cbm_branch_slug_from_qn(p->branch_qn) : NULL;
+    }
+    if (files_reparsed) {
+        *files_reparsed = p ? p->files_reparsed : -1;
     }
 }
 
@@ -2010,6 +2052,57 @@ const char *cbm_pipeline_export_error(const cbm_pipeline_t *p) {
     return p ? p->export_error : "";
 }
 
+/* Park/restore the cache database when the checkout's branch differs from
+ * the one it was built for (branch_slots.h). Runs under the index lease,
+ * before routing, so the incremental pass sees the restored or seeded graph.
+ * Only the default cache database takes part: an explicit db_path is a file
+ * the caller owns, and outside git there is no branch to key on. */
+static void pipeline_branch_switch(cbm_pipeline_t *p) {
+    p->branch_action = CBM_BRANCH_SWITCH_NONE;
+    p->branch_from[0] = '\0';
+    if (!p->default_db_path || !p->db_path || !p->git_ctx.is_git || p->branch_keep < 1) {
+        return;
+    }
+    p->branch_action =
+        cbm_branch_slots_switch(p->db_path, p->project_name, cbm_branch_slug_from_qn(p->branch_qn),
+                                p->branch_keep, p->branch_from, sizeof(p->branch_from));
+}
+
+/* Record the branch this run indexed on the Branch node. A full run builds
+ * the node from the current checkout already; an incremental (or no-op) run
+ * keeps the stored structure, which names whichever branch last ran a full
+ * rebuild -- and that label is what the next run's park step reads. Written
+ * only when it differs, so a no-op run still leaves the file untouched. */
+static void pipeline_stamp_branch(cbm_pipeline_t *p) {
+    if (!p->branch_qn) {
+        return;
+    }
+    char *db_path = resolve_db_path(p);
+    if (!db_path) {
+        return;
+    }
+    char stored[CBM_SZ_1K] = "";
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    int get_rc = s ? cbm_store_get_branch(s, p->project_name, stored, sizeof(stored), NULL, 0)
+                   : CBM_STORE_ERR;
+    cbm_store_close(s);
+    if (get_rc == CBM_STORE_OK && strcmp(stored, p->branch_qn) != 0) {
+        char props[CBM_SZ_2K];
+        const char *props_json =
+            cbm_git_context_props_json(&p->git_ctx, props, sizeof(props)) > 0 ? props : "{}";
+        const char *name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
+        s = cbm_store_open_path(db_path);
+        if (!s || cbm_store_set_branch(s, p->project_name, p->branch_qn, name, props_json) !=
+                      CBM_STORE_OK) {
+            cbm_log_warn("pipeline.err", "phase", "branch_stamp", "project", p->project_name);
+        }
+        cbm_store_close(s);
+    }
+    free(db_path);
+}
+
+static int pipeline_run_claimed(cbm_pipeline_t *p);
+
 int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
@@ -2023,6 +2116,15 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     // export. MCP may already own this lease before artifact bootstrap.
     pipeline_lease_scope lease_scope{p};
 
+    pipeline_branch_switch(p);
+    int rc = pipeline_run_claimed(p);
+    if (rc == 0 && !check_cancel(p)) {
+        pipeline_stamp_branch(p);
+    }
+    return rc;
+}
+
+static int pipeline_run_claimed(cbm_pipeline_t *p) {
     CBM_PROF_START(t_pipeline_total);
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -2106,6 +2208,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         return rc;
     }
     cbm_log_info("pipeline.route", "path", "full");
+    p->files_reparsed = file_count;
 
     /* Capture source versions before extraction. Changes after this snapshot
      * must remain visible to the next incremental run, even if extraction

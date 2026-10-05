@@ -102,6 +102,18 @@ int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *
 int cbm_store_get_format_version(cbm_store_t *s, int *out);
 int cbm_store_set_format_version(cbm_store_t *s, int version);
 
+/* The branch a database was built for is the project's Branch node
+ * (QN "<project>.__branch__.<slug>", see git_context.h). get copies its
+ * qualified name and display name (either buffer may be NULL) and returns
+ * CBM_STORE_NOT_FOUND when the graph has no Branch node. set rewrites that
+ * node in place — same id, so HAS_BRANCH keeps pointing at it — and the edge's
+ * properties; an incremental run reuses the stored structure and would
+ * otherwise keep the branch of whichever run last rebuilt it. set WRITES. */
+int cbm_store_get_branch(cbm_store_t *s, const char *project, char *qn_buf, size_t qn_sz,
+                         char *name_buf, size_t name_sz);
+int cbm_store_set_branch(cbm_store_t *s, const char *project, const char *qn, const char *name,
+                         const char *props_json);
+
 /* Get caller/callee names for a node (CALLS/HTTP_CALLS/ASYNC_CALLS edges).
  * Returns 0 on success. Caller must free each out_callers[i]/out_callees[i]
  * and the arrays themselves. */

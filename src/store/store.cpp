@@ -3274,6 +3274,85 @@ int cbm_store_set_format_version(cbm_store_t *s, int version) {
     return exec_sql(s, sql);
 }
 
+/* ── Indexed branch (the project's Branch node) ─────────────────── */
+
+int cbm_store_get_branch(cbm_store_t *s, const char *project, char *qn_buf, size_t qn_sz,
+                         char *name_buf, size_t name_sz) {
+    if (qn_buf && qn_sz > 0) {
+        qn_buf[0] = '\0';
+    }
+    if (name_buf && name_sz > 0) {
+        name_buf[0] = '\0';
+    }
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT qualified_name, name FROM nodes "
+                           "WHERE project = ?1 AND label = 'Branch' ORDER BY id LIMIT 1;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int rc = sqlite3_step(stmt);
+    int result = CBM_STORE_NOT_FOUND;
+    if (rc == SQLITE_ROW) {
+        const char *qn = (const char *)sqlite3_column_text(stmt, 0);
+        const char *name = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        if (qn_buf && qn_sz > 0) {
+            snprintf(qn_buf, qn_sz, "%s", qn ? qn : "");
+        }
+        if (name_buf && name_sz > 0) {
+            snprintf(name_buf, name_sz, "%s", name ? name : "");
+        }
+        result = CBM_STORE_OK;
+    } else if (rc != SQLITE_DONE) {
+        result = CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+int cbm_store_set_branch(cbm_store_t *s, const char *project, const char *qn, const char *name,
+                         const char *props_json) {
+    if (!s || !s->db || !project || !qn || !name) {
+        return CBM_STORE_ERR;
+    }
+    const char *props = props_json && props_json[0] ? props_json : "{}";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "UPDATE nodes SET qualified_name = ?2, name = ?3, properties = ?4 "
+                           "WHERE project = ?1 AND label = 'Branch';",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, ST_COL_2, qn);
+    bind_text(stmt, ST_COL_3, name);
+    bind_text(stmt, ST_COL_4, props);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "set_branch");
+        return CBM_STORE_ERR;
+    }
+    if (sqlite3_changes(s->db) == 0) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    if (sqlite3_prepare_v2(s->db,
+                           "UPDATE edges SET properties = ?2 "
+                           "WHERE project = ?1 AND type = 'HAS_BRANCH';",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, ST_COL_2, props);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
 /* ── Node neighbor names ──────────────────────────────────────── */
 
 static int query_neighbor_names(sqlite3 *db, const char *sql, int64_t node_id, int limit,

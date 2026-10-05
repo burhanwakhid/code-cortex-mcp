@@ -326,10 +326,17 @@ code-cortex-mcp config list
 code-cortex-mcp config set auto_index true        # index on MCP session start
 code-cortex-mcp config set auto_index_limit 50000 # max files for auto-index
 code-cortex-mcp config set auto_watch false       # default: true
+code-cortex-mcp config set branch_index false     # one index per git branch; default: true
+code-cortex-mcp config set branch_index_keep 8     # parked branch indexes per project
 code-cortex-mcp config set ui-lang en              # auto, en, or zh; default: auto
 ```
 
 - **Storage** — `~/.cache/code-cortex-mcp/`; override with `CBM_CACHE_DIR`.
+- **Branches** — each git branch keeps its own index. When an index run finds the checkout on
+  another branch, it parks the old branch's index under `branches/<project>/` in the cache and
+  restores the new branch's index if one is parked, so only the files that differ are re-indexed.
+  `index_status` shows `indexed_branch`, and `index_matches_checkout` is false until the next index
+  run after a checkout. `CBM_BRANCH_INDEX=0` turns this off for one process.
 - **Parallelism** — auto-detected (cgroup-aware); override with `CBM_WORKERS` (1–256).
 - **Ignore rules** — `.gitignore`, then `.cbmignore` (gitignore syntax). The indexer skips symlinks.
 - **Custom extensions** — `.code-cortex.json`: `{"extra_extensions": {".mjs": "javascript"}}`.

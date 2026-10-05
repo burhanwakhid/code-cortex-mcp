@@ -35,6 +35,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1
 #include <sys/stat.h>
 #include "foundation/cbm_atomic.h"
 #include <stdint.h>
+#include <memory>
 #include <vector>
 
 static constexpr size_t INCR_SOURCE_DIGEST_STRIDE = CBM_SHA256_HEX_LEN + 1;
@@ -111,12 +112,58 @@ struct classified_version {
     char sha256[CBM_SHA256_HEX_LEN + 1] = {0};
 };
 
+static bool stored_sha_valid(const cbm_file_hash_t *h) {
+    bool valid = h->sha256 && strlen(h->sha256) == CBM_SHA256_HEX_LEN;
+    for (size_t j = 0; valid && j < CBM_SHA256_HEX_LEN; ++j) {
+        valid = isxdigit((unsigned char)h->sha256[j]) != 0;
+    }
+    return valid;
+}
+
+/* SHA-256 of a file's bytes, the same digest extraction records over the
+ * buffer it parses. False when the file cannot be read in full. */
+static bool file_sha256_hex(const char *path, char out[CBM_SHA256_HEX_LEN + 1]) {
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    cbm_sha256_ctx c;
+    cbm_sha256_init(&c);
+    enum { CHUNK = 64 * 1024 };
+    std::vector<unsigned char> buf(CHUNK);
+    size_t n;
+    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
+        cbm_sha256_update(&c, buf.data(), n);
+    }
+    bool ok = ferror(f) == 0;
+    (void)fclose(f);
+    if (!ok) {
+        return false;
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&c, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[(i * 2) + 1] = hex[digest[i] & 0xF];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+    return true;
+}
+
 /* Classify discovered files against stored hashes using mtime+size.
  * Returns a boolean array: changed[i] = true if files[i] needs re-parsing.
- * Caller must free the returned array. */
+ * Caller must free the returned array.
+ *
+ * Same size under a new mtime is settled by content: `git checkout` rewrites
+ * every file that differs between two branches, so after switching back to a
+ * branch whose database was parked (branch_slots.h) those files carry new
+ * mtimes over the very bytes the stored graph was built from. Hashing them is
+ * a read; re-extracting them is a parse. Such files are unchanged, and
+ * refreshed[i] marks that their stored row needs the new mtime. */
 static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_hash_t *stored,
                             int stored_count, int *out_changed, int *out_unchanged,
-                            classified_version *versions) {
+                            classified_version *versions, bool *refreshed) {
     bool *changed = (bool *)calloc((size_t)file_count, sizeof(bool));
     if (!changed) {
         return NULL;
@@ -147,15 +194,24 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
             continue;
         }
 
-        if (stat_mtime_ns(&st) != h->mtime_ns || st.st_size != h->size) {
+        if (st.st_size != h->size) {
             changed[i] = true;
             n_changed++;
-        } else {
-            bool valid_sha = h->sha256 && strlen(h->sha256) == CBM_SHA256_HEX_LEN;
-            for (size_t j = 0; valid_sha && j < CBM_SHA256_HEX_LEN; ++j) {
-                valid_sha = isxdigit((unsigned char)h->sha256[j]) != 0;
+        } else if (stat_mtime_ns(&st) != h->mtime_ns) {
+            char digest[CBM_SHA256_HEX_LEN + 1];
+            if (stored_sha_valid(h) && file_sha256_hex(files[i].path, digest) &&
+                strcmp(digest, h->sha256) == 0) {
+                snprintf(versions[i].sha256, sizeof(versions[i].sha256), "%s", digest);
+                if (refreshed) {
+                    refreshed[i] = true;
+                }
+                n_unchanged++;
+            } else {
+                changed[i] = true;
+                n_changed++;
             }
-            if (valid_sha) {
+        } else {
+            if (stored_sha_valid(h)) {
                 snprintf(versions[i].sha256, sizeof(versions[i].sha256), "%s", h->sha256);
             }
             n_unchanged++;
@@ -758,8 +814,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int n_changed = 0;
     int n_unchanged = 0;
     std::vector<classified_version> versions((size_t)file_count);
+    std::unique_ptr<bool[]> refreshed(new bool[(size_t)file_count + 1]());
     bool *is_changed = classify_files(files, file_count, stored, stored_count, &n_changed,
-                                      &n_unchanged, versions.data());
+                                      &n_unchanged, versions.data(), refreshed.get());
 
     /* Classify stored files absent from current discovery: truly-deleted
      * (purge) vs mode-skipped (preserve nodes AND hash rows). */
@@ -787,6 +844,17 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * that were already preserved by an earlier run) remain intact. */
     if (n_changed == 0 && deleted_count == 0) {
         cbm_log_info("incremental.noop", "reason", "no_changes");
+        cbm_pipeline_set_files_reparsed(p, 0);
+        /* Content matched under a new mtime (classify_files): record the new
+         * mtime, or every later run would hash those files again. */
+        for (int i = 0; i < file_count; i++) {
+            if (refreshed[i] && cbm_store_upsert_file_hash(store, project, files[i].rel_path,
+                                                           versions[i].sha256, versions[i].mtime_ns,
+                                                           versions[i].size) != CBM_STORE_OK) {
+                cbm_log_warn("incremental.persist_hash_failed", "scope", "refresh", "rel_path",
+                             files[i].rel_path);
+            }
+        }
         free(is_changed);
         free(deleted);
         free_mode_skipped(mode_skipped, mode_skipped_count);
@@ -826,6 +894,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     free(is_changed);
 
     cbm_log_info("incremental.reparse", "files", itoa_buf(ci));
+    cbm_pipeline_set_files_reparsed(p, ci);
 
     struct timespec t;
 

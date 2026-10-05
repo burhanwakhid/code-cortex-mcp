@@ -25,6 +25,8 @@
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
 #include "pipeline/artifact.h" /* CBM_ARTIFACT_DIR: the indexer's own output directory */
+/* Parked per-branch databases of a pruned project. */
+#include "pipeline/branch_slots.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -40,7 +42,8 @@
 typedef struct {
     char *project_name;
     char *root_path;
-    char last_head[CBM_SZ_64]; /* git HEAD hash */
+    /* HEAD hash + symbolic ref (see git_head) */
+    char last_head[CBM_SZ_512];
     bool is_git;               /* false → skip polling */
     bool baseline_done;        /* true after first poll */
     atomic_bool index_pending; /* autoindex deferred before any completed index */
@@ -168,24 +171,42 @@ static bool is_git_repo(const char *root_path) {
     return rc == 0;
 }
 
+/* HEAD's commit AND its symbolic ref ("<sha> refs/heads/<branch>", or
+ * "<sha> HEAD" when detached), from one rev-parse. The ref matters because
+ * each branch has its own index (pipeline/branch_slots.h): checking out a
+ * branch that points at the same commit changes no SHA, yet the index must
+ * still be switched to that branch's database. */
 static int git_head(const char *root_path, char *out, size_t out_size) {
     char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse HEAD 2>%s", root_path, WATCHER_NULDEV);
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse HEAD --symbolic-full-name HEAD 2>%s",
+             root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return CBM_NOT_FOUND;
     }
 
-    if (fgets(out, (int)out_size, fp)) {
-        size_t len = strlen(out);
-        while (len > 0 && (out[len - SKIP_ONE] == '\n' || out[len - SKIP_ONE] == '\r')) {
-            out[--len] = '\0';
+    size_t off = 0;
+    char line[CBM_SZ_512];
+    while (fgets(line, (int)sizeof(line), fp)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
+            line[--len] = '\0';
         }
-        cbm_pclose(fp);
-        return 0;
+        if (len == 0 || off + len + SKIP_ONE >= out_size) {
+            continue; /* drain: closing early would hand git SIGPIPE */
+        }
+        if (off > 0) {
+            out[off++] = ' ';
+        }
+        memcpy(out + off, line, len);
+        off += len;
+        out[off] = '\0';
     }
-    cbm_pclose(fp);
-    return CBM_NOT_FOUND;
+    int rc = cbm_pclose(fp);
+    if (rc != 0 || off == 0) {
+        return CBM_NOT_FOUND;
+    }
+    return 0;
 }
 
 /* Returns true if working tree has changes (modified, untracked, etc.).
@@ -414,6 +435,7 @@ static int delete_cached_project_db(const char *project_name) {
         return CBM_NOT_FOUND;
     }
     cbm_remove_db_sidecars(path);
+    (void)cbm_branch_slots_delete_all(path, project_name);
     cbm_db_lease_release(lease);
     return 0;
 }
@@ -605,7 +627,7 @@ static bool check_changes(project_state_t *s, bool *dirty) {
     s->needs_clean_reindex |= *dirty;
 
     /* Check HEAD movement */
-    char head[CBM_SZ_64] = {0};
+    char head[CBM_SZ_512] = {0};
     if (git_head(s->root_path, head, sizeof(head)) == 0) {
         if (s->last_head[0] != '\0' && strcmp(head, s->last_head) != 0) {
             /* Keep the old baseline until indexing succeeds so a failed

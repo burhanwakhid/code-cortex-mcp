@@ -401,6 +401,64 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
     return 0;
 }
 
+/* First line of a small text file, newline stripped. False when unreadable. */
+static bool read_first_line(const char *path, char *buf, size_t bufsz) {
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        return false;
+    }
+    bool ok = fgets(buf, (int)bufsz, fp) != NULL;
+    (void)fclose(fp);
+    if (ok) {
+        trim_newlines(buf);
+    }
+    return ok;
+}
+
+char *cbm_git_head_slug(const char *root) {
+    if (!root || !root[0]) {
+        return NULL;
+    }
+    char path[GIT_OUTPUT_MAX];
+    char head[GIT_OUTPUT_MAX];
+    snprintf(path, sizeof(path), "%s/.git", root);
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return NULL;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        snprintf(path, sizeof(path), "%s/.git/HEAD", root);
+    } else {
+        /* Linked worktree: ".git" holds "gitdir: <dir>", absolute or relative
+         * to the worktree root. */
+        static const char prefix[] = "gitdir: ";
+        if (!read_first_line(path, head, sizeof(head)) ||
+            strncmp(head, prefix, sizeof(prefix) - 1) != 0) {
+            return NULL;
+        }
+        const char *dir = head + sizeof(prefix) - 1;
+        int n = path_is_absolute(dir) ? snprintf(path, sizeof(path), "%s/HEAD", dir)
+                                      : snprintf(path, sizeof(path), "%s/%s/HEAD", root, dir);
+        if (n <= 0 || (size_t)n >= sizeof(path)) {
+            return NULL;
+        }
+    }
+    if (!read_first_line(path, head, sizeof(head))) {
+        return NULL;
+    }
+    static const char ref_prefix[] = "ref: refs/heads/";
+    if (strncmp(head, ref_prefix, sizeof(ref_prefix) - 1) == 0) {
+        return slug_from_branch(head + sizeof(ref_prefix) - 1, false);
+    }
+    /* A detached HEAD holds the commit id itself. */
+    size_t len = strlen(head);
+    bool hex = len >= 40;
+    for (size_t i = 0; hex && i < len; i++) {
+        hex = isxdigit((unsigned char)head[i]) != 0;
+    }
+    return hex ? slug_from_branch(NULL, true) : NULL;
+}
+
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx) {
     const char *project = project_name && project_name[0] ? project_name : "project";
     const char *slug = "working-tree";

@@ -57,6 +57,13 @@ cbm_git_checkout_kind_t cbm_git_checkout_root_kind(const char *dir);
 /* True when dir's .git is a gitlink naming "<common>/worktrees/<name>", i.e.
  * dir is a linked worktree rather than a submodule. Reads the small .git file. */
 bool cbm_git_is_linked_worktree(const char *dir);
+/* Branch slug of the checkout rooted at `root`, read from its HEAD file — no
+ * git subprocess, for callers on a latency budget. Follows a linked
+ * worktree's `.git` FILE ("gitdir: <path>") to its private HEAD. Returns the
+ * same slug cbm_git_context_resolve would ("detached" for a detached HEAD), or
+ * NULL when root is not the top of a checkout or HEAD is unreadable. Caller
+ * frees. */
+char *cbm_git_head_slug(const char *root);
 
 #ifdef __cplusplus
 }

@@ -361,6 +361,49 @@ TEST(watcher_detects_git_commit) {
     PASS();
 }
 
+/* Each branch has its own index (pipeline/branch_slots.h), so checking out a
+ * branch at the SAME commit still has to trigger a run: the SHA alone does not
+ * move. */
+TEST(watcher_detects_branch_switch_same_commit) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_test_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+    ASSERT_EQ(wt_git(tmpdir, "branch -q side"), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "temp-repo", tmpdir);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w); /* baseline */
+    ASSERT_EQ(index_call_count, 0);
+
+    ASSERT_EQ(wt_git(tmpdir, "checkout -q side"), 0);
+    cbm_watcher_touch(w, "temp-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    cbm_watcher_touch(w, "temp-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* settled on the new branch */
+
+    ASSERT_EQ(wt_git(tmpdir, "checkout -q --detach HEAD"), 0);
+    cbm_watcher_touch(w, "temp-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2); /* detaching is a switch too */
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(watcher_detects_dirty_worktree) {
     /* Create a temporary git repo */
     char tmpdir[256];
@@ -2017,6 +2060,7 @@ SUITE(watcher) {
 
     /* Git change detection */
     RUN_TEST(watcher_detects_git_commit);
+    RUN_TEST(watcher_detects_branch_switch_same_commit);
     RUN_TEST(watcher_detects_dirty_worktree);
     RUN_TEST(watcher_detects_new_file);
     RUN_TEST(watcher_reindexes_clean_reset_and_retries_failure);

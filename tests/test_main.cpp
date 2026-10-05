@@ -248,6 +248,7 @@ extern void suite_grammar_probe_e(void);
 extern void suite_grammar_probe_f(void);
 extern void suite_grammar_probe_g(void);
 extern void suite_incremental(void);
+extern void suite_branch_index(void);
 extern void suite_simhash(void);
 extern void suite_stack_overflow(void);
 
@@ -445,6 +446,7 @@ int main(int argc, char **argv) {
     RUN_SUITE(grammar_probe_g);
 
     RUN_SUITE(incremental);
+    RUN_SUITE(branch_index);
 
     /* Release process-lifetime caches so LeakSanitizer reports no leaks. */
     cbm_kind_in_set_free_cache();

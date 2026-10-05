@@ -97,6 +97,7 @@ enum {
 #include "foundation/dump_verify.h"
 #include "foundation/compat_regex.h"
 #include "pipeline/artifact.h"
+#include "pipeline/branch_slots.h"
 
 static size_t trace_hash_file_max = MCP_PATH_HASH_FILE_MAX;
 static size_t trace_hash_request_max = MCP_PATH_HASH_REQUEST_MAX;
@@ -2161,7 +2162,45 @@ static void add_git_context_string(yyjson_mut_doc *doc, yyjson_mut_val *obj, con
     }
 }
 
-static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *root_path) {
+/* Per-branch index facts for one project (pipeline/branch_slots.h), added to
+ * its git block: the branch the graph was built for (only when the caller has
+ * the store open — list_projects answers from the store_meta memo and does
+ * not), whether that matches the checkout, and the parked branch databases (a
+ * directory read). A mismatch means the graph answers for another branch
+ * until the next index run swaps it. */
+static void add_branch_index_json(yyjson_mut_doc *doc, yyjson_mut_val *git, cbm_store_t *store,
+                                  const char *project, const cbm_git_context_t *ctx) {
+    if (!project || !ctx->is_git) {
+        return;
+    }
+    if (store) {
+        char qn[CBM_SZ_1K];
+        char name[CBM_SZ_512];
+        if (cbm_store_get_branch(store, project, qn, sizeof(qn), name, sizeof(name)) ==
+            CBM_STORE_OK) {
+            const char *slug = cbm_branch_slug_from_qn(qn);
+            yyjson_mut_obj_add_strcpy(doc, git, "indexed_branch", name);
+            if (slug && ctx->branch_slug) {
+                const char *current = ctx->is_detached ? "detached" : ctx->branch_slug;
+                yyjson_mut_obj_add_bool(doc, git, "index_matches_checkout",
+                                        strcmp(slug, current) == 0);
+            }
+        }
+    }
+    char db_path[CBM_SZ_1K];
+    project_db_path(project, db_path, sizeof(db_path));
+    char **parked = NULL;
+    int n = db_path[0] ? cbm_branch_slots_list(db_path, project, &parked) : 0;
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < n; i++) {
+        yyjson_mut_arr_add_strcpy(doc, arr, parked[i]);
+    }
+    cbm_branch_slots_free_list(parked, n);
+    yyjson_mut_obj_add_val(doc, git, "parked_branches", arr);
+}
+
+static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *root_path,
+                                 cbm_store_t *store = NULL, const char *project = NULL) {
     cbm_git_context_t ctx = {0};
     (void)cbm_git_context_resolve(root_path, &ctx);
 
@@ -2178,6 +2217,7 @@ static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const
     add_git_context_string(doc, git, "branch_slug", ctx.branch_slug);
     add_git_context_string(doc, git, "head_sha", ctx.head_sha);
     add_git_context_string(doc, git, "base_sha", ctx.base_sha);
+    add_branch_index_json(doc, git, store, project, &ctx);
     yyjson_mut_obj_add_val(doc, obj, "git", git);
 
     cbm_git_context_free(&ctx);
@@ -2476,7 +2516,7 @@ static void list_projects_emit_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr,
     yyjson_mut_obj_add_strcpy(doc, p, "name", project_name);
     if (include_details) {
         yyjson_mut_obj_add_strcpy(doc, p, "root_path", root_path);
-        add_git_context_json(doc, p, root_path[0] ? root_path : NULL);
+        add_git_context_json(doc, p, root_path[0] ? root_path : NULL, NULL, project_name);
         yyjson_mut_obj_add_int(doc, p, "nodes", nodes);
         yyjson_mut_obj_add_int(doc, p, "edges", edges);
         yyjson_mut_obj_add_int(doc, p, "size_bytes", size_bytes);
@@ -3875,7 +3915,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         if (cbm_store_get_project(store, project, &proj_info) == CBM_STORE_OK) {
             yyjson_mut_obj_add_strcpy(doc, root, "root_path",
                                       proj_info.root_path ? proj_info.root_path : "");
-            add_git_context_json(doc, root, proj_info.root_path);
+            add_git_context_json(doc, root, proj_info.root_path, store, project);
             safe_str_free(&proj_info.name);
             safe_str_free(&proj_info.indexed_at);
             safe_str_free(&proj_info.root_path);
@@ -3978,6 +4018,13 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     } else {
         is_error = true;
     }
+    /* The project's parked per-branch databases go with it, under the same
+     * lease; they can outlive a main file that is already gone. */
+    int parked_deleted = cbm_branch_slots_delete_all(path, name);
+    if (!exists && parked_deleted > 0) {
+        status = "deleted";
+        is_error = false;
+    }
 
     cbm_pipeline_unlock();
     cbm_db_lease_release(lease);
@@ -3993,6 +4040,9 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "project", name);
     yyjson_mut_obj_add_str(doc, root, "status", status);
+    if (parked_deleted > 0) {
+        yyjson_mut_obj_add_int(doc, root, "parked_branches_deleted", parked_deleted);
+    }
     if (error_detail) {
         yyjson_mut_obj_add_str(doc, root, "error", error_detail);
     }
@@ -7393,6 +7443,66 @@ static char *resolved_repo_path_from_project_arg(const char *args) {
     return root_path;
 }
 
+/* Parked-branch budget for an index run (pipeline/branch_slots.h): config
+ * branch_index (default true) and branch_index_keep (default 8); the
+ * CBM_BRANCH_INDEX=0 environment switch wins. The supervised worker runs
+ * without srv->config, so the store is opened just for this read. Returns -1
+ * to keep the pipeline's own default. */
+static int branch_index_keep(const cbm_mcp_server_t *srv) {
+    char env[CBM_SZ_32] = "";
+    cbm_safe_getenv("CBM_BRANCH_INDEX", env, sizeof(env), NULL);
+    if (strcmp(env, "0") == 0) {
+        return 0;
+    }
+    cbm_config_t *cfg = srv ? srv->config : NULL;
+    cbm_config_t *owned = NULL;
+    if (!cfg) {
+        const char *dir = cbm_resolve_cache_dir();
+        owned = dir ? cbm_config_open(dir) : NULL;
+        cfg = owned;
+    }
+    int keep = -1;
+    if (cfg) {
+        keep = cbm_config_get_bool(cfg, CBM_CONFIG_BRANCH_INDEX, true)
+                   ? cbm_config_get_int(cfg, CBM_CONFIG_BRANCH_INDEX_KEEP,
+                                        CBM_BRANCH_SLOTS_DEFAULT_KEEP)
+                   : 0;
+    }
+    cbm_config_close(owned);
+    return keep;
+}
+
+static void apply_branch_index_config(const cbm_mcp_server_t *srv, cbm_pipeline_t *p) {
+    int keep = branch_index_keep(srv);
+    if (keep >= 0) {
+        cbm_pipeline_set_branch_keep(p, keep);
+    }
+}
+
+/* index_repository's "branch" block: which branch this run indexed, which one
+ * the database had been built for, and what the per-branch switch did. */
+static void add_branch_switch_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                   const cbm_pipeline_t *p) {
+    const char *action = NULL;
+    const char *from = NULL;
+    const char *to = NULL;
+    int reparsed = -1;
+    cbm_pipeline_get_branch_switch(p, &action, &from, &to, &reparsed);
+    if (!to) {
+        return;
+    }
+    yyjson_mut_val *b = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_strcpy(doc, b, "indexed", to);
+    if (from) {
+        yyjson_mut_obj_add_strcpy(doc, b, "previous", from);
+    }
+    yyjson_mut_obj_add_strcpy(doc, b, "switch", action);
+    if (reparsed >= 0) {
+        yyjson_mut_obj_add_int(doc, b, "files_reparsed", reparsed);
+    }
+    yyjson_mut_obj_add_val(doc, root, "branch", b);
+}
+
 static bool wait_for_pipeline_lock(int timeout_ms) {
     uint64_t deadline_ms = cbm_now_ms() + (uint64_t)timeout_ms;
     do {
@@ -7470,6 +7580,7 @@ static char *index_repository_in_process(cbm_mcp_server_t *srv, const char *args
     }
     free(name_override);
     cbm_pipeline_set_persistence(p, persistence);
+    apply_branch_index_config(srv, p);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
 
@@ -7548,6 +7659,7 @@ static char *index_repository_in_process(cbm_mcp_server_t *srv, const char *args
         if (cbm_pipeline_had_format_migration(p)) {
             yyjson_mut_obj_add_bool(doc, root, "format_migration", true);
         }
+        add_branch_switch_json(doc, root, p);
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         /* #1665: a post-publish artifact export failure (read-only repo, etc.)
@@ -12619,6 +12731,7 @@ static void *autoindex_thread(void *arg) {
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
         return NULL;
     }
+    apply_branch_index_config(srv, p);
 
     /* Block until any concurrent pipeline finishes */
     cbm_pipeline_lock();
@@ -12646,6 +12759,32 @@ static void *autoindex_thread(void *arg) {
 }
 
 /* Start auto-indexing if configured and project not yet indexed. */
+/* True when the session's index was built for another branch than the one
+ * checked out now — a checkout made while no server was watching. The watcher
+ * baselines on the CURRENT HEAD, so it would never see that switch; marking
+ * the project pending makes its first poll run the index, which swaps in this
+ * branch's database (pipeline/branch_slots.h). One SQLite read and a HEAD
+ * file read: initialize stays free of git subprocesses. */
+static bool session_index_on_other_branch(const cbm_mcp_server_t *srv, const char *db_path) {
+    char *slug = cbm_git_head_slug(srv->session_root);
+    if (!slug) {
+        return false;
+    }
+    char qn[CBM_SZ_1K] = "";
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    bool known = store && cbm_store_get_branch(store, srv->session_project, qn, sizeof(qn), NULL,
+                                               0) == CBM_STORE_OK;
+    cbm_store_close(store);
+    const char *indexed = known ? cbm_branch_slug_from_qn(qn) : NULL;
+    bool other = indexed && strcmp(indexed, slug) != 0;
+    if (other) {
+        cbm_log_info("autoindex.branch_changed", "project", srv->session_project, "indexed",
+                     indexed, "checkout", slug);
+    }
+    free(slug);
+    return other;
+}
+
 static void maybe_auto_index(cbm_mcp_server_t *srv) {
     if (srv->session_root[0] == '\0') {
         return; /* no session root detected */
@@ -12661,7 +12800,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
             /* Already indexed → register watcher for change detection */
             cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",
                          srv->session_project);
-            register_watcher_if_enabled(srv);
+            register_watcher_if_enabled(srv, session_index_on_other_branch(srv, db_check));
             return;
         }
     }

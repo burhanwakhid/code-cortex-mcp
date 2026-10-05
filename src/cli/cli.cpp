@@ -12,6 +12,8 @@
 #include "foundation/sha256.h"
 #include "foundation/str_util.h" // cbm_is_project_index_db
 #include "mcp/mcp.h"             // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
+/* cbm_branch_slots_delete_all: an index reset drops parked branch indexes too. */
+#include "pipeline/branch_slots.h"
 
 /* CLI buffer size constants. */
 enum {
@@ -3365,6 +3367,11 @@ static int remove_indexes_in_dir(const char *cache_dir) {
              * count is unchanged. */
             cbm_remove_db_sidecars(target);
             cbm_remove_db_sidecars(tmp_path);
+            /* Parked per-branch databases of the same project (branch_slots.h)
+             * live under branches/<project>/, outside this scan. */
+            char project[CLI_BUF_1K];
+            snprintf(project, sizeof(project), "%.*s", (int)(len - DB_EXT_LEN), ent->name);
+            (void)cbm_branch_slots_delete_all(target, project);
             cbm_db_lease_release(lease);
         }
     }
@@ -3537,6 +3544,10 @@ int cbm_cmd_config(int argc, char **argv) {
                "Max files for auto-indexing new projects");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_WATCH, "true",
                "Register background git watcher on session connect");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_BRANCH_INDEX, "true",
+               "Keep one index per git branch (park/restore on checkout)");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_BRANCH_INDEX_KEEP, "8",
+               "Parked branch indexes kept per project (oldest dropped)");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
                "Pin graph UI language: en, zh, or auto");
         return 0;
@@ -3566,6 +3577,10 @@ int cbm_cmd_config(int argc, char **argv) {
                cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_WATCH,
                cbm_config_get(cfg, CBM_CONFIG_AUTO_WATCH, "true"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_BRANCH_INDEX,
+               cbm_config_get(cfg, CBM_CONFIG_BRANCH_INDEX, "true"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_BRANCH_INDEX_KEEP,
+               cbm_config_get(cfg, CBM_CONFIG_BRANCH_INDEX_KEEP, "8"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
                cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto"));
     } else if (strcmp(argv[0], "get") == 0) {

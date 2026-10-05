@@ -102,6 +102,20 @@ const char *cbm_pipeline_export_error(const cbm_pipeline_t *p);
 
 void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges);
 
+/* Per-branch databases (pipeline/branch_slots.h): how many parked branch
+ * databases to keep for this project. < 1 turns parking off, so a branch
+ * switch reindexes the one database in place. Default
+ * CBM_BRANCH_SLOTS_DEFAULT_KEEP, or 0 when CBM_BRANCH_INDEX=0. Set before run. */
+void cbm_pipeline_set_branch_keep(cbm_pipeline_t *p, int keep);
+
+/* After run: what the branch switch did ("none", "restored", "seeded",
+ * "in_place"), the slug the database had been built for (NULL unknown), the
+ * slug this run indexed (NULL outside git), and how many source files the run
+ * re-extracted (-1 unknown). Borrowed strings, valid until free. Any out
+ * pointer may be NULL. */
+void cbm_pipeline_get_branch_switch(const cbm_pipeline_t *p, const char **action, const char **from,
+                                    const char **to, int *files_reparsed);
+
 /* ── Per-file indexing failures (Stage 2 / Track B) ─────────────── */
 
 /* One source file that was skipped during indexing. All strings are owned by
