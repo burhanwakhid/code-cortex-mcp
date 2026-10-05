@@ -211,7 +211,20 @@ static bool slug_is_safe(const char *slug) {
     return true;
 }
 
-bool cbm_branch_slots_dir(const char *db_path, const char *project, char *buf, size_t bufsz) {
+bool cbm_branch_root_key(const char *root, char *buf, size_t bufsz) {
+    char canon[CBM_ROOT_MAX];
+    if (!buf || bufsz <= CBM_BRANCH_ROOT_KEY_LEN ||
+        !cbm_root_canonical(root, canon, sizeof(canon))) {
+        return false;
+    }
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(canon, strlen(canon), digest);
+    snprintf(buf, bufsz, "%.*s", (int)CBM_BRANCH_ROOT_KEY_LEN, digest);
+    return true;
+}
+
+bool cbm_branch_slots_dir(const char *db_path, const char *project, const char *root, char *buf,
+                          size_t bufsz) {
     if (!buf || bufsz == 0) {
         return false;
     }
@@ -226,7 +239,12 @@ bool cbm_branch_slots_dir(const char *db_path, const char *project, char *buf, s
     }
     int dir_len = slash ? (int)(slash - db_path) : 1;
     const char *dir = slash ? db_path : ".";
-    int n = snprintf(buf, bufsz, "%.*s/branches/%s", dir_len, dir, project);
+    char key[CBM_BRANCH_ROOT_KEY_LEN + 1] = "";
+    if (root && root[0] && !cbm_branch_root_key(root, key, sizeof(key))) {
+        return false;
+    }
+    int n =
+        snprintf(buf, bufsz, "%.*s/branches/%s%s%s", dir_len, dir, project, key[0] ? "/" : "", key);
     if (n <= 0 || (size_t)n >= bufsz) {
         buf[0] = '\0';
         return false;
@@ -506,6 +524,36 @@ static bool db_root_matches(const char *path, const char *project, const char *r
     return ok;
 }
 
+/* Earlier builds parked slots directly under branches/<project>/, shared by
+ * every root with that derived name. Move such a slot into this root's
+ * directory when it records this root; otherwise leave it (delete_project
+ * and the index reset still find it). */
+static bool adopt_legacy_slot(const char *db_path, const char *project, const char *root,
+                              const char *slug, const char *dir, const char *incoming) {
+    char legacy_dir[BS_PATH_MAX];
+    char legacy[BS_PATH_MAX];
+    if (!root || !root[0] ||
+        !cbm_branch_slots_dir(db_path, project, NULL, legacy_dir, sizeof(legacy_dir)) ||
+        !slot_path(legacy_dir, slug, legacy, sizeof(legacy)) || !cbm_file_exists(legacy)) {
+        return false;
+    }
+    cbm_store_t *s = cbm_store_open_path_query(legacy);
+    cbm_project_t proj = {0};
+    bool mine = s && cbm_store_get_project(s, project, &proj) == CBM_STORE_OK && proj.root_path &&
+                proj.root_path[0] && cbm_root_matches(proj.root_path, root);
+    cbm_project_free_fields(&proj);
+    cbm_store_close(s);
+    if (!mine || !cbm_mkdir_p(dir, 0755)) {
+        return false;
+    }
+    cbm_remove_db_sidecars(incoming);
+    if (cbm_rename_replace(legacy, incoming) != 0) {
+        return false;
+    }
+    cbm_remove_db_sidecars(legacy);
+    return true;
+}
+
 cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *project,
                                             const char *slug, const char *root, int keep,
                                             char **from) {
@@ -515,11 +563,14 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
     char dir[BS_PATH_MAX];
     char incoming[BS_PATH_MAX];
     if (keep < 1 || !slug_is_safe(slug) ||
-        !cbm_branch_slots_dir(db_path, project, dir, sizeof(dir)) ||
+        !cbm_branch_slots_dir(db_path, project, root, dir, sizeof(dir)) ||
         !slot_path(dir, slug, incoming, sizeof(incoming))) {
         return CBM_BRANCH_SWITCH_NONE;
     }
     bool have_incoming = cbm_file_exists(incoming);
+    if (!have_incoming) {
+        have_incoming = adopt_legacy_slot(db_path, project, root, slug, dir, incoming);
+    }
 
     /* No current database (first index here, an interrupted full rebuild, a
      * manual delete): this branch's parked database is a better start than
@@ -528,10 +579,7 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
      * copied into place the way a fresh database is installed (stale
      * sidecars removed, then one rename). */
     if (!cbm_file_exists(db_path)) {
-        /* A slot parked by another directory under the same derived name is
-         * not this checkout's: leave it where it is and build fresh. */
-        if (have_incoming && db_root_matches(incoming, project, root) &&
-            copy_db(incoming, db_path)) {
+        if (have_incoming && copy_db(incoming, db_path)) {
             unlink_slot(incoming);
             cbm_log_info("branch.switch", "action", "restored", "to", slug, "from", "");
             return CBM_BRANCH_SWITCH_RESTORED;
@@ -545,15 +593,14 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
          * the normal routing, which rebuilds what it cannot use. */
         return CBM_BRANCH_SWITCH_NONE;
     }
-    /* On a switch, the live database must be this checkout's to be parked
-     * under its slots, and the incoming slot must be too. A live database
-     * from another directory (a derived-name collision) is left to the
-     * normal routing, which reindexes over it as it always has; no slot is
-     * touched. Checked only when a switch is due, so a run on the same
-     * branch opens nothing extra. */
+    /* Slots live under this root's own directory, so every slot found there
+     * is this checkout's. The live database is shared by name, though: one
+     * from another directory (a derived-name collision) must not be parked
+     * among this root's slots. It is left to the normal routing, which
+     * reindexes over it as it always has. Checked only when a switch is due,
+     * so a run on the same branch opens nothing extra. */
     cbm_branch_switch_t action = CBM_BRANCH_SWITCH_NONE;
     if (strcmp(indexed, slug) != 0 && db_root_matches(db_path, project, root)) {
-        have_incoming = have_incoming && db_root_matches(incoming, project, root);
         action = switch_from(db_path, project, slug, indexed, dir, incoming, have_incoming, keep);
     }
     if (from) {
@@ -593,45 +640,98 @@ static cbm_branch_switch_t switch_from(const char *db_path, const char *project,
     return action;
 }
 
-int cbm_branch_slots_list(const char *db_path, const char *project, char ***out) {
-    if (out) {
-        *out = NULL;
-    }
-    char dir[BS_PATH_MAX];
-    if (!out || !cbm_branch_slots_dir(db_path, project, dir, sizeof(dir))) {
-        return 0;
-    }
+/* Append the slot stems in dir, each prefixed with prefix, to *list. */
+static void list_dir_slots(const char *dir, const char *prefix, char ***list, int *n, int *cap) {
     cbm_dir_t *d = cbm_opendir(dir);
     if (!d) {
-        return 0;
+        return;
     }
-    int cap = 0;
-    int n = 0;
-    char **list = NULL;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
         if (ent->is_dir || !is_slot_db_name(ent->name)) {
             continue;
         }
-        if (n == cap) {
-            int next_cap = cap ? cap * 2 : 8;
-            char **grown = (char **)realloc(list, (size_t)next_cap * sizeof(char *));
+        if (*n == *cap) {
+            int next_cap = *cap ? *cap * 2 : 8;
+            char **grown = (char **)realloc(*list, (size_t)next_cap * sizeof(char *));
             if (!grown) {
                 break;
             }
-            list = grown;
-            cap = next_cap;
+            *list = grown;
+            *cap = next_cap;
         }
+        size_t plen = strlen(prefix);
         size_t len = strlen(ent->name) - BS_DB_EXT;
-        char *slug = (char *)malloc(len + 1);
+        char *slug = (char *)malloc(plen + len + 1);
         if (!slug) {
             break;
         }
-        memcpy(slug, ent->name, len);
-        slug[len] = '\0';
-        list[n++] = slug;
+        memcpy(slug, prefix, plen);
+        memcpy(slug + plen, ent->name, len);
+        slug[plen + len] = '\0';
+        (*list)[(*n)++] = slug;
     }
     cbm_closedir(d);
+}
+
+/* The root-key subdirectories of a project's slot directory. */
+static int list_root_dirs(const char *pdir, char ***out) {
+    *out = NULL;
+    cbm_dir_t *d = cbm_opendir(pdir);
+    if (!d) {
+        return 0;
+    }
+    int n = 0;
+    int cap = 0;
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (!ent->is_dir || ent->name[0] == '.') {
+            continue;
+        }
+        if (n == cap) {
+            int next_cap = cap ? cap * 2 : 4;
+            char **grown = (char **)realloc(*out, (size_t)next_cap * sizeof(char *));
+            if (!grown) {
+                break;
+            }
+            *out = grown;
+            cap = next_cap;
+        }
+        if (!((*out)[n] = strdup(ent->name))) {
+            break;
+        }
+        n++;
+    }
+    cbm_closedir(d);
+    return n;
+}
+
+int cbm_branch_slots_list(const char *db_path, const char *project, const char *root, char ***out) {
+    if (out) {
+        *out = NULL;
+    }
+    char dir[BS_PATH_MAX];
+    if (!out || !cbm_branch_slots_dir(db_path, project, root, dir, sizeof(dir))) {
+        return 0;
+    }
+    int cap = 0;
+    int n = 0;
+    char **list = NULL;
+    list_dir_slots(dir, "", &list, &n, &cap);
+    if (!root || !root[0]) {
+        /* Every root's slots, as "<root-key>/<slot>" (plus legacy ones). */
+        char **keys = NULL;
+        int nk = list_root_dirs(dir, &keys);
+        for (int i = 0; i < nk; i++) {
+            char sub[BS_PATH_MAX];
+            char prefix[CBM_DIRENT_NAME_MAX + 2];
+            snprintf(sub, sizeof(sub), "%s/%s", dir, keys[i]);
+            snprintf(prefix, sizeof(prefix), "%s/", keys[i]);
+            list_dir_slots(sub, prefix, &list, &n, &cap);
+            free(keys[i]);
+        }
+        free(keys);
+    }
     if (n > 1) {
         qsort(list, (size_t)n, sizeof(char *), [](const void *a, const void *b) {
             return strcmp(*(const char *const *)a, *(const char *const *)b);
@@ -648,11 +748,8 @@ void cbm_branch_slots_free_list(char **list, int count) {
     free(list);
 }
 
-int cbm_branch_slots_delete_all(const char *db_path, const char *project) {
-    char dir[BS_PATH_MAX];
-    if (!cbm_branch_slots_dir(db_path, project, dir, sizeof(dir))) {
-        return 0;
-    }
+/* Delete the slot files in dir (this module's names only). */
+static int delete_dir_slots(const char *dir) {
     cbm_dir_t *d = cbm_opendir(dir);
     if (!d) {
         return 0;
@@ -705,6 +802,27 @@ int cbm_branch_slots_delete_all(const char *db_path, const char *project) {
         free(names[i]);
     }
     free(names);
+    return removed;
+}
+
+int cbm_branch_slots_delete_all(const char *db_path, const char *project) {
+    char dir[BS_PATH_MAX];
+    if (!cbm_branch_slots_dir(db_path, project, NULL, dir, sizeof(dir))) {
+        return 0;
+    }
+    /* Every root's slots (a derived name can be several directories'), and
+     * any legacy ones parked directly in the project directory. */
+    int removed = delete_dir_slots(dir);
+    char **keys = NULL;
+    int nk = list_root_dirs(dir, &keys);
+    for (int i = 0; i < nk; i++) {
+        char sub[BS_PATH_MAX];
+        snprintf(sub, sizeof(sub), "%s/%s", dir, keys[i]);
+        removed += delete_dir_slots(sub);
+        (void)cbm_rmdir(sub);
+        free(keys[i]);
+    }
+    free(keys);
     (void)cbm_rmdir(dir);
     /* The shared parent goes too once no project has parked anything. */
     char *slash = strrchr(dir, '/');

@@ -324,7 +324,8 @@ static size_t read_metadata_original_size(const char *repo_path) {
 
 /* Write artifact.json metadata. */
 static int write_metadata(const char *repo_path, const char *project_name, int nodes, int edges,
-                          size_t original_size, size_t compressed_size, int compression_level) {
+                          const char *branch_qn, const char *branch_props, size_t original_size,
+                          size_t compressed_size, int compression_level) {
     char commit[CBM_SZ_64] = "";
     git_head_hash(repo_path, commit, sizeof(commit));
 
@@ -341,6 +342,11 @@ static int write_metadata(const char *repo_path, const char *project_name, int n
     yyjson_mut_obj_add_str(doc, root, "project", project_name);
     yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, root, "edges", edges);
+    /* The graph's Branch node, so a later run can tell, without opening the
+     * artifact, whether the live database has moved on from it
+     * (cbm_artifact_is_current). */
+    yyjson_mut_obj_add_str(doc, root, "branch_qn", branch_qn ? branch_qn : "");
+    yyjson_mut_obj_add_str(doc, root, "branch_props", branch_props ? branch_props : "");
     yyjson_mut_obj_add_uint(doc, root, "original_size", (uint64_t)original_size);
     yyjson_mut_obj_add_uint(doc, root, "compressed_size", (uint64_t)compressed_size);
     yyjson_mut_obj_add_int(doc, root, "compression_level", compression_level);
@@ -572,10 +578,13 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     /* Get node/edge counts for metadata */
     int nodes = 0;
     int edges = 0;
+    char *branch_qn = NULL;
+    char *branch_props = NULL;
     cbm_store_t *count_store = cbm_store_open_path(db_path);
     if (count_store) {
         nodes = cbm_store_count_nodes(count_store, project_name);
         edges = cbm_store_count_edges(count_store, project_name);
+        (void)cbm_store_get_branch_dup(count_store, project_name, &branch_qn, NULL, &branch_props);
         cbm_store_close(count_store);
         /* A failed read is CBM_STORE_ERR; never record it as a count. */
         nodes = nodes < 0 ? 0 : nodes;
@@ -583,8 +592,11 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     }
 
     /* Write metadata */
-    if (write_metadata(repo_path, project_name, nodes, edges, db_size, (size_t)clen,
-                       compression_level) != 0) {
+    int mrc = write_metadata(repo_path, project_name, nodes, edges, branch_qn, branch_props,
+                             db_size, (size_t)clen, compression_level);
+    free(branch_qn);
+    free(branch_props);
+    if (mrc != 0) {
         cbm_unlink(zst_path);
         return CBM_NOT_FOUND;
     }
@@ -761,6 +773,41 @@ bool cbm_artifact_exists(const char *repo_path) {
     /* Check schema version is compatible */
     int version = read_metadata_version(repo_path);
     return version >= 0 && version <= CBM_ARTIFACT_SCHEMA_VERSION;
+}
+
+bool cbm_artifact_is_current(const char *db_path, const char *repo_path, const char *project) {
+    char meta_path[CBM_SZ_4K];
+    if (!db_path || !project ||
+        !artifact_path(meta_path, sizeof(meta_path), repo_path, CBM_ARTIFACT_META)) {
+        return false;
+    }
+    size_t len = 0;
+    char *json = read_file_alloc(meta_path, &len);
+    yyjson_doc *doc = json ? yyjson_read(json, len, 0) : NULL;
+    free(json);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    const char *a_qn = yyjson_get_str(root ? yyjson_obj_get(root, "branch_qn") : NULL);
+    const char *a_props = yyjson_get_str(root ? yyjson_obj_get(root, "branch_props") : NULL);
+    yyjson_val *a_nodes = root ? yyjson_obj_get(root, "nodes") : NULL;
+    yyjson_val *a_edges = root ? yyjson_obj_get(root, "edges") : NULL;
+    bool current = false;
+    /* Metadata from a build that did not record the Branch node is never
+     * current: one export brings it up to date. */
+    if (a_qn && a_props && yyjson_is_int(a_nodes) && yyjson_is_int(a_edges)) {
+        cbm_store_t *s = cbm_store_open_path_query(db_path);
+        char *qn = NULL;
+        char *props = NULL;
+        if (s && cbm_store_get_branch_dup(s, project, &qn, NULL, &props) != CBM_STORE_ERR) {
+            current = strcmp(qn ? qn : "", a_qn) == 0 && strcmp(props ? props : "", a_props) == 0 &&
+                      cbm_store_count_nodes(s, project) == (int)yyjson_get_int(a_nodes) &&
+                      cbm_store_count_edges(s, project) == (int)yyjson_get_int(a_edges);
+        }
+        free(qn);
+        free(props);
+        cbm_store_close(s);
+    }
+    yyjson_doc_free(doc);
+    return current;
 }
 
 /* ── Commit hash extraction ──────────────────────────────────────── */

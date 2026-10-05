@@ -111,8 +111,20 @@ bool cbm_branch_id_same(const cbm_branch_id_t *indexed, const cbm_branch_id_t *c
  * matches a known checkout. */
 bool cbm_branch_id_same_strict(const cbm_branch_id_t *indexed, const cbm_branch_id_t *current);
 
-/* <dir of db_path>/branches/<project>. Returns false when it does not fit. */
-bool cbm_branch_slots_dir(const char *db_path, const char *project, char *buf, size_t bufsz);
+enum { CBM_BRANCH_ROOT_KEY_LEN = 12 };
+
+/* A short stable key for a checkout root: hex of the SHA-256 of its
+ * canonical form (cbm_root_canonical), so every spelling of one directory
+ * agrees. False when root is empty or bufsz <= CBM_BRANCH_ROOT_KEY_LEN. */
+bool cbm_branch_root_key(const char *root, char *buf, size_t bufsz);
+
+/* <dir of db_path>/branches/<project>/<root key>: one directory per checkout
+ * root, because a derived project name can be several directories' and they
+ * must never share slots. root NULL or "" gives the project directory
+ * itself (every root's directories, and slots earlier builds parked there).
+ * Returns false when it does not fit. */
+bool cbm_branch_slots_dir(const char *db_path, const char *project, const char *root, char *buf,
+                          size_t bufsz);
 
 /* Park/restore before an index run on `slug`. The caller MUST hold the index
  * lease for db_path (cbm_pipeline_claim_index) — that lease is what excludes
@@ -134,14 +146,17 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
 void cbm_branch_slots_test_before_restore(void (*callback)(void *), void *data);
 #endif
 
-/* Sorted slugs of the parked databases for project. Returns the count (0 when
- * none); *out is a malloc'd array of malloc'd strings, free with
+/* Sorted slot stems (cbm_branch_slot_name) of root's parked databases; with
+ * root NULL, every root's, as "<root key>/<stem>" (and bare stems for slots
+ * an earlier build parked in the project directory). Returns the count (0
+ * when none); *out is a malloc'd array of malloc'd strings, free with
  * cbm_branch_slots_free_list. */
-int cbm_branch_slots_list(const char *db_path, const char *project, char ***out);
+int cbm_branch_slots_list(const char *db_path, const char *project, const char *root, char ***out);
 void cbm_branch_slots_free_list(char **list, int count);
 
-/* Delete every parked database of project (plus sidecars and temp files) and
- * the then-empty directories. Returns the number of databases removed. */
+/* Delete every parked database of project -- every root's, and legacy ones
+ * -- (plus sidecars and temp files) and the then-empty directories. Returns
+ * the number of databases removed. */
 int cbm_branch_slots_delete_all(const char *db_path, const char *project);
 
 #ifdef __cplusplus

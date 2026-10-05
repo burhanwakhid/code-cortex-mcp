@@ -2260,14 +2260,22 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         if (cbm_pipeline_stamp_branch(p, db_path)) {
             p->artifact_stale = true;
         }
-        /* Export iff the live database changed after the run's last export:
-         * a restore with nothing re-extracted, a stamp-only switch, a full
-         * rebuild without the persistence flag while an artifact exists.
-         * The dump paths clear the flag when they export themselves, so no
-         * run exports twice, and an unchanged run never exports. The
-         * export's own files under .code-cortex/ move neither HEAD nor the
-         * branch, so the next run's stamp writes nothing: no loop. */
-        if (p->artifact_stale && (p->persistence || cbm_artifact_exists(p->repo_path))) {
+        /* Export iff the artifact is behind the live database: a restore
+         * with nothing re-extracted, a stamp-only switch, a full rebuild
+         * without the persistence flag while an artifact exists, an earlier
+         * run's failed export. The dump paths clear artifact_stale when they
+         * export themselves, so no run exports twice, and a run right after
+         * a successful export finds the metadata current and exports
+         * nothing. The artifact directory is not indexed, so an export
+         * changes nothing the next run reads: no loop. */
+        /* Behind: changed this run after its last export, or -- durable
+         * across runs, so a failed export is repaired by any later run --
+         * the artifact's metadata no longer matches the live database, or
+         * the run asked for an artifact that does not exist yet. */
+        bool exists = cbm_artifact_exists(p->repo_path);
+        bool behind = p->artifact_stale || (p->persistence && !exists) ||
+                      (exists && !cbm_artifact_is_current(db_path, p->repo_path, p->project_name));
+        if (behind && (p->persistence || exists)) {
             int arc = cbm_artifact_export(db_path, p->repo_path, p->project_name,
                                           p->persistence ? CBM_ARTIFACT_BEST : CBM_ARTIFACT_FAST);
             if (arc != 0) {

@@ -645,6 +645,108 @@ bool cbm_file_gen_equal(const cbm_file_gen_t *a, const cbm_file_gen_t *b) {
            a->ino == b->ino;
 }
 
+bool cbm_root_normalize(const char *in, bool fold_case, char *out, size_t out_sz) {
+    if (!in || !out || out_sz < 2) {
+        return false;
+    }
+    size_t n = strlen(in);
+    char *work = (char *)malloc(n + 1);
+    if (!work) {
+        return false;
+    }
+    for (size_t i = 0; i <= n; i++) {
+        char c = in[i] == '\\' ? '/' : in[i];
+        work[i] = fold_case ? (char)tolower((unsigned char)c) : c;
+    }
+    /* Prefix: a drive ("c:"), a UNC share ("//"), or a POSIX root ("/");
+     * none for a relative path. The drive letter's case never matters. */
+    size_t o = 0;
+    const char *p = work;
+    bool absolute = false;
+    if (isalpha((unsigned char)p[0]) && p[1] == ':') {
+        if (o + 2 >= out_sz) {
+            free(work);
+            return false;
+        }
+        out[o++] = (char)tolower((unsigned char)p[0]);
+        out[o++] = ':';
+        p += 2;
+    }
+    if (p[0] == '/' && p[1] == '/' && o == 0) {
+        out[o++] = '/';
+        p++;
+    }
+    if (p[0] == '/') {
+        absolute = true;
+    }
+    size_t base = o; /* never pop below the prefix */
+    if (absolute) {
+        out[o++] = '/';
+        base = o;
+    }
+    out[o] = '\0';
+    /* Segments: drop "" and ".", let ".." remove the previous one. */
+    while (*p) {
+        while (*p == '/') {
+            p++;
+        }
+        const char *seg = p;
+        while (*p && *p != '/') {
+            p++;
+        }
+        size_t len = (size_t)(p - seg);
+        if (len == 0 || (len == 1 && seg[0] == '.')) {
+            continue;
+        }
+        bool dotdot = len == 2 && seg[0] == '.' && seg[1] == '.';
+        if (dotdot && o == base && absolute) {
+            continue; /* "/.." is "/" */
+        }
+        if (dotdot && o > base) {
+            while (o > base && out[o - 1] != '/') {
+                o--;
+            }
+            if (o > base) {
+                o--; /* the separator before the dropped segment */
+            }
+            out[o] = '\0';
+            continue;
+        }
+        size_t need = (o > base ? 1 : 0) + len;
+        if (o + need >= out_sz) {
+            free(work);
+            return false;
+        }
+        if (o > base) {
+            out[o++] = '/';
+        }
+        memcpy(out + o, seg, len);
+        o += len;
+        out[o] = '\0';
+    }
+    free(work);
+    return true;
+}
+
+bool cbm_root_canonical(const char *root, char *out, size_t out_sz) {
+    if (!root || !root[0]) {
+        return false;
+    }
+#ifdef _WIN32
+    char full[_MAX_PATH];
+    const char *src = _fullpath(full, root, sizeof(full)) ? full : root;
+    return cbm_root_normalize(src, true, out, out_sz);
+#else
+    /* Lexical form first, so "x/./gone/.." still resolves through x. */
+    char lex[CBM_ROOT_MAX];
+    char real[PATH_MAX];
+    if (!cbm_root_normalize(root, false, lex, sizeof(lex))) {
+        return false;
+    }
+    return cbm_root_normalize(realpath(lex, real) ? real : lex, false, out, out_sz);
+#endif
+}
+
 bool cbm_root_matches(const char *recorded, const char *dir) {
     if (!dir || !dir[0] || !recorded || !recorded[0]) {
         return true; /* nothing expected, or a legacy database with no root */
@@ -652,17 +754,30 @@ bool cbm_root_matches(const char *recorded, const char *dir) {
     if (strcmp(recorded, dir) == 0) {
         return true;
     }
+    /* Both sides canonical: separators, drive-letter case, "."/".." and
+     * trailing separators folded, symlinks resolved where the path exists
+     * (macOS /tmp -> /private/tmp; on Windows _fullpath and case folding).
+     * A recorded root that no longer exists still compares lexically. */
+    char a[CBM_ROOT_MAX];
+    char b[CBM_ROOT_MAX];
 #ifdef _WIN32
-    return _stricmp(recorded, dir) == 0;
+    const bool fold = true;
 #else
-    /* realpath folds symlinks (macOS /tmp -> /private/tmp) and "..";
-     * dev+inode then covers a case-insensitive volume, where two spellings of
-     * one directory realpath to different strings. */
-    char a[PATH_MAX];
-    char b[PATH_MAX];
-    if (realpath(recorded, a) && realpath(dir, b) && strcmp(a, b) == 0) {
+    const bool fold = false;
+#endif
+    if (cbm_root_normalize(recorded, fold, a, sizeof(a)) &&
+        cbm_root_normalize(dir, fold, b, sizeof(b)) && strcmp(a, b) == 0) {
+        return true; /* lexically equal: no filesystem access needed */
+    }
+    if (cbm_root_canonical(recorded, a, sizeof(a)) && cbm_root_canonical(dir, b, sizeof(b)) &&
+        strcmp(a, b) == 0) {
         return true;
     }
+#ifdef _WIN32
+    return false;
+#else
+    /* A case-insensitive volume: two spellings of one directory realpath to
+     * different strings, but are one inode. */
     struct stat sa;
     struct stat sb;
     return stat(recorded, &sa) == 0 && stat(dir, &sb) == 0 && sa.st_dev == sb.st_dev &&

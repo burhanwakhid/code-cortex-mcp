@@ -2248,7 +2248,8 @@ static void add_git_context_string(yyjson_mut_doc *doc, yyjson_mut_val *obj, con
  * directory read). A mismatch means the graph answers for another branch
  * until the next index run swaps it. */
 static void add_branch_index_json(yyjson_mut_doc *doc, yyjson_mut_val *git, cbm_store_t *store,
-                                  const char *project, const cbm_git_context_t *ctx) {
+                                  const char *project, const char *root_path,
+                                  const cbm_git_context_t *ctx) {
     if (!project || !ctx->is_git) {
         return;
     }
@@ -2274,7 +2275,10 @@ static void add_branch_index_json(yyjson_mut_doc *doc, yyjson_mut_val *git, cbm_
     char db_path[CBM_SZ_1K];
     project_db_path(project, db_path, sizeof(db_path));
     char **parked = NULL;
-    int n = db_path[0] ? cbm_branch_slots_list(db_path, project, &parked) : 0;
+    /* This checkout's slots only: a derived name can be several roots'. */
+    int n = db_path[0] && root_path && root_path[0]
+                ? cbm_branch_slots_list(db_path, project, root_path, &parked)
+                : 0;
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
     for (int i = 0; i < n; i++) {
         yyjson_mut_arr_add_strcpy(doc, arr, parked[i]);
@@ -2301,7 +2305,7 @@ static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const
     add_git_context_string(doc, git, "branch_slug", ctx.branch_slug);
     add_git_context_string(doc, git, "head_sha", ctx.head_sha);
     add_git_context_string(doc, git, "base_sha", ctx.base_sha);
-    add_branch_index_json(doc, git, store, project, &ctx);
+    add_branch_index_json(doc, git, store, project, root_path, &ctx);
     yyjson_mut_obj_add_val(doc, obj, "git", git);
 
     cbm_git_context_free(&ctx);

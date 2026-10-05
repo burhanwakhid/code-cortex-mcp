@@ -81,6 +81,7 @@ typedef struct {
 } bi_run_t;
 
 static char g_bi_project[1024];
+static char g_bi_root[1024]; /* the checkout g_bi_project was last indexed from */
 
 /* Index repo into the default cache database. keep < 0: pipeline default. */
 static bi_run_t bi_index(const char *repo, int keep) {
@@ -93,6 +94,7 @@ static bi_run_t bi_index(const char *repo, int keep) {
         cbm_pipeline_set_branch_keep(p, keep);
     }
     snprintf(g_bi_project, sizeof(g_bi_project), "%s", cbm_pipeline_project_name(p));
+    snprintf(g_bi_root, sizeof(g_bi_root), "%s", cbm_pipeline_repo_path(p));
     r.rc = cbm_pipeline_run(p);
     const char *action = NULL;
     const char *from = NULL;
@@ -125,7 +127,7 @@ static int bi_count(const char *name) {
 
 static int bi_parked(char ***out) {
     char db[1024];
-    return cbm_branch_slots_list(bi_db_path(db, sizeof(db)), g_bi_project, out);
+    return cbm_branch_slots_list(bi_db_path(db, sizeof(db)), g_bi_project, g_bi_root, out);
 }
 
 static bool bi_is_parked(const char *slug) {
@@ -158,9 +160,9 @@ TEST(branch_slug_from_qn) {
     ASSERT_NULL(cbm_branch_slug_from_qn("other.__branch__.main", "proj"));
     ASSERT_NULL(cbm_branch_slug_from_qn(NULL, "proj"));
     char dir[256];
-    ASSERT_TRUE(cbm_branch_slots_dir("/c/proj.db", "proj", dir, sizeof(dir)));
+    ASSERT_TRUE(cbm_branch_slots_dir("/c/proj.db", "proj", NULL, dir, sizeof(dir)));
     ASSERT_STR_EQ(dir, "/c/branches/proj");
-    ASSERT_FALSE(cbm_branch_slots_dir("/c/proj.db", "../x", dir, sizeof(dir)));
+    ASSERT_FALSE(cbm_branch_slots_dir("/c/proj.db", "../x", NULL, dir, sizeof(dir)));
     PASS();
 }
 
@@ -353,7 +355,8 @@ TEST(branch_parked_hidden_status_and_delete) {
     ASSERT_EQ(bi_parked(&list), 0);
     char dir[1024];
     char db[1024];
-    ASSERT_TRUE(cbm_branch_slots_dir(bi_db_path(db, sizeof(db)), g_bi_project, dir, sizeof(dir)));
+    ASSERT_TRUE(
+        cbm_branch_slots_dir(bi_db_path(db, sizeof(db)), g_bi_project, NULL, dir, sizeof(dir)));
     ASSERT_FALSE(cbm_file_exists(dir));
     ASSERT_FALSE(cbm_file_exists(db));
 
@@ -534,6 +537,7 @@ TEST(branch_seeded_artifact_names_new_branch) {
     ASSERT_NOT_NULL(p);
     cbm_pipeline_set_persistence(p, true);
     snprintf(g_bi_project, sizeof(g_bi_project), "%s", cbm_pipeline_project_name(p));
+    snprintf(g_bi_root, sizeof(g_bi_root), "%s", cbm_pipeline_repo_path(p));
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
     ASSERT_TRUE(cbm_artifact_exists(repo));
@@ -576,6 +580,7 @@ TEST(branch_index_config_applies_in_process) {
     char *project = cbm_project_name_from_path(repo);
     ASSERT_NOT_NULL(project);
     snprintf(g_bi_project, sizeof(g_bi_project), "%s", project);
+    snprintf(g_bi_root, sizeof(g_bi_root), "%s", repo);
     free(project);
 
     ASSERT_EQ(cbm_mcp_index_in_process(repo), 0);
@@ -1382,6 +1387,7 @@ TEST(branch_restore_reexports_artifact) {
     ASSERT_NOT_NULL(p);
     cbm_pipeline_set_persistence(p, true);
     snprintf(g_bi_project, sizeof(g_bi_project), "%s", cbm_pipeline_project_name(p));
+    snprintf(g_bi_root, sizeof(g_bi_root), "%s", cbm_pipeline_repo_path(p));
     ASSERT_EQ(cbm_pipeline_run(p), 0); /* main, exported */
     cbm_pipeline_free(p);
 
@@ -1418,6 +1424,7 @@ TEST(branch_stamp_only_switch_reexports_artifact) {
     ASSERT_NOT_NULL(p);
     cbm_pipeline_set_persistence(p, true);
     snprintf(g_bi_project, sizeof(g_bi_project), "%s", cbm_pipeline_project_name(p));
+    snprintf(g_bi_root, sizeof(g_bi_root), "%s", cbm_pipeline_repo_path(p));
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
     ASSERT_TRUE(cbm_artifact_exists(repo));
@@ -1597,6 +1604,7 @@ static int bi_index_persist(const char *repo) {
     }
     cbm_pipeline_set_persistence(p, true);
     snprintf(g_bi_project, sizeof(g_bi_project), "%s", cbm_pipeline_project_name(p));
+    snprintf(g_bi_root, sizeof(g_bi_root), "%s", cbm_pipeline_repo_path(p));
     int rc = cbm_pipeline_run(p);
     cbm_pipeline_free(p);
     return rc;
@@ -1627,10 +1635,28 @@ TEST(branch_requested_export_failure_fails_run) {
     int rc = bi_index_persist(repo); /* restored, nothing re-extracted */
     ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
     bi_run_t r = bi_index(repo, -1); /* restored, opportunistic refresh */
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    bi_run_t r2 = bi_index(repo, -1); /* restored again; export fails again */
     (void)chmod(art, 0755);
     ASSERT_NEQ(rc, 0);
     ASSERT_EQ(r.rc, 0);
     ASSERT_STR_EQ(r.action, "restored");
+    ASSERT_EQ(r2.rc, 0);
+
+    /* The artifact still holds feature. A later run with nothing to do (no
+     * persistence flag either) repairs it, and the one after that is a true
+     * no-op. */
+    r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "none");
+    ASSERT_EQ(r.reparsed, 0);
+    char slug[256];
+    ASSERT_EQ(bi_artifact_probe(repo, "only_main", slug, sizeof(slug)), 1);
+    ASSERT_STR_EQ(slug, "main");
+    int64_t before = bi_artifact_mtime(repo);
+    cbm_usleep(1100000);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_artifact_mtime(repo), before);
 
     bi_cleanup(repo);
     PASS();
@@ -1650,13 +1676,14 @@ static bool bi_repo_at(const char *path, const char *fn) {
     return bi_git(path, "add .") == 0 && bi_git(path, "commit -q -m init") == 0;
 }
 
-/* The root recorded in the parked slot `slug`; "" when unreadable. */
-static void bi_slot_root(const char *slug, char *buf, size_t n) {
+/* The root recorded in checkout root's parked slot `slug`; "" when
+ * unreadable. */
+static void bi_slot_root(const char *root, const char *slug, char *buf, size_t n) {
     buf[0] = '\0';
     char db[1024];
     char dir[1100];
     char slot[1300];
-    if (!cbm_branch_slots_dir(bi_db_path(db, sizeof(db)), g_bi_project, dir, sizeof(dir))) {
+    if (!cbm_branch_slots_dir(bi_db_path(db, sizeof(db)), g_bi_project, root, dir, sizeof(dir))) {
         return;
     }
     snprintf(slot, sizeof(slot), "%s/%s.db", dir, slug);
@@ -1693,7 +1720,7 @@ TEST(branch_slots_reject_other_roots) {
     ASSERT_EQ(bi_adr_put("A-ADR"), CBM_STORE_OK);
     ASSERT_EQ(bi_git(a, "checkout -q -b feature"), 0);
     ASSERT_EQ(bi_index(a, -1).rc, 0); /* A's main parked */
-    bi_slot_root("main", root, sizeof(root));
+    bi_slot_root(a, "main", root, sizeof(root));
     ASSERT_STR_EQ(root, a);
 
     /* Live database gone; B (also on main) must not install A's slot. */
@@ -1706,24 +1733,116 @@ TEST(branch_slots_reject_other_roots) {
     ASSERT_STR_EQ(bi_adr(adr, sizeof(adr)), "");
     ASSERT_EQ(bi_count("from_b"), 1);
     ASSERT_EQ(bi_count("from_a"), 0);
-    ASSERT_TRUE(bi_is_parked("main"));
+    char **none = NULL;
+    int nb = bi_parked(&none); /* B's own slot directory */
+    cbm_branch_slots_free_list(none, nb);
+    ASSERT_EQ(nb, 0);
+    bi_slot_root(a, "main", root, sizeof(root));
+    ASSERT_STR_EQ(root, a); /* A's slot, untouched */
 
     /* The live database is now B's. A on feature must not park it as its
      * "main" (over A's own slot); the run reindexes over it, as before. */
     r = bi_index(a, -1);
     ASSERT_EQ(r.rc, 0);
     ASSERT_STR_EQ(r.action, "none");
-    bi_slot_root("main", root, sizeof(root));
+    bi_slot_root(a, "main", root, sizeof(root));
     ASSERT_STR_EQ(root, a);
     char **list = NULL;
     int n = bi_parked(&list);
     cbm_branch_slots_free_list(list, n);
     ASSERT_EQ(n, 1);
 
+    /* B switching branches parks its own main -- in its own directory, not
+     * over A's slot of the same name. */
+    ASSERT_EQ(bi_git(b, "checkout -q -b other"), 0);
+    ASSERT_EQ(bi_index(b, -1).rc, 0); /* live is A's: no switch, reindexed */
+    ASSERT_EQ(bi_git(b, "checkout -q main"), 0);
+    ASSERT_EQ(bi_index(b, -1).rc, 0);
+    ASSERT_EQ(bi_git(b, "checkout -q other"), 0);
+    r = bi_index(b, -1);
+    ASSERT_STR_EQ(r.action, "restored"); /* B's own "other" */
+    bi_slot_root(b, "main", root, sizeof(root));
+    ASSERT_STR_EQ(root, b);
+    bi_slot_root(a, "main", root, sizeof(root));
+    ASSERT_STR_EQ(root, a);
+
     (void)cbm_branch_slots_delete_all(db, g_bi_project);
     cbm_unlink(db);
     cbm_remove_db_sidecars(db);
     th_rmtree(base);
+    PASS();
+}
+
+/* Root normalization is a pure string function, so Windows spellings are
+ * checked on every platform; the comparison and the slot key build on it. */
+TEST(branch_root_normalize_and_key) {
+    char out[256];
+    ASSERT_TRUE(cbm_root_normalize("C:\\Users\\Me\\repo\\", true, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "c:/users/me/repo");
+    ASSERT_TRUE(cbm_root_normalize("c:/Users/Me/./x/../repo", true, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "c:/users/me/repo");
+    ASSERT_TRUE(cbm_root_normalize("C:\\", true, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "c:/");
+    ASSERT_TRUE(cbm_root_normalize("\\\\srv\\share\\x\\", true, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "//srv/share/x");
+    ASSERT_TRUE(cbm_root_normalize("/a/./b//../c/", false, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "/a/c");
+    ASSERT_TRUE(cbm_root_normalize("/..", false, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "/");
+    ASSERT_TRUE(cbm_root_normalize("/A/B", false, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "/A/B"); /* POSIX keeps case */
+
+    /* Trailing separators, "."/"..", and a recorded root that no longer
+     * exists still match their directory. */
+    char *dir = th_mktempdir("cbm_bi_rootcmp");
+    ASSERT_NOT_NULL(dir);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", dir);
+    char spelled[512];
+    snprintf(spelled, sizeof(spelled), "%s/./sub/../", saved);
+    ASSERT_TRUE(cbm_root_matches(spelled, saved));
+    ASSERT_TRUE(cbm_root_matches("/nonexistent/cbm/x/", "/nonexistent/cbm/x"));
+    ASSERT_FALSE(cbm_root_matches("/nonexistent/cbm/x", "/nonexistent/cbm/y"));
+    char k1[32];
+    char k2[32];
+    ASSERT_TRUE(cbm_branch_root_key(saved, k1, sizeof(k1)));
+    ASSERT_TRUE(cbm_branch_root_key(spelled, k2, sizeof(k2)));
+    ASSERT_STR_EQ(k1, k2);
+    th_rmtree(saved);
+    PASS();
+}
+
+/* A slot an earlier build parked directly in the project directory is
+ * adopted when it records this checkout, and used. */
+TEST(branch_legacy_slot_adopted) {
+    char *repo = bi_make_repo("cbm_bi_legacy_slot");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* main parked (namespaced) */
+
+    char db[1024];
+    char ns[1100];
+    char flat[1100];
+    char from[1300];
+    char to[1300];
+    bi_db_path(db, sizeof(db));
+    ASSERT_TRUE(cbm_branch_slots_dir(db, g_bi_project, repo, ns, sizeof(ns)));
+    ASSERT_TRUE(cbm_branch_slots_dir(db, g_bi_project, NULL, flat, sizeof(flat)));
+    snprintf(from, sizeof(from), "%s/main.db", ns);
+    snprintf(to, sizeof(to), "%s/main.db", flat);
+    ASSERT_EQ(rename(from, to), 0); /* the old, shared layout */
+
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_STR_EQ(r.action, "restored");
+    ASSERT_EQ(r.reparsed, 0);
+    ASSERT_FALSE(cbm_file_exists(to));
+
+    bi_cleanup(repo);
     PASS();
 }
 
@@ -1772,4 +1891,6 @@ SUITE(branch_index) {
     RUN_TEST(branch_requested_export_failure_fails_run);
 #endif
     RUN_TEST(branch_slots_reject_other_roots);
+    RUN_TEST(branch_root_normalize_and_key);
+    RUN_TEST(branch_legacy_slot_adopted);
 }

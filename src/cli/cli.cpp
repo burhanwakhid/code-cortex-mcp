@@ -3323,7 +3323,7 @@ static int parked_indexes(const char *cache_dir, bool print) {
         char db_path[CLI_BUF_1K];
         snprintf(db_path, sizeof(db_path), "%s/%s.db", cache_dir, ent->name);
         char **slots = NULL;
-        int n = cbm_branch_slots_list(db_path, ent->name, &slots);
+        int n = cbm_branch_slots_list(db_path, ent->name, NULL, &slots);
         for (int i = 0; print && i < n; i++) {
             printf("  %s/%s/%s.db (parked branch index)\n", dir, ent->name, slots[i]);
         }
