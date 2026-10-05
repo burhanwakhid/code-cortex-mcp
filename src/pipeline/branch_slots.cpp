@@ -375,14 +375,16 @@ static adr_state_t read_adr(const char *db_path, const char *project, char **con
  * checked out, so the outgoing live database is the authority. Write its
  * state -- the ADR, or its absence (a delete leaves no row) -- into the slot
  * about to be restored, before the restore, so the restore installs both in
- * one transaction. Only when the outgoing database could not be read does
- * the slot keep its own. False when the slot could not be brought in line. */
+ * one transaction. False when the slot could not be brought in line -- and
+ * when the outgoing ADR could not be read: the live database may then hold
+ * the only copy of the newest ADR, so it must stay in place (the caller
+ * keeps it as the seed) rather than be overwritten by the slot's older one. */
 static bool carry_adr(const char *db_path, const char *project, const char *slot) {
     char *adr = NULL;
     adr_state_t state = read_adr(db_path, project, &adr);
     if (state == ADR_UNREADABLE) {
         cbm_log_warn("branch.adr_unreadable", "project", project);
-        return true;
+        return false;
     }
     char *parked = NULL;
     adr_state_t parked_state = read_adr(slot, project, &parked);

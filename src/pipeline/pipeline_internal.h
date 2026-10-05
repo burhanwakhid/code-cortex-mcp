@@ -810,6 +810,8 @@ void cbm_pipeline_set_before_dump_hook_for_tests(void (*hook)(const cbm_gbuf_t *
 #endif
 
 #ifdef CBM_ENABLE_TEST_SEAMS
+/* Session-brief carry-over bound (PL_BRIEF_RECOMPUTE_MAX_NODES); <= 0 resets. */
+void cbm_pipeline_test_set_brief_recompute_max(int64_t nodes);
 /* One-shot callback after classification, for concurrent source-edit tests. */
 void cbm_pipeline_test_after_classify(void (*callback)(void *), void *data);
 void cbm_pipeline_test_after_extract(void (*callback)(void *), void *data);

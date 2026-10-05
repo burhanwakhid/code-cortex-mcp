@@ -2022,12 +2022,25 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
  * The SessionStart hook uses the same bound for its live fallback. */
 #define PL_BRIEF_RECOMPUTE_MAX_NODES 200000
 
+static int64_t brief_recompute_max_nodes = PL_BRIEF_RECOMPUTE_MAX_NODES;
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_pipeline_test_set_brief_recompute_max(int64_t nodes) {
+    brief_recompute_max_nodes = nodes > 0 ? nodes : PL_BRIEF_RECOMPUTE_MAX_NODES;
+}
+#endif
+
 /* Store the SessionStart brief inputs in the freshly written database, so the
  * hook reads one row instead of running architecture queries per session.
  * Full runs always recompute. Incremental runs keep a brief that survived
- * (a no-op run leaves the file untouched), recompute on small graphs, and
- * otherwise carry the previous brief over (counts as of the last full run).
- * Best-effort: a failure leaves no brief, and the hook degrades. */
+ * (a no-op run leaves the file untouched, so the graph it describes is the
+ * same), recompute on small graphs, and otherwise carry the previous brief
+ * over (counts as of the last full run) -- unless the stored graph was built
+ * from another checkout (verify_content): the previous brief then describes
+ * another branch or commit, so it is recomputed whatever the size. That puts
+ * the seconds-long queries on switch, pull and commit runs of very large
+ * graphs, which already pay for the identity change. Best-effort: a failure
+ * leaves no brief, and the hook degrades. */
 static void pipeline_refresh_session_brief(cbm_pipeline_t *p, bool full) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
@@ -2041,8 +2054,8 @@ static void pipeline_refresh_session_brief(cbm_pipeline_t *p, bool full) {
     char *brief = NULL;
     if (!full && cbm_store_session_brief_get(store, p->project_name, &brief) == CBM_STORE_OK) {
         how = "kept";
-    } else if (!full && p->saved_brief &&
-               cbm_store_node_id_ceiling(store) >= PL_BRIEF_RECOMPUTE_MAX_NODES) {
+    } else if (!full && p->saved_brief && !p->verify_content &&
+               cbm_store_node_id_ceiling(store) >= brief_recompute_max_nodes) {
         how = "carried";
         if (cbm_store_session_brief_put(store, p->project_name, p->saved_brief) != CBM_STORE_OK) {
             how = "failed";

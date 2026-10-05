@@ -19,6 +19,7 @@
 #include <pipeline/artifact.h>
 #include <pipeline/branch_slots.h>
 #include <pipeline/pipeline.h>
+#include <pipeline/pipeline_internal.h> /* cbm_pipeline_test_set_brief_recompute_max */
 #include <store/store.h>
 #include <foundation/platform.h>
 
@@ -1198,6 +1199,82 @@ TEST(branch_stamp_repairs_torn_edge) {
     PASS();
 }
 
+/* An outgoing database whose ADR cannot be read may hold the only copy of
+ * the newest ADR: the switch must keep it in place as the seed rather than
+ * restore a parked database over it. */
+TEST(branch_unreadable_adr_blocks_restore) {
+    char *repo = bi_make_repo("cbm_bi_adrerr");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char adr[256];
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_adr_put("OLD"), CBM_STORE_OK);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* main parked with "OLD" */
+    ASSERT_TRUE(bi_is_parked("main"));
+
+    /* The live ADR becomes unreadable (its table is gone). */
+    char db[1024];
+    cbm_store_t *s = cbm_store_open_path(bi_db_path(db, sizeof(db)));
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_exec(s, "DROP TABLE project_summaries;"), CBM_STORE_OK);
+    cbm_store_close(s);
+
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "seeded");
+    ASSERT_STR_NEQ(bi_adr(adr, sizeof(adr)), "OLD");
+    ASSERT_EQ(bi_count("only_main"), 1);
+
+    bi_cleanup(repo);
+    PASS();
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* A graph large enough that the session brief is carried over instead of
+ * recomputed (bound lowered by the seam): after a switch the carried brief
+ * would describe the other branch, so it is recomputed. */
+TEST(branch_switch_recomputes_session_brief) {
+    char *repo = bi_make_repo("cbm_bi_brief");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    /* feature also gains Go sources main does not have. */
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    th_write_file(TH_PATH(repo, "src/g.go"), "package src\n\nfunc GoOnly() int { return 1 }\n");
+    ASSERT_EQ(bi_git(repo, "add ."), 0);
+    ASSERT_EQ(bi_git(repo, "commit -q -m go"), 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    cbm_pipeline_test_set_brief_recompute_max(1);
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    cbm_pipeline_test_set_brief_recompute_max(0);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "seeded");
+    ASSERT_EQ(bi_count("GoOnly"), 1);
+
+    char db[1024];
+    cbm_store_t *s = cbm_store_open_path_query(bi_db_path(db, sizeof(db)));
+    ASSERT_NOT_NULL(s);
+    char *brief = NULL;
+    ASSERT_EQ(cbm_store_session_brief_get(s, g_bi_project, &brief), CBM_STORE_OK);
+    cbm_store_close(s);
+    bool has_go = brief && strstr(brief, "\"language\":\"Go\"") != NULL;
+    free(brief);
+    ASSERT_TRUE(has_go);
+
+    bi_cleanup(repo);
+    PASS();
+}
+#endif
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -1229,4 +1306,8 @@ SUITE(branch_index) {
 #endif
     RUN_TEST(branch_stamp_keeps_fts_in_step);
     RUN_TEST(branch_stamp_repairs_torn_edge);
+    RUN_TEST(branch_unreadable_adr_blocks_restore);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(branch_switch_recomputes_session_brief);
+#endif
 }
