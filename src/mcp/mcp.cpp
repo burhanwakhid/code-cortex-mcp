@@ -1296,7 +1296,13 @@ static void note_store_generation(cbm_mcp_server_t *srv, const char *path) {
 }
 
 void cbm_mcp_server_revalidate_store(cbm_mcp_server_t *srv) {
-    if (!srv || !srv->store || !srv->owns_store || !srv->store_gen_valid) {
+    if (!srv || !srv->store) {
+        return;
+    }
+    /* Same file or not, an index run may have written into it in place:
+     * start this request on a fresh read snapshot. */
+    cbm_store_end_reads(srv->store);
+    if (!srv->owns_store || !srv->store_gen_valid) {
         return;
     }
     const char *path = cbm_store_db_path(srv->store);
@@ -2174,16 +2180,17 @@ static void add_branch_index_json(yyjson_mut_doc *doc, yyjson_mut_val *git, cbm_
         return;
     }
     if (store) {
-        char qn[CBM_SZ_1K];
         char name[CBM_SZ_512];
-        if (cbm_store_get_branch(store, project, qn, sizeof(qn), name, sizeof(name)) ==
-            CBM_STORE_OK) {
-            const char *slug = cbm_branch_slug_from_qn(qn);
+        if (cbm_store_get_branch(store, project, NULL, 0, name, sizeof(name)) == CBM_STORE_OK) {
             yyjson_mut_obj_add_strcpy(doc, git, "indexed_branch", name);
-            if (slug && ctx->branch_slug) {
-                const char *current = ctx->is_detached ? "detached" : ctx->branch_slug;
+            /* The same identity session start checks: branch name and HEAD
+             * commit, not the slug two branches can share. */
+            cbm_branch_id_t indexed;
+            cbm_branch_id_t current;
+            cbm_branch_id_from_context(ctx, &current);
+            if (cbm_branch_id_indexed(store, project, &indexed) && current.known) {
                 yyjson_mut_obj_add_bool(doc, git, "index_matches_checkout",
-                                        strcmp(slug, current) == 0);
+                                        cbm_branch_id_same(&indexed, &current));
             }
         }
     }
@@ -12770,29 +12777,30 @@ static void *autoindex_thread(void *arg) {
 }
 
 /* Start auto-indexing if configured and project not yet indexed. */
-/* True when the session's index was built for another branch than the one
- * checked out now — a checkout made while no server was watching. The watcher
- * baselines on the CURRENT HEAD, so it would never see that switch; marking
- * the project pending makes its first poll run the index, which swaps in this
- * branch's database (pipeline/branch_slots.h). One SQLite read and a HEAD
- * file read: initialize stays free of git subprocesses. */
+/* True when the session's index was built for another checkout than the one
+ * there now -- another branch, or the same branch (or a detached HEAD) at
+ * another commit: a checkout, pull or commit made while no server was
+ * watching. The watcher baselines on the CURRENT HEAD, so it would never see
+ * that move; marking the project pending makes its first poll run the index,
+ * which swaps in this branch's database (pipeline/branch_slots.h) and passes
+ * over the changed files. One SQLite read and a few small file reads (HEAD,
+ * the branch ref or packed-refs): initialize stays free of git subprocesses.
+ * When HEAD's commit cannot be read from files, only the branch is compared. */
 static bool session_index_on_other_branch(const cbm_mcp_server_t *srv, const char *db_path) {
-    char *slug = cbm_git_head_slug(srv->session_root);
-    if (!slug) {
+    cbm_branch_id_t current;
+    if (!cbm_branch_id_from_head(srv->session_root, &current)) {
         return false;
     }
-    char qn[CBM_SZ_1K] = "";
+    cbm_branch_id_t indexed;
     cbm_store_t *store = cbm_store_open_path_query(db_path);
-    bool known = store && cbm_store_get_branch(store, srv->session_project, qn, sizeof(qn), NULL,
-                                               0) == CBM_STORE_OK;
+    bool known = store && cbm_branch_id_indexed(store, srv->session_project, &indexed);
     cbm_store_close(store);
-    const char *indexed = known ? cbm_branch_slug_from_qn(qn) : NULL;
-    bool other = indexed && strcmp(indexed, slug) != 0;
+    bool other = known && !cbm_branch_id_same(&indexed, &current);
     if (other) {
-        cbm_log_info("autoindex.branch_changed", "project", srv->session_project, "indexed",
-                     indexed, "checkout", slug);
+        cbm_log_info("autoindex.checkout_changed", "project", srv->session_project, "indexed",
+                     indexed.slug, "indexed_head", indexed.head_sha, "checkout", current.slug,
+                     "checkout_head", current.head_sha);
     }
-    free(slug);
     return other;
 }
 

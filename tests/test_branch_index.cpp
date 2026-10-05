@@ -142,11 +142,14 @@ static void bi_cleanup(const char *repo) {
 }
 
 TEST(branch_slug_from_qn) {
-    ASSERT_STR_EQ(cbm_branch_slug_from_qn("proj.__branch__.main"), "main");
-    ASSERT_STR_EQ(cbm_branch_slug_from_qn("a.__branch__.b.__branch__.feature-x"), "feature-x");
-    ASSERT_NULL(cbm_branch_slug_from_qn("proj.main"));
-    ASSERT_NULL(cbm_branch_slug_from_qn("proj.__branch__."));
-    ASSERT_NULL(cbm_branch_slug_from_qn(NULL));
+    ASSERT_STR_EQ(cbm_branch_slug_from_qn("proj.__branch__.main", "proj"), "main");
+    /* A branch whose name contains the marker keeps all of it. */
+    ASSERT_STR_EQ(cbm_branch_slug_from_qn("a.__branch__.b.__branch__.feature-x", "a"),
+                  "b.__branch__.feature-x");
+    ASSERT_NULL(cbm_branch_slug_from_qn("proj.main", "proj"));
+    ASSERT_NULL(cbm_branch_slug_from_qn("proj.__branch__.", "proj"));
+    ASSERT_NULL(cbm_branch_slug_from_qn("other.__branch__.main", "proj"));
+    ASSERT_NULL(cbm_branch_slug_from_qn(NULL, "proj"));
     char dir[256];
     ASSERT_TRUE(cbm_branch_slots_dir("/c/proj.db", "proj", dir, sizeof(dir)));
     ASSERT_STR_EQ(dir, "/c/branches/proj");
@@ -534,7 +537,7 @@ TEST(branch_seeded_artifact_names_new_branch) {
     char qn[1024] = "";
     ASSERT_EQ(cbm_store_get_branch(s, g_bi_project, qn, sizeof(qn), NULL, 0), CBM_STORE_OK);
     cbm_store_close(s);
-    ASSERT_STR_EQ(cbm_branch_slug_from_qn(qn), "feature");
+    ASSERT_STR_EQ(cbm_branch_slug_from_qn(qn, g_bi_project), "feature");
 
     th_rmtree(dir);
     bi_cleanup(repo);
@@ -574,6 +577,213 @@ TEST(branch_index_config_applies_in_process) {
     PASS();
 }
 
+/* index_status's index_matches_checkout for the project: 1, 0, or -1 when
+ * the field is missing. */
+static int bi_status_matches(cbm_mcp_server_t *srv) {
+    char args[1200];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\"}", g_bi_project);
+    /* As the tool server does before every request. */
+    cbm_mcp_server_revalidate_store(srv);
+    char *resp = cbm_mcp_handle_tool(srv, "index_status", args);
+    int r = !resp                                                  ? -1
+            : strstr(resp, "\\\"index_matches_checkout\\\":true")  ? 1
+            : strstr(resp, "\\\"index_matches_checkout\\\":false") ? 0
+                                                                   : -1;
+    free(resp);
+    return r;
+}
+
+/* What session start compares: the checkout's HEAD files against the
+ * identity recorded in the current database. */
+static bool bi_head_matches_index(const char *repo) {
+    cbm_branch_id_t current;
+    cbm_branch_id_t indexed;
+    if (!cbm_branch_id_from_head(repo, &current)) {
+        return true;
+    }
+    char db[1024];
+    cbm_store_t *s = cbm_store_open_path_query(bi_db_path(db, sizeof(db)));
+    bool known = s && cbm_branch_id_indexed(s, g_bi_project, &indexed);
+    cbm_store_close(s);
+    return !known || cbm_branch_id_same(&indexed, &current);
+}
+
+/* Identity is the branch name plus HEAD commit, not the slug: a detached HEAD
+ * that moved, a named branch that gained a commit, and two branches whose
+ * names slug alike are all "another checkout" -- for index_status and for the
+ * session-start check -- until the next index run records the new HEAD. */
+TEST(branch_identity_is_name_and_head) {
+    char *repo = bi_make_repo("cbm_bi_ident");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* Detached at main's commit, then at feature's: both slug "detached". */
+    ASSERT_EQ(bi_git(repo, "checkout -q --detach main"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_status_matches(srv), 1);
+    ASSERT_TRUE(bi_head_matches_index(repo));
+    ASSERT_EQ(bi_git(repo, "checkout -q --detach feature"), 0);
+    ASSERT_EQ(bi_status_matches(srv), 0);
+    ASSERT_FALSE(bi_head_matches_index(repo));
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "none"); /* same slot: an incremental pass, no park */
+    ASSERT_EQ(bi_status_matches(srv), 1);
+    ASSERT_TRUE(bi_head_matches_index(repo));
+
+    /* A named branch that gains a commit while nothing watched. The HEAD
+     * commit is read from packed-refs once the loose ref is packed. */
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_status_matches(srv), 1);
+    th_write_file(TH_PATH(repo, "src/common.py"), "def common_helper():\n    return 3\n");
+    ASSERT_EQ(bi_git(repo, "commit -q -am bump"), 0);
+    ASSERT_EQ(bi_git(repo, "pack-refs --all"), 0);
+    ASSERT_EQ(bi_status_matches(srv), 0);
+    ASSERT_FALSE(bi_head_matches_index(repo));
+    r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_EQ(r.reparsed, 1); /* incremental: only the changed file */
+    ASSERT_EQ(bi_status_matches(srv), 1);
+    ASSERT_TRUE(bi_head_matches_index(repo));
+
+    /* "a/b" and "a-b" share the slug "a-b" (and a slot), not an identity. */
+    ASSERT_EQ(bi_git(repo, "branch -q a/b main"), 0);
+    ASSERT_EQ(bi_git(repo, "branch -q a-b main"), 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q a/b"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_status_matches(srv), 1);
+    ASSERT_EQ(bi_git(repo, "checkout -q a-b"), 0);
+    ASSERT_EQ(bi_status_matches(srv), 0);
+    ASSERT_FALSE(bi_head_matches_index(repo));
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_status_matches(srv), 1);
+
+    cbm_mcp_server_free(srv);
+    bi_cleanup(repo);
+    PASS();
+}
+
+/* The file-only HEAD read agrees with git on the commit, through a loose ref,
+ * packed-refs, a detached HEAD and a linked worktree. */
+TEST(branch_head_read_matches_git) {
+    char *repo = bi_make_repo("cbm_bi_headsha");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char wt[512];
+    snprintf(wt, sizeof(wt), "%s/wt", repo);
+    char cmd[700];
+    snprintf(cmd, sizeof(cmd), "worktree add -q -b side \"%s\" feature", wt);
+    ASSERT_EQ(bi_git(repo, cmd), 0);
+
+    for (int round = 0; round < 3; round++) {
+        if (round == 1) {
+            ASSERT_EQ(bi_git(repo, "pack-refs --all"), 0);
+        } else if (round == 2) {
+            ASSERT_EQ(bi_git(repo, "checkout -q --detach feature"), 0);
+        }
+        const char *roots[] = {repo, wt};
+        for (int i = 0; i < 2; i++) {
+            cbm_git_context_t ctx = {0};
+            ASSERT_EQ(cbm_git_context_resolve(roots[i], &ctx), 0);
+            cbm_git_head_t head;
+            ASSERT_EQ(cbm_git_head_read(roots[i], &head), 0);
+            ASSERT_STR_EQ(head.head_sha, ctx.head_sha);
+            ASSERT_EQ(head.is_detached, ctx.is_detached);
+            if (!ctx.is_detached) {
+                ASSERT_STR_EQ(head.branch, ctx.branch);
+            }
+            cbm_git_context_free(&ctx);
+        }
+    }
+    th_rmtree(repo);
+    PASS();
+}
+
+/* A branch whose name contains the QN marker is still one branch: the second
+ * run on it is not a switch, nothing is parked under a truncated name, and
+ * the index matches the checkout. */
+TEST(branch_name_containing_marker) {
+    char *repo = bi_make_repo("cbm_bi_marker");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q -b foo.__branch__.bar"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "seeded");
+    r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "none");
+    ASSERT_STR_EQ(r.from, "foo.__branch__.bar");
+    ASSERT_FALSE(bi_is_parked("bar"));
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_EQ(bi_status_matches(srv), 1);
+    cbm_mcp_server_free(srv);
+
+    bi_cleanup(repo);
+    PASS();
+}
+
+/* Databases written before the identity was kept current: one whose Branch
+ * properties carry a stale HEAD (an older build's incremental runs never
+ * refreshed them) and one with no properties at all. Neither may cause a
+ * branch switch or a full rebuild; the stale one costs one incremental pass,
+ * after which the identity is current. */
+TEST(branch_identity_from_older_databases) {
+    char *repo = bi_make_repo("cbm_bi_legacy");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char db[1024];
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    cbm_store_t *s = cbm_store_open_path(bi_db_path(db, sizeof(db)));
+    ASSERT_NOT_NULL(s);
+    char qn[1024];
+    char props[4096];
+    ASSERT_EQ(
+        cbm_store_get_branch_props(s, g_bi_project, qn, sizeof(qn), NULL, 0, props, sizeof(props)),
+        CBM_STORE_OK);
+    char *sha = strstr(props, "\"head_sha\":\"");
+    ASSERT_NOT_NULL(sha);
+    sha += strlen("\"head_sha\":\"");
+    memset(sha, '0', 40); /* a commit that is not HEAD */
+    ASSERT_EQ(cbm_store_set_branch(s, g_bi_project, qn, "main", props), CBM_STORE_OK);
+    cbm_store_close(s);
+    ASSERT_FALSE(bi_head_matches_index(repo));
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "none");
+    ASSERT_EQ(r.reparsed, 0);
+    ASSERT_TRUE(bi_head_matches_index(repo));
+
+    s = cbm_store_open_path(bi_db_path(db, sizeof(db)));
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_set_branch(s, g_bi_project, qn, "main", "{}"), CBM_STORE_OK);
+    cbm_store_close(s);
+    ASSERT_TRUE(bi_head_matches_index(repo)); /* slug only: same branch */
+    r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "none");
+    ASSERT_STR_EQ(r.from, "main");
+    ASSERT_EQ(r.reparsed, 0);
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -591,4 +801,8 @@ SUITE(branch_index) {
     RUN_TEST(branch_switch_keeps_newest_adr);
     RUN_TEST(branch_seeded_artifact_names_new_branch);
     RUN_TEST(branch_index_config_applies_in_process);
+    RUN_TEST(branch_identity_is_name_and_head);
+    RUN_TEST(branch_head_read_matches_git);
+    RUN_TEST(branch_name_containing_marker);
+    RUN_TEST(branch_identity_from_older_databases);
 }

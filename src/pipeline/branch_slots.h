@@ -21,15 +21,20 @@
  * not derived from the source, the project's ADR, follows the checkout: a
  * restore keeps the outgoing database's ADR.
  *
- * The slug is the suffix of the Branch node's QN (git_context.h): a branch
- * name made filesystem-safe, "detached" for every detached HEAD (one shared
- * slot), and "working-tree" outside git. Two branch names that slug alike
- * ("a/b", "a-b") share a slot.
+ * The slug names the slot: a branch name made filesystem-safe (git_context.h),
+ * "detached" for every detached HEAD (one shared slot), and "working-tree"
+ * outside git. Two branch names that slug alike ("a/b", "a-b") share a slot.
+ * Whether a database matches the checkout is decided on the full identity the
+ * Branch node's properties record (real branch name, detached, HEAD commit),
+ * never on the slug, so a shared slot costs re-work, not a missed switch.
  *
- * Depends on: store, foundation (compat_fs, platform, log)
+ * Depends on: store, git (git_context), foundation (compat_fs, platform, log)
  */
 #ifndef CBM_BRANCH_SLOTS_H
 #define CBM_BRANCH_SLOTS_H
+
+#include "git/git_context.h"
+#include "store/store.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -53,9 +58,33 @@ typedef enum {
 /* Stable lowercase name of a switch outcome ("none", "restored", ...). */
 const char *cbm_branch_switch_str(cbm_branch_switch_t action);
 
-/* The slug a Branch-node QN ends with: the text after the last
- * ".__branch__.". NULL when qn is not a branch QN. Borrowed from qn. */
-const char *cbm_branch_slug_from_qn(const char *qn);
+/* The slug of project's Branch-node QN "<project>.__branch__.<slug>": the
+ * text after that prefix, so a slug that itself contains the marker survives.
+ * NULL when qn is not project's branch QN. Borrowed from qn. */
+const char *cbm_branch_slug_from_qn(const char *qn, const char *project);
+
+/* The git identity a database was built for, or a checkout has now. */
+typedef struct {
+    bool known; /* false: nothing to compare against */
+    bool is_detached;
+    bool has_sha;      /* head_sha is recorded ("" then means an unborn branch) */
+    char branch[1024]; /* real branch name; "" when detached or not recorded */
+    char slug[1024];   /* the slot name */
+    char head_sha[72];
+} cbm_branch_id_t;
+
+/* The identity recorded on project's Branch node: its properties, or for a
+ * node without them only the slug from its QN. Returns out->known. */
+bool cbm_branch_id_indexed(cbm_store_t *s, const char *project, cbm_branch_id_t *out);
+/* The identity of a resolved checkout (subprocess-backed git_context). */
+void cbm_branch_id_from_context(const cbm_git_context_t *ctx, cbm_branch_id_t *out);
+/* The identity of the checkout at root from its HEAD files only (no git
+ * subprocess). Returns out->known. */
+bool cbm_branch_id_from_head(const char *root, cbm_branch_id_t *out);
+/* True unless the two identities are known and differ: another branch name
+ * (the slug when a name is not recorded), detached versus attached, or
+ * another HEAD commit when both sides know theirs. */
+bool cbm_branch_id_same(const cbm_branch_id_t *indexed, const cbm_branch_id_t *current);
 
 /* <dir of db_path>/branches/<project>. Returns false when it does not fit. */
 bool cbm_branch_slots_dir(const char *db_path, const char *project, char *buf, size_t bufsz);

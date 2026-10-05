@@ -578,7 +578,8 @@ void cbm_pipeline_get_branch_switch(const cbm_pipeline_t *p, const char **action
         *from = p && p->branch_from[0] ? p->branch_from : NULL;
     }
     if (to) {
-        *to = p && p->git_ctx.is_git ? cbm_branch_slug_from_qn(p->branch_qn) : NULL;
+        *to =
+            p && p->git_ctx.is_git ? cbm_branch_slug_from_qn(p->branch_qn, p->project_name) : NULL;
     }
     if (files_reparsed) {
         *files_reparsed = p ? p->files_reparsed : -1;
@@ -2063,31 +2064,39 @@ static void pipeline_branch_switch(cbm_pipeline_t *p) {
     if (!p->default_db_path || !p->db_path || !p->git_ctx.is_git || p->branch_keep < 1) {
         return;
     }
-    p->branch_action =
-        cbm_branch_slots_switch(p->db_path, p->project_name, cbm_branch_slug_from_qn(p->branch_qn),
-                                p->branch_keep, p->branch_from, sizeof(p->branch_from));
+    p->branch_action = cbm_branch_slots_switch(
+        p->db_path, p->project_name, cbm_branch_slug_from_qn(p->branch_qn, p->project_name),
+        p->branch_keep, p->branch_from, sizeof(p->branch_from));
 }
 
-/* Record the branch this run indexed on the Branch node. A full run builds
- * the node from the current checkout already; an incremental (or no-op) run
- * keeps the stored structure, which names whichever branch last ran a full
- * rebuild -- and that label is what the next run's park step reads. Written
- * only when it differs, so a no-op run still leaves the file untouched. The
- * incremental dump also calls this before it refreshes the artifact. */
+/* Record the checkout this run indexed on the Branch node: the QN (the slot
+ * the next run's park step reads) and the properties (branch name, HEAD
+ * commit -- the identity session start and index_status compare). A full run
+ * builds the node from the current checkout already; an incremental (or
+ * no-op) run keeps the stored structure, which names whichever checkout last
+ * ran a full rebuild. Written only when something differs, so a no-op run on
+ * an unmoved HEAD still leaves the file untouched. The incremental dump also
+ * calls this before it refreshes the artifact. */
 void cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
     if (!p || !p->branch_qn || !db_path) {
         return;
     }
-    char stored[CBM_SZ_1K] = "";
+    char props[CBM_SZ_4K];
+    const char *props_json =
+        cbm_git_context_props_json(&p->git_ctx, props, sizeof(props)) > 0 ? props : "{}";
+    const char *name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
+    char stored_qn[CBM_SZ_1K] = "";
+    char stored_name[CBM_SZ_1K] = "";
+    char stored_props[CBM_SZ_4K] = "";
     cbm_store_t *s = cbm_store_open_path_query(db_path);
-    int get_rc = s ? cbm_store_get_branch(s, p->project_name, stored, sizeof(stored), NULL, 0)
+    int get_rc = s ? cbm_store_get_branch_props(s, p->project_name, stored_qn, sizeof(stored_qn),
+                                                stored_name, sizeof(stored_name), stored_props,
+                                                sizeof(stored_props))
                    : CBM_STORE_ERR;
     cbm_store_close(s);
-    if (get_rc == CBM_STORE_OK && strcmp(stored, p->branch_qn) != 0) {
-        char props[CBM_SZ_2K];
-        const char *props_json =
-            cbm_git_context_props_json(&p->git_ctx, props, sizeof(props)) > 0 ? props : "{}";
-        const char *name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
+    if (get_rc == CBM_STORE_OK &&
+        (strcmp(stored_qn, p->branch_qn) != 0 || strcmp(stored_name, name) != 0 ||
+         strcmp(stored_props, props_json) != 0)) {
         s = cbm_store_open_path(db_path);
         if (!s || cbm_store_set_branch(s, p->project_name, p->branch_qn, name, props_json) !=
                       CBM_STORE_OK) {

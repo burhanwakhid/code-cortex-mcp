@@ -12,6 +12,7 @@
 #include "foundation/str_util.h"
 
 #include "sqlite3.h"
+#include <yyjson/yyjson.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -39,18 +40,107 @@ const char *cbm_branch_switch_str(cbm_branch_switch_t action) {
     }
 }
 
-const char *cbm_branch_slug_from_qn(const char *qn) {
-    if (!qn) {
+const char *cbm_branch_slug_from_qn(const char *qn, const char *project) {
+    if (!qn || !project) {
         return NULL;
     }
-    const char *hit = NULL;
-    for (const char *p = strstr(qn, BS_BRANCH_MARK); p; p = strstr(p + 1, BS_BRANCH_MARK)) {
-        hit = p;
-    }
-    if (!hit || !hit[sizeof(BS_BRANCH_MARK) - 1]) {
+    size_t plen = strlen(project);
+    if (strncmp(qn, project, plen) != 0 ||
+        strncmp(qn + plen, BS_BRANCH_MARK, SLEN(BS_BRANCH_MARK)) != 0 ||
+        !qn[plen + SLEN(BS_BRANCH_MARK)]) {
         return NULL;
     }
-    return hit + sizeof(BS_BRANCH_MARK) - 1;
+    return qn + plen + SLEN(BS_BRANCH_MARK);
+}
+
+static void set_slug(cbm_branch_id_t *out, const char *branch, bool detached) {
+    char *slug = cbm_git_branch_slug(branch, detached);
+    snprintf(out->slug, sizeof(out->slug), "%s", slug ? slug : "");
+    free(slug);
+}
+
+bool cbm_branch_id_indexed(cbm_store_t *s, const char *project, cbm_branch_id_t *out) {
+    memset(out, 0, sizeof(*out));
+    char qn[BS_PATH_MAX];
+    char props[CBM_SZ_4K];
+    if (cbm_store_get_branch_props(s, project, qn, sizeof(qn), NULL, 0, props, sizeof(props)) !=
+        CBM_STORE_OK) {
+        return false;
+    }
+    yyjson_doc *doc = yyjson_read(props, strlen(props), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *is_git = root ? yyjson_obj_get(root, "is_git") : NULL;
+    yyjson_val *branch = root ? yyjson_obj_get(root, "branch") : NULL;
+    if (yyjson_get_bool(is_git) && yyjson_is_str(branch)) {
+        out->is_detached = yyjson_get_bool(yyjson_obj_get(root, "is_detached"));
+        if (!out->is_detached) {
+            snprintf(out->branch, sizeof(out->branch), "%s", yyjson_get_str(branch));
+        }
+        yyjson_val *sha = yyjson_obj_get(root, "head_sha");
+        out->has_sha = yyjson_is_str(sha);
+        snprintf(out->head_sha, sizeof(out->head_sha), "%s",
+                 out->has_sha ? yyjson_get_str(sha) : "");
+        set_slug(out, out->branch, out->is_detached);
+    } else {
+        /* No git identity recorded (a non-git index, or properties that
+         * failed to serialize): the QN's slug is all there is. */
+        const char *slug = cbm_branch_slug_from_qn(qn, project);
+        snprintf(out->slug, sizeof(out->slug), "%s", slug ? slug : "");
+        out->is_detached = slug && strcmp(slug, "detached") == 0;
+    }
+    yyjson_doc_free(doc);
+    out->known = out->slug[0] != '\0';
+    return out->known;
+}
+
+void cbm_branch_id_from_context(const cbm_git_context_t *ctx, cbm_branch_id_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!ctx || !ctx->is_git) {
+        return;
+    }
+    out->is_detached = ctx->is_detached;
+    if (!ctx->is_detached) {
+        snprintf(out->branch, sizeof(out->branch), "%s", ctx->branch ? ctx->branch : "");
+    }
+    out->has_sha = ctx->head_sha != NULL;
+    snprintf(out->head_sha, sizeof(out->head_sha), "%s", ctx->head_sha ? ctx->head_sha : "");
+    set_slug(out, out->branch, out->is_detached);
+    out->known = out->slug[0] != '\0';
+}
+
+bool cbm_branch_id_from_head(const char *root, cbm_branch_id_t *out) {
+    memset(out, 0, sizeof(*out));
+    cbm_git_head_t head;
+    if (cbm_git_head_read(root, &head) != 0) {
+        return false;
+    }
+    out->is_detached = head.is_detached;
+    snprintf(out->branch, sizeof(out->branch), "%s", head.branch);
+    /* An unreadable ref and an unborn branch both leave head_sha empty; only
+     * a commit actually read is compared. */
+    out->has_sha = head.head_sha[0] != '\0';
+    snprintf(out->head_sha, sizeof(out->head_sha), "%s", head.head_sha);
+    set_slug(out, out->branch, out->is_detached);
+    out->known = out->slug[0] != '\0';
+    return out->known;
+}
+
+bool cbm_branch_id_same(const cbm_branch_id_t *indexed, const cbm_branch_id_t *current) {
+    if (!indexed || !current || !indexed->known || !current->known) {
+        return true;
+    }
+    if (indexed->is_detached != current->is_detached) {
+        return false;
+    }
+    if (!indexed->is_detached) {
+        bool named = indexed->branch[0] && current->branch[0];
+        if (named ? strcmp(indexed->branch, current->branch) != 0
+                  : strcmp(indexed->slug, current->slug) != 0) {
+            return false;
+        }
+    }
+    return !(indexed->has_sha && current->has_sha &&
+             strcmp(indexed->head_sha, current->head_sha) != 0);
 }
 
 /* A slug is one path component: the git_context slugger only emits
@@ -108,14 +198,13 @@ static bool read_indexed_slug(const char *db_path, const char *project, char *bu
     if (!s) {
         return false;
     }
-    char qn[BS_PATH_MAX];
-    bool ok = cbm_store_get_branch(s, project, qn, sizeof(qn), NULL, 0) == CBM_STORE_OK;
+    cbm_branch_id_t id;
+    bool ok = cbm_branch_id_indexed(s, project, &id);
     cbm_store_close(s);
-    const char *slug = ok ? cbm_branch_slug_from_qn(qn) : NULL;
-    if (!slug || !slug_is_safe(slug)) {
+    if (!ok || !slug_is_safe(id.slug)) {
         return false;
     }
-    snprintf(buf, bufsz, "%s", slug);
+    snprintf(buf, bufsz, "%s", id.slug);
     return true;
 }
 

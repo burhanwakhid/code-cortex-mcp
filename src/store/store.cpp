@@ -1311,6 +1311,17 @@ sqlite3 *cbm_store_get_db(cbm_store_t *s) {
     return s ? s->db : NULL;
 }
 
+void cbm_store_end_reads(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return;
+    }
+    for (sqlite3_stmt *st = sqlite3_next_stmt(s->db, NULL); st; st = sqlite3_next_stmt(s->db, st)) {
+        if (sqlite3_stmt_busy(st)) {
+            sqlite3_reset(st);
+        }
+    }
+}
+
 int cbm_store_exec(cbm_store_t *s, const char *sql) {
     return exec_sql(s, sql);
 }
@@ -3278,18 +3289,26 @@ int cbm_store_set_format_version(cbm_store_t *s, int version) {
 
 int cbm_store_get_branch(cbm_store_t *s, const char *project, char *qn_buf, size_t qn_sz,
                          char *name_buf, size_t name_sz) {
+    return cbm_store_get_branch_props(s, project, qn_buf, qn_sz, name_buf, name_sz, NULL, 0);
+}
+
+int cbm_store_get_branch_props(cbm_store_t *s, const char *project, char *qn_buf, size_t qn_sz,
+                               char *name_buf, size_t name_sz, char *props_buf, size_t props_sz) {
     if (qn_buf && qn_sz > 0) {
         qn_buf[0] = '\0';
     }
     if (name_buf && name_sz > 0) {
         name_buf[0] = '\0';
     }
+    if (props_buf && props_sz > 0) {
+        props_buf[0] = '\0';
+    }
     if (!s || !s->db || !project) {
         return CBM_STORE_ERR;
     }
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db,
-                           "SELECT qualified_name, name FROM nodes "
+                           "SELECT qualified_name, name, properties FROM nodes "
                            "WHERE project = ?1 AND label = 'Branch' ORDER BY id LIMIT 1;",
                            CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         return CBM_STORE_ERR;
@@ -3305,6 +3324,10 @@ int cbm_store_get_branch(cbm_store_t *s, const char *project, char *qn_buf, size
         }
         if (name_buf && name_sz > 0) {
             snprintf(name_buf, name_sz, "%s", name ? name : "");
+        }
+        const char *props = (const char *)sqlite3_column_text(stmt, ST_COL_2);
+        if (props_buf && props_sz > 0) {
+            snprintf(props_buf, props_sz, "%s", props ? props : "");
         }
         result = CBM_STORE_OK;
     } else if (rc != SQLITE_DONE) {

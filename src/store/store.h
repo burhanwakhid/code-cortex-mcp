@@ -113,6 +113,10 @@ int cbm_store_get_branch(cbm_store_t *s, const char *project, char *qn_buf, size
                          char *name_buf, size_t name_sz);
 int cbm_store_set_branch(cbm_store_t *s, const char *project, const char *qn, const char *name,
                          const char *props_json);
+/* get, plus the node's properties: the git identity it was built from
+ * (cbm_git_context_props_json). */
+int cbm_store_get_branch_props(cbm_store_t *s, const char *project, char *qn_buf, size_t qn_sz,
+                               char *name_buf, size_t name_sz, char *props_buf, size_t props_sz);
 
 /* Get caller/callee names for a node (CALLS/HTTP_CALLS/ASYNC_CALLS edges).
  * Returns 0 on success. Caller must free each out_callers[i]/out_callees[i]
@@ -291,6 +295,13 @@ cbm_store_t *cbm_store_open(const char *project);
 
 /* Close the store and free all resources. NULL-safe. */
 void cbm_store_close(cbm_store_t *s);
+
+/* Reset every statement still holding a read open. Cached statements are
+ * reset on their next use, not after the last row, so a long-lived connection
+ * otherwise keeps reading the snapshot of its last query and never sees a
+ * later in-place write (a Branch-node stamp, an ADR) by another connection.
+ * Call between requests only, never while a caller is stepping a statement. */
+void cbm_store_end_reads(cbm_store_t *s);
 
 /* Get the underlying sqlite3 handle (for testing only). */
 struct sqlite3 *cbm_store_get_db(cbm_store_t *s);

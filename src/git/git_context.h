@@ -57,6 +57,27 @@ cbm_git_checkout_kind_t cbm_git_checkout_root_kind(const char *dir);
 /* True when dir's .git is a gitlink naming "<common>/worktrees/<name>", i.e.
  * dir is a linked worktree rather than a submodule. Reads the small .git file. */
 bool cbm_git_is_linked_worktree(const char *dir);
+
+/* What HEAD of the checkout rooted at `root` names, read from files only (no
+ * git subprocess, for callers on a latency budget): HEAD, a linked worktree's
+ * `.git` file and "commondir", the loose branch ref and packed-refs. branch is
+ * the name `git symbolic-ref --short HEAD` prints ("" when detached);
+ * head_sha is "" when the branch has no commit yet or its ref could not be
+ * read from files. Returns non-zero when root is not the top of a checkout,
+ * HEAD is unreadable, HEAD points outside refs/heads, or the repository keeps
+ * its refs in a reftable. */
+typedef struct {
+    bool is_detached;
+    char branch[1024];
+    char head_sha[72];
+} cbm_git_head_t;
+
+int cbm_git_head_read(const char *root, cbm_git_head_t *out);
+
+/* The filesystem-safe slug of a branch name, as cbm_git_context_resolve
+ * computes branch_slug ("detached" when detached). Caller frees. */
+char *cbm_git_branch_slug(const char *branch, bool detached);
+
 /* Branch slug of the checkout rooted at `root`, read from its HEAD file — no
  * git subprocess, for callers on a latency budget. Follows a linked
  * worktree's `.git` FILE ("gitdir: <path>") to its private HEAD. Returns the

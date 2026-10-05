@@ -415,48 +415,136 @@ static bool read_first_line(const char *path, char *buf, size_t bufsz) {
     return ok;
 }
 
-char *cbm_git_head_slug(const char *root) {
+/* "<dir>/<rel>", or rel itself when absolute. False when it does not fit. */
+static bool path_under(const char *dir, const char *rel, char *buf, size_t bufsz) {
+    int n = path_is_absolute(rel) ? snprintf(buf, bufsz, "%s", rel)
+                                  : snprintf(buf, bufsz, "%s/%s", dir, rel);
+    return n > 0 && (size_t)n < bufsz;
+}
+
+static bool is_object_id(const char *s) {
+    size_t len = strlen(s);
+    if (len != 40 && len != 64) { /* SHA-1, SHA-256 */
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (!isxdigit((unsigned char)s[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The commit refs/heads/<branch> names, from the loose ref file or
+ * packed-refs in the common dir. False when neither has it: an unborn
+ * branch, a symbolic ref, or a ref store this does not read. */
+static bool read_branch_sha(const char *common, const char *branch, char *sha, size_t shasz) {
+    char path[GIT_OUTPUT_MAX];
+    char line[GIT_OUTPUT_MAX];
+    int n = snprintf(path, sizeof(path), "%s/refs/heads/%s", common, branch);
+    if (n > 0 && (size_t)n < sizeof(path) && read_first_line(path, line, sizeof(line))) {
+        if (!is_object_id(line)) {
+            return false;
+        }
+        snprintf(sha, shasz, "%s", line);
+        return true;
+    }
+    snprintf(path, sizeof(path), "%s/packed-refs", common);
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        return false;
+    }
+    char want[GIT_OUTPUT_MAX];
+    snprintf(want, sizeof(want), "refs/heads/%s", branch);
+    bool found = false;
+    while (!found && fgets(line, sizeof(line), fp)) {
+        trim_newlines(line);
+        char *space = strchr(line, ' ');
+        if (line[0] == '#' || line[0] == '^' || !space) {
+            continue;
+        }
+        *space = '\0';
+        if (strcmp(space + 1, want) == 0 && is_object_id(line)) {
+            snprintf(sha, shasz, "%s", line);
+            found = true;
+        }
+    }
+    (void)fclose(fp);
+    return found;
+}
+
+int cbm_git_head_read(const char *root, cbm_git_head_t *out) {
+    if (!out) {
+        return CBM_NOT_FOUND;
+    }
+    memset(out, 0, sizeof(*out));
     if (!root || !root[0]) {
-        return NULL;
+        return CBM_NOT_FOUND;
     }
     char path[GIT_OUTPUT_MAX];
-    char head[GIT_OUTPUT_MAX];
+    char gitdir[GIT_OUTPUT_MAX];
+    char line[GIT_OUTPUT_MAX];
     snprintf(path, sizeof(path), "%s/.git", root);
     struct stat st;
     if (stat(path, &st) != 0) {
-        return NULL;
+        return CBM_NOT_FOUND;
     }
     if (S_ISDIR(st.st_mode)) {
-        snprintf(path, sizeof(path), "%s/.git/HEAD", root);
+        snprintf(gitdir, sizeof(gitdir), "%s", path);
     } else {
         /* Linked worktree: ".git" holds "gitdir: <dir>", absolute or relative
          * to the worktree root. */
         static const char prefix[] = "gitdir: ";
-        if (!read_first_line(path, head, sizeof(head)) ||
-            strncmp(head, prefix, sizeof(prefix) - 1) != 0) {
-            return NULL;
-        }
-        const char *dir = head + sizeof(prefix) - 1;
-        int n = path_is_absolute(dir) ? snprintf(path, sizeof(path), "%s/HEAD", dir)
-                                      : snprintf(path, sizeof(path), "%s/%s/HEAD", root, dir);
-        if (n <= 0 || (size_t)n >= sizeof(path)) {
-            return NULL;
+        if (!read_first_line(path, line, sizeof(line)) ||
+            strncmp(line, prefix, sizeof(prefix) - 1) != 0 ||
+            !path_under(root, line + sizeof(prefix) - 1, gitdir, sizeof(gitdir))) {
+            return CBM_NOT_FOUND;
         }
     }
-    if (!read_first_line(path, head, sizeof(head))) {
-        return NULL;
+    /* Branch refs live in the common dir; a linked worktree's gitdir names it
+     * in its "commondir" file, relative to the gitdir. */
+    char common[GIT_OUTPUT_MAX];
+    snprintf(path, sizeof(path), "%s/commondir", gitdir);
+    if (!read_first_line(path, line, sizeof(line)) ||
+        !path_under(gitdir, line, common, sizeof(common))) {
+        snprintf(common, sizeof(common), "%s", gitdir);
+    }
+    snprintf(path, sizeof(path), "%s/HEAD", gitdir);
+    if (!read_first_line(path, line, sizeof(line))) {
+        return CBM_NOT_FOUND;
     }
     static const char ref_prefix[] = "ref: refs/heads/";
-    if (strncmp(head, ref_prefix, sizeof(ref_prefix) - 1) == 0) {
-        return slug_from_branch(head + sizeof(ref_prefix) - 1, false);
+    if (strncmp(line, ref_prefix, sizeof(ref_prefix) - 1) == 0) {
+        const char *branch = line + sizeof(ref_prefix) - 1;
+        /* A reftable repository keeps refs out of the file tree and points
+         * HEAD at the placeholder "refs/heads/.invalid". */
+        snprintf(path, sizeof(path), "%s/reftable", common);
+        if (strcmp(branch, ".invalid") == 0 || cbm_is_dir(path)) {
+            return CBM_NOT_FOUND;
+        }
+        snprintf(out->branch, sizeof(out->branch), "%s", branch);
+        (void)read_branch_sha(common, branch, out->head_sha, sizeof(out->head_sha));
+        return 0;
     }
     /* A detached HEAD holds the commit id itself. */
-    size_t len = strlen(head);
-    bool hex = len >= 40;
-    for (size_t i = 0; hex && i < len; i++) {
-        hex = isxdigit((unsigned char)head[i]) != 0;
+    if (!is_object_id(line)) {
+        return CBM_NOT_FOUND;
     }
-    return hex ? slug_from_branch(NULL, true) : NULL;
+    out->is_detached = true;
+    snprintf(out->head_sha, sizeof(out->head_sha), "%s", line);
+    return 0;
+}
+
+char *cbm_git_branch_slug(const char *branch, bool detached) {
+    return slug_from_branch(branch, detached);
+}
+
+char *cbm_git_head_slug(const char *root) {
+    cbm_git_head_t head;
+    if (cbm_git_head_read(root, &head) != 0) {
+        return NULL;
+    }
+    return slug_from_branch(head.branch, head.is_detached);
 }
 
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx) {
