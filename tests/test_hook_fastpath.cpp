@@ -834,6 +834,17 @@ static char *hf_index_dir(const hf_env_t *e, const char *dir) {
         free(name);
         return nullptr;
     }
+    /* Record dir as the root, as index_repository does: resolvers accept a
+     * derived name only from the directory it was indexed from. */
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.db", e->dir, name);
+    cbm_store_t *st = name ? cbm_store_open_path(path) : nullptr;
+    bool ok = st && cbm_store_upsert_project(st, name, dir) == CBM_STORE_OK;
+    cbm_store_close(st);
+    if (!ok) {
+        free(name);
+        return nullptr;
+    }
     return name;
 }
 #endif
@@ -1014,6 +1025,131 @@ TEST(mcp_cwd_project_stops_at_unindexed_checkout_root) {
 #endif
 }
 
+/* Distinct directories can derive the same project name ('/' and '-' both
+ * fold to '-'). Fixture under a realpath'd temp base:
+ *   a/b-repo   indexed (root recorded), with src/partial.c in its coverage
+ *   a-b/repo   NOT indexed; derives the same name
+ *   c/d-repo   indexed
+ *   c-d/repo   a symlink to c/d-repo: same name, same directory
+ * Every resolver -- hook walk-ups, the MCP cwd resolver, a project argument
+ * given as a path -- must answer for the indexed directory and its alias and
+ * never for its unindexed namesake. */
+TEST(resolvers_reject_colliding_project_names) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && !defined(_WIN32)
+    hf_env_t env;
+    if (!hf_env_open(&env, "cbm-collide-cache")) {
+        PASS();
+    }
+    char old_cwd[1024];
+    ASSERT_NOT_NULL(getcwd(old_cwd, sizeof(old_cwd)));
+    /* Restore cwd and the cache dir however the test ends, so a failure
+     * here does not cascade into later suites. */
+    struct restore_t {
+        hf_env_t *env;
+        const char *cwd;
+        ~restore_t() {
+            (void)chdir(cwd);
+            cbm_mcp_reset_cwd_project_cache();
+            hf_env_close(env);
+        }
+    } restore{&env, old_cwd};
+    const char *made = th_mktempdir("cbm-collide");
+    char *base = made ? realpath(made, NULL) : NULL;
+    ASSERT_NOT_NULL(base);
+    char owner[1024];
+    char other[1024];
+    char real2[1024];
+    char alias[1024];
+    char p[1200];
+    snprintf(owner, sizeof(owner), "%s/a/b-repo", base);
+    snprintf(other, sizeof(other), "%s/a-b/repo", base);
+    snprintf(real2, sizeof(real2), "%s/c/d-repo", base);
+    snprintf(alias, sizeof(alias), "%s/c-d/repo", base);
+    const char *mk[] = {owner, other, real2};
+    for (int i = 0; i < 3; i++) {
+        snprintf(p, sizeof(p), "%s/src", mk[i]);
+        ASSERT_TRUE(cbm_mkdir_p(p, 0755));
+    }
+    snprintf(p, sizeof(p), "%s/c-d", base);
+    ASSERT_TRUE(cbm_mkdir_p(p, 0755));
+    ASSERT_EQ(symlink(real2, alias), 0);
+
+    char *name = hf_index_dir(&env, owner);
+    ASSERT_NOT_NULL(name);
+    char *other_name = cbm_project_name_from_path(other);
+    ASSERT_STR_EQ(other_name, name); /* the collision */
+    free(other_name);
+    char *name2 = hf_index_dir(&env, real2);
+    ASSERT_NOT_NULL(name2);
+    char *alias_name = cbm_project_name_from_path(alias);
+    ASSERT_STR_EQ(alias_name, name2);
+    free(alias_name);
+    snprintf(p, sizeof(p), "%s/%s.db", env.dir, name);
+    cbm_store_t *st = cbm_store_open_path(p);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_file_hash(st, name, "src/partial.c", "aa", 1, 10), CBM_STORE_OK);
+    cbm_coverage_row_t rows[] = {{"src/partial.c", "parse_partial", "3-9"}};
+    ASSERT_EQ(cbm_store_coverage_replace(st, name, rows, 1), CBM_STORE_OK);
+    cbm_store_close(st);
+
+    /* Hook walk-ups: SessionStart and the Read coverage note. */
+    char want[1200];
+    snprintf(want, sizeof(want), "indexed as \"%s\"", name);
+    const struct {
+        const char *root;
+        bool owned;
+    } cases[] = {{owner, true}, {other, false}, {alias, true}};
+    for (const auto &c : cases) {
+        snprintf(p, sizeof(p), "%s/src", c.root);
+        char *text = cbm_session_start_text_for_testing(p);
+        bool hit = text && (strstr(text, "indexed as \"") != NULL);
+        free(text);
+        ASSERT_EQ(hit, c.owned);
+        snprintf(p, sizeof(p), "%s/src/partial.c", c.root);
+        char *note = cbm_hook_coverage_walk_for_testing(p);
+        bool noted = note != NULL;
+        free(note);
+        ASSERT_EQ(noted, c.owned && c.root == owner);
+    }
+
+    /* The MCP cwd resolver. */
+    for (const auto &c : cases) {
+        snprintf(p, sizeof(p), "%s/src", c.root);
+        ASSERT_EQ(chdir(p), 0);
+        cbm_mcp_reset_cwd_project_cache();
+        ASSERT_EQ(cbm_mcp_cwd_project() != NULL, c.owned);
+    }
+    ASSERT_EQ(chdir(old_cwd), 0);
+    cbm_mcp_reset_cwd_project_cache();
+
+    /* A project argument given as a path (canonicalized, then derived). */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    for (const auto &c : cases) {
+        snprintf(p, sizeof(p), "{\"project\":\"%s\"}", c.root);
+        char *resp = cbm_mcp_handle_tool(srv, "index_status", p);
+        ASSERT_NOT_NULL(resp);
+        bool found = strstr(resp, "no_project") == NULL && strstr(resp, "\\\"nodes\\\"") != NULL;
+        free(resp);
+        ASSERT_EQ(found, c.owned);
+    }
+    /* By name the project still resolves: names are not paths. */
+    snprintf(p, sizeof(p), "{\"project\":\"%s\"}", name);
+    char *resp = cbm_mcp_handle_tool(srv, "index_status", p);
+    ASSERT_NOT_NULL(strstr(resp, "\\\"nodes\\\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(cbm_mcp_root_matches("", other)); /* legacy: no recorded root */
+
+    free(name);
+    free(name2);
+    th_rmtree(base);
+    free(base);
+#endif
+    PASS();
+}
+
 void suite_hook_fastpath(void) {
     RUN_TEST(hook_scan_fallback_off_resolves_from_the_memo_only);
     RUN_TEST(hook_scan_fallback_defaults_on_and_toggles_back);
@@ -1029,4 +1165,5 @@ void suite_hook_fastpath(void) {
     RUN_TEST(hook_walkup_stops_at_unindexed_checkout_root);
     RUN_TEST(hook_coverage_walk_stops_at_unindexed_checkout_root);
     RUN_TEST(mcp_cwd_project_stops_at_unindexed_checkout_root);
+    RUN_TEST(resolvers_reject_colliding_project_names);
 }

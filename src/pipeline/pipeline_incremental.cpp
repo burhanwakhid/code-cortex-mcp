@@ -815,8 +815,10 @@ static void dump_and_persist(cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const char *db
     free(saved_adr);
 
     /* Auto-update artifact if one already exists (persistence was enabled previously) */
-    if (repo_path && cbm_artifact_exists(repo_path)) {
-        cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
+    cbm_pipeline_set_artifact_stale(p, true);
+    if (repo_path && cbm_artifact_exists(repo_path) &&
+        cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST) == 0) {
+        cbm_pipeline_set_artifact_stale(p, false);
     }
 }
 

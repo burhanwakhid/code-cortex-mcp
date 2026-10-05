@@ -33,6 +33,10 @@ int cbm_gitignore_match_result(const cbm_gitignore_t *gi, const char *rel_path, 
 static const char *ALWAYS_SKIP_DIRS[] = {
     /* VCS */
     ".git", ".hg", ".svn", ".worktrees",
+    /* The indexer's own artifact (pipeline/artifact.h CBM_ARTIFACT_DIR): an
+     * export rewrites it, so indexing it made every run after an export
+     * re-extract and re-export it. */
+    ".code-cortex",
     /* IDE */
     ".idea", ".vs", ".vscode", ".eclipse", ".claude", ".claude-worktrees", "Antigravity",
     /* Python */

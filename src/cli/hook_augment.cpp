@@ -220,6 +220,25 @@ static bool ha_stop_at_checkout(const char *dir) {
     return cbm_git_checkout_root_kind(dir) != CBM_GIT_CHECKOUT_NONE;
 }
 
+/* The project a walk-up level would answer from: dir's derived name, which
+ * may also be another directory's (names fold separators to '-'), so the
+ * lookups that follow accept only a database indexed from dir itself
+ * (cbm_mcp_expect_project_root). Every walk-up uses this, inside a
+ * ha_root_scope that clears the expectation when the walk ends. Caller frees. */
+static char *ha_level_project(const char *dir) {
+    cbm_mcp_expect_project_root(dir);
+    return cbm_project_name_from_path(dir);
+}
+
+struct ha_root_scope {
+    ha_root_scope() = default;
+    ha_root_scope(const ha_root_scope &) = delete;
+    ha_root_scope &operator=(const ha_root_scope &) = delete;
+    ~ha_root_scope() {
+        cbm_mcp_expect_project_root(nullptr);
+    }
+};
+
 /* Walk up from the file's parent directory to find the indexed project, then
  * check whether the file (repo-relative) is listed in its coverage report.
  * Mirrors ha_resolve_and_query: an MCP error means "not indexed here" →
@@ -231,8 +250,9 @@ static char *ha_resolve_coverage(cbm_mcp_server_t *srv, const char *file_path) {
         return NULL; /* file directly at a root — nothing to resolve against */
     }
 
+    ha_root_scope root_scope;
     for (int level = 0; level < HA_MAX_WALKUP && cbm_hook_path_is_abs(dir); level++) {
-        char *project = cbm_project_name_from_path(dir);
+        char *project = ha_level_project(dir);
         if (project) {
             bool resolved = false;
             const char *rel = file_path + strlen(dir) + 1;
@@ -1498,8 +1518,9 @@ static char *ha_session_brief(cbm_mcp_server_t *srv, const char *project, bool *
 static char *ha_walk_symbol(cbm_mcp_server_t *srv, const char *start, const char *token) {
     char dir[4096];
     snprintf(dir, sizeof(dir), "%s", start);
+    ha_root_scope root_scope;
     for (int level = 0; level < HA_MAX_WALKUP && cbm_hook_path_is_abs(dir); level++) {
-        char *project = cbm_project_name_from_path(dir);
+        char *project = ha_level_project(dir);
         if (project) {
             bool resolved = false;
             char *ctx = ha_symbol_brief(srv, project, token, &resolved);
@@ -1526,8 +1547,9 @@ static char *ha_walk_session(cbm_mcp_server_t *srv, const char *start, bool *ind
     stop_root[0] = '\0';
     char dir[4096];
     snprintf(dir, sizeof(dir), "%s", start);
+    ha_root_scope root_scope;
     for (int level = 0; level < HA_MAX_WALKUP && cbm_hook_path_is_abs(dir); level++) {
-        char *project = cbm_project_name_from_path(dir);
+        char *project = ha_level_project(dir);
         if (project) {
             bool resolved = false;
             char *ctx = ha_session_brief(srv, project, &resolved);
@@ -1600,8 +1622,9 @@ static char *ha_walk_edit(cbm_mcp_server_t *srv, const char *file_path) {
     if (!ha_strip_last_component(dir)) {
         return NULL;
     }
+    ha_root_scope root_scope;
     for (int level = 0; level < HA_MAX_WALKUP && cbm_hook_path_is_abs(dir); level++) {
-        char *project = cbm_project_name_from_path(dir);
+        char *project = ha_level_project(dir);
         if (project) {
             bool resolved = false;
             const char *rel = file_path + strlen(dir) + 1;
@@ -4469,8 +4492,11 @@ static char *ha_prompt_context(cbm_mcp_server_t *srv, const char *cwd, const ha_
     snprintf(dir, sizeof(dir), "%s", cwd);
     char *project = nullptr;
     char *first = nullptr;
+    /* Held to the end: the targets after the first are looked up in the
+     * project the walk settled on, under the same ownership check. */
+    ha_root_scope root_scope;
     for (int level = 0; level < HA_MAX_WALKUP && cbm_hook_path_is_abs(dir); level++) {
-        char *name = cbm_project_name_from_path(dir);
+        char *name = ha_level_project(dir);
         if (name) {
             bool resolved = false;
             char *json = cbm_mcp_symbol_nodes(srv, name, req.targets[0].bare.c_str(), &resolved);

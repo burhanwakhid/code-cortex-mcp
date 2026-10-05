@@ -156,6 +156,10 @@ struct cbm_pipeline {
      * incremental pass must not trust size+mtime alone (see
      * pipeline_decide_content_check). */
     bool verify_content;
+    /* The live database changed this run after the last artifact export of
+     * the run (or with none): a restore, a dump, a stamp. Read at the end of
+     * cbm_pipeline_run, which exports iff it is set. */
+    bool artifact_stale;
 };
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
@@ -565,6 +569,12 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) 
 void cbm_pipeline_set_files_reparsed(cbm_pipeline_t *p, int count) {
     if (p) {
         p->files_reparsed = count;
+    }
+}
+
+void cbm_pipeline_set_artifact_stale(cbm_pipeline_t *p, bool stale) {
+    if (p) {
+        p->artifact_stale = stale;
     }
 }
 
@@ -1841,6 +1851,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     p->saved_adr = NULL;
 
     /* Export persistent artifact if enabled */
+    p->artifact_stale = true;
     if (p->persistence) {
         CBM_PROF_START(t_art);
         int arc = cbm_artifact_export(db_path, p->repo_path, p->project_name, CBM_ARTIFACT_BEST);
@@ -1854,6 +1865,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
             /* A failed persistence export intentionally fails the run; this used to be ignored. */
             return arc;
         }
+        p->artifact_stale = false;
     }
 
     return 0;
@@ -2087,9 +2099,12 @@ static void pipeline_branch_switch(cbm_pipeline_t *p) {
     if (!p->default_db_path || !p->db_path || !p->git_ctx.is_git || p->branch_keep < 1) {
         return;
     }
+    p->artifact_stale = false;
     p->branch_action = cbm_branch_slots_switch(
         p->db_path, p->project_name, cbm_branch_slug_from_qn(p->branch_qn, p->project_name),
         p->branch_keep, &p->branch_from);
+    /* A restore replaced the live content; nothing has exported it yet. */
+    p->artifact_stale = p->branch_action == CBM_BRANCH_SWITCH_RESTORED;
 }
 
 /* Record the checkout this run indexed on the Branch node: the QN (the slot
@@ -2242,15 +2257,17 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     int rc = pipeline_run_claimed(p);
     if (rc == 0 && !check_cancel(p)) {
         char *db_path = resolve_db_path(p);
-        /* A run whose only write is the stamp (a switch to a branch with the
-         * same indexed contents ends as an incremental no-op) exported
-         * nothing, so an existing artifact still names the outgoing branch:
-         * export again, as the incremental path would have. Only when the
-         * stamp wrote, so an unchanged run never re-exports; the export's
-         * own files under .code-cortex/ do not move HEAD, so the next run's
-         * stamp writes nothing and this cannot repeat on its own. */
-        if (cbm_pipeline_stamp_branch(p, db_path) &&
-            (p->persistence || cbm_artifact_exists(p->repo_path)) &&
+        if (cbm_pipeline_stamp_branch(p, db_path)) {
+            p->artifact_stale = true;
+        }
+        /* Export iff the live database changed after the run's last export:
+         * a restore with nothing re-extracted, a stamp-only switch, a full
+         * rebuild without the persistence flag while an artifact exists.
+         * The dump paths clear the flag when they export themselves, so no
+         * run exports twice, and an unchanged run never exports. The
+         * export's own files under .code-cortex/ move neither HEAD nor the
+         * branch, so the next run's stamp writes nothing: no loop. */
+        if (p->artifact_stale && (p->persistence || cbm_artifact_exists(p->repo_path)) &&
             cbm_artifact_export(db_path, p->repo_path, p->project_name,
                                 p->persistence ? CBM_ARTIFACT_BEST : CBM_ARTIFACT_FAST) != 0) {
             const char *err = cbm_artifact_export_last_error();

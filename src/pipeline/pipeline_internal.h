@@ -835,6 +835,9 @@ void cbm_pipeline_set_files_reparsed(cbm_pipeline_t *p, int count);
 /* True when this run's database was recorded for another checkout, so the
  * incremental pass hashes same-size files even when their mtime matches. */
 bool cbm_pipeline_verify_content(const cbm_pipeline_t *p);
+/* Whether the live database changed after the run's last artifact export
+ * (cbm_pipeline_run exports at the end iff so). */
+void cbm_pipeline_set_artifact_stale(cbm_pipeline_t *p, bool stale);
 
 /* Parse a gRPC stub call "<service-stub>.<method>" into the canonical proto
  * service name + method. Returns true ONLY when a recognized gRPC stub/client

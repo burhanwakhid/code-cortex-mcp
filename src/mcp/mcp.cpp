@@ -1065,6 +1065,9 @@ static char *normalize_project_arg(char *project) {
     project = canonicalize_repo_path_if_exists(project);
     char *normalized = cbm_project_name_from_path(project);
     if (normalized) {
+        /* The path names the directory; the derived name alone may belong to
+         * another one (see cbm_mcp_root_matches). */
+        cbm_mcp_expect_project_root(project);
         free(project);
         return normalized;
     }
@@ -1391,6 +1394,78 @@ static bool project_db_exists(const char *project) {
     return path[0] != '\0' && cbm_file_exists(path);
 }
 
+/* ── Project ownership of a directory ───────────────────────────
+ * A project name derived from a path is not unique: cbm_project_name_from_path
+ * folds separators and unsafe characters to '-', so /x/a-b/repo and
+ * /x/a/b-repo both derive the same name. A resolver that tries a directory's
+ * derived name must therefore check that the database found under it was
+ * indexed from THAT directory before answering from it -- otherwise an
+ * unindexed checkout is silently answered from another one. */
+
+bool cbm_mcp_root_matches(const char *recorded, const char *dir) {
+    if (!dir || !dir[0] || !recorded || !recorded[0]) {
+        return true; /* nothing expected, or a legacy database with no root */
+    }
+    if (strcmp(recorded, dir) == 0) {
+        return true;
+    }
+#ifdef _WIN32
+    return _stricmp(recorded, dir) == 0;
+#else
+    /* realpath folds symlinks (macOS /tmp -> /private/tmp) and "..";
+     * dev+inode then covers a case-insensitive volume, where two spellings of
+     * one directory realpath to different strings. */
+    char a[PATH_MAX];
+    char b[PATH_MAX];
+    if (realpath(recorded, a) && realpath(dir, b) && strcmp(a, b) == 0) {
+        return true;
+    }
+    struct stat sa;
+    struct stat sb;
+    return stat(recorded, &sa) == 0 && stat(dir, &sb) == 0 && sa.st_dev == sb.st_dev &&
+           sa.st_ino == sb.st_ino;
+#endif
+}
+
+/* The directory the current tool call's project must have been indexed from,
+ * or "": set by a walk-up level (cbm_mcp_expect_project_root) or by a project
+ * argument given as a path, cleared at the start of every tool call. Per
+ * process, like g_project_note. */
+static char g_expected_root[CBM_SZ_4K];
+
+void cbm_mcp_expect_project_root(const char *dir) {
+    snprintf(g_expected_root, sizeof(g_expected_root), "%s", dir ? dir : "");
+}
+
+static void store_meta_note_project(const char *path, const char *project, const char *root_path);
+
+/* Whether <project>.db was indexed from dir: the root recorded in the memo at
+ * the file's current generation, else read from the database once (and
+ * memoized, as resolve_store does). True when the file is absent or records
+ * no root. */
+static bool project_db_owned_by(const char *project, const char *dir, cbm_store_meta_db_t *meta) {
+    char path[CBM_SZ_1K];
+    project_db_path(project, path, sizeof(path));
+    cbm_file_gen_t gen;
+    if (!path[0] || !cbm_file_generation(path, &gen)) {
+        return true;
+    }
+    cbm_store_meta_row_t row;
+    if (meta && cbm_store_meta_get(meta, path, &gen, &row) && strcmp(row.project, project) == 0) {
+        return cbm_mcp_root_matches(row.root_path, dir);
+    }
+    cbm_store_t *s = cbm_store_open_path_query(path);
+    cbm_project_t proj = {0};
+    bool owned = true;
+    if (s && cbm_store_get_project(s, project, &proj) == CBM_STORE_OK) {
+        owned = cbm_mcp_root_matches(proj.root_path, dir);
+        store_meta_note_project(path, project, proj.root_path);
+        cbm_project_free_fields(&proj);
+    }
+    cbm_store_close(s);
+    return owned;
+}
+
 /* Project name derived from cwd or one of its ancestors that has an indexed
  * db, or NULL. Cached for the life of the process (cwd does not change). */
 static const char *cwd_project_name(void) {
@@ -1415,7 +1490,7 @@ static const char *cwd_project_name(void) {
     for (int level = 0; level < CWD_PROJECT_MAX_WALKUP; level++) {
         char *pname = cbm_project_name_from_path(dir);
         if (pname) {
-            bool hit = project_db_exists(pname);
+            bool hit = project_db_exists(pname) && project_db_owned_by(pname, dir, meta);
             if (hit) {
                 snprintf(g_cwd_project, sizeof(g_cwd_project), "%s", pname);
             }
@@ -1678,10 +1753,33 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     return store;
 }
 
+static cbm_store_t *resolve_store_by_name(cbm_mcp_server_t *srv, const char *project);
+
+/* resolve_store_by_name, then the ownership check when the call expects a
+ * root (g_expected_root): a database indexed from another directory under
+ * the same derived name is "not found" here. One point query on the handle
+ * the call needs anyway. */
+static cbm_store_t *resolve_store_open(cbm_mcp_server_t *srv, const char *project) {
+    cbm_store_t *store = resolve_store_by_name(srv, project);
+    if (store && g_expected_root[0]) {
+        cbm_project_t proj = {0};
+        if (cbm_store_get_project(store, project, &proj) == CBM_STORE_OK) {
+            bool owned = cbm_mcp_root_matches(proj.root_path, g_expected_root);
+            if (!owned) {
+                cbm_log_info("project.name_collision", "project", project, "indexed_root",
+                             proj.root_path ? proj.root_path : "", "wanted", g_expected_root);
+                store = NULL;
+            }
+            cbm_project_free_fields(&proj);
+        }
+    }
+    return store;
+}
+
 /* Open the right project's .db file for query tools.
  * Caches the connection — reopens only when project changes.
  * Tracks last-access time so the event loop can evict idle stores. */
-static cbm_store_t *resolve_store_open(cbm_mcp_server_t *srv, const char *project) {
+static cbm_store_t *resolve_store_by_name(cbm_mcp_server_t *srv, const char *project) {
     srv->store_resolution_incomplete = false;
     srv->store_resolution_state = CBM_INTEGRITY_OK;
     if (!project) {
@@ -12528,8 +12626,19 @@ static bool mcp_tool_reads_in_batch(const char *tool_name) {
 }
 
 static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json);
+static char *handle_tool_impl(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json);
 
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
+    /* A project argument given as a path scopes lookups to that directory for
+     * this call only: clear it on the way in and out, so it never leaks into
+     * a later call or a direct cbm_mcp_* lookup. */
+    g_expected_root[0] = '\0';
+    char *result = handle_tool_impl(srv, tool_name, args_json);
+    g_expected_root[0] = '\0';
+    return result;
+}
+
+static char *handle_tool_impl(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     g_project_note[0] = '\0';
     /* Every tool call starts here -- tool-server worker, in-process stdio
      * server, CLI, hooks -- and none is nested inside another's statement
@@ -12828,6 +12937,17 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         char db_check[CBM_SZ_1K];
         snprintf(db_check, sizeof(db_check), "%s/%s.db", cbm_resolve_cache_dir(),
                  srv->session_project);
+        if (cbm_file_size(db_check) >= 0 &&
+            !project_db_owned_by(srv->session_project, srv->session_root, NULL)) {
+            /* The derived name belongs to a database indexed from another
+             * directory (cbm_mcp_root_matches). Watching or auto-indexing this
+             * root under that name would overwrite the other checkout's
+             * index, so do neither; an explicit index_repository with a
+             * name override is the way out. */
+            cbm_log_warn("autoindex.skip", "reason", "project_name_collision", "project",
+                         srv->session_project, "path", srv->session_root);
+            return;
+        }
         if (cbm_file_size(db_check) >= 0) {
             /* Already indexed → register watcher for change detection */
             cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",

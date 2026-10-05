@@ -536,9 +536,6 @@ TEST(branch_seeded_artifact_names_new_branch) {
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
     ASSERT_TRUE(cbm_artifact_exists(repo));
-    /* The export added indexable files under .code-cortex/; take them into
-     * main's graph so the switch below stays incremental. */
-    ASSERT_EQ(bi_index(repo, -1).rc, 0);
 
     ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
     bi_run_t r = bi_index(repo, -1);
@@ -1321,6 +1318,92 @@ TEST(branch_restore_keeps_concurrent_adr_write) {
 }
 #endif
 
+/* mtime (ns) of the repo's exported graph artifact; -1 when absent. */
+static int64_t bi_artifact_mtime(const char *repo) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/.code-cortex/graph.db.zst", repo);
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return -1;
+    }
+#ifdef __APPLE__
+    return ((int64_t)st.st_mtimespec.tv_sec * 1000000000LL) + st.st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st.st_mtime * 1000000000LL;
+#else
+    return ((int64_t)st.st_mtim.tv_sec * 1000000000LL) + st.st_mtim.tv_nsec;
+#endif
+}
+
+/* The graph the repo's artifact holds: its Branch slug into slug and the
+ * count of nodes named `symbol`; -1 when it cannot be imported. */
+static int bi_artifact_probe(const char *repo, const char *symbol, char *slug, size_t slug_sz) {
+    slug[0] = '\0';
+    char *dir = th_mktempdir("cbm_bi_art_probe");
+    if (!dir) {
+        return -1;
+    }
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", dir);
+    char imported[1024];
+    snprintf(imported, sizeof(imported), "%s/imported.db", saved);
+    int count = -1;
+    if (cbm_artifact_import(repo, imported) == 0) {
+        cbm_store_t *s = cbm_store_open_path_query(imported);
+        char qn[4096] = "";
+        if (s && cbm_store_get_branch(s, g_bi_project, qn, sizeof(qn), NULL, 0) == CBM_STORE_OK) {
+            const char *sl = cbm_branch_slug_from_qn(qn, g_bi_project);
+            snprintf(slug, slug_sz, "%s", sl ? sl : "");
+        }
+        cbm_node_t *nodes = NULL;
+        count = 0;
+        if (s) {
+            cbm_store_find_nodes_by_name(s, g_bi_project, symbol, &nodes, &count);
+            cbm_store_free_nodes(nodes, count);
+        }
+        cbm_store_close(s);
+    }
+    th_rmtree(saved);
+    return count;
+}
+
+/* A restore whose tree needs nothing re-extracted exports nothing through
+ * the incremental path; the artifact must still follow the live database to
+ * the restored branch. */
+TEST(branch_restore_reexports_artifact) {
+    char *repo = bi_make_repo("cbm_bi_artrest");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    snprintf(g_bi_project, sizeof(g_bi_project), "%s", cbm_pipeline_project_name(p));
+    ASSERT_EQ(cbm_pipeline_run(p), 0); /* main, exported */
+    cbm_pipeline_free(p);
+
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_STR_EQ(r.action, "seeded"); /* re-extracts, exports feature */
+    char slug[256];
+    ASSERT_EQ(bi_artifact_probe(repo, "only_feature", slug, sizeof(slug)), 1);
+    ASSERT_STR_EQ(slug, "feature");
+
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "restored");
+    ASSERT_EQ(r.reparsed, 0); /* nothing for the incremental pass to export */
+    ASSERT_EQ(bi_artifact_probe(repo, "only_main", slug, sizeof(slug)), 1);
+    ASSERT_STR_EQ(slug, "main");
+    ASSERT_EQ(bi_artifact_probe(repo, "only_feature", slug, sizeof(slug)), 0);
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 /* A switch to a branch with the same indexed contents writes only the stamp;
  * an existing artifact must still be re-exported under the new branch. */
 TEST(branch_stamp_only_switch_reexports_artifact) {
@@ -1337,7 +1420,6 @@ TEST(branch_stamp_only_switch_reexports_artifact) {
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
     ASSERT_TRUE(cbm_artifact_exists(repo));
-    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* take in the .code-cortex/ files */
 
     ASSERT_EQ(bi_git(repo, "branch -q twin"), 0);
     ASSERT_EQ(bi_git(repo, "checkout -q twin"), 0);
@@ -1358,11 +1440,14 @@ TEST(branch_stamp_only_switch_reexports_artifact) {
     cbm_store_close(s);
     ASSERT_STR_EQ(cbm_branch_slug_from_qn(qn, g_bi_project), "twin");
 
-    /* The next run on twin writes no stamp. (It still re-extracts the
-     * artifact's own metadata file under .code-cortex/ and re-exports through
-     * the incremental path, as every run after an export already did.) */
+    /* The next run on twin changes nothing -- the artifact directory is not
+     * indexed -- so it does not export again: no loop. */
+    int64_t before = bi_artifact_mtime(repo);
+    cbm_usleep(1100000);
     r = bi_index(repo, -1);
     ASSERT_EQ(r.rc, 0);
+    ASSERT_EQ(r.reparsed, 0);
+    ASSERT_EQ(bi_artifact_mtime(repo), before);
 
     th_rmtree(dir);
     bi_cleanup(repo);
@@ -1540,6 +1625,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_restore_keeps_concurrent_adr_write);
 #endif
     RUN_TEST(branch_stamp_only_switch_reexports_artifact);
+    RUN_TEST(branch_restore_reexports_artifact);
     RUN_TEST(branch_index_prompt_counts_parked_only_cache);
     RUN_TEST(branch_long_slug_slot_names);
     RUN_TEST(branch_long_names_park_and_restore);

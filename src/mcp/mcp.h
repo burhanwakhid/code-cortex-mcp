@@ -148,6 +148,16 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
  * (main.c) and the session auto-index (mcp.c) route through. */
 char *cbm_mcp_index_run_supervised_path(const char *root_path);
 
+/* Project names derived from paths collide (cbm_project_name_from_path folds
+ * separators to '-'). cbm_mcp_root_matches: whether a database's recorded
+ * root `recorded` is the directory `dir` (realpath, then device+inode; true
+ * when either is empty -- a legacy database records none).
+ * cbm_mcp_expect_project_root: until the next tool call (or a NULL call),
+ * project lookups answer only from a database indexed from `dir`; a walk-up
+ * sets it per level. */
+bool cbm_mcp_root_matches(const char *recorded, const char *dir);
+void cbm_mcp_expect_project_root(const char *dir);
+
 /* The in-process fallback of the above: a full index of root_path in THIS
  * process, with the persisted index config (branch_index, branch_index_keep)
  * applied exactly as index_repository applies it. The caller holds the
