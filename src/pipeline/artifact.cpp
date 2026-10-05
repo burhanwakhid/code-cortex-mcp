@@ -725,6 +725,27 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
         return CBM_NOT_FOUND;
     }
 
+    /* The artifact is adopted by THIS checkout: record its root, not the
+     * exporter's. Every ownership check (cbm_root_matches) then treats it as
+     * this checkout's own index, and the first run compares the exporter's
+     * Branch identity with this checkout and verifies content where they
+     * differ. File hashes are content digests, so the incremental pass works
+     * across machines. The exporter's root stays in the Branch properties
+     * until that first run's stamp. */
+    sqlite3 *idb = cbm_store_get_db(store);
+    sqlite3_stmt *rebind = NULL;
+    bool rebound = idb &&
+                   sqlite3_prepare_v2(idb, "UPDATE projects SET root_path = ?1;", -1, &rebind,
+                                      NULL) == SQLITE_OK &&
+                   sqlite3_bind_text(rebind, 1, repo_path, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                   sqlite3_step(rebind) == SQLITE_DONE;
+    sqlite3_finalize(rebind);
+    if (!rebound) {
+        /* Left as the exporter's root, the next run rebuilds it as a foreign
+         * index: slower, never wrong. */
+        cbm_log_warn("artifact.import", "warn", "rebind_root_failed");
+    }
+
     cbm_store_close(store);
 
     /* Atomic rename to final path. Drop the DESTINATION's leftover

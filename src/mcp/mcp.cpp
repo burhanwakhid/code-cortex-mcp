@@ -12886,25 +12886,38 @@ static void *autoindex_thread(void *arg) {
  * over the changed files. One SQLite read and a few small file reads (HEAD,
  * the branch ref or packed-refs): initialize stays free of git subprocesses.
  * When HEAD's commit cannot be read from files, only the branch is compared. */
-static bool session_index_on_other_branch(const cbm_mcp_server_t *srv, const char *db_path) {
+bool cbm_mcp_checkout_differs_from_index(const char *root, const char *project,
+                                         const char *db_path) {
     cbm_branch_id_t current;
-    if (!cbm_branch_id_from_head(srv->session_root, &current)) {
+    if (!cbm_branch_id_from_head(root, &current)) {
         cbm_branch_id_free(&current);
         return false;
     }
     cbm_branch_id_t indexed = {};
     cbm_store_t *store = cbm_store_open_path_query(db_path);
-    bool known = store && cbm_branch_id_indexed(store, srv->session_project, &indexed);
+    bool known = store && cbm_branch_id_indexed(store, project, &indexed);
     cbm_store_close(store);
-    bool other = known && !cbm_branch_id_same(&indexed, &current);
+    /* With HEAD's commit read from files, a recorded identity without one
+     * (a legacy node) is not trusted: pending once, and that run's stamp
+     * records the commit. Without it (a ref store files cannot read), the
+     * lenient comparison, so such a checkout is never marked pending on
+     * every session. An index with no usable identity at all (no Branch
+     * node; one built while git refused the checkout) is left alone: no run
+     * would record one, so marking it would repeat every session. */
+    bool other = known && !(current.has_sha ? cbm_branch_id_same_strict(&indexed, &current)
+                                            : cbm_branch_id_same(&indexed, &current));
     if (other) {
-        cbm_log_info("autoindex.checkout_changed", "project", srv->session_project, "indexed",
-                     indexed.slug, "indexed_head", indexed.head_sha, "checkout", current.slug,
-                     "checkout_head", current.head_sha);
+        cbm_log_info("autoindex.checkout_changed", "project", project, "indexed", indexed.slug,
+                     "indexed_head", indexed.head_sha, "checkout", current.slug, "checkout_head",
+                     current.head_sha);
     }
     cbm_branch_id_free(&indexed);
     cbm_branch_id_free(&current);
     return other;
+}
+
+static bool session_index_on_other_branch(const cbm_mcp_server_t *srv, const char *db_path) {
+    return cbm_mcp_checkout_differs_from_index(srv->session_root, srv->session_project, db_path);
 }
 
 static void maybe_auto_index(cbm_mcp_server_t *srv) {

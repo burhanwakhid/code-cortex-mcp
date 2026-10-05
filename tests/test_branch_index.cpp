@@ -2003,6 +2003,119 @@ TEST(branch_slots_kept_when_live_db_undeletable) {
 }
 #endif
 
+#ifndef _WIN32
+/* A team artifact exported from another clone under the same explicit
+ * project name is adopted by the checkout that bootstraps from it: no
+ * foreign-index rebuild, its ADR kept, and every ownership check answers for
+ * the importing checkout. */
+TEST(branch_artifact_bootstrap_adopted_by_importer) {
+    char *made = th_mktempdir("cbm_bi_boot");
+    ASSERT_NOT_NULL(made);
+    char base[256];
+    snprintf(base, sizeof(base), "%s", made);
+    char a[512];
+    char b[512];
+    snprintf(a, sizeof(a), "%s/exporter", base);
+    snprintf(b, sizeof(b), "%s/importer", base);
+    ASSERT_TRUE(bi_repo_at(a, "team_fn"));
+
+    cbm_pipeline_t *p = cbm_pipeline_new(a, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_TRUE(cbm_pipeline_set_project_name(p, "teamproj"));
+    snprintf(g_bi_project, sizeof(g_bi_project), "%s", "teamproj");
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    ASSERT_EQ(bi_adr_put("TEAM"), CBM_STORE_OK);
+    char db[1024];
+    bi_db_path(db, sizeof(db));
+    ASSERT_EQ(cbm_artifact_export(db, a, "teamproj", CBM_ARTIFACT_FAST), 0);
+
+    /* Another clone, with the committed-alongside artifact; no local index. */
+    char cmd[1400];
+    snprintf(cmd, sizeof(cmd), "clone -q \"%s\" \"%s\"", a, b);
+    ASSERT_EQ(bi_git(base, cmd), 0);
+    snprintf(cmd, sizeof(cmd), "cp -R \"%s/.code-cortex\" \"%s/\"", a, b);
+    ASSERT_EQ(system(cmd), 0);
+    ASSERT_EQ(cbm_unlink(db), 0);
+    cbm_remove_db_sidecars(db);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[1200];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"teamproj\"}", b);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    bool reused = strstr(resp, "\\\"files_reparsed\\\":0") != NULL;
+    free(resp);
+    ASSERT_TRUE(reused); /* incremental over the imported graph */
+    char adr[256];
+    ASSERT_STR_EQ(bi_adr(adr, sizeof(adr)), "TEAM");
+    ASSERT_EQ(bi_count("team_fn"), 1);
+    cbm_store_t *s = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(s);
+    cbm_project_t proj = {0};
+    ASSERT_EQ(cbm_store_get_project(s, "teamproj", &proj), CBM_STORE_OK);
+    bool mine = cbm_root_matches(proj.root_path, b) && !cbm_root_matches(proj.root_path, a);
+    cbm_project_free_fields(&proj);
+    cbm_store_close(s);
+    ASSERT_TRUE(mine);
+    snprintf(args, sizeof(args), "{\"project\":\"teamproj\"}");
+    resp = cbm_mcp_handle_tool(srv, "index_status", args);
+    ASSERT_NOT_NULL(resp);
+    bool matches = strstr(resp, "\\\"index_matches_checkout\\\":true") != NULL;
+    free(resp);
+    cbm_mcp_server_free(srv);
+    ASSERT_TRUE(matches);
+
+    (void)cbm_branch_slots_delete_all(db, "teamproj");
+    cbm_unlink(db);
+    cbm_remove_db_sidecars(db);
+    th_rmtree(base);
+    PASS();
+}
+#endif
+
+/* Session start, legacy and unreadable cases: a Branch node with no recorded
+ * commit marks the session pending once (HEAD readable from files) and the
+ * run that follows clears it; HEAD the file reader cannot read never marks
+ * pending. */
+TEST(branch_session_pending_legacy_once) {
+    char *repo = bi_make_repo("cbm_bi_sess");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    char db[1024];
+    bi_db_path(db, sizeof(db));
+    ASSERT_FALSE(cbm_mcp_checkout_differs_from_index(repo, g_bi_project, db));
+
+    char qn[1024];
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_get_branch(s, g_bi_project, qn, sizeof(qn), NULL, 0), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_set_branch(s, g_bi_project, qn, "main", "{}"), CBM_STORE_OK);
+    cbm_store_close(s);
+    ASSERT_TRUE(cbm_mcp_checkout_differs_from_index(repo, g_bi_project, db));
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_FALSE(cbm_mcp_checkout_differs_from_index(repo, g_bi_project, db));
+
+    /* A ref store the file reader does not read (reftable): never pending. */
+    s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_set_branch(s, g_bi_project, qn, "main", "{}"), CBM_STORE_OK);
+    cbm_store_close(s);
+    char reftable[512];
+    snprintf(reftable, sizeof(reftable), "%s/.git/reftable", repo);
+    ASSERT_TRUE(cbm_mkdir_p(reftable, 0755));
+    bool pending = cbm_mcp_checkout_differs_from_index(repo, g_bi_project, db);
+    (void)cbm_rmdir(reftable);
+    ASSERT_FALSE(pending);
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -2055,5 +2168,7 @@ SUITE(branch_index) {
 #ifndef _WIN32
     RUN_TEST(branch_artifact_behind_after_count_preserving_edit);
     RUN_TEST(branch_slots_kept_when_live_db_undeletable);
+    RUN_TEST(branch_artifact_bootstrap_adopted_by_importer);
 #endif
+    RUN_TEST(branch_session_pending_legacy_once);
 }

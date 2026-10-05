@@ -44,7 +44,8 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
 const char *cbm_artifact_export_last_error(void);
 
 /* Import artifact from .code-cortex/graph.db.zst to cache_db_path.
- * Decompresses, runs integrity check, recreates indexes.
+ * Decompresses, runs integrity check, recreates indexes, and records
+ * repo_path as the project root (the importing checkout adopts the graph).
  * Returns 0 on success, -1 on error. */
 int cbm_artifact_import(const char *repo_path, const char *cache_db_path);
 

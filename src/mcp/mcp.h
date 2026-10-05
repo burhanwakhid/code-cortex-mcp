@@ -153,6 +153,12 @@ char *cbm_mcp_index_run_supervised_path(const char *root_path);
  * per level. */
 void cbm_mcp_expect_project_root(const char *dir);
 
+/* Session start's pending decision: whether the checkout at root (HEAD read
+ * from files, no git subprocess) differs from the identity the database at
+ * db_path records for project, so the watcher's first poll must index. */
+bool cbm_mcp_checkout_differs_from_index(const char *root, const char *project,
+                                         const char *db_path);
+
 /* The in-process fallback of the above: a full index of root_path in THIS
  * process, with the persisted index config (branch_index, branch_index_keep)
  * applied exactly as index_repository applies it. The caller holds the
