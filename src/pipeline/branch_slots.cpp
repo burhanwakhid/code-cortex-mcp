@@ -9,6 +9,7 @@
 #include "foundation/constants.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
+#include "foundation/sha256.h"
 #include "foundation/str_util.h"
 
 #include "sqlite3.h"
@@ -53,34 +54,46 @@ const char *cbm_branch_slug_from_qn(const char *qn, const char *project) {
     return qn + plen + SLEN(BS_BRANCH_MARK);
 }
 
-static void set_slug(cbm_branch_id_t *out, const char *branch, bool detached) {
-    char *slug = cbm_git_branch_slug(branch, detached);
-    snprintf(out->slug, sizeof(out->slug), "%s", slug ? slug : "");
-    free(slug);
+static const char *nz(const char *p) {
+    return p ? p : "";
+}
+
+static void set_slug(cbm_branch_id_t *out) {
+    free(out->slug);
+    out->slug = cbm_git_branch_slug(out->branch, out->is_detached);
+}
+
+void cbm_branch_id_free(cbm_branch_id_t *id) {
+    if (id) {
+        free(id->branch);
+        free(id->slug);
+        id->branch = NULL;
+        id->slug = NULL;
+        id->known = false;
+    }
 }
 
 bool cbm_branch_id_indexed(cbm_store_t *s, const char *project, cbm_branch_id_t *out) {
     memset(out, 0, sizeof(*out));
-    char qn[BS_PATH_MAX];
-    char props[CBM_SZ_4K];
-    if (cbm_store_get_branch_props(s, project, qn, sizeof(qn), NULL, 0, props, sizeof(props)) !=
-        CBM_STORE_OK) {
+    char *qn = NULL;
+    char *props = NULL;
+    if (cbm_store_get_branch_dup(s, project, &qn, NULL, &props) != CBM_STORE_OK) {
         return false;
     }
-    yyjson_doc *doc = yyjson_read(props, strlen(props), 0);
+    yyjson_doc *doc = props ? yyjson_read(props, strlen(props), 0) : NULL;
     yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
     yyjson_val *is_git = root ? yyjson_obj_get(root, "is_git") : NULL;
     yyjson_val *branch = root ? yyjson_obj_get(root, "branch") : NULL;
     if (yyjson_get_bool(is_git) && yyjson_is_str(branch)) {
         out->is_detached = yyjson_get_bool(yyjson_obj_get(root, "is_detached"));
         if (!out->is_detached) {
-            snprintf(out->branch, sizeof(out->branch), "%s", yyjson_get_str(branch));
+            out->branch = strdup(yyjson_get_str(branch));
         }
         yyjson_val *sha = yyjson_obj_get(root, "head_sha");
         out->has_sha = yyjson_is_str(sha);
         snprintf(out->head_sha, sizeof(out->head_sha), "%s",
                  out->has_sha ? yyjson_get_str(sha) : "");
-        set_slug(out, out->branch, out->is_detached);
+        set_slug(out);
     } else if (yyjson_is_bool(is_git)) {
         /* Indexed as a non-git tree (or git refused the checkout, e.g.
          * safe.directory): there is no branch to compare, and comparing
@@ -90,11 +103,13 @@ bool cbm_branch_id_indexed(cbm_store_t *s, const char *project, cbm_branch_id_t 
         /* No properties (they failed to serialize): the QN's slug is all
          * there is. */
         const char *slug = cbm_branch_slug_from_qn(qn, project);
-        snprintf(out->slug, sizeof(out->slug), "%s", slug ? slug : "");
+        out->slug = slug ? strdup(slug) : NULL;
         out->is_detached = slug && strcmp(slug, "detached") == 0;
     }
     yyjson_doc_free(doc);
-    out->known = out->slug[0] != '\0';
+    free(qn);
+    free(props);
+    out->known = nz(out->slug)[0] != '\0';
     return out->known;
 }
 
@@ -104,13 +119,13 @@ void cbm_branch_id_from_context(const cbm_git_context_t *ctx, cbm_branch_id_t *o
         return;
     }
     out->is_detached = ctx->is_detached;
-    if (!ctx->is_detached) {
-        snprintf(out->branch, sizeof(out->branch), "%s", ctx->branch ? ctx->branch : "");
+    if (!ctx->is_detached && ctx->branch) {
+        out->branch = strdup(ctx->branch);
     }
     out->has_sha = ctx->head_sha != NULL;
-    snprintf(out->head_sha, sizeof(out->head_sha), "%s", ctx->head_sha ? ctx->head_sha : "");
-    set_slug(out, out->branch, out->is_detached);
-    out->known = out->slug[0] != '\0';
+    snprintf(out->head_sha, sizeof(out->head_sha), "%s", nz(ctx->head_sha));
+    set_slug(out);
+    out->known = nz(out->slug)[0] != '\0';
 }
 
 bool cbm_branch_id_from_head(const char *root, cbm_branch_id_t *out) {
@@ -120,13 +135,13 @@ bool cbm_branch_id_from_head(const char *root, cbm_branch_id_t *out) {
         return false;
     }
     out->is_detached = head.is_detached;
-    snprintf(out->branch, sizeof(out->branch), "%s", head.branch);
+    out->branch = head.branch; /* ownership moves */
     /* An unreadable ref and an unborn branch both leave head_sha empty; only
      * a commit actually read is compared. */
     out->has_sha = head.head_sha[0] != '\0';
     snprintf(out->head_sha, sizeof(out->head_sha), "%s", head.head_sha);
-    set_slug(out, out->branch, out->is_detached);
-    out->known = out->slug[0] != '\0';
+    set_slug(out);
+    out->known = nz(out->slug)[0] != '\0';
     return out->known;
 }
 
@@ -149,14 +164,36 @@ bool cbm_branch_id_same(const cbm_branch_id_t *indexed, const cbm_branch_id_t *c
         return false;
     }
     if (!indexed->is_detached) {
-        bool named = indexed->branch[0] && current->branch[0];
+        bool named = nz(indexed->branch)[0] && nz(current->branch)[0];
         if (named ? strcmp(indexed->branch, current->branch) != 0
-                  : strcmp(indexed->slug, current->slug) != 0) {
+                  : strcmp(nz(indexed->slug), nz(current->slug)) != 0) {
             return false;
         }
     }
     return !(indexed->has_sha && current->has_sha &&
              strcmp(indexed->head_sha, current->head_sha) != 0);
+}
+
+/* The slot file name for slug: the slug itself when it is short enough to be
+ * one path component with room for every suffix this module and SQLite add
+ * ("<name>.db.tmp-journal", "<name>.db-wal", ...). A longer slug -- a long or
+ * deeply nested branch name, which git allows -- becomes a prefix of it plus
+ * '-' and 16 hex digits of the SHA-256 of the whole slug, so distinct slugs
+ * keep distinct slots and the same slug always maps to the same file. */
+bool cbm_branch_slot_name(const char *slug, char *buf, size_t bufsz) {
+    if (!slug || !buf || bufsz <= CBM_BRANCH_SLOT_NAME_MAX) {
+        return false;
+    }
+    size_t len = strlen(slug);
+    if (len <= CBM_BRANCH_SLOT_NAME_MAX) {
+        snprintf(buf, bufsz, "%s", slug);
+        return true;
+    }
+    enum { HASH_HEX = 16, PREFIX = CBM_BRANCH_SLOT_NAME_MAX - HASH_HEX - 1 };
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(slug, len, digest);
+    snprintf(buf, bufsz, "%.*s-%.*s", (int)PREFIX, slug, (int)HASH_HEX, digest);
+    return true;
 }
 
 /* A slug is one path component: the git_context slugger only emits
@@ -198,7 +235,11 @@ bool cbm_branch_slots_dir(const char *db_path, const char *project, char *buf, s
 }
 
 static bool slot_path(const char *dir, const char *slug, char *buf, size_t bufsz) {
-    int n = snprintf(buf, bufsz, "%s/%s.db", dir, slug);
+    char name[CBM_BRANCH_SLOT_NAME_MAX + 1];
+    if (!cbm_branch_slot_name(slug, name, sizeof(name))) {
+        return false;
+    }
+    int n = snprintf(buf, bufsz, "%s/%s.db", dir, name);
     return n > 0 && (size_t)n < bufsz;
 }
 
@@ -207,21 +248,23 @@ static bool is_slot_db_name(const char *name) {
     return len > BS_DB_EXT && strcmp(name + len - BS_DB_EXT, ".db") == 0;
 }
 
-/* The slug the database at db_path was built for, from its Branch node. */
-static bool read_indexed_slug(const char *db_path, const char *project, char *buf, size_t bufsz) {
-    buf[0] = '\0';
+/* The slug the database at db_path was built for, from its Branch node;
+ * NULL when it records none. Caller frees. */
+static char *read_indexed_slug(const char *db_path, const char *project) {
     cbm_store_t *s = cbm_store_open_path_query(db_path);
     if (!s) {
-        return false;
+        return NULL;
     }
     cbm_branch_id_t id;
     bool ok = cbm_branch_id_indexed(s, project, &id);
     cbm_store_close(s);
-    if (!ok || !slug_is_safe(id.slug)) {
-        return false;
+    char *slug = NULL;
+    if (ok && slug_is_safe(id.slug)) {
+        slug = id.slug;
+        id.slug = NULL;
     }
-    snprintf(buf, bufsz, "%s", id.slug);
-    return true;
+    cbm_branch_id_free(&id);
+    return slug;
 }
 
 /* Copy the database at src to dest through the SQLite backup API: a read
@@ -438,11 +481,14 @@ static bool restore_into(const char *slot, const char *db_path, const char *proj
     return ok;
 }
 
+static cbm_branch_switch_t switch_from(const char *db_path, const char *project, const char *slug,
+                                       const char *indexed, const char *dir, const char *incoming,
+                                       bool have_incoming, int keep);
+
 cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *project,
-                                            const char *slug, int keep, char *from,
-                                            size_t from_sz) {
-    if (from && from_sz > 0) {
-        from[0] = '\0';
+                                            const char *slug, int keep, char **from) {
+    if (from) {
+        *from = NULL;
     }
     char dir[BS_PATH_MAX];
     char incoming[BS_PATH_MAX];
@@ -468,19 +514,28 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
         return CBM_BRANCH_SWITCH_NONE;
     }
 
-    char indexed[BS_PATH_MAX];
-    if (!read_indexed_slug(db_path, project, indexed, sizeof(indexed))) {
+    char *indexed = read_indexed_slug(db_path, project);
+    if (!indexed) {
         /* No Branch node: a non-git index or an unreadable file. Leave it to
          * the normal routing, which rebuilds what it cannot use. */
         return CBM_BRANCH_SWITCH_NONE;
     }
-    if (from && from_sz > 0) {
-        snprintf(from, from_sz, "%s", indexed);
+    cbm_branch_switch_t action =
+        strcmp(indexed, slug) == 0
+            ? CBM_BRANCH_SWITCH_NONE
+            : switch_from(db_path, project, slug, indexed, dir, incoming, have_incoming, keep);
+    if (from) {
+        *from = indexed;
+    } else {
+        free(indexed);
     }
-    if (strcmp(indexed, slug) == 0) {
-        return CBM_BRANCH_SWITCH_NONE;
-    }
+    return action;
+}
 
+/* The switch proper, once the database is known to be another branch's. */
+static cbm_branch_switch_t switch_from(const char *db_path, const char *project, const char *slug,
+                                       const char *indexed, const char *dir, const char *incoming,
+                                       bool have_incoming, int keep) {
     char outgoing[BS_PATH_MAX];
     if (!slot_path(dir, indexed, outgoing, sizeof(outgoing)) || !cbm_mkdir_p(dir, 0755) ||
         !copy_db(db_path, outgoing)) {

@@ -114,6 +114,10 @@ int cbm_store_get_branch(cbm_store_t *s, const char *project, char *qn_buf, size
                          char *name_buf, size_t name_sz);
 int cbm_store_set_branch(cbm_store_t *s, const char *project, const char *qn, const char *name,
                          const char *props_json);
+/* get, with qualified name, display name and properties (any may be NULL)
+ * each in its own allocation, however long a branch name makes them. */
+int cbm_store_get_branch_dup(cbm_store_t *s, const char *project, char **qn, char **name,
+                             char **props);
 /* True when the project has a Branch node and it, and every HAS_BRANCH edge,
  * already carry exactly these values (set would change nothing). */
 bool cbm_store_branch_is(cbm_store_t *s, const char *project, const char *qn, const char *name,

@@ -40,6 +40,9 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out);
 void cbm_git_context_free(cbm_git_context_t *ctx);
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx);
 int cbm_git_context_props_json(const cbm_git_context_t *ctx, char *buf, int buf_size);
+/* The same JSON in an allocation sized to fit (a long branch name or path
+ * would not fit a fixed buffer). NULL on failure. Caller frees. */
+char *cbm_git_context_props_json_dup(const cbm_git_context_t *ctx);
 
 /* What <dir>/.git says about dir, from one stat (no git subprocess): a main
  * checkout (.git is a directory), a gitlink (.git is a regular file: a linked
@@ -63,18 +66,20 @@ bool cbm_git_is_linked_worktree(const char *dir);
  * inside the checkout: the nearest enclosing `.git` (directory, or gitlink
  * file of a linked worktree or submodule) wins, as for git. Reads HEAD, the
  * gitdir's "commondir", the loose branch ref and packed-refs. branch is
- * the name `git symbolic-ref --short HEAD` prints ("" when detached);
+ * the name `git symbolic-ref --short HEAD` prints (NULL when detached; free
+ * with cbm_git_head_free);
  * head_sha is "" when the branch has no commit yet or its ref could not be
  * read from files. Returns non-zero when no enclosing checkout is found,
  * HEAD is unreadable, HEAD points outside refs/heads, or the repository keeps
  * its refs in a reftable. */
 typedef struct {
     bool is_detached;
-    char branch[1024];
+    char *branch; /* whole name, heap; NULL when detached */
     char head_sha[72];
 } cbm_git_head_t;
 
 int cbm_git_head_read(const char *root, cbm_git_head_t *out);
+void cbm_git_head_free(cbm_git_head_t *head);
 
 /* The filesystem-safe slug of a branch name, as cbm_git_context_resolve
  * computes branch_slug ("detached" when detached). Caller frees. */

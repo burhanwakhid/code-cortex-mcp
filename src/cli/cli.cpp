@@ -3304,6 +3304,36 @@ static const char *get_cache_dir(const char *home_dir) {
     return buf;
 }
 
+/* Parked per-branch databases under <cache>/branches/<project>/ (they count
+ * as indexes for every prompt that offers to delete indexes, and outlive a
+ * missing <project>.db). print lists each. Returns the count. */
+static int parked_indexes(const char *cache_dir, bool print) {
+    char dir[CLI_BUF_1K];
+    snprintf(dir, sizeof(dir), "%s/branches", cache_dir);
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return 0;
+    }
+    int count = 0;
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (!ent->is_dir || !cbm_validate_project_name(ent->name)) {
+            continue;
+        }
+        char db_path[CLI_BUF_1K];
+        snprintf(db_path, sizeof(db_path), "%s/%s.db", cache_dir, ent->name);
+        char **slots = NULL;
+        int n = cbm_branch_slots_list(db_path, ent->name, &slots);
+        for (int i = 0; print && i < n; i++) {
+            printf("  %s/%s/%s.db (parked branch index)\n", dir, ent->name, slots[i]);
+        }
+        cbm_branch_slots_free_list(slots, n);
+        count += n;
+    }
+    cbm_closedir(d);
+    return count;
+}
+
 int cbm_list_indexes(const char *home_dir) {
     const char *cache_dir = get_cache_dir(home_dir);
     if (!cache_dir) {
@@ -3324,20 +3354,21 @@ int cbm_list_indexes(const char *home_dir) {
         }
     }
     cbm_closedir(d);
-    return count;
+    return count + parked_indexes(cache_dir, true);
 }
 
 /* Parked databases whose project has no <project>.db any more (an
  * interrupted rebuild, a manual delete): the scan above never reaches them.
  * Each project is cleared under the lease of its would-be <project>.db, as
  * index runs and delete_project take it, and only while that file is absent;
- * a project being indexed right now keeps its slots. */
-static void remove_orphan_branch_slots(const char *cache_dir) {
+ * a project being indexed right now keeps its slots. Returns how many
+ * parked databases it removed. */
+static int remove_orphan_branch_slots(const char *cache_dir) {
     char dir[CLI_BUF_1K];
     snprintf(dir, sizeof(dir), "%s/branches", cache_dir);
     cbm_dir_t *d = cbm_opendir(dir);
     if (!d) {
-        return;
+        return 0;
     }
     /* Collect first: clearing a project removes its directory, and changing
      * a directory while reading it is unspecified on some platforms. */
@@ -3365,6 +3396,7 @@ static void remove_orphan_branch_slots(const char *cache_dir) {
         n++;
     }
     cbm_closedir(d);
+    int removed = 0;
     for (int i = 0; i < n; i++) {
         char path[CLI_BUF_1K];
         snprintf(path, sizeof(path), "%s/%s.db", cache_dir, names[i]);
@@ -3373,13 +3405,14 @@ static void remove_orphan_branch_slots(const char *cache_dir) {
             fprintf(stderr, "Keeping parked indexes of %s: database busy.\n", names[i]);
         } else {
             if (!cbm_file_exists(path)) {
-                (void)cbm_branch_slots_delete_all(path, names[i]);
+                removed += cbm_branch_slots_delete_all(path, names[i]);
             }
             cbm_db_lease_release(lease);
         }
         free(names[i]);
     }
     free(names);
+    return removed;
 }
 
 static int remove_indexes_in_dir(const char *cache_dir) {
@@ -3426,13 +3459,14 @@ static int remove_indexes_in_dir(const char *cache_dir) {
              * live under branches/<project>/, outside this scan. */
             char project[CLI_BUF_1K];
             snprintf(project, sizeof(project), "%.*s", (int)(len - DB_EXT_LEN), ent->name);
-            (void)cbm_branch_slots_delete_all(target, project);
+            count += cbm_branch_slots_delete_all(target, project);
             cbm_db_lease_release(lease);
         }
     }
     cbm_closedir(d);
-    /* Parked databases whose <project>.db was already gone. */
-    remove_orphan_branch_slots(cache_dir);
+    /* Parked databases whose <project>.db was already gone. Every parked
+     * database removed counts, as the prompts that led here counted them. */
+    count += remove_orphan_branch_slots(cache_dir);
     return count;
 }
 
@@ -4457,15 +4491,18 @@ extern "C" int cbm_install_codex_agent_config_for_testing(const char *home,
 }
 #endif
 
-/* Count .db files in the cache directory. */
+/* Count .db files in the cache directory, parked per-branch databases
+ * included: a project whose <project>.db is gone can still have those, and
+ * the install/uninstall/update prompts must not skip them. */
 static int count_db_indexes(const char *home) {
     const char *cache_dir = get_cache_dir(home);
     if (!cache_dir) {
         return 0;
     }
+    int parked = parked_indexes(cache_dir, false);
     cbm_dir_t *d = cbm_opendir(cache_dir);
     if (!d) {
-        return 0;
+        return parked;
     }
     int count = 0;
     cbm_dirent_t *ent;
@@ -4475,7 +4512,7 @@ static int count_db_indexes(const char *home) {
         }
     }
     cbm_closedir(d);
-    return count;
+    return count + parked;
 }
 
 /* Handle pre-existing indexes during (re)install (#607).

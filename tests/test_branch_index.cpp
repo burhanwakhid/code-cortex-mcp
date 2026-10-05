@@ -171,6 +171,7 @@ static const char *bi_head_slug(const char *dir, char *buf, size_t n) {
         char *slug = cbm_git_branch_slug(head.branch, head.is_detached);
         snprintf(buf, n, "%s", slug ? slug : "");
         free(slug);
+        cbm_git_head_free(&head);
     }
     return buf;
 }
@@ -613,15 +614,19 @@ static int bi_status_matches(cbm_mcp_server_t *srv) {
  * identity recorded in the current database. */
 static bool bi_head_matches_index(const char *repo) {
     cbm_branch_id_t current;
-    cbm_branch_id_t indexed;
+    cbm_branch_id_t indexed = {};
     if (!cbm_branch_id_from_head(repo, &current)) {
+        cbm_branch_id_free(&current);
         return true;
     }
     char db[1024];
     cbm_store_t *s = cbm_store_open_path_query(bi_db_path(db, sizeof(db)));
     bool known = s && cbm_branch_id_indexed(s, g_bi_project, &indexed);
     cbm_store_close(s);
-    return !known || cbm_branch_id_same(&indexed, &current);
+    bool same = !known || cbm_branch_id_same(&indexed, &current);
+    cbm_branch_id_free(&indexed);
+    cbm_branch_id_free(&current);
+    return same;
 }
 
 /* Identity is the branch name plus HEAD commit, not the slug: a detached HEAD
@@ -725,6 +730,7 @@ TEST(branch_head_read_matches_git) {
             if (!ctx.is_detached) {
                 ASSERT_STR_EQ(head.branch, ctx.branch);
             }
+            cbm_git_head_free(&head);
             cbm_git_context_free(&ctx);
         }
     }
@@ -919,7 +925,8 @@ TEST(branch_reset_clears_orphaned_slots) {
     cbm_db_lease_t *lease = NULL;
     ASSERT_EQ(cbm_db_lease_try_acquire(busy, &lease), 0);
 
-    ASSERT_EQ(cbm_remove_indexes(NULL), 1); /* live.db */
+    /* live.db, its parked main.db, and orphan's two parked databases. */
+    ASSERT_EQ(cbm_remove_indexes(NULL), 4);
     char path[1024];
     snprintf(path, sizeof(path), "%s/branches/live", cache);
     ASSERT_FALSE(cbm_file_exists(path));
@@ -929,7 +936,7 @@ TEST(branch_reset_clears_orphaned_slots) {
     ASSERT_TRUE(cbm_file_exists(path));
 
     cbm_db_lease_release(lease);
-    ASSERT_EQ(cbm_remove_indexes(NULL), 0);
+    ASSERT_EQ(cbm_remove_indexes(NULL), 1); /* busy's parked main.db */
     ASSERT_FALSE(cbm_file_exists(path));
     snprintf(path, sizeof(path), "%s/branches", cache);
     ASSERT_FALSE(cbm_file_exists(path));
@@ -1362,6 +1369,140 @@ TEST(branch_stamp_only_switch_reexports_artifact) {
     PASS();
 }
 
+extern "C" int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_run);
+extern "C" void cbm_set_auto_answer_for_test(int value);
+
+/* The install/uninstall/update index prompts count parked databases too, so
+ * a cache holding only orphaned ones (<project>.db already gone) is still
+ * offered for deletion and cleared. Driven through install's gate. */
+TEST(branch_index_prompt_counts_parked_only_cache) {
+    char *cache = th_mktempdir("cbm_bi_gate");
+    ASSERT_NOT_NULL(cache);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", cache);
+    cache = saved;
+    char old_cache[1024] = "";
+    bool had_cache = cbm_safe_getenv("CBM_CACHE_DIR", old_cache, sizeof(old_cache), NULL) != NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    char slot[1024];
+    snprintf(slot, sizeof(slot), "%s/branches/gone/main.db", cache);
+    ASSERT_EQ(th_write_file(slot, "x"), 0);
+
+    cbm_set_auto_answer_for_test(1);
+    int rc = cbm_install_handle_existing_indexes(NULL, true, false);
+    cbm_set_auto_answer_for_test(0);
+    ASSERT_EQ(rc, 1);
+    ASSERT_FALSE(cbm_file_exists(slot));
+
+    if (had_cache) {
+        cbm_setenv("CBM_CACHE_DIR", old_cache, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(cache);
+    PASS();
+}
+
+/* A branch name of n bytes in components of at most 200 (each one a path
+ * component in the loose ref store). */
+static void bi_long_name(char *buf, size_t n, char fill) {
+    size_t i = 0;
+    while (i + 1 < n) {
+        buf[i] = (i % 201 == 200) ? '/' : fill;
+        i++;
+    }
+    if (i > 0 && buf[i - 1] == '/') {
+        buf[i - 1] = fill;
+    }
+    buf[i] = '\0';
+}
+
+/* Long slugs map to bounded, distinct, stable slot names, and identities
+ * compare whole names whatever their length (no git needed). */
+TEST(branch_long_slug_slot_names) {
+    char name[CBM_BRANCH_SLOT_NAME_MAX + 1];
+    ASSERT_TRUE(cbm_branch_slot_name("main", name, sizeof(name)));
+    ASSERT_STR_EQ(name, "main");
+
+    static char a[1400];
+    static char b[1400];
+    bi_long_name(a, sizeof(a), 'q');
+    snprintf(b, sizeof(b), "%s", a);
+    b[sizeof(b) - 2] = 'z'; /* differs only in the last byte */
+    char na[CBM_BRANCH_SLOT_NAME_MAX + 1];
+    char nb[CBM_BRANCH_SLOT_NAME_MAX + 1];
+    char *sa = cbm_git_branch_slug(a, false);
+    char *sb = cbm_git_branch_slug(b, false);
+    ASSERT_TRUE(cbm_branch_slot_name(sa, na, sizeof(na)));
+    ASSERT_TRUE(cbm_branch_slot_name(sb, nb, sizeof(nb)));
+    ASSERT_EQ((int)strlen(na), CBM_BRANCH_SLOT_NAME_MAX);
+    ASSERT_STR_NEQ(na, nb);
+    ASSERT_TRUE(cbm_branch_slot_name(sa, nb, sizeof(nb)));
+    ASSERT_STR_EQ(na, nb); /* stable */
+
+    cbm_branch_id_t ia = {};
+    cbm_branch_id_t ib = {};
+    ia.known = ib.known = true;
+    ia.branch = strdup(a);
+    ib.branch = strdup(b);
+    ia.slug = sa;
+    ib.slug = sb;
+    ASSERT_FALSE(cbm_branch_id_same(&ia, &ib));
+    cbm_branch_id_free(&ia);
+    cbm_branch_id_free(&ib);
+    PASS();
+}
+
+/* Branches with ~300- and ~900-byte names (the longest this host's git can
+ * create: a loose ref path must fit PATH_MAX) park, restore and repeat like
+ * any other: a repeat run is not a switch, and the slot file is bounded. */
+TEST(branch_long_names_park_and_restore) {
+    char *repo = bi_make_repo("cbm_bi_long");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    static char longest[901];
+    static char mid[301];
+    bi_long_name(longest, sizeof(longest), 'l');
+    bi_long_name(mid, sizeof(mid), 'm');
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* main */
+    const char *names[] = {mid, longest};
+    for (int i = 0; i < 2; i++) {
+        char cmd[1100];
+        snprintf(cmd, sizeof(cmd), "checkout -q -b %s main", names[i]);
+        ASSERT_EQ(bi_git(repo, cmd), 0);
+        bi_run_t r = bi_index(repo, -1);
+        ASSERT_EQ(r.rc, 0);
+        ASSERT_STR_EQ(r.action, "seeded");
+        r = bi_index(repo, -1);
+        ASSERT_EQ(r.rc, 0);
+        ASSERT_STR_EQ(r.action, "none");
+        ASSERT_TRUE(bi_head_matches_index(repo));
+        ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+        r = bi_index(repo, -1);
+        ASSERT_STR_EQ(r.action, "restored");
+        snprintf(cmd, sizeof(cmd), "checkout -q %s", names[i]);
+        ASSERT_EQ(bi_git(repo, cmd), 0);
+        r = bi_index(repo, -1);
+        ASSERT_STR_EQ(r.action, "restored");
+        ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+        r = bi_index(repo, -1);
+        ASSERT_STR_EQ(r.action, "restored");
+    }
+    char **list = NULL;
+    int n = bi_parked(&list);
+    for (int i = 0; i < n; i++) {
+        ASSERT_TRUE(strlen(list[i]) <= CBM_BRANCH_SLOT_NAME_MAX);
+    }
+    cbm_branch_slots_free_list(list, n);
+    ASSERT_EQ(n, 2);
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -1399,4 +1540,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_restore_keeps_concurrent_adr_write);
 #endif
     RUN_TEST(branch_stamp_only_switch_reexports_artifact);
+    RUN_TEST(branch_index_prompt_counts_parked_only_cache);
+    RUN_TEST(branch_long_slug_slot_names);
+    RUN_TEST(branch_long_names_park_and_restore);
 }

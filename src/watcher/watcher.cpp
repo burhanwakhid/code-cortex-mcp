@@ -23,6 +23,7 @@
 #include "foundation/compat_thread.h"
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
+#include "foundation/sha256.h"
 #include "foundation/str_util.h"
 #include "pipeline/artifact.h" /* CBM_ARTIFACT_DIR: the indexer's own output directory */
 /* Parked per-branch databases of a pruned project. */
@@ -188,27 +189,46 @@ static int git_head(const char *root_path, char *out, size_t out_size) {
         return CBM_NOT_FOUND;
     }
 
-    size_t off = 0;
-    char line[CBM_SZ_512];
-    while (fgets(line, (int)sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
+    /* Read all of it: a branch name is bounded only by the filesystem, and
+     * a fixed line buffer would drop a long ref line, so two long branches
+     * at one commit would look alike. */
+    size_t cap = CBM_SZ_512;
+    size_t len = 0;
+    char *all = (char *)malloc(cap);
+    for (int c = fgetc(fp); all && c != EOF; c = fgetc(fp)) {
+        if (len + 1 >= cap) {
+            char *grown = (char *)realloc(all, cap * 2);
+            if (!grown) {
+                free(all);
+                all = NULL;
+                break;
+            }
+            all = grown;
+            cap *= 2;
         }
-        if (len == 0 || off + len + SKIP_ONE >= out_size) {
-            continue; /* drain: closing early would hand git SIGPIPE */
-        }
-        if (off > 0) {
-            out[off++] = ' ';
-        }
-        memcpy(out + off, line, len);
-        off += len;
-        out[off] = '\0';
+        all[len++] = c == '\n' || c == '\r' ? ' ' : (char)c;
     }
     int rc = cbm_pclose(fp);
-    if (rc != 0 || off == 0) {
+    while (all && len > 0 && all[len - 1] == ' ') {
+        len--;
+    }
+    if (!all || rc != 0 || len == 0) {
+        free(all);
         return CBM_NOT_FOUND;
     }
+    all[len] = '\0';
+    if (len < out_size) {
+        memcpy(out, all, len + 1);
+    } else {
+        /* Too long to keep verbatim: the commit, then a digest of the whole
+         * output -- still different for every distinct ref. */
+        char digest[CBM_SHA256_HEX_LEN + 1];
+        cbm_sha256_hex(all, len, digest);
+        const char *space = strchr(all, ' ');
+        int sha_len = space ? (int)(space - all) : 0;
+        snprintf(out, out_size, "%.*s #%s", sha_len, all, digest);
+    }
+    free(all);
     return 0;
 }
 

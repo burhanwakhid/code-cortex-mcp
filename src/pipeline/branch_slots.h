@@ -65,15 +65,31 @@ const char *cbm_branch_switch_str(cbm_branch_switch_t action);
  * NULL when qn is not project's branch QN. Borrowed from qn. */
 const char *cbm_branch_slug_from_qn(const char *qn, const char *project);
 
-/* The git identity a database was built for, or a checkout has now. */
+/* The git identity a database was built for, or a checkout has now. The
+ * strings are whole (git bounds a branch name only by the filesystem), heap
+ * allocated, and freed by cbm_branch_id_free. */
 typedef struct {
     bool known; /* false: nothing to compare against */
     bool is_detached;
-    bool has_sha;      /* head_sha is recorded ("" then means an unborn branch) */
-    char branch[1024]; /* real branch name; "" when detached or not recorded */
-    char slug[1024];   /* the slot name */
+    bool has_sha; /* head_sha is recorded ("" then means an unborn branch) */
+    char *branch; /* real branch name; NULL when detached or not recorded */
+    char *slug;   /* filesystem-safe form of the name (cbm_git_branch_slug) */
     char head_sha[72];
 } cbm_branch_id_t;
+
+void cbm_branch_id_free(cbm_branch_id_t *id);
+
+enum {
+    /* Longest slot file name stem: one path component (NAME_MAX 255) less
+     * room for every suffix written beside it (".db.tmp-journal"). */
+    CBM_BRANCH_SLOT_NAME_MAX = 200,
+};
+
+/* The slot file stem for slug (cbm_branch_slots_list reports these): the slug
+ * itself up to CBM_BRANCH_SLOT_NAME_MAX bytes, else a prefix of it plus '-'
+ * and 16 hex digits of the SHA-256 of the whole slug. bufsz must exceed
+ * CBM_BRANCH_SLOT_NAME_MAX. */
+bool cbm_branch_slot_name(const char *slug, char *buf, size_t bufsz);
 
 /* The identity recorded on project's Branch node: its properties, or for a
  * node without them only the slug from its QN. Returns out->known. */
@@ -103,9 +119,10 @@ bool cbm_branch_slots_dir(const char *db_path, const char *project, char *buf, s
  * other writers. Never leaves db_path missing or half-restored: parking only
  * reads db_path, and a restore is a single transaction on it.
  * `keep` bounds the parked count (< 1 disables parking: returns NONE).
- * `from` (optional) receives the slug the database was built for. */
+ * `from` (optional) receives the slug the database was built for, allocated
+ * (NULL when unknown); the caller frees it. */
 cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *project,
-                                            const char *slug, int keep, char *from, size_t from_sz);
+                                            const char *slug, int keep, char **from);
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* Callback run when a restore starts, before it takes the live database's

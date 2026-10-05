@@ -3405,6 +3405,39 @@ static bool fts_branch_indexed(cbm_store_t *s, const char *project) {
                        project, NULL, NULL, NULL) == SQLITE_ROW;
 }
 
+int cbm_store_get_branch_dup(cbm_store_t *s, const char *project, char **qn, char **name,
+                             char **props) {
+    char **outs[] = {qn, name, props};
+    for (char **o : outs) {
+        if (o) {
+            *o = NULL;
+        }
+    }
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT qualified_name, name, properties FROM nodes "
+                           "WHERE project = ?1 AND label = 'Branch' ORDER BY id LIMIT 1;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int rc = sqlite3_step(stmt);
+    int result = rc == SQLITE_ROW    ? CBM_STORE_OK
+                 : rc == SQLITE_DONE ? CBM_STORE_NOT_FOUND
+                                     : CBM_STORE_ERR;
+    for (int i = 0; result == CBM_STORE_OK && i < 3; i++) {
+        if (outs[i]) {
+            const char *v = (const char *)sqlite3_column_text(stmt, i);
+            *outs[i] = heap_strdup(v ? v : "");
+        }
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
 int cbm_store_set_branch(cbm_store_t *s, const char *project, const char *qn, const char *name,
                          const char *props_json) {
     if (!s || !s->db || !project || !qn || !name) {

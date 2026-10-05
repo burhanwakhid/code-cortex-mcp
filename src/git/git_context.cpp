@@ -40,6 +40,38 @@ static void trim_newlines(char *s) {
     }
 }
 
+/* One whole line from fp, newline stripped, however long (fgets into a fixed
+ * buffer would cut a long branch name, and differently on each reader).
+ * NULL at end of file. Caller frees. */
+static char *read_line_dup(FILE *fp) {
+    size_t cap = 128;
+    size_t len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) {
+        return NULL;
+    }
+    int c = EOF;
+    while ((c = fgetc(fp)) != EOF && c != '\n') {
+        if (len + 1 >= cap) {
+            char *grown = (char *)realloc(buf, cap * 2);
+            if (!grown) {
+                free(buf);
+                return NULL;
+            }
+            buf = grown;
+            cap *= 2;
+        }
+        buf[len++] = (char)c;
+    }
+    if (c == EOF && len == 0) {
+        free(buf);
+        return NULL;
+    }
+    buf[len] = '\0';
+    trim_newlines(buf);
+    return buf;
+}
+
 static bool git_validate_repo_path(const char *repo_path) {
     if (!cbm_validate_shell_arg(repo_path)) {
         return false;
@@ -81,20 +113,16 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
         return CBM_NOT_FOUND;
     }
 
-    char buf[GIT_OUTPUT_MAX];
-    if (!fgets(buf, sizeof(buf), fp)) {
-        cbm_pclose(fp);
-        return CBM_NOT_FOUND;
-    }
-    trim_newlines(buf);
-
+    char *line = read_line_dup(fp);
+    /* Drain: closing early would hand git SIGPIPE. */
+    for (int ch = fgetc(fp); ch != EOF; ch = fgetc(fp)) {}
     int rc = cbm_pclose(fp);
-    if (rc != 0 || buf[0] == '\0') {
+    if (!line || rc != 0 || line[0] == '\0') {
+        free(line);
         return CBM_NOT_FOUND;
     }
-
-    *out = git_strdup(buf);
-    return *out ? 0 : CBM_NOT_FOUND;
+    *out = line;
+    return 0;
 }
 
 /* Capture up to `max_lines` output lines instead of just the first.
@@ -415,6 +443,31 @@ static bool read_first_line(const char *path, char *buf, size_t bufsz) {
     return ok;
 }
 
+/* The whole first line of a small text file; NULL when unreadable. */
+static char *read_first_line_dup(const char *path) {
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        return NULL;
+    }
+    char *line = read_line_dup(fp);
+    (void)fclose(fp);
+    return line;
+}
+
+/* "<a><b><c>" in a new allocation. Caller frees. */
+static char *str_cat3(const char *a, const char *b, const char *c) {
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+    size_t lc = strlen(c);
+    char *out = (char *)malloc(la + lb + lc + 1);
+    if (out) {
+        memcpy(out, a, la);
+        memcpy(out + la, b, lb);
+        memcpy(out + la + lb, c, lc + 1);
+    }
+    return out;
+}
+
 /* "<dir>/<rel>", or rel itself when absolute. False when it does not fit. */
 static bool path_under(const char *dir, const char *rel, char *buf, size_t bufsz) {
     int n = path_is_absolute(rel) ? snprintf(buf, bufsz, "%s", rel)
@@ -439,37 +492,38 @@ static bool is_object_id(const char *s) {
  * packed-refs in the common dir. False when neither has it: an unborn
  * branch, a symbolic ref, or a ref store this does not read. */
 static bool read_branch_sha(const char *common, const char *branch, char *sha, size_t shasz) {
-    char path[GIT_OUTPUT_MAX];
-    char line[GIT_OUTPUT_MAX];
-    int n = snprintf(path, sizeof(path), "%s/refs/heads/%s", common, branch);
-    if (n > 0 && (size_t)n < sizeof(path) && read_first_line(path, line, sizeof(line))) {
-        if (!is_object_id(line)) {
-            return false;
-        }
-        snprintf(sha, shasz, "%s", line);
-        return true;
-    }
-    snprintf(path, sizeof(path), "%s/packed-refs", common);
-    FILE *fp = cbm_fopen(path, "rb");
-    if (!fp) {
-        return false;
-    }
-    char want[GIT_OUTPUT_MAX];
-    snprintf(want, sizeof(want), "refs/heads/%s", branch);
+    char *ref = str_cat3("refs/heads/", branch, "");
+    char *path = ref ? str_cat3(common, "/", ref) : NULL;
+    char *line = path ? read_first_line_dup(path) : NULL;
+    free(path);
     bool found = false;
-    while (!found && fgets(line, sizeof(line), fp)) {
-        trim_newlines(line);
-        char *space = strchr(line, ' ');
-        if (line[0] == '#' || line[0] == '^' || !space) {
-            continue;
-        }
-        *space = '\0';
-        if (strcmp(space + 1, want) == 0 && is_object_id(line)) {
+    if (line) {
+        found = is_object_id(line);
+        if (found) {
             snprintf(sha, shasz, "%s", line);
-            found = true;
         }
+        free(line);
+        free(ref);
+        return found;
     }
-    (void)fclose(fp);
+    path = str_cat3(common, "/packed-refs", "");
+    FILE *fp = path ? cbm_fopen(path, "rb") : NULL;
+    free(path);
+    while (fp && ref && !found && (line = read_line_dup(fp)) != NULL) {
+        char *space = strchr(line, ' ');
+        if (line[0] != '#' && line[0] != '^' && space) {
+            *space = '\0';
+            if (strcmp(space + 1, ref) == 0 && is_object_id(line)) {
+                snprintf(sha, shasz, "%s", line);
+                found = true;
+            }
+        }
+        free(line);
+    }
+    if (fp) {
+        (void)fclose(fp);
+    }
+    free(ref);
     return found;
 }
 
@@ -525,29 +579,37 @@ int cbm_git_head_read(const char *root, cbm_git_head_t *out) {
         snprintf(common, sizeof(common), "%s", gitdir);
     }
     snprintf(path, sizeof(path), "%s/HEAD", gitdir);
-    if (!read_first_line(path, line, sizeof(line))) {
+    char *head = read_first_line_dup(path); /* whole line: names are unbounded */
+    if (!head) {
         return CBM_NOT_FOUND;
     }
     static const char ref_prefix[] = "ref: refs/heads/";
-    if (strncmp(line, ref_prefix, sizeof(ref_prefix) - 1) == 0) {
-        const char *branch = line + sizeof(ref_prefix) - 1;
+    int rc = CBM_NOT_FOUND;
+    if (strncmp(head, ref_prefix, sizeof(ref_prefix) - 1) == 0) {
+        const char *branch = head + sizeof(ref_prefix) - 1;
         /* A reftable repository keeps refs out of the file tree and points
          * HEAD at the placeholder "refs/heads/.invalid". */
         snprintf(path, sizeof(path), "%s/reftable", common);
-        if (strcmp(branch, ".invalid") == 0 || cbm_is_dir(path)) {
-            return CBM_NOT_FOUND;
+        if (strcmp(branch, ".invalid") != 0 && !cbm_is_dir(path)) {
+            out->branch = git_strdup(branch);
+            (void)read_branch_sha(common, branch, out->head_sha, sizeof(out->head_sha));
+            rc = out->branch ? 0 : CBM_NOT_FOUND;
         }
-        snprintf(out->branch, sizeof(out->branch), "%s", branch);
-        (void)read_branch_sha(common, branch, out->head_sha, sizeof(out->head_sha));
-        return 0;
+    } else if (is_object_id(head)) {
+        /* A detached HEAD holds the commit id itself. */
+        out->is_detached = true;
+        snprintf(out->head_sha, sizeof(out->head_sha), "%s", head);
+        rc = 0;
     }
-    /* A detached HEAD holds the commit id itself. */
-    if (!is_object_id(line)) {
-        return CBM_NOT_FOUND;
+    free(head);
+    return rc;
+}
+
+void cbm_git_head_free(cbm_git_head_t *head) {
+    if (head) {
+        free(head->branch);
+        head->branch = NULL;
     }
-    out->is_detached = true;
-    snprintf(out->head_sha, sizeof(out->head_sha), "%s", line);
-    return 0;
 }
 
 char *cbm_git_branch_slug(const char *branch, bool detached) {
@@ -658,6 +720,20 @@ int cbm_git_context_props_json(const cbm_git_context_t *ctx, char *buf, int buf_
         return 0;
     }
     return off;
+}
+
+char *cbm_git_context_props_json_dup(const cbm_git_context_t *ctx) {
+    for (int size = 4096; size <= (1 << 24); size *= 2) {
+        char *buf = (char *)malloc((size_t)size);
+        if (!buf) {
+            return NULL;
+        }
+        if (cbm_git_context_props_json(ctx, buf, size) > 0) {
+            return buf;
+        }
+        free(buf);
+    }
+    return NULL;
 }
 
 cbm_git_checkout_kind_t cbm_git_checkout_root_kind(const char *dir) {

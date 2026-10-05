@@ -150,7 +150,7 @@ struct cbm_pipeline {
      * parking; the outcome of this run's switch is reported back. */
     int branch_keep;
     cbm_branch_switch_t branch_action;
-    char branch_from[CBM_SZ_256]; /* slug the database was built for; "" unknown */
+    char *branch_from;            /* slug the database was built for; NULL unknown */
     int files_reparsed;           /* source files extracted this run; -1 unknown */
     /* The database was recorded for another checkout than this run's: the
      * incremental pass must not trust size+mtime alone (see
@@ -440,6 +440,7 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     p->file_errors_count = 0;
     p->file_errors_cap = 0;
     free(p->branch_qn);
+    free(p->branch_from);
     free(p->saved_brief);
     p->saved_brief = NULL;
     free(p->saved_adr); /* freed here too: error paths can exit before the
@@ -583,7 +584,7 @@ void cbm_pipeline_get_branch_switch(const cbm_pipeline_t *p, const char **action
         *action = cbm_branch_switch_str(p ? p->branch_action : CBM_BRANCH_SWITCH_NONE);
     }
     if (from) {
-        *from = p && p->branch_from[0] ? p->branch_from : NULL;
+        *from = p ? p->branch_from : NULL;
     }
     if (to) {
         *to =
@@ -880,11 +881,10 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_stem_marks_t *marks,
     cbm_gbuf_upsert_node(p->gbuf, "Project", p->project_name, p->project_name, NULL, 0, 0, "{}");
     const char *branch_qn = p->branch_qn ? p->branch_qn : p->project_name;
     const char *branch_name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
-    char branch_props[CBM_SZ_4K]; /* the same size the stamp writes with */
-    const char *branch_props_json = "{}";
-    if (cbm_git_context_props_json(&p->git_ctx, branch_props, sizeof(branch_props)) > 0) {
-        branch_props_json = branch_props;
-    }
+    /* Sized to fit, as the stamp writes it: a long branch name or path must
+     * not degrade the identity to "{}". */
+    char *branch_props = cbm_git_context_props_json_dup(&p->git_ctx);
+    const char *branch_props_json = branch_props ? branch_props : "{}";
     if (p->branch_qn) {
         int64_t branch_id = cbm_gbuf_upsert_node(p->gbuf, "Branch", branch_name, branch_qn, NULL, 0,
                                                  0, branch_props_json);
@@ -894,6 +894,7 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_stem_marks_t *marks,
                                  branch_props_json);
         }
     }
+    free(branch_props);
 
     /* Collect unique directories and create Folder/Package nodes */
     CBMHashTable *seen_dirs = cbm_ht_create(CBM_SZ_256);
@@ -2081,13 +2082,14 @@ const char *cbm_pipeline_export_error(const cbm_pipeline_t *p) {
  * the caller owns, and outside git there is no branch to key on. */
 static void pipeline_branch_switch(cbm_pipeline_t *p) {
     p->branch_action = CBM_BRANCH_SWITCH_NONE;
-    p->branch_from[0] = '\0';
+    free(p->branch_from);
+    p->branch_from = NULL;
     if (!p->default_db_path || !p->db_path || !p->git_ctx.is_git || p->branch_keep < 1) {
         return;
     }
     p->branch_action = cbm_branch_slots_switch(
         p->db_path, p->project_name, cbm_branch_slug_from_qn(p->branch_qn, p->project_name),
-        p->branch_keep, p->branch_from, sizeof(p->branch_from));
+        p->branch_keep, &p->branch_from);
 }
 
 /* Record the checkout this run indexed on the Branch node: the QN (the slot
@@ -2103,20 +2105,21 @@ bool cbm_pipeline_stamp_branch_store(cbm_pipeline_t *p, cbm_store_t *s) {
     if (!p || !p->branch_qn || !s) {
         return false;
     }
-    char props[CBM_SZ_4K];
-    const char *props_json =
-        cbm_git_context_props_json(&p->git_ctx, props, sizeof(props)) > 0 ? props : "{}";
+    char *props = cbm_git_context_props_json_dup(&p->git_ctx);
+    const char *props_json = props ? props : "{}";
     const char *name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
-    if (cbm_store_get_branch(s, p->project_name, NULL, 0, NULL, 0) != CBM_STORE_OK ||
-        cbm_store_branch_is(s, p->project_name, p->branch_qn, name, props_json)) {
-        return false;
+    bool wrote = false;
+    if (cbm_store_get_branch(s, p->project_name, NULL, 0, NULL, 0) == CBM_STORE_OK &&
+        !cbm_store_branch_is(s, p->project_name, p->branch_qn, name, props_json)) {
+        wrote = cbm_store_set_branch(s, p->project_name, p->branch_qn, name, props_json) ==
+                CBM_STORE_OK;
+        if (!wrote) {
+            cbm_log_warn("pipeline.err", "phase", "branch_stamp", "project", p->project_name, "err",
+                         cbm_store_error(s));
+        }
     }
-    if (cbm_store_set_branch(s, p->project_name, p->branch_qn, name, props_json) != CBM_STORE_OK) {
-        cbm_log_warn("pipeline.err", "phase", "branch_stamp", "project", p->project_name, "err",
-                     cbm_store_error(s));
-        return false;
-    }
-    return true;
+    free(props);
+    return wrote;
 }
 
 bool cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
@@ -2125,14 +2128,14 @@ bool cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
     }
     /* Check on a read-only connection first: opening read-write is itself a
      * write (WAL setup), which a no-op run must not do. */
-    char props[CBM_SZ_4K];
-    const char *props_json =
-        cbm_git_context_props_json(&p->git_ctx, props, sizeof(props)) > 0 ? props : "{}";
+    char *props = cbm_git_context_props_json_dup(&p->git_ctx);
+    const char *props_json = props ? props : "{}";
     const char *name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
     cbm_store_t *s = cbm_store_open_path_query(db_path);
     bool needed = s && cbm_store_get_branch(s, p->project_name, NULL, 0, NULL, 0) == CBM_STORE_OK &&
                   !cbm_store_branch_is(s, p->project_name, p->branch_qn, name, props_json);
     cbm_store_close(s);
+    free(props);
     bool wrote = false;
     if (needed) {
         s = cbm_store_open_path(db_path);
@@ -2176,6 +2179,8 @@ static void pipeline_note_checkout_moved(const cbm_pipeline_t *p) {
                      "indexed_head", start.head_sha, "checkout", now.slug, "checkout_head",
                      now.head_sha);
     }
+    cbm_branch_id_free(&start);
+    cbm_branch_id_free(&now);
 }
 
 /* Whether this run's incremental pass must verify same-size files by content.
@@ -2207,8 +2212,10 @@ static void pipeline_decide_content_check(cbm_pipeline_t *p) {
          * verified on every run. */
         (void)cbm_branch_id_indexed(s, p->project_name, &indexed);
         p->verify_content = !cbm_branch_id_same_strict(&indexed, &current);
+        cbm_branch_id_free(&indexed);
         cbm_store_close(s);
     }
+    cbm_branch_id_free(&current);
     free(db_path);
     if (p->verify_content) {
         cbm_log_info("pipeline.verify_content", "project", p->project_name, "reason",

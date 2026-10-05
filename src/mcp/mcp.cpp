@@ -2180,9 +2180,9 @@ static void add_branch_index_json(yyjson_mut_doc *doc, yyjson_mut_val *git, cbm_
         return;
     }
     if (store) {
-        char name[CBM_SZ_512];
-        if (cbm_store_get_branch(store, project, NULL, 0, name, sizeof(name)) == CBM_STORE_OK) {
-            yyjson_mut_obj_add_strcpy(doc, git, "indexed_branch", name);
+        char *name = NULL;
+        if (cbm_store_get_branch_dup(store, project, NULL, &name, NULL) == CBM_STORE_OK) {
+            yyjson_mut_obj_add_strcpy(doc, git, "indexed_branch", name ? name : "");
             /* Branch name and HEAD commit, not the slug two branches can
              * share; a graph with no recorded commit is not claimed current
              * (the strict form the content check uses). */
@@ -2193,7 +2193,10 @@ static void add_branch_index_json(yyjson_mut_doc *doc, yyjson_mut_val *git, cbm_
                 yyjson_mut_obj_add_bool(doc, git, "index_matches_checkout",
                                         cbm_branch_id_same_strict(&indexed, &current));
             }
+            cbm_branch_id_free(&indexed);
+            cbm_branch_id_free(&current);
         }
+        free(name);
     }
     char db_path[CBM_SZ_1K];
     project_db_path(project, db_path, sizeof(db_path));
@@ -12796,9 +12799,10 @@ static void *autoindex_thread(void *arg) {
 static bool session_index_on_other_branch(const cbm_mcp_server_t *srv, const char *db_path) {
     cbm_branch_id_t current;
     if (!cbm_branch_id_from_head(srv->session_root, &current)) {
+        cbm_branch_id_free(&current);
         return false;
     }
-    cbm_branch_id_t indexed;
+    cbm_branch_id_t indexed = {};
     cbm_store_t *store = cbm_store_open_path_query(db_path);
     bool known = store && cbm_branch_id_indexed(store, srv->session_project, &indexed);
     cbm_store_close(store);
@@ -12808,6 +12812,8 @@ static bool session_index_on_other_branch(const cbm_mcp_server_t *srv, const cha
                      indexed.slug, "indexed_head", indexed.head_sha, "checkout", current.slug,
                      "checkout_head", current.head_sha);
     }
+    cbm_branch_id_free(&indexed);
+    cbm_branch_id_free(&current);
     return other;
 }
 
