@@ -157,45 +157,57 @@ TEST(branch_slug_from_qn) {
     PASS();
 }
 
+/* Slug of the HEAD the file-only reader sees from dir; "" when it fails. */
+static const char *bi_head_slug(const char *dir, char *buf, size_t n) {
+    buf[0] = '\0';
+    cbm_git_head_t head;
+    if (cbm_git_head_read(dir, &head) == 0) {
+        char *slug = cbm_git_branch_slug(head.branch, head.is_detached);
+        snprintf(buf, n, "%s", slug ? slug : "");
+        free(slug);
+    }
+    return buf;
+}
+
 /* The subprocess-free HEAD read agrees with cbm_git_context_resolve, also
- * through a linked worktree's .git file. */
+ * through a linked worktree's .git file, and from any directory inside the
+ * checkout (an index root below the checkout root). */
 TEST(branch_git_head_slug_reads_head_file) {
     char *repo = bi_make_repo("cbm_bi_head");
     ASSERT_NOT_NULL(repo);
     char saved[256];
     snprintf(saved, sizeof(saved), "%s", repo);
     repo = saved;
+    char slug[256];
+    char sub[600];
+    snprintf(sub, sizeof(sub), "%s/src", repo);
 
-    char *slug = cbm_git_head_slug(repo);
-    ASSERT_NOT_NULL(slug);
-    ASSERT_STR_EQ(slug, "main");
-    free(slug);
+    ASSERT_STR_EQ(bi_head_slug(repo, slug, sizeof(slug)), "main");
+    ASSERT_STR_EQ(bi_head_slug(sub, slug, sizeof(slug)), "main");
     ASSERT_EQ(bi_git(repo, "checkout -q -b topic/x-y"), 0);
-    slug = cbm_git_head_slug(repo);
-    ASSERT_STR_EQ(slug, "topic-x-y");
-    free(slug);
+    ASSERT_STR_EQ(bi_head_slug(repo, slug, sizeof(slug)), "topic-x-y");
     ASSERT_EQ(bi_git(repo, "checkout -q --detach HEAD"), 0);
-    slug = cbm_git_head_slug(repo);
-    ASSERT_STR_EQ(slug, "detached");
-    free(slug);
+    ASSERT_STR_EQ(bi_head_slug(repo, slug, sizeof(slug)), "detached");
 
     char wt[512];
     snprintf(wt, sizeof(wt), "%s/wt", repo);
     char cmd[700];
     snprintf(cmd, sizeof(cmd), "worktree add -q -b side \"%s\"", wt);
     ASSERT_EQ(bi_git(repo, cmd), 0);
-    slug = cbm_git_head_slug(wt);
-    ASSERT_NOT_NULL(slug);
-    ASSERT_STR_EQ(slug, "side");
-    free(slug);
+    ASSERT_STR_EQ(bi_head_slug(wt, slug, sizeof(slug)), "side");
+    char wt_sub[600];
+    snprintf(wt_sub, sizeof(wt_sub), "%s/src", wt);
+    ASSERT_STR_EQ(bi_head_slug(wt_sub, slug, sizeof(slug)), "side");
     cbm_git_context_t ctx = {0};
     ASSERT_EQ(cbm_git_context_resolve(wt, &ctx), 0);
     ASSERT_STR_EQ(ctx.branch_slug, "side");
     cbm_git_context_free(&ctx);
 
-    char sub[600];
-    snprintf(sub, sizeof(sub), "%s/src", repo);
-    ASSERT_NULL(cbm_git_head_slug(sub)); /* not a checkout root */
+    /* Outside any checkout there is nothing to read. */
+    char *plain = th_mktempdir("cbm_bi_nogit");
+    ASSERT_NOT_NULL(plain);
+    ASSERT_STR_EQ(bi_head_slug(plain, slug, sizeof(slug)), "");
+    th_rmtree(plain);
 
     th_rmtree(repo);
     PASS();
@@ -669,7 +681,7 @@ TEST(branch_identity_is_name_and_head) {
 }
 
 /* The file-only HEAD read agrees with git on the commit, through a loose ref,
- * packed-refs, a detached HEAD and a linked worktree. */
+ * packed-refs, a detached HEAD, a linked worktree and a submodule. */
 TEST(branch_head_read_matches_git) {
     char *repo = bi_make_repo("cbm_bi_headsha");
     ASSERT_NOT_NULL(repo);
@@ -682,14 +694,24 @@ TEST(branch_head_read_matches_git) {
     snprintf(cmd, sizeof(cmd), "worktree add -q -b side \"%s\" feature", wt);
     ASSERT_EQ(bi_git(repo, cmd), 0);
 
+    /* A submodule: its .git is a gitlink into the superproject's
+     * .git/modules, with no commondir. */
+    char sub_cmd[1200];
+    snprintf(sub_cmd, sizeof(sub_cmd), "-c protocol.file.allow=always submodule add -q \"%s\" mod",
+             repo);
+    ASSERT_EQ(bi_git(repo, sub_cmd), 0);
+    ASSERT_EQ(bi_git(repo, "commit -q -m submodule"), 0);
+    char mod[600];
+    snprintf(mod, sizeof(mod), "%s/mod/src", repo); /* below the submodule root */
+
     for (int round = 0; round < 3; round++) {
         if (round == 1) {
             ASSERT_EQ(bi_git(repo, "pack-refs --all"), 0);
         } else if (round == 2) {
             ASSERT_EQ(bi_git(repo, "checkout -q --detach feature"), 0);
         }
-        const char *roots[] = {repo, wt};
-        for (int i = 0; i < 2; i++) {
+        const char *roots[] = {repo, wt, mod};
+        for (int i = 0; i < 3; i++) {
             cbm_git_context_t ctx = {0};
             ASSERT_EQ(cbm_git_context_resolve(roots[i], &ctx), 0);
             cbm_git_head_t head;
@@ -774,6 +796,21 @@ TEST(branch_identity_from_older_databases) {
     ASSERT_EQ(cbm_store_set_branch(s, g_bi_project, qn, "main", "{}"), CBM_STORE_OK);
     cbm_store_close(s);
     ASSERT_TRUE(bi_head_matches_index(repo)); /* slug only: same branch */
+    /* Built while git refused the checkout (is_git false, slot "working-tree"):
+     * nothing to compare, so no session is marked pending for it. */
+    char nongit_qn[1100];
+    snprintf(nongit_qn, sizeof(nongit_qn), "%s.__branch__.working-tree", g_bi_project);
+    s = cbm_store_open_path(bi_db_path(db, sizeof(db)));
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_set_branch(s, g_bi_project, nongit_qn, "working-tree",
+                                   "{\"is_git\":false,\"branch\":\"\",\"head_sha\":\"\"}"),
+              CBM_STORE_OK);
+    cbm_store_close(s);
+    ASSERT_TRUE(bi_head_matches_index(repo));
+    s = cbm_store_open_path(bi_db_path(db, sizeof(db)));
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_set_branch(s, g_bi_project, qn, "main", "{}"), CBM_STORE_OK);
+    cbm_store_close(s);
     r = bi_index(repo, -1);
     ASSERT_EQ(r.rc, 0);
     ASSERT_STR_EQ(r.action, "none");
@@ -781,6 +818,124 @@ TEST(branch_identity_from_older_databases) {
     ASSERT_EQ(r.reparsed, 0);
 
     bi_cleanup(repo);
+    PASS();
+}
+
+/* A project indexed at a directory BELOW the checkout root: an offline branch
+ * change must still be seen by the session-start check (which reads HEAD
+ * from files) and by index_status, and the next run parks and seeds as for a
+ * root project. */
+TEST(branch_subdir_root_sees_offline_switch) {
+    char *repo = bi_make_repo("cbm_bi_subdir");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char sub[600];
+    snprintf(sub, sizeof(sub), "%s/src", repo);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    ASSERT_EQ(bi_index(sub, -1).rc, 0);
+    ASSERT_TRUE(bi_head_matches_index(sub));
+    ASSERT_EQ(bi_status_matches(srv), 1);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_FALSE(bi_head_matches_index(sub));
+    ASSERT_EQ(bi_status_matches(srv), 0);
+
+    bi_run_t r = bi_index(sub, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "seeded");
+    ASSERT_STR_EQ(r.from, "main");
+    ASSERT_TRUE(bi_is_parked("main"));
+    ASSERT_TRUE(bi_head_matches_index(sub));
+    ASSERT_EQ(bi_status_matches(srv), 1);
+
+    cbm_mcp_server_free(srv);
+    char db[1024];
+    bi_db_path(db, sizeof(db));
+    (void)cbm_branch_slots_delete_all(db, g_bi_project);
+    cbm_unlink(db);
+    cbm_remove_db_sidecars(db);
+    th_rmtree(repo);
+    PASS();
+}
+
+/* <project>.db gone (an interrupted full rebuild, a manual delete) while the
+ * checked-out branch has a parked database: that one is restored, and the
+ * incremental pass takes it from there. */
+TEST(branch_missing_live_db_restores_parked) {
+    char *repo = bi_make_repo("cbm_bi_nolive");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* main parked */
+    char db[1024];
+    bi_db_path(db, sizeof(db));
+    ASSERT_EQ(cbm_unlink(db), 0);
+    cbm_remove_db_sidecars(db);
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "restored");
+    ASSERT_STR_EQ(r.from, "");
+    ASSERT_EQ(r.reparsed, 0);
+    ASSERT_EQ(bi_count("only_main"), 1);
+    ASSERT_FALSE(bi_is_parked("main"));
+
+    bi_cleanup(repo);
+    PASS();
+}
+
+/* The bulk index reset also clears parked databases whose <project>.db is
+ * already gone, but keeps those of a project another process is indexing. */
+TEST(branch_reset_clears_orphaned_slots) {
+    char *cache = th_mktempdir("cbm_bi_reset");
+    ASSERT_NOT_NULL(cache);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", cache);
+    cache = saved;
+    char old_cache[1024] = "";
+    bool had_cache = cbm_safe_getenv("CBM_CACHE_DIR", old_cache, sizeof(old_cache), NULL) != NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *files[] = {"live.db", "branches/live/main.db", "branches/orphan/main.db",
+                           "branches/orphan/feature.db", "branches/busy/main.db"};
+    for (int i = 0; i < 5; i++) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", cache, files[i]);
+        ASSERT_EQ(th_write_file(path, "x"), 0);
+    }
+    char busy[1024];
+    snprintf(busy, sizeof(busy), "%s/busy.db", cache);
+    cbm_db_lease_t *lease = NULL;
+    ASSERT_EQ(cbm_db_lease_try_acquire(busy, &lease), 0);
+
+    ASSERT_EQ(cbm_remove_indexes(NULL), 1); /* live.db */
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/branches/live", cache);
+    ASSERT_FALSE(cbm_file_exists(path));
+    snprintf(path, sizeof(path), "%s/branches/orphan", cache);
+    ASSERT_FALSE(cbm_file_exists(path));
+    snprintf(path, sizeof(path), "%s/branches/busy/main.db", cache);
+    ASSERT_TRUE(cbm_file_exists(path));
+
+    cbm_db_lease_release(lease);
+    ASSERT_EQ(cbm_remove_indexes(NULL), 0);
+    ASSERT_FALSE(cbm_file_exists(path));
+    snprintf(path, sizeof(path), "%s/branches", cache);
+    ASSERT_FALSE(cbm_file_exists(path));
+
+    if (had_cache) {
+        cbm_setenv("CBM_CACHE_DIR", old_cache, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(cache);
     PASS();
 }
 
@@ -805,4 +960,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_head_read_matches_git);
     RUN_TEST(branch_name_containing_marker);
     RUN_TEST(branch_identity_from_older_databases);
+    RUN_TEST(branch_subdir_root_sees_offline_switch);
+    RUN_TEST(branch_missing_live_db_restores_parked);
+    RUN_TEST(branch_reset_clears_orphaned_slots);
 }

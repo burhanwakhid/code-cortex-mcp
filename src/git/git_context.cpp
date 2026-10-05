@@ -484,20 +484,35 @@ int cbm_git_head_read(const char *root, cbm_git_head_t *out) {
     char path[GIT_OUTPUT_MAX];
     char gitdir[GIT_OUTPUT_MAX];
     char line[GIT_OUTPUT_MAX];
-    snprintf(path, sizeof(path), "%s/.git", root);
+    /* An index root can sit below the checkout root (repo/services/api): walk
+     * up to the nearest directory holding a .git, as git itself does. */
+    char top[GIT_OUTPUT_MAX];
+    snprintf(top, sizeof(top), "%s", root);
     struct stat st;
-    if (stat(path, &st) != 0) {
-        return CBM_NOT_FOUND;
+    for (;;) {
+        int n = snprintf(path, sizeof(path), "%s/.git", top);
+        if (n > 0 && (size_t)n < sizeof(path) && stat(path, &st) == 0) {
+            break;
+        }
+        char *slash = strrchr(top, '/');
+        char *bslash = strrchr(top, '\\');
+        if (bslash && (!slash || bslash > slash)) {
+            slash = bslash;
+        }
+        if (!slash || slash == top || slash[1] == '\0') {
+            return CBM_NOT_FOUND; /* reached the filesystem root */
+        }
+        *slash = '\0';
     }
     if (S_ISDIR(st.st_mode)) {
         snprintf(gitdir, sizeof(gitdir), "%s", path);
     } else {
-        /* Linked worktree: ".git" holds "gitdir: <dir>", absolute or relative
-         * to the worktree root. */
+        /* Linked worktree or submodule: ".git" holds "gitdir: <dir>",
+         * absolute or relative to the directory holding that file. */
         static const char prefix[] = "gitdir: ";
         if (!read_first_line(path, line, sizeof(line)) ||
             strncmp(line, prefix, sizeof(prefix) - 1) != 0 ||
-            !path_under(root, line + sizeof(prefix) - 1, gitdir, sizeof(gitdir))) {
+            !path_under(top, line + sizeof(prefix) - 1, gitdir, sizeof(gitdir))) {
             return CBM_NOT_FOUND;
         }
     }
@@ -537,14 +552,6 @@ int cbm_git_head_read(const char *root, cbm_git_head_t *out) {
 
 char *cbm_git_branch_slug(const char *branch, bool detached) {
     return slug_from_branch(branch, detached);
-}
-
-char *cbm_git_head_slug(const char *root) {
-    cbm_git_head_t head;
-    if (cbm_git_head_read(root, &head) != 0) {
-        return NULL;
-    }
-    return slug_from_branch(head.branch, head.is_detached);
 }
 
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx) {

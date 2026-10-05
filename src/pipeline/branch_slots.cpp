@@ -81,9 +81,14 @@ bool cbm_branch_id_indexed(cbm_store_t *s, const char *project, cbm_branch_id_t 
         snprintf(out->head_sha, sizeof(out->head_sha), "%s",
                  out->has_sha ? yyjson_get_str(sha) : "");
         set_slug(out, out->branch, out->is_detached);
+    } else if (yyjson_is_bool(is_git)) {
+        /* Indexed as a non-git tree (or git refused the checkout, e.g.
+         * safe.directory): there is no branch to compare, and comparing
+         * "working-tree" with the checkout's branch would mark every session
+         * pending. Leave it unknown. */
     } else {
-        /* No git identity recorded (a non-git index, or properties that
-         * failed to serialize): the QN's slug is all there is. */
+        /* No properties (they failed to serialize): the QN's slug is all
+         * there is. */
         const char *slug = cbm_branch_slug_from_qn(qn, project);
         snprintf(out->slug, sizeof(out->slug), "%s", slug ? slug : "");
         out->is_detached = slug && strcmp(slug, "detached") == 0;

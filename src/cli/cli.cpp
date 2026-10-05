@@ -10,7 +10,7 @@
 #include "foundation/platform.h"
 #include "foundation/constants.h"
 #include "foundation/sha256.h"
-#include "foundation/str_util.h" // cbm_is_project_index_db
+#include "foundation/str_util.h" // cbm_is_project_index_db, cbm_validate_project_name
 #include "mcp/mcp.h"             // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
 /* cbm_branch_slots_delete_all: an index reset drops parked branch indexes too. */
 #include "pipeline/branch_slots.h"
@@ -3327,6 +3327,61 @@ int cbm_list_indexes(const char *home_dir) {
     return count;
 }
 
+/* Parked databases whose project has no <project>.db any more (an
+ * interrupted rebuild, a manual delete): the scan above never reaches them.
+ * Each project is cleared under the lease of its would-be <project>.db, as
+ * index runs and delete_project take it, and only while that file is absent;
+ * a project being indexed right now keeps its slots. */
+static void remove_orphan_branch_slots(const char *cache_dir) {
+    char dir[CLI_BUF_1K];
+    snprintf(dir, sizeof(dir), "%s/branches", cache_dir);
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return;
+    }
+    /* Collect first: clearing a project removes its directory, and changing
+     * a directory while reading it is unspecified on some platforms. */
+    int n = 0;
+    int cap = 0;
+    char **names = NULL;
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (!ent->is_dir || !cbm_validate_project_name(ent->name)) {
+            continue;
+        }
+        if (n == cap) {
+            int next_cap = cap ? cap * 2 : 8;
+            char **grown = (char **)realloc(names, (size_t)next_cap * sizeof(char *));
+            if (!grown) {
+                break;
+            }
+            names = grown;
+            cap = next_cap;
+        }
+        names[n] = strdup(ent->name);
+        if (!names[n]) {
+            break;
+        }
+        n++;
+    }
+    cbm_closedir(d);
+    for (int i = 0; i < n; i++) {
+        char path[CLI_BUF_1K];
+        snprintf(path, sizeof(path), "%s/%s.db", cache_dir, names[i]);
+        cbm_db_lease_t *lease = NULL;
+        if (cbm_db_lease_try_acquire(path, &lease) != 0) {
+            fprintf(stderr, "Keeping parked indexes of %s: database busy.\n", names[i]);
+        } else {
+            if (!cbm_file_exists(path)) {
+                (void)cbm_branch_slots_delete_all(path, names[i]);
+            }
+            cbm_db_lease_release(lease);
+        }
+        free(names[i]);
+    }
+    free(names);
+}
+
 static int remove_indexes_in_dir(const char *cache_dir) {
     if (!cache_dir) {
         return 0;
@@ -3376,6 +3431,8 @@ static int remove_indexes_in_dir(const char *cache_dir) {
         }
     }
     cbm_closedir(d);
+    /* Parked databases whose <project>.db was already gone. */
+    remove_orphan_branch_slots(cache_dir);
     return count;
 }
 
