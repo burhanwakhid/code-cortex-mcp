@@ -11,7 +11,9 @@
 #include "../src/foundation/compat_fs.h"
 #include "test_framework.h"
 #include "test_helpers.h" /* th_mktempdir / th_rmtree */
+#include <git/git_context.h>
 #include <mcp/mcp.h>
+#include <pipeline/pipeline.h> /* cbm_project_name_from_path */
 #include <store/store.h>
 #include <sqlite3.h>
 #include <stdlib.h>
@@ -773,6 +775,245 @@ TEST(hook_prompt_caller_evidence_keeps_lexical_and_binding_uncertainty) {
     PASS();
 }
 
+/* Each git worktree has its own index. Fixture: an indexed main checkout
+ * <repo> (.git directory) holding a plain subdirectory, a linked worktree
+ * (.git file naming .git/worktrees/wt), a nested repo (.git directory) and a
+ * submodule (.git file naming .git/modules/sub) — none of the last three
+ * indexed. Returns the realpath'd repo root (caller frees) or NULL. POSIX
+ * only (realpath, chdir); the helper itself is a plain stat. */
+#ifndef _WIN32
+static bool hf_write_file(const char *path, const char *text) {
+    FILE *f = cbm_fopen(path, "w");
+    if (!f) {
+        return false;
+    }
+    fputs(text, f);
+    fclose(f);
+    return true;
+}
+
+static char *hf_make_checkouts(void) {
+    const char *made = th_mktempdir("cbm-wt-boundary");
+    char *base = made ? realpath(made, NULL) : NULL; /* getcwd form on macOS */
+    if (!base) {
+        return NULL;
+    }
+    char p[1024];
+    char text[1200];
+    bool ok = true;
+    const char *dirs[] = {"/repo/.git/worktrees/wt",
+                          "/repo/.git/modules/sub",
+                          "/repo/src/deep",
+                          "/repo/.worktrees/wt/src",
+                          "/repo/nested/.git",
+                          "/repo/nested/src",
+                          "/repo/sub"};
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        snprintf(p, sizeof(p), "%s%s", base, dirs[i]);
+        ok = ok && cbm_mkdir_p(p, 0755);
+    }
+    snprintf(p, sizeof(p), "%s/repo/.worktrees/wt/.git", base);
+    snprintf(text, sizeof(text), "gitdir: %s/repo/.git/worktrees/wt\n", base);
+    ok = ok && hf_write_file(p, text);
+    snprintf(p, sizeof(p), "%s/repo/sub/.git", base);
+    ok = ok && hf_write_file(p, "gitdir: ../.git/modules/sub\n");
+    char *repo = nullptr;
+    if (ok) {
+        snprintf(p, sizeof(p), "%s/repo", base);
+        repo = strdup(p);
+    }
+    free(base);
+    return repo;
+}
+
+/* Index `dir` as far as the walk-ups can tell: a brief-bearing db under the
+ * path-derived project name. Returns that name (caller frees). */
+static char *hf_index_dir(const hf_env_t *e, const char *dir) {
+    char *name = cbm_project_name_from_path(dir);
+    if (name && !hf_seed_brief_db(e, name, 0)) {
+        free(name);
+        return nullptr;
+    }
+    return name;
+}
+#endif
+
+TEST(hook_walkup_stops_at_unindexed_checkout_root) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && !defined(_WIN32)
+    hf_env_t env;
+    if (!hf_env_open(&env, "cbm-wt-cache")) {
+        PASS();
+    }
+    char *repo = hf_make_checkouts();
+    ASSERT_NOT_NULL(repo);
+    char *parent = hf_index_dir(&env, repo);
+    ASSERT_NOT_NULL(parent);
+    char p[1024];
+    char want[1200];
+
+    /* The helper: one stat per question, no git subprocess. */
+    ASSERT_EQ(cbm_git_checkout_root_kind(repo), CBM_GIT_CHECKOUT_MAIN);
+    snprintf(p, sizeof(p), "%s/.worktrees/wt", repo);
+    ASSERT_EQ(cbm_git_checkout_root_kind(p), CBM_GIT_CHECKOUT_GITLINK);
+    ASSERT_TRUE(cbm_git_is_linked_worktree(p));
+    snprintf(p, sizeof(p), "%s/sub", repo);
+    ASSERT_EQ(cbm_git_checkout_root_kind(p), CBM_GIT_CHECKOUT_GITLINK);
+    ASSERT_FALSE(cbm_git_is_linked_worktree(p));
+    snprintf(p, sizeof(p), "%s/src/deep", repo);
+    ASSERT_EQ(cbm_git_checkout_root_kind(p), CBM_GIT_CHECKOUT_NONE);
+
+    /* A plain subdirectory still climbs to the indexed checkout. */
+    char *text = cbm_session_start_text_for_testing(p);
+    ASSERT_NOT_NULL(text);
+    snprintf(want, sizeof(want), "indexed as \"%s\"", parent);
+    ASSERT_NOT_NULL(strstr(text, want));
+    free(text);
+
+    /* Linked worktree: not answered from the parent; told to index itself. */
+    snprintf(p, sizeof(p), "%s/.worktrees/wt/src", repo);
+    text = cbm_session_start_text_for_testing(p);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NULL(strstr(text, parent));
+    ASSERT_NOT_NULL(strstr(text, "is not indexed"));
+    snprintf(want, sizeof(want), "repo_path = %s/.worktrees/wt)", repo);
+    ASSERT_NOT_NULL(strstr(text, want));
+    ASSERT_NOT_NULL(strstr(text, "linked git worktree"));
+    free(text);
+
+    /* Nested repo (.git directory) and submodule: same stop, no worktree hint. */
+    const char *others[] = {"nested", "sub"};
+    for (size_t i = 0; i < 2; i++) {
+        snprintf(p, sizeof(p), "%s/%s", repo, others[i]);
+        text = cbm_session_start_text_for_testing(p);
+        ASSERT_NOT_NULL(text);
+        snprintf(want, sizeof(want), "repo_path = %s)", p);
+        ASSERT_NOT_NULL(strstr(text, want));
+        ASSERT_NULL(strstr(text, "linked git worktree"));
+        free(text);
+    }
+
+    /* Once the worktree is indexed it answers from its own project. */
+    snprintf(p, sizeof(p), "%s/.worktrees/wt", repo);
+    char *own = hf_index_dir(&env, p);
+    ASSERT_NOT_NULL(own);
+    snprintf(p, sizeof(p), "%s/.worktrees/wt/src", repo);
+    text = cbm_session_start_text_for_testing(p);
+    ASSERT_NOT_NULL(text);
+    snprintf(want, sizeof(want), "indexed as \"%s\"", own);
+    ASSERT_NOT_NULL(strstr(text, want));
+    free(text);
+
+    free(own);
+    free(parent);
+    char *base = strdup(repo);
+    *strrchr(base, '/') = '\0';
+    th_rmtree(base);
+    free(base);
+    free(repo);
+    hf_env_close(&env);
+#endif
+    PASS();
+}
+
+/* The Read coverage walk-up: a parent index that lists a path under the
+ * nested worktree must not annotate the worktree's copy of that file. */
+TEST(hook_coverage_walk_stops_at_unindexed_checkout_root) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && !defined(_WIN32)
+    hf_env_t env;
+    if (!hf_env_open(&env, "cbm-wt-cache")) {
+        PASS();
+    }
+    char *repo = hf_make_checkouts();
+    ASSERT_NOT_NULL(repo);
+    char *name = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(name);
+    char p[1024];
+    snprintf(p, sizeof(p), "%s/%s.db", env.dir, name);
+    cbm_store_t *st = cbm_store_open_path(p);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, name, repo), CBM_STORE_OK);
+    const char *rels[] = {"src/deep/partial.c", ".worktrees/wt/src/partial.c"};
+    for (size_t i = 0; i < 2; i++) {
+        ASSERT_EQ(cbm_store_upsert_file_hash(st, name, rels[i], "aa", 1, 10), CBM_STORE_OK);
+    }
+    cbm_coverage_row_t rows[] = {{rels[0], "parse_partial", "3-9"},
+                                 {rels[1], "parse_partial", "3-9"}};
+    ASSERT_EQ(cbm_store_coverage_replace(st, name, rows, 2), CBM_STORE_OK);
+    cbm_store_close(st);
+
+    snprintf(p, sizeof(p), "%s/%s", repo, rels[0]);
+    char *note = cbm_hook_coverage_walk_for_testing(p);
+    ASSERT_NOT_NULL(note); /* subdirectory: the parent's note */
+    free(note);
+    snprintf(p, sizeof(p), "%s/%s", repo, rels[1]);
+    ASSERT_NULL(cbm_hook_coverage_walk_for_testing(p)); /* worktree: no climb */
+
+    free(name);
+    char *base = strdup(repo);
+    *strrchr(base, '/') = '\0';
+    th_rmtree(base);
+    free(base);
+    free(repo);
+    hf_env_close(&env);
+#endif
+    PASS();
+}
+
+/* The MCP server's cwd resolver (project argument omitted) obeys the same
+ * boundary as the hooks. */
+TEST(mcp_cwd_project_stops_at_unindexed_checkout_root) {
+#ifdef _WIN32
+    PASS(); /* chdir/realpath-driven, like tool_project_resolves_from_cwd */
+#else
+    hf_env_t env;
+    if (!hf_env_open(&env, "cbm-wt-cache")) {
+        PASS();
+    }
+    char *repo = hf_make_checkouts();
+    ASSERT_NOT_NULL(repo);
+    char *parent = hf_index_dir(&env, repo);
+    ASSERT_NOT_NULL(parent);
+    char old_cwd[1024];
+    ASSERT_NOT_NULL(getcwd(old_cwd, sizeof(old_cwd)));
+    char p[1024];
+
+    snprintf(p, sizeof(p), "%s/src/deep", repo);
+    ASSERT_EQ(chdir(p), 0);
+    cbm_mcp_reset_cwd_project_cache();
+    ASSERT_NOT_NULL(cbm_mcp_cwd_project());
+    ASSERT_STR_EQ(cbm_mcp_cwd_project(), parent);
+
+    const char *stops[] = {"/.worktrees/wt/src", "/nested/src", "/sub"};
+    for (size_t i = 0; i < 3; i++) {
+        snprintf(p, sizeof(p), "%s%s", repo, stops[i]);
+        ASSERT_EQ(chdir(p), 0);
+        cbm_mcp_reset_cwd_project_cache();
+        ASSERT_NULL(cbm_mcp_cwd_project());
+    }
+
+    snprintf(p, sizeof(p), "%s/.worktrees/wt", repo);
+    char *own = hf_index_dir(&env, p);
+    ASSERT_NOT_NULL(own);
+    snprintf(p, sizeof(p), "%s/.worktrees/wt/src", repo);
+    ASSERT_EQ(chdir(p), 0);
+    cbm_mcp_reset_cwd_project_cache();
+    ASSERT_NOT_NULL(cbm_mcp_cwd_project());
+    ASSERT_STR_EQ(cbm_mcp_cwd_project(), own);
+
+    ASSERT_EQ(chdir(old_cwd), 0);
+    cbm_mcp_reset_cwd_project_cache();
+    free(own);
+    free(parent);
+    char *base = strdup(repo);
+    *strrchr(base, '/') = '\0';
+    th_rmtree(base);
+    free(base);
+    free(repo);
+    hf_env_close(&env);
+    PASS();
+#endif
+}
+
 void suite_hook_fastpath(void) {
     RUN_TEST(hook_scan_fallback_off_resolves_from_the_memo_only);
     RUN_TEST(hook_scan_fallback_defaults_on_and_toggles_back);
@@ -785,4 +1026,7 @@ void suite_hook_fastpath(void) {
     RUN_TEST(hook_prompt_chain_uses_bare_path_and_preserves_qualified_identities);
     RUN_TEST(hook_prompt_context_preserves_explicit_verification_requests);
     RUN_TEST(hook_prompt_caller_evidence_keeps_lexical_and_binding_uncertainty);
+    RUN_TEST(hook_walkup_stops_at_unindexed_checkout_root);
+    RUN_TEST(hook_coverage_walk_stops_at_unindexed_checkout_root);
+    RUN_TEST(mcp_cwd_project_stops_at_unindexed_checkout_root);
 }

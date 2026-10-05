@@ -41,6 +41,23 @@ void cbm_git_context_free(cbm_git_context_t *ctx);
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx);
 int cbm_git_context_props_json(const cbm_git_context_t *ctx, char *buf, int buf_size);
 
+/* What <dir>/.git says about dir, from one stat (no git subprocess): a main
+ * checkout (.git is a directory), a gitlink (.git is a regular file: a linked
+ * worktree or a submodule), or neither. Project resolvers that walk up from
+ * cwd stop at a checkout root, so a nested worktree or repo is never answered
+ * from the enclosing checkout's index. */
+typedef enum {
+    CBM_GIT_CHECKOUT_NONE = 0,
+    CBM_GIT_CHECKOUT_MAIN,
+    CBM_GIT_CHECKOUT_GITLINK,
+} cbm_git_checkout_kind_t;
+
+cbm_git_checkout_kind_t cbm_git_checkout_root_kind(const char *dir);
+
+/* True when dir's .git is a gitlink naming "<common>/worktrees/<name>", i.e.
+ * dir is a linked worktree rather than a submodule. Reads the small .git file. */
+bool cbm_git_is_linked_worktree(const char *dir);
+
 #ifdef __cplusplus
 }
 #endif

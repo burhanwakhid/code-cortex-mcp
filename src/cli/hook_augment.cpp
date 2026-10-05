@@ -36,6 +36,7 @@
 #include "foundation/platform.h"
 #include "foundation/mem.h"
 #include "foundation/subprocess.h"
+#include "git/git_context.h"
 #include "mcp/mcp.h"
 #include "pipeline/pipeline.h"
 #include "yyjson/yyjson.h"
@@ -211,6 +212,14 @@ static bool ha_strip_last_component(char *dir) {
     return true;
 }
 
+/* A level that did not resolve to an indexed project ends the walk-up when it
+ * is a git checkout root (.git directory or gitlink file): a linked worktree
+ * or nested repo inside an indexed checkout must not be answered from the
+ * parent's index — another branch's code, with no warning. */
+static bool ha_stop_at_checkout(const char *dir) {
+    return cbm_git_checkout_root_kind(dir) != CBM_GIT_CHECKOUT_NONE;
+}
+
 /* Walk up from the file's parent directory to find the indexed project, then
  * check whether the file (repo-relative) is listed in its coverage report.
  * Mirrors ha_resolve_and_query: an MCP error means "not indexed here" →
@@ -236,7 +245,7 @@ static char *ha_resolve_coverage(cbm_mcp_server_t *srv, const char *file_path) {
                 return NULL; /* indexed project, file not listed → stop */
             }
         }
-        if (!ha_strip_last_component(dir)) {
+        if (ha_stop_at_checkout(dir) || !ha_strip_last_component(dir)) {
             break;
         }
     }
@@ -1502,14 +1511,19 @@ static char *ha_walk_symbol(cbm_mcp_server_t *srv, const char *start, const char
                 return NULL;
             }
         }
-        if (!ha_strip_last_component(dir)) {
+        if (ha_stop_at_checkout(dir) || !ha_strip_last_component(dir)) {
             break;
         }
     }
     return NULL;
 }
 
-static char *ha_walk_session(cbm_mcp_server_t *srv, const char *start) {
+/* *indexed reports whether some level resolved; when none did and the walk
+ * stopped at a checkout root, that root is copied to stop_root (else ""). */
+static char *ha_walk_session(cbm_mcp_server_t *srv, const char *start, bool *indexed,
+                             char *stop_root, size_t stop_root_sz) {
+    *indexed = false;
+    stop_root[0] = '\0';
     char dir[4096];
     snprintf(dir, sizeof(dir), "%s", start);
     for (int level = 0; level < HA_MAX_WALKUP && cbm_hook_path_is_abs(dir); level++) {
@@ -1518,12 +1532,14 @@ static char *ha_walk_session(cbm_mcp_server_t *srv, const char *start) {
             bool resolved = false;
             char *ctx = ha_session_brief(srv, project, &resolved);
             free(project);
-            if (ctx) {
+            if (ctx || resolved) {
+                *indexed = true;
                 return ctx;
             }
-            if (resolved) {
-                return NULL;
-            }
+        }
+        if (ha_stop_at_checkout(dir)) {
+            snprintf(stop_root, stop_root_sz, "%s", dir);
+            break;
         }
         if (!ha_strip_last_component(dir)) {
             break;
@@ -1531,6 +1547,52 @@ static char *ha_walk_session(cbm_mcp_server_t *srv, const char *start) {
     }
     return NULL;
 }
+
+/* What SessionStart prints for cwd: the brief, or the "not indexed" pointer —
+ * naming the checkout root to index when the walk stopped at one. NULL when an
+ * indexed project has no brief to show. Caller frees. */
+static char *ha_session_start_text(cbm_mcp_server_t *srv, const char *cwd) {
+    bool indexed = false;
+    char root[4096];
+    char *brief = ha_walk_session(srv, cwd, &indexed, root, sizeof(root));
+    if (brief || indexed) {
+        return brief;
+    }
+    std::string text = "code-cortex: this repository is not indexed, so callers, impact and "
+                       "cross-language queries are unavailable. Index it once with the "
+                       "index_repository tool (repo_path = ";
+    text += root[0] ? root : "the repository root";
+    text += "); it takes seconds for most repositories and stays current afterwards.";
+    if (root[0] && cbm_git_is_linked_worktree(root)) {
+        text += " This is a linked git worktree: each worktree has its own index, and the main "
+                "checkout's index is not used here.";
+    }
+    return strdup(text.c_str());
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+char *cbm_session_start_text_for_testing(const char *cwd) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    cbm_mcp_server_set_scan_fallback(srv, false);
+    char *text = ha_session_start_text(srv, cwd);
+    cbm_mcp_server_free(srv);
+    return text;
+}
+
+char *cbm_hook_coverage_walk_for_testing(const char *file_path) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    cbm_mcp_server_set_scan_fallback(srv, false);
+    char *note = ha_resolve_coverage(srv, file_path);
+    cbm_mcp_server_free(srv);
+    return note;
+}
+#endif
 
 static char *ha_walk_edit(cbm_mcp_server_t *srv, const char *file_path) {
     char dir[4096];
@@ -1552,7 +1614,7 @@ static char *ha_walk_edit(cbm_mcp_server_t *srv, const char *file_path) {
                 return NULL;
             }
         }
-        if (!ha_strip_last_component(dir)) {
+        if (ha_stop_at_checkout(dir) || !ha_strip_last_component(dir)) {
             break;
         }
     }
@@ -4420,7 +4482,7 @@ static char *ha_prompt_context(cbm_mcp_server_t *srv, const char *cwd, const ha_
             free(json);
             free(name);
         }
-        if (!ha_strip_last_component(dir)) {
+        if (ha_stop_at_checkout(dir) || !ha_strip_last_component(dir)) {
             break;
         }
     }
@@ -4931,17 +4993,11 @@ int cbm_cmd_hook_augment(void) {
             cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
             if (srv) {
                 cbm_mcp_server_set_scan_fallback(srv, false);
-                char *brief = ha_walk_session(srv, cwd);
-                if (brief) {
-                    fputs(brief, stdout);
+                char *text = ha_session_start_text(srv, cwd);
+                if (text) {
+                    fputs(text, stdout);
                     fputc('\n', stdout);
-                    free(brief);
-                } else {
-                    fputs("code-cortex: this repository is not indexed, so callers, impact and "
-                          "cross-language queries are unavailable. Index it once with the "
-                          "index_repository tool (repo_path = the repository root); it takes "
-                          "seconds for most repositories and stays current afterwards.\n",
-                          stdout);
+                    free(text);
                 }
                 cbm_mcp_server_free(srv);
             }

@@ -399,6 +399,10 @@ char *cbm_definition_context_for_testing(const char *events, const char *symbol,
 char *cbm_request_symbol_for_testing(const char *request, bool automatic);
 /* SessionStart brief text from stored brief inputs JSON (NULL when unusable). */
 char *cbm_session_brief_format_for_testing(const char *project, const char *json);
+/* The real walk-ups with the hook's scan-free policy: SessionStart's text for
+ * cwd, and the Read coverage note for an absolute file path. */
+char *cbm_session_start_text_for_testing(const char *cwd);
+char *cbm_hook_coverage_walk_for_testing(const char *file_path);
 /* UserPromptSubmit context seams. Candidates: code-looking prose tokens joined
  * by '\n'. Targets: "intent=<callers|->[,chain]" then one
  * "name|qualifier|hint,hint" line per target. Resolve: the node(s) the first

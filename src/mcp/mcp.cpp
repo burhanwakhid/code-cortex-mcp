@@ -1426,6 +1426,11 @@ static const char *cwd_project_name(void) {
             cbm_store_meta_close(meta);
             return g_cwd_project;
         }
+        /* An unindexed git checkout root (a linked worktree, a nested repo)
+         * ends the walk: the enclosing checkout's index is other code. */
+        if (cbm_git_checkout_root_kind(dir) != CBM_GIT_CHECKOUT_NONE) {
+            break;
+        }
         char *slash = strrchr(dir, '/');
         char *bslash = strrchr(dir, '\\');
         if (bslash && (!slash || bslash > slash)) {

@@ -506,3 +506,55 @@ int cbm_git_context_props_json(const cbm_git_context_t *ctx, char *buf, int buf_
     }
     return off;
 }
+
+cbm_git_checkout_kind_t cbm_git_checkout_root_kind(const char *dir) {
+    if (!dir || !dir[0]) {
+        return CBM_GIT_CHECKOUT_NONE;
+    }
+    char dot_git[CBM_SZ_4K];
+    if (snprintf(dot_git, sizeof(dot_git), "%s/.git", dir) >= (int)sizeof(dot_git)) {
+        return CBM_GIT_CHECKOUT_NONE;
+    }
+    if (cbm_is_dir(dot_git)) {
+        return CBM_GIT_CHECKOUT_MAIN;
+    }
+    return cbm_file_exists(dot_git) ? CBM_GIT_CHECKOUT_GITLINK : CBM_GIT_CHECKOUT_NONE;
+}
+
+bool cbm_git_is_linked_worktree(const char *dir) {
+    if (cbm_git_checkout_root_kind(dir) != CBM_GIT_CHECKOUT_GITLINK) {
+        return false;
+    }
+    char path[CBM_SZ_4K];
+    snprintf(path, sizeof(path), "%s/.git", dir);
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return false;
+    }
+    char line[CBM_SZ_4K];
+    bool got = fgets(line, sizeof(line), f) != NULL;
+    fclose(f);
+    if (!got || strncmp(line, "gitdir:", 7) != 0) {
+        return false;
+    }
+    /* "gitdir: <common>/worktrees/<name>" — a submodule's is ".../modules/<name>".
+     * Strip the line end and trailing separators, then the <name> component. */
+    char *val = line + 7;
+    size_t n = strlen(val);
+    for (size_t i = 0; i < n; i++) {
+        if (val[i] == '\\') {
+            val[i] = '/';
+        }
+    }
+    while (n > 0 &&
+           (val[n - 1] == '\n' || val[n - 1] == '\r' || val[n - 1] == ' ' || val[n - 1] == '/')) {
+        val[--n] = '\0';
+    }
+    char *name = strrchr(val, '/');
+    if (!name) {
+        return false;
+    }
+    *name = '\0';
+    const char *parent = strrchr(val, '/');
+    return parent && strcmp(parent + 1, "worktrees") == 0;
+}
