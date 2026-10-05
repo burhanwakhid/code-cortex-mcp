@@ -827,6 +827,9 @@ atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
 /* Record how many source files this run re-extracted (incremental path). */
 void cbm_pipeline_set_files_reparsed(cbm_pipeline_t *p, int count);
+/* True when this run's database was recorded for another checkout, so the
+ * incremental pass hashes same-size files even when their mtime matches. */
+bool cbm_pipeline_verify_content(const cbm_pipeline_t *p);
 
 /* Parse a gRPC stub call "<service-stub>.<method>" into the canonical proto
  * service name + method. Returns true ONLY when a recognized gRPC stub/client

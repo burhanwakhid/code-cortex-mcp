@@ -25,6 +25,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#endif
 
 static const char *bi_null_dev(void) {
 #ifdef _WIN32
@@ -1012,6 +1016,66 @@ TEST(branch_switch_uses_checkout_at_run_time) {
     PASS();
 }
 
+#ifndef _WIN32
+/* Pin path's mtime to a fixed instant, to the nanosecond. */
+static int bi_pin_mtime(const char *path) {
+    struct timespec ts[2] = {{1700000000, 123456789}, {1700000000, 123456789}};
+    return utimensat(AT_FDCWD, path, ts, 0);
+}
+
+/* A file whose bytes differ between two checkouts while its size and mtime
+ * do not: after a branch switch, and after a same-branch HEAD move, the run
+ * must notice and re-extract it rather than trust the stored hash. */
+TEST(branch_switch_rehashes_same_size_same_mtime) {
+    char *repo = th_mktempdir("cbm_bi_mtime");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char x[512];
+    snprintf(x, sizeof(x), "%s/src/x.py", repo);
+    ASSERT_EQ(bi_git(repo, "init -q -b main"), 0);
+    th_write_file(x, "def aaa():\n    return 1\n");
+    ASSERT_EQ(bi_git(repo, "add ."), 0);
+    ASSERT_EQ(bi_git(repo, "commit -q -m main"), 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q -b feature"), 0);
+    th_write_file(x, "def bbb():\n    return 1\n"); /* same size */
+    ASSERT_EQ(bi_git(repo, "commit -q -am feature"), 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+
+    ASSERT_EQ(bi_pin_mtime(x), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_count("aaa"), 1);
+
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_pin_mtime(x), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "seeded");
+    ASSERT_EQ(r.reparsed, 1);
+    ASSERT_EQ(bi_count("bbb"), 1);
+    ASSERT_EQ(bi_count("aaa"), 0);
+
+    /* Same branch, HEAD moved (a pull): same size, same mtime again. */
+    th_write_file(x, "def ccc():\n    return 1\n");
+    ASSERT_EQ(bi_git(repo, "commit -q -am pull"), 0);
+    ASSERT_EQ(bi_pin_mtime(x), 0);
+    r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "none");
+    ASSERT_EQ(r.reparsed, 1);
+    ASSERT_EQ(bi_count("ccc"), 1);
+    ASSERT_EQ(bi_count("bbb"), 0);
+
+    /* Identity unchanged: the size+mtime fast path holds (nothing re-read). */
+    r = bi_index(repo, -1);
+    ASSERT_EQ(r.reparsed, 0);
+
+    bi_cleanup(repo);
+    PASS();
+}
+#endif
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -1038,4 +1102,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_reset_clears_orphaned_slots);
     RUN_TEST(branch_restore_is_visible_to_open_readers);
     RUN_TEST(branch_switch_uses_checkout_at_run_time);
+#ifndef _WIN32
+    RUN_TEST(branch_switch_rehashes_same_size_same_mtime);
+#endif
 }

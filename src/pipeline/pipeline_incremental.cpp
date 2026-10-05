@@ -160,10 +160,13 @@ static bool file_sha256_hex(const char *path, char out[CBM_SHA256_HEX_LEN + 1]) 
  * branch whose database was parked (branch_slots.h) those files carry new
  * mtimes over the very bytes the stored graph was built from. Hashing them is
  * a read; re-extracting them is a parse. Such files are unchanged, and
- * refreshed[i] marks that their stored row needs the new mtime. */
+ * refreshed[i] marks that their stored row needs the new mtime.
+ *
+ * verify_content (the stored graph was built from another checkout) settles
+ * same size AND same mtime by content too: there the pair proves nothing. */
 static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_hash_t *stored,
                             int stored_count, int *out_changed, int *out_unchanged,
-                            classified_version *versions, bool *refreshed) {
+                            classified_version *versions, bool *refreshed, bool verify_content) {
     bool *changed = (bool *)calloc((size_t)file_count, sizeof(bool));
     if (!changed) {
         return NULL;
@@ -197,12 +200,12 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
         if (st.st_size != h->size) {
             changed[i] = true;
             n_changed++;
-        } else if (stat_mtime_ns(&st) != h->mtime_ns) {
+        } else if (stat_mtime_ns(&st) != h->mtime_ns || verify_content) {
             char digest[CBM_SHA256_HEX_LEN + 1];
             if (stored_sha_valid(h) && file_sha256_hex(files[i].path, digest) &&
                 strcmp(digest, h->sha256) == 0) {
                 snprintf(versions[i].sha256, sizeof(versions[i].sha256), "%s", digest);
-                if (refreshed) {
+                if (refreshed && stat_mtime_ns(&st) != h->mtime_ns) {
                     refreshed[i] = true;
                 }
                 n_unchanged++;
@@ -842,8 +845,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int n_unchanged = 0;
     std::vector<classified_version> versions((size_t)file_count);
     std::unique_ptr<bool[]> refreshed(new bool[(size_t)file_count + 1]());
-    bool *is_changed = classify_files(files, file_count, stored, stored_count, &n_changed,
-                                      &n_unchanged, versions.data(), refreshed.get());
+    bool *is_changed =
+        classify_files(files, file_count, stored, stored_count, &n_changed, &n_unchanged,
+                       versions.data(), refreshed.get(), cbm_pipeline_verify_content(p));
 
     /* Classify stored files absent from current discovery: truly-deleted
      * (purge) vs mode-skipped (preserve nodes AND hash rows). */

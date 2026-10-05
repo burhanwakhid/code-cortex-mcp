@@ -152,6 +152,10 @@ struct cbm_pipeline {
     cbm_branch_switch_t branch_action;
     char branch_from[CBM_SZ_256]; /* slug the database was built for; "" unknown */
     int files_reparsed;           /* source files extracted this run; -1 unknown */
+    /* The database was recorded for another checkout than this run's: the
+     * incremental pass must not trust size+mtime alone (see
+     * pipeline_decide_content_check). */
+    bool verify_content;
 };
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
@@ -561,6 +565,10 @@ void cbm_pipeline_set_files_reparsed(cbm_pipeline_t *p, int count) {
     if (p) {
         p->files_reparsed = count;
     }
+}
+
+bool cbm_pipeline_verify_content(const cbm_pipeline_t *p) {
+    return p && p->verify_content;
 }
 
 void cbm_pipeline_set_branch_keep(cbm_pipeline_t *p, int keep) {
@@ -2139,6 +2147,35 @@ static void pipeline_note_checkout_moved(const cbm_pipeline_t *p) {
     }
 }
 
+/* Whether this run's incremental pass must verify same-size files by content.
+ * A file can differ in bytes yet keep the stored size and mtime (whole-second
+ * timestamps, tools that preserve mtimes, two branches written in the same
+ * second), and the mtime shortcut would then keep another checkout's symbols
+ * for good. That can only happen when the graph was built from another
+ * checkout: a seeded or failed switch, two branches sharing a slot, a parked
+ * graph older than its branch, a pull. So compare the identity the database
+ * records -- read after the switch, so a restored graph is judged by its own
+ * stamp, and before this run stamps anything -- with the checkout now. An
+ * unrecorded identity counts as different; a non-git checkout has none. */
+static void pipeline_decide_content_check(cbm_pipeline_t *p) {
+    p->verify_content = false;
+    cbm_branch_id_t current;
+    cbm_branch_id_from_context(&p->git_ctx, &current);
+    char *db_path = current.known ? resolve_db_path(p) : NULL;
+    cbm_store_t *s = db_path ? cbm_store_open_path_query(db_path) : NULL;
+    if (s) {
+        cbm_branch_id_t indexed;
+        bool known = cbm_branch_id_indexed(s, p->project_name, &indexed);
+        p->verify_content = !known || !cbm_branch_id_same(&indexed, &current);
+        cbm_store_close(s);
+    }
+    free(db_path);
+    if (p->verify_content) {
+        cbm_log_info("pipeline.verify_content", "project", p->project_name, "reason",
+                     "checkout_changed");
+    }
+}
+
 int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
@@ -2154,6 +2191,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 
     pipeline_refresh_checkout(p);
     pipeline_branch_switch(p);
+    pipeline_decide_content_check(p);
     int rc = pipeline_run_claimed(p);
     if (rc == 0 && !check_cancel(p)) {
         char *db_path = resolve_db_path(p);
