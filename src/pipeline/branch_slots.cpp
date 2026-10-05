@@ -213,35 +213,55 @@ static bool read_indexed_slug(const char *db_path, const char *project, char *bu
     return true;
 }
 
-/* Fold the WAL into the main file and truncate it, so the main file alone is
- * the whole database. A reader in the middle of a WAL read makes this return
- * false (SQLITE_BUSY); readers never write, so once it succeeds the WAL stays
- * empty for as long as the caller holds the index lease. */
-static bool checkpoint_truncate(const char *db_path) {
-    cbm_store_t *s = cbm_store_open_path(db_path);
-    if (!s) {
-        return false;
-    }
-    sqlite3 *db = cbm_store_get_db(s);
-    int log_frames = -1;
-    int done_frames = -1;
-    int rc = db ? sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_TRUNCATE, &log_frames,
-                                            &done_frames)
-                : SQLITE_ERROR;
-    cbm_store_close(s);
-    return rc == SQLITE_OK;
-}
-
-/* Copy db_path to dest through the SQLite backup API (a consistent snapshot,
- * WAL included) into dest.tmp, then rename over dest. */
-static bool park_copy(const char *db_path, const char *dest) {
-    cbm_store_t *s = cbm_store_open_path_query(db_path);
+/* Copy the database at src to dest through the SQLite backup API: a read
+ * transaction on src, so a consistent committed snapshot with its WAL frames
+ * included, written to dest.tmp and renamed over dest after dest's own stale
+ * sidecars are removed (cbm_store_dump_to_file, #897). src is only read --
+ * no checkpoint, nothing done to its WAL, so readers of src are untouched.
+ * dest must have no readers of its own: a slot, or a db_path that does not
+ * exist. */
+static bool copy_db(const char *src, const char *dest) {
+    cbm_store_t *s = cbm_store_open_path_query(src);
     if (!s) {
         return false;
     }
     int rc = cbm_store_dump_to_file(s, dest);
     cbm_store_close(s);
     return rc == CBM_STORE_OK;
+}
+
+/* Replace the CONTENT of the live database at db_path with the slot's, as
+ * one ordinary SQLite write transaction (backup API into db_path's own
+ * connection). The file, its WAL and its shared memory stay in place: a
+ * reader mid-query keeps its snapshot, the next read transaction sees the
+ * whole restored database, a crash before the commit leaves the outgoing
+ * database intact, and nothing is renamed over a file another process has
+ * open. Swapping the file in instead would leave a window -- and after a
+ * crash, a permanent state -- in which db_path's old WAL sits beside the new
+ * main file and is replayed onto it. The price is the copy going through the
+ * WAL (the slot's size written twice, and the WAL keeps that size on disk
+ * until the next re-dump replaces the file). Fails, leaving db_path as it
+ * was, when the page sizes differ (a WAL database cannot change its page
+ * size) or the write lock is not granted in time. */
+static bool restore_into(const char *slot, const char *db_path) {
+    cbm_store_t *src = cbm_store_open_path_query(slot);
+    cbm_store_t *dst = src ? cbm_store_open_path(db_path) : NULL;
+    sqlite3 *sdb = cbm_store_get_db(src);
+    sqlite3 *ddb = cbm_store_get_db(dst);
+    bool ok = false;
+    if (sdb && ddb) {
+        sqlite3_backup *bk = sqlite3_backup_init(ddb, "main", sdb, "main");
+        if (bk) {
+            int rc = sqlite3_backup_step(bk, -1);
+            ok = rc == SQLITE_DONE && sqlite3_backup_finish(bk) == SQLITE_OK;
+            if (rc != SQLITE_DONE) {
+                (void)sqlite3_backup_finish(bk);
+            }
+        }
+    }
+    cbm_store_close(dst);
+    cbm_store_close(src);
+    return ok;
 }
 
 typedef struct {
@@ -315,58 +335,59 @@ static void evict_slots(const char *dir, int keep) {
     free(items);
 }
 
-/* Move a parked database into place. Only the rename is visible to readers:
- * db_path is replaced atomically or not at all. Its sidecars go first (the
- * #897 rule for installing a new generation), which is safe only because
- * checkpoint_truncate already made the main file complete — a failed rename
- * then leaves a whole database behind. */
-static bool install_slot(const char *slot, const char *db_path) {
-    cbm_remove_db_sidecars(db_path);
-    if (cbm_rename_replace(slot, db_path) != 0) {
-        return false;
-    }
-    cbm_remove_db_sidecars(slot);
-    return true;
-}
+typedef enum { ADR_ABSENT = 0, ADR_PRESENT, ADR_UNREADABLE } adr_state_t;
 
-/* The project's ADR (project_summaries) in the database at db_path; NULL when
- * there is none. Caller frees. */
-static char *read_adr(const char *db_path, const char *project) {
+/* The project's ADR (project_summaries) in the database at db_path. *content
+ * (caller frees) is set only for ADR_PRESENT. */
+static adr_state_t read_adr(const char *db_path, const char *project, char **content) {
+    *content = NULL;
     cbm_store_t *s = cbm_store_open_path_query(db_path);
     if (!s) {
-        return NULL;
+        return ADR_UNREADABLE;
     }
-    char *content = NULL;
     cbm_adr_t adr = {0};
-    if (cbm_store_adr_get(s, project, &adr) == CBM_STORE_OK) {
-        content = adr.content ? strdup(adr.content) : NULL;
-        cbm_store_adr_free(&adr);
-    }
+    int rc = cbm_store_adr_get(s, project, &adr);
     cbm_store_close(s);
-    return content;
+    if (rc == CBM_STORE_NOT_FOUND) {
+        return ADR_ABSENT;
+    }
+    if (rc != CBM_STORE_OK || !adr.content || !(*content = strdup(adr.content))) {
+        cbm_store_adr_free(&adr);
+        return ADR_UNREADABLE;
+    }
+    cbm_store_adr_free(&adr);
+    return ADR_PRESENT;
 }
 
 /* The ADR is the one table in the database that is not derived from the
  * indexed source: manage_adr writes it for the project, whatever branch is
- * checked out. A restored database carries the ADR from when it was parked,
- * so put the outgoing (newest) one back. An outgoing database without an ADR
- * cannot say whether it was deleted or never set (a delete leaves no trace),
- * so then the restored database keeps its own. */
-static void carry_adr(const char *db_path, const char *project, const char *adr) {
-    if (!adr) {
-        return;
+ * checked out, so the outgoing live database is the authority. Write its
+ * state -- the ADR, or its absence (a delete leaves no row) -- into the slot
+ * about to be restored, before the restore, so the restore installs both in
+ * one transaction. Only when the outgoing database could not be read does
+ * the slot keep its own. False when the slot could not be brought in line. */
+static bool carry_adr(const char *db_path, const char *project, const char *slot) {
+    char *adr = NULL;
+    adr_state_t state = read_adr(db_path, project, &adr);
+    if (state == ADR_UNREADABLE) {
+        cbm_log_warn("branch.adr_unreadable", "project", project);
+        return true;
     }
-    char *restored = read_adr(db_path, project);
-    bool same = restored && strcmp(restored, adr) == 0;
-    free(restored);
-    if (same) {
-        return;
+    char *parked = NULL;
+    adr_state_t parked_state = read_adr(slot, project, &parked);
+    bool same = parked_state == state && (state == ADR_ABSENT || strcmp(parked, adr) == 0);
+    free(parked);
+    bool ok = same;
+    if (!same) {
+        cbm_store_t *s = cbm_store_open_path(slot);
+        int rc = !s                     ? CBM_STORE_ERR
+                 : state == ADR_PRESENT ? cbm_store_adr_store(s, project, adr)
+                                        : cbm_store_adr_delete(s, project);
+        ok = rc == CBM_STORE_OK || (state == ADR_ABSENT && rc == CBM_STORE_NOT_FOUND);
+        cbm_store_close(s);
     }
-    cbm_store_t *s = cbm_store_open_path(db_path);
-    if (!s || cbm_store_adr_store(s, project, adr) != CBM_STORE_OK) {
-        cbm_log_warn("branch.adr_carry_failed", "project", project);
-    }
-    cbm_store_close(s);
+    free(adr);
+    return ok;
 }
 
 cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *project,
@@ -384,11 +405,15 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
     }
     bool have_incoming = cbm_file_exists(incoming);
 
-    /* No current database (first index here, or a full rebuild that died
-     * after deleting it): a parked one for this branch is a better start than
-     * nothing. Nothing is outgoing, so nothing needs parking. */
+    /* No current database (first index here, an interrupted full rebuild, a
+     * manual delete): this branch's parked database is a better start than
+     * nothing, and the incremental pass corrects whatever moved since it was
+     * parked. With no main file there is no reader to protect, so it is
+     * copied into place the way a fresh database is installed (stale
+     * sidecars removed, then one rename). */
     if (!cbm_file_exists(db_path)) {
-        if (have_incoming && install_slot(incoming, db_path)) {
+        if (have_incoming && copy_db(incoming, db_path)) {
+            unlink_slot(incoming);
             cbm_log_info("branch.switch", "action", "restored", "to", slug, "from", "");
             return CBM_BRANCH_SWITCH_RESTORED;
         }
@@ -410,25 +435,22 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
 
     char outgoing[BS_PATH_MAX];
     if (!slot_path(dir, indexed, outgoing, sizeof(outgoing)) || !cbm_mkdir_p(dir, 0755) ||
-        !checkpoint_truncate(db_path) || !park_copy(db_path, outgoing)) {
+        !copy_db(db_path, outgoing)) {
         cbm_log_warn("branch.park_failed", "from", indexed, "to", slug, "action", "in_place");
         return CBM_BRANCH_SWITCH_IN_PLACE;
     }
 
+    /* Restore by content (restore_into). A failure at any step leaves the
+     * outgoing database in place, already parked: it becomes the seed, as if
+     * nothing had been parked for this branch. */
     cbm_branch_switch_t action = CBM_BRANCH_SWITCH_SEEDED;
     if (have_incoming) {
-        char *adr = read_adr(db_path, project);
-        if (install_slot(incoming, db_path)) {
+        if (carry_adr(db_path, project, incoming) && restore_into(incoming, db_path)) {
             action = CBM_BRANCH_SWITCH_RESTORED;
-            carry_adr(db_path, project, adr);
+            unlink_slot(incoming);
         } else {
-            /* Windows refuses to replace a file another process has open. The
-             * outgoing database is still in place and parked; carry on with
-             * it as the seed, exactly as if nothing had been parked for this
-             * branch. */
             cbm_log_warn("branch.restore_failed", "to", slug, "action", "seeded");
         }
-        free(adr);
     }
     evict_slots(dir, keep);
     cbm_log_info("branch.switch", "action", cbm_branch_switch_str(action), "from", indexed, "to",

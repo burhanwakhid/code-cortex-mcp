@@ -44,6 +44,9 @@ typedef struct {
     char *root_path;
     /* HEAD hash + symbolic ref (see git_head) */
     char last_head[CBM_SZ_512];
+    /* HEAD sampled by check_changes before the index runs; becomes last_head
+     * when that run succeeds (empty: not sampled) */
+    char seen_head[CBM_SZ_512];
     bool is_git;               /* false → skip polling */
     bool baseline_done;        /* true after first poll */
     atomic_bool index_pending; /* autoindex deferred before any completed index */
@@ -628,7 +631,9 @@ static bool check_changes(project_state_t *s, bool *dirty) {
 
     /* Check HEAD movement */
     char head[CBM_SZ_512] = {0};
+    s->seen_head[0] = '\0';
     if (git_head(s->root_path, head, sizeof(head)) == 0) {
+        snprintf(s->seen_head, sizeof(s->seen_head), "%s", head);
         if (s->last_head[0] != '\0' && strcmp(head, s->last_head) != 0) {
             /* Keep the old baseline until indexing succeeds so a failed
              * attempt remains observable and is retried after backoff. */
@@ -770,8 +775,14 @@ static void poll_project(const char *key, void *val, void *ud) {
             atomic_store(&s->index_failure_count, 0);
             s->needs_clean_reindex = dirty;
             ctx->reindexed++;
-            /* Update HEAD after successful reindex */
-            git_head(s->root_path, s->last_head, sizeof(s->last_head));
+            /* Baseline on the HEAD seen BEFORE the run: one that moved
+             * while the run read files is then still a change at the next
+             * poll, instead of being taken as indexed. */
+            if (s->is_git && s->seen_head[0]) {
+                snprintf(s->last_head, sizeof(s->last_head), "%s", s->seen_head);
+            } else {
+                git_head(s->root_path, s->last_head, sizeof(s->last_head));
+            }
             /* Refresh file count for interval */
             s->file_count = git_file_count(s->root_path);
             s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);

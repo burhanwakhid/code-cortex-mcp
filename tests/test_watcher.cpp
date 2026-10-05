@@ -1411,6 +1411,67 @@ TEST(watcher_modify_tracked_file) {
     PASS();
 }
 
+/* A commit lands WHILE the index runs: that run read the old HEAD's files,
+ * so the next poll must still see a change instead of taking the new HEAD as
+ * indexed. */
+static int commit_during_index_callback(const char *name, const char *path, void *ud) {
+    (void)name;
+    (void)ud;
+    index_call_count++;
+    if (index_call_count == 1) {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), path, "file.txt"), "mid-run\n");
+        wt_git(path, "commit -q -am mid-run");
+    }
+    return 0;
+}
+
+TEST(watcher_head_moved_during_index_reindexes) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_midrun_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "one\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m initial");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, commit_during_index_callback, NULL);
+    cbm_watcher_watch(w, "midrun-repo", tmpdir);
+    index_call_count = 0;
+    cbm_watcher_poll_once(w); /* baseline */
+
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "two\n");
+    }
+    wt_git(tmpdir, "commit -q -am two");
+    cbm_watcher_touch(w, "midrun-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* commits "mid-run" while indexing */
+
+    cbm_watcher_touch(w, "midrun-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2); /* the mid-run commit was not indexed */
+
+    cbm_watcher_touch(w, "midrun-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2); /* settled */
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(watcher_failed_commit_index_retries_without_losing_head) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_retry_XXXXXX");
@@ -2061,6 +2122,7 @@ SUITE(watcher) {
     /* Git change detection */
     RUN_TEST(watcher_detects_git_commit);
     RUN_TEST(watcher_detects_branch_switch_same_commit);
+    RUN_TEST(watcher_head_moved_during_index_reindexes);
     RUN_TEST(watcher_detects_dirty_worktree);
     RUN_TEST(watcher_detects_new_file);
     RUN_TEST(watcher_reindexes_clean_reset_and_retries_failure);

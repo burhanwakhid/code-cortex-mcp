@@ -2108,6 +2108,37 @@ void cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
 
 static int pipeline_run_claimed(cbm_pipeline_t *p);
 
+/* Re-resolve the checkout once the run owns the index. cbm_pipeline_new
+ * captured it, but the caller may have waited on the lease or the pipeline
+ * lock since, and the slot choice, the Branch node and the stamp must all
+ * name the checkout whose files discovery is about to read. */
+static void pipeline_refresh_checkout(cbm_pipeline_t *p) {
+    cbm_git_context_t fresh;
+    (void)cbm_git_context_resolve(p->repo_path, &fresh);
+    cbm_git_context_free(&p->git_ctx);
+    p->git_ctx = fresh;
+    free(p->branch_qn);
+    p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
+}
+
+/* The checkout moved WHILE the run read files, so the graph may mix both
+ * states. The run still stamps the identity it started with (the Branch
+ * node of a full run already carries it): that is what the graph is mostly
+ * built from, and it guarantees a mismatch with the checkout now -- the next
+ * session start or index_status sees the difference, and the watcher, which
+ * baselines on the HEAD it saw before the run, polls a moved HEAD again. The
+ * next incremental pass then re-extracts every file whose bytes changed. */
+static void pipeline_note_checkout_moved(const cbm_pipeline_t *p) {
+    cbm_branch_id_t start;
+    cbm_branch_id_t now;
+    cbm_branch_id_from_context(&p->git_ctx, &start);
+    if (cbm_branch_id_from_head(p->repo_path, &now) && !cbm_branch_id_same(&start, &now)) {
+        cbm_log_warn("pipeline.checkout_moved", "project", p->project_name, "indexed", start.slug,
+                     "indexed_head", start.head_sha, "checkout", now.slug, "checkout_head",
+                     now.head_sha);
+    }
+}
+
 int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
@@ -2121,12 +2152,14 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     // export. MCP may already own this lease before artifact bootstrap.
     pipeline_lease_scope lease_scope{p};
 
+    pipeline_refresh_checkout(p);
     pipeline_branch_switch(p);
     int rc = pipeline_run_claimed(p);
     if (rc == 0 && !check_cancel(p)) {
         char *db_path = resolve_db_path(p);
         cbm_pipeline_stamp_branch(p, db_path);
         free(db_path);
+        pipeline_note_checkout_moved(p);
     }
     return rc;
 }

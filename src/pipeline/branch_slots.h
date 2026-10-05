@@ -9,8 +9,10 @@
  *
  *     <cache_dir>/branches/<project>/<slug>.db
  *
- * and, if the incoming branch was parked earlier, that database is moved back
- * into place. Otherwise the outgoing graph stays in place as the seed, so the
+ * and, if the incoming branch was parked earlier, its content is copied back
+ * into <project>.db as one SQLite write transaction -- the file is never
+ * swapped under a reader, and its WAL is never checkpointed or truncated
+ * here. Otherwise the outgoing graph stays in place as the seed, so the
  * incremental pass pays only the diff between the branches either way. The
  * subdirectory keeps parked files out of every cache scan: those read only
  * top-level *.db entries.
@@ -19,7 +21,7 @@
  * what to re-extract from the stored file hashes, not from the branch label,
  * so a wrong or stale slot costs time, not correctness. The one table that is
  * not derived from the source, the project's ADR, follows the checkout: a
- * restore keeps the outgoing database's ADR.
+ * restore installs the outgoing database's ADR, or its absence.
  *
  * The slug names the slot: a branch name made filesystem-safe (git_context.h),
  * "detached" for every detached HEAD (one shared slot), and "working-tree"
@@ -91,8 +93,8 @@ bool cbm_branch_slots_dir(const char *db_path, const char *project, char *buf, s
 
 /* Park/restore before an index run on `slug`. The caller MUST hold the index
  * lease for db_path (cbm_pipeline_claim_index) — that lease is what excludes
- * other writers. Never leaves db_path missing: every step that could fail
- * runs before the single atomic rename that installs a restored database.
+ * other writers. Never leaves db_path missing or half-restored: parking only
+ * reads db_path, and a restore is a single transaction on it.
  * `keep` bounds the parked count (< 1 disables parking: returns NONE).
  * `from` (optional) receives the slug the database was built for. */
 cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *project,

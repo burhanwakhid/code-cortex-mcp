@@ -500,13 +500,13 @@ TEST(branch_switch_keeps_newest_adr) {
     ASSERT_STR_EQ(r.action, "restored");
     ASSERT_STR_EQ(bi_adr(adr, sizeof(adr)), "B");
 
-    /* No ADR on the outgoing side cannot be told apart from "never set", so
-     * the incoming database keeps its own. */
+    /* A delete is carried too: the outgoing database is the authority, so
+     * main's parked "B" must not come back. */
     ASSERT_EQ(bi_adr_put(NULL), CBM_STORE_OK);
     ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
     r = bi_index(repo, -1);
     ASSERT_STR_EQ(r.action, "restored");
-    ASSERT_STR_EQ(bi_adr(adr, sizeof(adr)), "B");
+    ASSERT_STR_EQ(bi_adr(adr, sizeof(adr)), "");
 
     bi_cleanup(repo);
     PASS();
@@ -939,6 +939,79 @@ TEST(branch_reset_clears_orphaned_slots) {
     PASS();
 }
 
+/* A restore replaces the CONTENT of <project>.db, not the file: a reader
+ * that already has it open (a tool worker's cached store) sees the restored
+ * graph on its next read, instead of the outgoing one forever from an
+ * unlinked inode. */
+TEST(branch_restore_is_visible_to_open_readers) {
+    char *repo = bi_make_repo("cbm_bi_reader");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* main parked, feature live */
+
+    char db[1024];
+    cbm_store_t *reader = cbm_store_open_path_query(bi_db_path(db, sizeof(db)));
+    ASSERT_NOT_NULL(reader);
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(reader, g_bi_project, "only_feature", &nodes, &count),
+              CBM_STORE_OK);
+    cbm_store_free_nodes(nodes, count);
+    ASSERT_EQ(count, 1);
+
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_STR_EQ(r.action, "restored");
+
+    cbm_store_end_reads(reader);
+    nodes = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(reader, g_bi_project, "only_main", &nodes, &count),
+              CBM_STORE_OK);
+    cbm_store_free_nodes(nodes, count);
+    ASSERT_EQ(count, 1);
+    cbm_store_close(reader);
+
+    bi_cleanup(repo);
+    PASS();
+}
+
+/* The checkout changes between creating the pipeline and running it (the
+ * run waited on the index lease or the pipeline lock): the run must index,
+ * park and stamp the checkout it actually reads. */
+TEST(branch_switch_uses_checkout_at_run_time) {
+    char *repo = bi_make_repo("cbm_bi_late");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* main */
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *action = NULL;
+    const char *from = NULL;
+    const char *to = NULL;
+    cbm_pipeline_get_branch_switch(p, &action, &from, &to, NULL);
+    ASSERT_STR_EQ(action, "seeded");
+    ASSERT_STR_EQ(from, "main");
+    ASSERT_STR_EQ(to, "feature");
+    cbm_pipeline_free(p);
+    ASSERT_TRUE(bi_is_parked("main"));
+    ASSERT_EQ(bi_count("only_feature"), 1);
+    ASSERT_TRUE(bi_head_matches_index(repo));
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -963,4 +1036,6 @@ SUITE(branch_index) {
     RUN_TEST(branch_subdir_root_sees_offline_switch);
     RUN_TEST(branch_missing_live_db_restores_parked);
     RUN_TEST(branch_reset_clears_orphaned_slots);
+    RUN_TEST(branch_restore_is_visible_to_open_readers);
+    RUN_TEST(branch_switch_uses_checkout_at_run_time);
 }

@@ -742,17 +742,19 @@ static void dump_and_persist(cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const char *db
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
     /* The re-dump below starts project_summaries empty: carry the ADR over,
-     * as the full rebuild does (#516). */
+     * as the full rebuild does (#516). No ADR needs nothing; one that cannot
+     * be read is lost with the old file, so say so. */
     char *saved_adr = NULL;
     cbm_store_t *adr_store = cbm_store_open_path_query(db_path);
-    if (adr_store) {
-        cbm_adr_t adr = {0};
-        if (cbm_store_adr_get(adr_store, project, &adr) == CBM_STORE_OK) {
-            saved_adr = adr.content ? strdup(adr.content) : NULL;
-            cbm_store_adr_free(&adr);
-        }
-        cbm_store_close(adr_store);
+    cbm_adr_t adr = {0};
+    int adr_rc = adr_store ? cbm_store_adr_get(adr_store, project, &adr) : CBM_STORE_ERR;
+    if (adr_rc == CBM_STORE_OK) {
+        saved_adr = adr.content ? strdup(adr.content) : NULL;
+    } else if (adr_rc != CBM_STORE_NOT_FOUND) {
+        cbm_log_error("incremental.err", "msg", "adr_unreadable", "project", project);
     }
+    cbm_store_adr_free(&adr);
+    cbm_store_close(adr_store);
 
     cbm_unlink(db_path);
     char wal[INCR_WAL_BUF];
