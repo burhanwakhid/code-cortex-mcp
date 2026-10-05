@@ -17,7 +17,9 @@
  *
  * Parking is a cache, never a source of truth: the incremental pass decides
  * what to re-extract from the stored file hashes, not from the branch label,
- * so a wrong or stale slot costs time, not correctness.
+ * so a wrong or stale slot costs time, not correctness. The one table that is
+ * not derived from the source, the project's ADR, follows the checkout: a
+ * restore keeps the outgoing database's ADR.
  *
  * The slug is the suffix of the Branch node's QN (git_context.h): a branch
  * name made filesystem-safe, "detached" for every detached HEAD (one shared

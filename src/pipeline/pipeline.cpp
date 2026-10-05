@@ -2072,13 +2072,10 @@ static void pipeline_branch_switch(cbm_pipeline_t *p) {
  * the node from the current checkout already; an incremental (or no-op) run
  * keeps the stored structure, which names whichever branch last ran a full
  * rebuild -- and that label is what the next run's park step reads. Written
- * only when it differs, so a no-op run still leaves the file untouched. */
-static void pipeline_stamp_branch(cbm_pipeline_t *p) {
-    if (!p->branch_qn) {
-        return;
-    }
-    char *db_path = resolve_db_path(p);
-    if (!db_path) {
+ * only when it differs, so a no-op run still leaves the file untouched. The
+ * incremental dump also calls this before it refreshes the artifact. */
+void cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
+    if (!p || !p->branch_qn || !db_path) {
         return;
     }
     char stored[CBM_SZ_1K] = "";
@@ -2098,7 +2095,6 @@ static void pipeline_stamp_branch(cbm_pipeline_t *p) {
         }
         cbm_store_close(s);
     }
-    free(db_path);
 }
 
 static int pipeline_run_claimed(cbm_pipeline_t *p);
@@ -2119,7 +2115,9 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     pipeline_branch_switch(p);
     int rc = pipeline_run_claimed(p);
     if (rc == 0 && !check_cancel(p)) {
-        pipeline_stamp_branch(p);
+        char *db_path = resolve_db_path(p);
+        cbm_pipeline_stamp_branch(p, db_path);
+        free(db_path);
     }
     return rc;
 }

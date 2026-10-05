@@ -733,13 +733,26 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
  * not visited this pass". */
-static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
-                             cbm_file_info_t *files, int file_count,
+static void dump_and_persist(cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const char *db_path,
+                             const char *project, cbm_file_info_t *files, int file_count,
                              const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
                              const char *repo_path, const cbm_coverage_row_t *cov, int cov_count,
                              const classified_version *versions) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+
+    /* The re-dump below starts project_summaries empty: carry the ADR over,
+     * as the full rebuild does (#516). */
+    char *saved_adr = NULL;
+    cbm_store_t *adr_store = cbm_store_open_path_query(db_path);
+    if (adr_store) {
+        cbm_adr_t adr = {0};
+        if (cbm_store_adr_get(adr_store, project, &adr) == CBM_STORE_OK) {
+            saved_adr = adr.content ? strdup(adr.content) : NULL;
+            cbm_store_adr_free(&adr);
+        }
+        cbm_store_close(adr_store);
+    }
 
     cbm_unlink(db_path);
     char wal[INCR_WAL_BUF];
@@ -754,6 +767,7 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
                  itoa_buf((int)elapsed_ms(t)));
 
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
+    bool persisted = hash_store != NULL;
     if (hash_store) {
         /* #769: this path DELETES and re-dumps the DB, so the format stamp has
          * to be re-applied here as well as on the full-index dump. Without it
@@ -765,6 +779,10 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
 
         persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count,
                        versions);
+
+        if (saved_adr && cbm_store_adr_store(hash_store, project, saved_adr) != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "msg", "adr_restore", "project", project);
+        }
 
         /* Coverage rows (#963): re-write the merged set into the rebuilt DB
          * (AFTER hashes, so the deleted-file prune sees the live file set). */
@@ -781,6 +799,13 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
         (void)cbm_store_fts_rebuild(hash_store);
 
         cbm_store_close(hash_store);
+    }
+    free(saved_adr);
+
+    /* The stored structure names the branch of the last full rebuild; name
+     * this checkout's before the artifact below copies the database. */
+    if (dump_rc == 0 && persisted && !atomic_load(cbm_pipeline_cancelled_ptr(p))) {
+        cbm_pipeline_stamp_branch(p, db_path);
     }
 
     /* Auto-update artifact if one already exists (persistence was enabled previously) */
@@ -1129,7 +1154,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * covers incremental reindexes, not just full ones. */
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
-    dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
+    dump_and_persist(p, existing, db_path, project, files, file_count, mode_skipped,
                      mode_skipped_count, cbm_pipeline_repo_path(p), cov, cov_n, versions.data());
     free(cov);
     cbm_store_free_coverage(old_cov, old_cov_count);

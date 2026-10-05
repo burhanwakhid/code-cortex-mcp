@@ -7479,6 +7479,17 @@ static void apply_branch_index_config(const cbm_mcp_server_t *srv, cbm_pipeline_
     }
 }
 
+int cbm_mcp_index_in_process(const char *root_path) {
+    cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
+    if (!p) {
+        return CBM_NOT_FOUND;
+    }
+    apply_branch_index_config(NULL, p);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
 /* index_repository's "branch" block: which branch this run indexed, which one
  * the database had been built for, and what the per-branch switch did. */
 static void add_branch_switch_json(yyjson_mut_doc *doc, yyjson_mut_val *root,

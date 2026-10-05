@@ -148,6 +148,12 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
  * (main.c) and the session auto-index (mcp.c) route through. */
 char *cbm_mcp_index_run_supervised_path(const char *root_path);
 
+/* The in-process fallback of the above: a full index of root_path in THIS
+ * process, with the persisted index config (branch_index, branch_index_keep)
+ * applied exactly as index_repository applies it. The caller holds the
+ * pipeline lock. Returns cbm_pipeline_run's code. */
+int cbm_mcp_index_in_process(const char *root_path);
+
 /* ── Idle store eviction ──────────────────────────────────────── */
 
 /* Evict the cached project store if idle for more than timeout_s seconds.

@@ -16,6 +16,7 @@
 #include <cli/cli.h>
 #include <git/git_context.h>
 #include <mcp/mcp.h>
+#include <pipeline/artifact.h>
 #include <pipeline/branch_slots.h>
 #include <pipeline/pipeline.h>
 #include <store/store.h>
@@ -424,6 +425,155 @@ TEST(branch_index_disabled_reindexes_in_place) {
     PASS();
 }
 
+/* Set (content != NULL) or delete the project's ADR in its current database. */
+static int bi_adr_put(const char *content) {
+    char db[1024];
+    cbm_store_t *s = cbm_store_open_path(bi_db_path(db, sizeof(db)));
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    int rc = content ? cbm_store_adr_store(s, g_bi_project, content)
+                     : cbm_store_adr_delete(s, g_bi_project);
+    cbm_store_close(s);
+    return rc;
+}
+
+/* The project's ADR in its current database into buf; "" when none. */
+static const char *bi_adr(char *buf, size_t n) {
+    buf[0] = '\0';
+    char db[1024];
+    cbm_store_t *s = cbm_store_open_path_query(bi_db_path(db, sizeof(db)));
+    if (!s) {
+        return buf;
+    }
+    cbm_adr_t adr = {0};
+    if (cbm_store_adr_get(s, g_bi_project, &adr) == CBM_STORE_OK) {
+        snprintf(buf, n, "%s", adr.content ? adr.content : "");
+        cbm_store_adr_free(&adr);
+    }
+    cbm_store_close(s);
+    return buf;
+}
+
+/* The ADR is about the project, not a branch: whatever was written last
+ * survives every switch, seeded or restored. */
+TEST(branch_switch_keeps_newest_adr) {
+    char *repo = bi_make_repo("cbm_bi_adr");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char adr[256];
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_adr_put("A"), CBM_STORE_OK);
+
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_STR_EQ(r.action, "seeded");
+    ASSERT_STR_EQ(bi_adr(adr, sizeof(adr)), "A");
+    ASSERT_EQ(bi_adr_put("B"), CBM_STORE_OK);
+
+    /* main's parked database still holds "A". */
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    r = bi_index(repo, -1);
+    ASSERT_STR_EQ(r.action, "restored");
+    ASSERT_STR_EQ(bi_adr(adr, sizeof(adr)), "B");
+
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    r = bi_index(repo, -1);
+    ASSERT_STR_EQ(r.action, "restored");
+    ASSERT_STR_EQ(bi_adr(adr, sizeof(adr)), "B");
+
+    /* No ADR on the outgoing side cannot be told apart from "never set", so
+     * the incoming database keeps its own. */
+    ASSERT_EQ(bi_adr_put(NULL), CBM_STORE_OK);
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    r = bi_index(repo, -1);
+    ASSERT_STR_EQ(r.action, "restored");
+    ASSERT_STR_EQ(bi_adr(adr, sizeof(adr)), "B");
+
+    bi_cleanup(repo);
+    PASS();
+}
+
+/* The first run on a new branch is incremental, and it refreshes an existing
+ * .code-cortex artifact: that artifact must already name the new branch, or a
+ * checkout bootstrapped from it parks the graph under the old one. */
+TEST(branch_seeded_artifact_names_new_branch) {
+    char *repo = bi_make_repo("cbm_bi_art");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    snprintf(g_bi_project, sizeof(g_bi_project), "%s", cbm_pipeline_project_name(p));
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    ASSERT_TRUE(cbm_artifact_exists(repo));
+    /* The export added indexable files under .code-cortex/; take them into
+     * main's graph so the switch below stays incremental. */
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "seeded");
+    ASSERT_EQ(r.reparsed, 1); /* incremental, so the artifact took the FAST re-export */
+
+    char *dir = th_mktempdir("cbm_bi_art_import");
+    ASSERT_NOT_NULL(dir);
+    char imported[1024];
+    snprintf(imported, sizeof(imported), "%s/imported.db", dir);
+    ASSERT_EQ(cbm_artifact_import(repo, imported), 0);
+    cbm_store_t *s = cbm_store_open_path_query(imported);
+    ASSERT_NOT_NULL(s);
+    char qn[1024] = "";
+    ASSERT_EQ(cbm_store_get_branch(s, g_bi_project, qn, sizeof(qn), NULL, 0), CBM_STORE_OK);
+    cbm_store_close(s);
+    ASSERT_STR_EQ(cbm_branch_slug_from_qn(qn), "feature");
+
+    th_rmtree(dir);
+    bi_cleanup(repo);
+    PASS();
+}
+
+/* The in-process index run (the watcher's path when CBM_INDEX_SUPERVISOR=0)
+ * reads the branch_index config key like index_repository does. */
+TEST(branch_index_config_applies_in_process) {
+    char *repo = bi_make_repo("cbm_bi_inproc");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+
+    cbm_config_t *cfg = cbm_config_open(cbm_resolve_cache_dir());
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_BRANCH_INDEX, "false"), 0);
+    char *project = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(project);
+    snprintf(g_bi_project, sizeof(g_bi_project), "%s", project);
+    free(project);
+
+    ASSERT_EQ(cbm_mcp_index_in_process(repo), 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(cbm_mcp_index_in_process(repo), 0);
+    char **list = NULL;
+    int parked = bi_parked(&list);
+    cbm_branch_slots_free_list(list, parked);
+    ASSERT_EQ(bi_count("only_feature"), 1);
+
+    ASSERT_EQ(cbm_config_delete(cfg, CBM_CONFIG_BRANCH_INDEX), 0);
+    cbm_config_close(cfg);
+    ASSERT_EQ(parked, 0);
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -438,4 +588,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_parked_hidden_status_and_delete);
     RUN_TEST(branch_park_cap_evicts_oldest);
     RUN_TEST(branch_index_disabled_reindexes_in_place);
+    RUN_TEST(branch_switch_keeps_newest_adr);
+    RUN_TEST(branch_seeded_artifact_names_new_branch);
+    RUN_TEST(branch_index_config_applies_in_process);
 }

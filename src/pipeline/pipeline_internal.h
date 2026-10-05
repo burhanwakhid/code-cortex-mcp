@@ -815,6 +815,10 @@ void cbm_pipeline_test_after_classify(void (*callback)(void *), void *data);
 void cbm_pipeline_test_after_extract(void (*callback)(void *), void *data);
 #endif
 
+/* Write this checkout's branch onto the Branch node of the database at
+ * db_path when it names another (pipeline.cpp). */
+void cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path);
+
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);

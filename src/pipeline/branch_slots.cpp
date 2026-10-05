@@ -235,6 +235,46 @@ static bool install_slot(const char *slot, const char *db_path) {
     return true;
 }
 
+/* The project's ADR (project_summaries) in the database at db_path; NULL when
+ * there is none. Caller frees. */
+static char *read_adr(const char *db_path, const char *project) {
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return NULL;
+    }
+    char *content = NULL;
+    cbm_adr_t adr = {0};
+    if (cbm_store_adr_get(s, project, &adr) == CBM_STORE_OK) {
+        content = adr.content ? strdup(adr.content) : NULL;
+        cbm_store_adr_free(&adr);
+    }
+    cbm_store_close(s);
+    return content;
+}
+
+/* The ADR is the one table in the database that is not derived from the
+ * indexed source: manage_adr writes it for the project, whatever branch is
+ * checked out. A restored database carries the ADR from when it was parked,
+ * so put the outgoing (newest) one back. An outgoing database without an ADR
+ * cannot say whether it was deleted or never set (a delete leaves no trace),
+ * so then the restored database keeps its own. */
+static void carry_adr(const char *db_path, const char *project, const char *adr) {
+    if (!adr) {
+        return;
+    }
+    char *restored = read_adr(db_path, project);
+    bool same = restored && strcmp(restored, adr) == 0;
+    free(restored);
+    if (same) {
+        return;
+    }
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s || cbm_store_adr_store(s, project, adr) != CBM_STORE_OK) {
+        cbm_log_warn("branch.adr_carry_failed", "project", project);
+    }
+    cbm_store_close(s);
+}
+
 cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *project,
                                             const char *slug, int keep, char *from,
                                             size_t from_sz) {
@@ -283,8 +323,10 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
 
     cbm_branch_switch_t action = CBM_BRANCH_SWITCH_SEEDED;
     if (have_incoming) {
+        char *adr = read_adr(db_path, project);
         if (install_slot(incoming, db_path)) {
             action = CBM_BRANCH_SWITCH_RESTORED;
+            carry_adr(db_path, project, adr);
         } else {
             /* Windows refuses to replace a file another process has open. The
              * outgoing database is still in place and parked; carry on with
@@ -292,6 +334,7 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
              * branch. */
             cbm_log_warn("branch.restore_failed", "to", slug, "action", "seeded");
         }
+        free(adr);
     }
     evict_slots(dir, keep);
     cbm_log_info("branch.switch", "action", cbm_branch_switch_str(action), "from", indexed, "to",
