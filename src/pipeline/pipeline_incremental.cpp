@@ -270,8 +270,9 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
  * because the indexer follows symlinks during discovery — a stale symlink
  * has no source to parse. */
 static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int file_count,
-                              cbm_file_hash_t *stored, int stored_count, char ***out_deleted,
-                              cbm_file_hash_t **out_mode_skipped, int *out_mode_skipped_count) {
+                              cbm_file_hash_t *stored, int stored_count, bool verify_content,
+                              char ***out_deleted, cbm_file_hash_t **out_mode_skipped,
+                              int *out_mode_skipped_count) {
     *out_deleted = NULL;
     *out_mode_skipped = NULL;
     *out_mode_skipped_count = 0;
@@ -325,8 +326,16 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
         } else {
             struct stat st;
             if (stat(abs_path, &st) == 0) {
-                /* File exists on disk — mode-skipped, not deleted. */
-                preserve = true;
+                /* File exists on disk — mode-skipped, not deleted. When the
+                 * stored graph was built from another checkout
+                 * (verify_content), that holds only for the same bytes: this
+                 * mode will not re-extract the file, so a changed one is
+                 * purged rather than kept with the other checkout's symbols
+                 * (the next run that discovers it extracts it afresh). */
+                char digest[CBM_SHA256_HEX_LEN + 1];
+                preserve = !verify_content ||
+                           (stored_sha_valid(&stored[i]) && file_sha256_hex(abs_path, digest) &&
+                            strcmp(digest, stored[i].sha256) == 0);
             } else if (errno != ENOENT && errno != ENOTDIR) {
                 /* Transient or permission error — fail safe by preserving.
                  * EACCES, EIO, ELOOP, ENAMETOOLONG, etc. */
@@ -857,9 +866,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     char **deleted = NULL;
     cbm_file_hash_t *mode_skipped = NULL;
     int mode_skipped_count = 0;
-    int deleted_count =
-        find_deleted_files(cbm_pipeline_repo_path(p), files, file_count, stored, stored_count,
-                           &deleted, &mode_skipped, &mode_skipped_count);
+    int deleted_count = find_deleted_files(cbm_pipeline_repo_path(p), files, file_count, stored,
+                                           stored_count, cbm_pipeline_verify_content(p), &deleted,
+                                           &mode_skipped, &mode_skipped_count);
 
     cbm_log_info("incremental.classify", "changed", itoa_buf(n_changed), "unchanged",
                  itoa_buf(n_unchanged), "deleted", itoa_buf(deleted_count), "mode_skipped",

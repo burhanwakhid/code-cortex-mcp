@@ -3444,7 +3444,8 @@ static int remove_indexes_in_dir(const char *cache_dir) {
             /* Also remove the old temporary generation, under the same lease. */
             char tmp_path[CLI_FIELD_1040];
             snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", target);
-            if (cbm_unlink(target) == 0) {
+            bool gone = cbm_unlink(target) == 0;
+            if (gone) {
                 cbm_unlink(tmp_path);
                 count++;
             }
@@ -3459,7 +3460,11 @@ static int remove_indexes_in_dir(const char *cache_dir) {
              * live under branches/<project>/, outside this scan. */
             char project[CLI_BUF_1K];
             snprintf(project, sizeof(project), "%.*s", (int)(len - DB_EXT_LEN), ent->name);
-            count += cbm_branch_slots_delete_all(target, project);
+            /* Only with the main file gone: a project whose database could
+             * not be removed keeps its parked branches too. */
+            if (gone || !cbm_file_exists(target)) {
+                count += cbm_branch_slots_delete_all(target, project);
+            }
             cbm_db_lease_release(lease);
         }
     }

@@ -160,6 +160,10 @@ struct cbm_pipeline {
      * the run (or with none): a restore, a dump, a stamp. Read at the end of
      * cbm_pipeline_run, which exports iff it is set. */
     bool artifact_stale;
+    /* The database under this project's name was indexed from another
+     * directory (a derived-name collision): this checkout has no index, so
+     * the run rebuilds in full and carries nothing over from it. */
+    bool foreign_db;
 };
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
@@ -1613,7 +1617,12 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         free(db_path);
         return CBM_NOT_FOUND;
     }
-    cbm_store_t *check_store = cbm_store_open_path(db_path);
+    /* Another directory's database (pipeline_check_foreign_db): nothing in
+     * it is this checkout's -- not its file hashes, not its ADR. */
+    cbm_store_t *check_store = p->foreign_db ? NULL : cbm_store_open_path(db_path);
+    if (p->foreign_db) {
+        cbm_log_info("pipeline.route", "path", "foreign_db_reindex");
+    }
     if (check_store && cbm_store_check_integrity(check_store)) {
         /* #769: an index written under an older format identity encodes a
          * different QN/node-identity scheme. Patching it incrementally would
@@ -1665,7 +1674,7 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     cbm_log_info("pipeline.route", "path", "reindex", "action", "deleting old db");
     /* Capture any ADR before deleting the DB so the full-reindex rebuild can
      * restore it (project_summaries is otherwise lost). Issue #516. */
-    {
+    if (!p->foreign_db) {
         cbm_store_t *adr_store = cbm_store_open_path(db_path);
         if (adr_store) {
             cbm_adr_t existing;
@@ -2165,6 +2174,29 @@ bool cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
 
 static int pipeline_run_claimed(cbm_pipeline_t *p);
 
+/* Whether the database this run would write was indexed from another
+ * directory: the root it records (projects.root_path) is not this run's.
+ * Checked before anything compares branches -- the same branch, commit and
+ * bytes in another checkout must not pass for this checkout's index. One
+ * small query per run; a database without a recorded root is accepted. */
+static void pipeline_check_foreign_db(cbm_pipeline_t *p) {
+    p->foreign_db = false;
+    char *db_path = resolve_db_path(p);
+    cbm_store_t *s =
+        db_path && cbm_file_exists(db_path) ? cbm_store_open_path_query(db_path) : NULL;
+    cbm_project_t proj = {0};
+    if (s && cbm_store_get_project(s, p->project_name, &proj) == CBM_STORE_OK) {
+        p->foreign_db = !cbm_root_matches(proj.root_path, p->repo_path);
+        if (p->foreign_db) {
+            cbm_log_warn("pipeline.foreign_db", "project", p->project_name, "indexed_root",
+                         proj.root_path ? proj.root_path : "", "root", p->repo_path);
+        }
+        cbm_project_free_fields(&proj);
+    }
+    cbm_store_close(s);
+    free(db_path);
+}
+
 /* Re-resolve the checkout once the run owns the index. cbm_pipeline_new
  * captured it, but the caller may have waited on the lease or the pipeline
  * lock since, and the slot choice, the Branch node and the stamp must all
@@ -2252,7 +2284,10 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     pipeline_lease_scope lease_scope{p};
 
     pipeline_refresh_checkout(p);
-    pipeline_branch_switch(p);
+    pipeline_check_foreign_db(p);
+    if (!p->foreign_db) {
+        pipeline_branch_switch(p);
+    }
     pipeline_decide_content_check(p);
     int rc = pipeline_run_claimed(p);
     if (rc == 0 && !check_cancel(p)) {

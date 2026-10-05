@@ -114,6 +114,11 @@ int cbm_store_get_branch(cbm_store_t *s, const char *project, char *qn_buf, size
                          char *name_buf, size_t name_sz);
 int cbm_store_set_branch(cbm_store_t *s, const char *project, const char *qn, const char *name,
                          const char *props_json);
+/* SHA-256 over the project's (rel_path, source digest) rows in file_hashes,
+ * in path order: identical for identical indexed sources, different after
+ * any source change. Not mtimes. One indexed scan of file_hashes. */
+bool cbm_store_content_fingerprint(cbm_store_t *s, const char *project, char out[65]);
+
 /* get, with qualified name, display name and properties (any may be NULL)
  * each in its own allocation, however long a branch name makes them. */
 int cbm_store_get_branch_dup(cbm_store_t *s, const char *project, char **qn, char **name,

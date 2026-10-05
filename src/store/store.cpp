@@ -69,6 +69,7 @@ enum {
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "store/store.h"
+#include "foundation/sha256.h"
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
@@ -3403,6 +3404,44 @@ static bool fts_branch_indexed(cbm_store_t *s, const char *project) {
                        "SELECT 1 FROM nodes_fts WHERE rowid = (SELECT id FROM nodes WHERE "
                        "project = ?1 AND label = 'Branch' ORDER BY id LIMIT 1);",
                        project, NULL, NULL, NULL) == SQLITE_ROW;
+}
+
+bool cbm_store_content_fingerprint(cbm_store_t *s, const char *project,
+                                   char out[CBM_SHA256_HEX_LEN + 1]) {
+    out[0] = '\0';
+    sqlite3_stmt *stmt = NULL;
+    if (!s || !s->db || !project ||
+        sqlite3_prepare_v2(s->db,
+                           "SELECT rel_path, sha256 FROM file_hashes WHERE project = ?1 "
+                           "ORDER BY rel_path;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    cbm_sha256_ctx c;
+    cbm_sha256_init(&c);
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        for (int col = 0; col < 2; col++) {
+            const unsigned char *v = sqlite3_column_text(stmt, col);
+            int n = sqlite3_column_bytes(stmt, col);
+            cbm_sha256_update(&c, v ? v : (const unsigned char *)"", (size_t)n);
+            cbm_sha256_update(&c, "", 1); /* field separator: NUL */
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        return false;
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&c, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[(i * 2) + 1] = hex[digest[i] & 0xF];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+    return true;
 }
 
 int cbm_store_get_branch_dup(cbm_store_t *s, const char *project, char **qn, char **name,

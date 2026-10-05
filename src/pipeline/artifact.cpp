@@ -24,6 +24,7 @@ enum {
 
 #include "pipeline/artifact.h"
 #include "store/store.h"
+#include "foundation/sha256.h"
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat.h"
@@ -324,8 +325,8 @@ static size_t read_metadata_original_size(const char *repo_path) {
 
 /* Write artifact.json metadata. */
 static int write_metadata(const char *repo_path, const char *project_name, int nodes, int edges,
-                          const char *branch_qn, const char *branch_props, size_t original_size,
-                          size_t compressed_size, int compression_level) {
+                          const char *branch_qn, const char *branch_props, const char *content_fp,
+                          size_t original_size, size_t compressed_size, int compression_level) {
     char commit[CBM_SZ_64] = "";
     git_head_hash(repo_path, commit, sizeof(commit));
 
@@ -347,6 +348,7 @@ static int write_metadata(const char *repo_path, const char *project_name, int n
      * (cbm_artifact_is_current). */
     yyjson_mut_obj_add_str(doc, root, "branch_qn", branch_qn ? branch_qn : "");
     yyjson_mut_obj_add_str(doc, root, "branch_props", branch_props ? branch_props : "");
+    yyjson_mut_obj_add_str(doc, root, "content_fp", content_fp ? content_fp : "");
     yyjson_mut_obj_add_uint(doc, root, "original_size", (uint64_t)original_size);
     yyjson_mut_obj_add_uint(doc, root, "compressed_size", (uint64_t)compressed_size);
     yyjson_mut_obj_add_int(doc, root, "compression_level", compression_level);
@@ -580,11 +582,13 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     int edges = 0;
     char *branch_qn = NULL;
     char *branch_props = NULL;
+    char content_fp[CBM_SHA256_HEX_LEN + 1] = "";
     cbm_store_t *count_store = cbm_store_open_path(db_path);
     if (count_store) {
         nodes = cbm_store_count_nodes(count_store, project_name);
         edges = cbm_store_count_edges(count_store, project_name);
         (void)cbm_store_get_branch_dup(count_store, project_name, &branch_qn, NULL, &branch_props);
+        (void)cbm_store_content_fingerprint(count_store, project_name, content_fp);
         cbm_store_close(count_store);
         /* A failed read is CBM_STORE_ERR; never record it as a count. */
         nodes = nodes < 0 ? 0 : nodes;
@@ -593,7 +597,7 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
 
     /* Write metadata */
     int mrc = write_metadata(repo_path, project_name, nodes, edges, branch_qn, branch_props,
-                             db_size, (size_t)clen, compression_level);
+                             content_fp, db_size, (size_t)clen, compression_level);
     free(branch_qn);
     free(branch_props);
     if (mrc != 0) {
@@ -788,19 +792,18 @@ bool cbm_artifact_is_current(const char *db_path, const char *repo_path, const c
     yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
     const char *a_qn = yyjson_get_str(root ? yyjson_obj_get(root, "branch_qn") : NULL);
     const char *a_props = yyjson_get_str(root ? yyjson_obj_get(root, "branch_props") : NULL);
-    yyjson_val *a_nodes = root ? yyjson_obj_get(root, "nodes") : NULL;
-    yyjson_val *a_edges = root ? yyjson_obj_get(root, "edges") : NULL;
+    const char *a_fp = yyjson_get_str(root ? yyjson_obj_get(root, "content_fp") : NULL);
     bool current = false;
-    /* Metadata from a build that did not record the Branch node is never
-     * current: one export brings it up to date. */
-    if (a_qn && a_props && yyjson_is_int(a_nodes) && yyjson_is_int(a_edges)) {
+    /* Metadata from a build that did not record these is never current: one
+     * export brings it up to date. */
+    if (a_qn && a_props && a_fp && a_fp[0]) {
         cbm_store_t *s = cbm_store_open_path_query(db_path);
         char *qn = NULL;
         char *props = NULL;
+        char fp[CBM_SHA256_HEX_LEN + 1];
         if (s && cbm_store_get_branch_dup(s, project, &qn, NULL, &props) != CBM_STORE_ERR) {
             current = strcmp(qn ? qn : "", a_qn) == 0 && strcmp(props ? props : "", a_props) == 0 &&
-                      cbm_store_count_nodes(s, project) == (int)yyjson_get_int(a_nodes) &&
-                      cbm_store_count_edges(s, project) == (int)yyjson_get_int(a_edges);
+                      cbm_store_content_fingerprint(s, project, fp) && strcmp(fp, a_fp) == 0;
         }
         free(qn);
         free(props);

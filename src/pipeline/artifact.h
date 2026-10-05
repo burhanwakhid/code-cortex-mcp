@@ -55,9 +55,11 @@ bool cbm_artifact_exists(const char *repo_path);
 
 /* Whether the artifact's metadata matches the live database at db_path: the
  * same Branch node (qualified name and properties: branch, HEAD commit) and
- * the same node and edge counts. Reads artifact.json and runs three small
- * queries; never decompresses the artifact. False when either side cannot be
- * read or the metadata predates these fields. */
+ * the same content fingerprint (cbm_store_content_fingerprint: the indexed
+ * sources' digests, so any source edit moves it, count-preserving or not).
+ * Reads artifact.json, one Branch query and one scan of file_hashes; never
+ * decompresses the artifact. False when either side cannot be read or the
+ * metadata predates these fields. */
 bool cbm_artifact_is_current(const char *db_path, const char *repo_path, const char *project);
 
 /* Get the git commit hash from artifact metadata. Caller must free().

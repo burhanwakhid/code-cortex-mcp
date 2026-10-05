@@ -4107,8 +4107,10 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
         is_error = true;
     }
     /* The project's parked per-branch databases go with it, under the same
-     * lease; they can outlive a main file that is already gone. */
-    int parked_deleted = cbm_branch_slots_delete_all(path, name);
+     * lease; they can outlive a main file that is already gone. Not when the
+     * main file could not be removed: the project still exists, and its
+     * parked branches with it. */
+    int parked_deleted = !is_error || !exists ? cbm_branch_slots_delete_all(path, name) : 0;
     if (!exists && parked_deleted > 0) {
         status = "deleted";
         is_error = false;

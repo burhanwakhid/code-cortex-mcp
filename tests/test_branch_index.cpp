@@ -1846,6 +1846,163 @@ TEST(branch_legacy_slot_adopted) {
     PASS();
 }
 
+/* Index repo in `mode` into the default cache database. */
+static bi_run_t bi_index_mode(const char *repo, cbm_index_mode_t mode) {
+    bi_run_t r = {CBM_NOT_FOUND, "", "", -1};
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, mode);
+    if (!p) {
+        return r;
+    }
+    snprintf(g_bi_project, sizeof(g_bi_project), "%s", cbm_pipeline_project_name(p));
+    snprintf(g_bi_root, sizeof(g_bi_root), "%s", cbm_pipeline_repo_path(p));
+    r.rc = cbm_pipeline_run(p);
+    const char *action = NULL;
+    cbm_pipeline_get_branch_switch(p, &action, NULL, NULL, &r.reparsed);
+    snprintf(r.action, sizeof(r.action), "%s", action ? action : "");
+    cbm_pipeline_free(p);
+    return r;
+}
+
+/* After a switch, a stored file the current mode does not discover (docs/
+ * in fast mode) cannot be re-extracted; when its bytes differ on the new
+ * branch it is purged rather than kept with the old branch's symbols. */
+TEST(branch_switch_purges_changed_mode_skipped_file) {
+    char *repo = bi_make_repo("cbm_bi_modeskip");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    th_write_file(TH_PATH(repo, "docs/x.py"), "def doc_main():\n    return 1\n");
+    ASSERT_EQ(bi_git(repo, "add ."), 0);
+    ASSERT_EQ(bi_git(repo, "commit -q -m docs"), 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q -b docsonly"), 0);
+    th_write_file(TH_PATH(repo, "docs/x.py"), "def doc_feat():\n    return 1\n");
+    ASSERT_EQ(bi_git(repo, "commit -q -am docs2"), 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+
+    ASSERT_EQ(bi_index_mode(repo, CBM_MODE_FULL).rc, 0);
+    ASSERT_EQ(bi_count("doc_main"), 1);
+    ASSERT_EQ(bi_git(repo, "checkout -q docsonly"), 0);
+    bi_run_t r = bi_index_mode(repo, CBM_MODE_FAST);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "seeded");
+    ASSERT_EQ(bi_count("doc_main"), 0);
+    ASSERT_EQ(bi_count("only_main"), 1); /* the rest of the tree is kept */
+
+    bi_cleanup(repo);
+    PASS();
+}
+
+/* A live database another checkout indexed with the same branch, commit and
+ * bytes is still not this checkout's index: the run rebuilds it, so it
+ * records this root. */
+TEST(branch_foreign_live_db_same_identity_rebuilds) {
+    char *made = th_mktempdir("cbm_bi_foreign");
+    ASSERT_NOT_NULL(made);
+    char base[256];
+    snprintf(base, sizeof(base), "%s", made);
+    char a[512];
+    char b[512];
+    snprintf(a, sizeof(a), "%s/a/b-repo", base);
+    snprintf(b, sizeof(b), "%s/a-b/repo", base);
+    ASSERT_TRUE(bi_repo_at(a, "from_a"));
+    char cmd[1200];
+    snprintf(cmd, sizeof(cmd), "clone -q \"%s\" \"%s\"", a, b);
+    ASSERT_EQ(bi_git(base, cmd), 0); /* same branch, HEAD and bytes */
+
+    ASSERT_EQ(bi_index(a, -1).rc, 0);
+    ASSERT_EQ(bi_adr_put("A-ADR"), CBM_STORE_OK);
+    bi_run_t r = bi_index(b, -1);
+    ASSERT_EQ(r.rc, 0);
+    char db[1024];
+    cbm_store_t *s = cbm_store_open_path_query(bi_db_path(db, sizeof(db)));
+    ASSERT_NOT_NULL(s);
+    cbm_project_t proj = {0};
+    ASSERT_EQ(cbm_store_get_project(s, g_bi_project, &proj), CBM_STORE_OK);
+    bool mine = cbm_root_matches(proj.root_path, b) && !cbm_root_matches(proj.root_path, a);
+    cbm_project_free_fields(&proj);
+    cbm_store_close(s);
+    ASSERT_TRUE(mine);
+    char adr[256];
+    ASSERT_STR_EQ(bi_adr(adr, sizeof(adr)), ""); /* A's ADR is not B's */
+
+    bi_cleanup(b);
+    th_rmtree(base);
+    PASS();
+}
+
+#ifndef _WIN32
+/* A rename that keeps node and edge counts, made while the export fails, is
+ * still caught by a later no-op run: the artifact is compared by content. */
+TEST(branch_artifact_behind_after_count_preserving_edit) {
+    if (geteuid() == 0) {
+        PASS();
+    }
+    char *repo = bi_make_repo("cbm_bi_artfp");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char art[512];
+    snprintf(art, sizeof(art), "%s/.code-cortex", repo);
+    ASSERT_EQ(bi_index_persist(repo), 0);
+
+    ASSERT_EQ(chmod(art, 0500), 0);
+    th_write_file(TH_PATH(repo, "src/common.py"), "def common_helpex():\n    return 2\n");
+    bi_run_t r = bi_index(repo, -1); /* re-extracts; its export fails */
+    (void)chmod(art, 0755);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_EQ(r.reparsed, 1);
+
+    r = bi_index(repo, -1); /* nothing to do, but the artifact is behind */
+    ASSERT_EQ(r.reparsed, 0);
+    char slug[256];
+    ASSERT_EQ(bi_artifact_probe(repo, "common_helpex", slug, sizeof(slug)), 1);
+
+    bi_cleanup(repo);
+    PASS();
+}
+
+/* delete_project and the index reset keep a project's parked branches when
+ * its live database could not be removed. */
+TEST(branch_slots_kept_when_live_db_undeletable) {
+    if (geteuid() == 0) {
+        PASS();
+    }
+    char *repo = bi_make_repo("cbm_bi_undel");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* main parked */
+    ASSERT_TRUE(bi_is_parked("main"));
+
+    const char *cache = cbm_resolve_cache_dir();
+    char cache_dir[1024];
+    snprintf(cache_dir, sizeof(cache_dir), "%s", cache);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[1200];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\"}", g_bi_project);
+    ASSERT_EQ(chmod(cache_dir, 0500), 0); /* the live .db cannot be unlinked */
+    char *resp = cbm_mcp_handle_tool(srv, "delete_project", args);
+    int reset_removed = cbm_remove_indexes(NULL);
+    (void)chmod(cache_dir, 0755);
+    ASSERT_NOT_NULL(resp);
+    bool failed = strstr(resp, "delete_failed") != NULL;
+    free(resp);
+    cbm_mcp_server_free(srv);
+    ASSERT_TRUE(failed);
+    ASSERT_EQ(reset_removed, 0);
+    ASSERT_TRUE(bi_is_parked("main"));
+
+    bi_cleanup(repo);
+    PASS();
+}
+#endif
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -1893,4 +2050,10 @@ SUITE(branch_index) {
     RUN_TEST(branch_slots_reject_other_roots);
     RUN_TEST(branch_root_normalize_and_key);
     RUN_TEST(branch_legacy_slot_adopted);
+    RUN_TEST(branch_switch_purges_changed_mode_skipped_file);
+    RUN_TEST(branch_foreign_live_db_same_identity_rebuilds);
+#ifndef _WIN32
+    RUN_TEST(branch_artifact_behind_after_count_preserving_edit);
+    RUN_TEST(branch_slots_kept_when_live_db_undeletable);
+#endif
 }
