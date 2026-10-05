@@ -30,6 +30,7 @@
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 static const char *bi_null_dev(void) {
@@ -1588,6 +1589,144 @@ TEST(branch_long_names_park_and_restore) {
     PASS();
 }
 
+/* Index repo into the default cache database with persistence requested. */
+static int bi_index_persist(const char *repo) {
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, CBM_MODE_FULL);
+    if (!p) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_pipeline_set_persistence(p, true);
+    snprintf(g_bi_project, sizeof(g_bi_project), "%s", cbm_pipeline_project_name(p));
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+#ifndef _WIN32
+/* An artifact export the run was asked for fails the run, also when it is
+ * the end-of-run export (a restore with nothing re-extracted); refreshing an
+ * existing artifact nobody asked for stays best-effort. */
+TEST(branch_requested_export_failure_fails_run) {
+    if (geteuid() == 0) {
+        PASS(); /* root writes through 0500 */
+    }
+    char *repo = bi_make_repo("cbm_bi_artfail");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char art[512];
+    snprintf(art, sizeof(art), "%s/.code-cortex", repo);
+
+    ASSERT_EQ(bi_index_persist(repo), 0); /* main, exported */
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* feature, exported; main parked */
+
+    ASSERT_EQ(chmod(art, 0500), 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    int rc = bi_index_persist(repo); /* restored, nothing re-extracted */
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    bi_run_t r = bi_index(repo, -1); /* restored, opportunistic refresh */
+    (void)chmod(art, 0755);
+    ASSERT_NEQ(rc, 0);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "restored");
+
+    bi_cleanup(repo);
+    PASS();
+}
+#endif
+
+/* A git repo at exactly `path` on main with one file defining `fn`. */
+static bool bi_repo_at(const char *path, const char *fn) {
+    if (!cbm_mkdir_p(path, 0755) || bi_git(path, "init -q -b main") != 0) {
+        return false;
+    }
+    char file[1024];
+    snprintf(file, sizeof(file), "%s/src/m.py", path);
+    char body[256];
+    snprintf(body, sizeof(body), "def %s():\n    return 1\n", fn);
+    th_write_file(file, body);
+    return bi_git(path, "add .") == 0 && bi_git(path, "commit -q -m init") == 0;
+}
+
+/* The root recorded in the parked slot `slug`; "" when unreadable. */
+static void bi_slot_root(const char *slug, char *buf, size_t n) {
+    buf[0] = '\0';
+    char db[1024];
+    char dir[1100];
+    char slot[1300];
+    if (!cbm_branch_slots_dir(bi_db_path(db, sizeof(db)), g_bi_project, dir, sizeof(dir))) {
+        return;
+    }
+    snprintf(slot, sizeof(slot), "%s/%s.db", dir, slug);
+    cbm_store_t *s = cbm_store_open_path_query(slot);
+    cbm_project_t proj = {0};
+    if (s && cbm_store_get_project(s, g_bi_project, &proj) == CBM_STORE_OK) {
+        snprintf(buf, n, "%s", proj.root_path ? proj.root_path : "");
+        cbm_project_free_fields(&proj);
+    }
+    cbm_store_close(s);
+}
+
+/* Two checkouts whose paths derive the same project name share its slots
+ * directory: neither may install, nor park over, the other's database. */
+TEST(branch_slots_reject_other_roots) {
+    char *made = th_mktempdir("cbm_bi_collide");
+    ASSERT_NOT_NULL(made);
+    char base[256];
+    snprintf(base, sizeof(base), "%s", made);
+    char a[512];
+    char b[512];
+    snprintf(a, sizeof(a), "%s/a/b-repo", base);
+    snprintf(b, sizeof(b), "%s/a-b/repo", base);
+    ASSERT_TRUE(bi_repo_at(a, "from_a"));
+    ASSERT_TRUE(bi_repo_at(b, "from_b"));
+    char root[1024];
+    char adr[256];
+    char db[1024];
+
+    ASSERT_EQ(bi_index(a, -1).rc, 0); /* A on main */
+    char *name_b = cbm_project_name_from_path(b);
+    ASSERT_STR_EQ(name_b, g_bi_project); /* the collision */
+    free(name_b);
+    ASSERT_EQ(bi_adr_put("A-ADR"), CBM_STORE_OK);
+    ASSERT_EQ(bi_git(a, "checkout -q -b feature"), 0);
+    ASSERT_EQ(bi_index(a, -1).rc, 0); /* A's main parked */
+    bi_slot_root("main", root, sizeof(root));
+    ASSERT_STR_EQ(root, a);
+
+    /* Live database gone; B (also on main) must not install A's slot. */
+    bi_db_path(db, sizeof(db));
+    ASSERT_EQ(cbm_unlink(db), 0);
+    cbm_remove_db_sidecars(db);
+    bi_run_t r = bi_index(b, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "none");
+    ASSERT_STR_EQ(bi_adr(adr, sizeof(adr)), "");
+    ASSERT_EQ(bi_count("from_b"), 1);
+    ASSERT_EQ(bi_count("from_a"), 0);
+    ASSERT_TRUE(bi_is_parked("main"));
+
+    /* The live database is now B's. A on feature must not park it as its
+     * "main" (over A's own slot); the run reindexes over it, as before. */
+    r = bi_index(a, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "none");
+    bi_slot_root("main", root, sizeof(root));
+    ASSERT_STR_EQ(root, a);
+    char **list = NULL;
+    int n = bi_parked(&list);
+    cbm_branch_slots_free_list(list, n);
+    ASSERT_EQ(n, 1);
+
+    (void)cbm_branch_slots_delete_all(db, g_bi_project);
+    cbm_unlink(db);
+    cbm_remove_db_sidecars(db);
+    th_rmtree(base);
+    PASS();
+}
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -1629,4 +1768,8 @@ SUITE(branch_index) {
     RUN_TEST(branch_index_prompt_counts_parked_only_cache);
     RUN_TEST(branch_long_slug_slot_names);
     RUN_TEST(branch_long_names_park_and_restore);
+#ifndef _WIN32
+    RUN_TEST(branch_requested_export_failure_fails_run);
+#endif
+    RUN_TEST(branch_slots_reject_other_roots);
 }

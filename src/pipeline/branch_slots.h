@@ -119,10 +119,14 @@ bool cbm_branch_slots_dir(const char *db_path, const char *project, char *buf, s
  * other writers. Never leaves db_path missing or half-restored: parking only
  * reads db_path, and a restore is a single transaction on it.
  * `keep` bounds the parked count (< 1 disables parking: returns NONE).
+ * `root` is the checkout being indexed: a live database or slot recorded for
+ * another directory (a derived-name collision) is neither parked nor
+ * restored, and a rejected slot stays in place.
  * `from` (optional) receives the slug the database was built for, allocated
  * (NULL when unknown); the caller frees it. */
 cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *project,
-                                            const char *slug, int keep, char **from);
+                                            const char *slug, const char *root, int keep,
+                                            char **from);
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* Callback run when a restore starts, before it takes the live database's

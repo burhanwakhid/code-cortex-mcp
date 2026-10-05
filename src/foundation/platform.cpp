@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <limits.h>
 #include <string.h>
 
 /* Canonicalize a Windows drive letter to upper-case in place: "c:/x" -> "C:/x".
@@ -642,4 +643,29 @@ bool cbm_file_gen_equal(const cbm_file_gen_t *a, const cbm_file_gen_t *b) {
     }
     return a->size == b->size && a->mtime == b->mtime && a->mtime_ns == b->mtime_ns &&
            a->ino == b->ino;
+}
+
+bool cbm_root_matches(const char *recorded, const char *dir) {
+    if (!dir || !dir[0] || !recorded || !recorded[0]) {
+        return true; /* nothing expected, or a legacy database with no root */
+    }
+    if (strcmp(recorded, dir) == 0) {
+        return true;
+    }
+#ifdef _WIN32
+    return _stricmp(recorded, dir) == 0;
+#else
+    /* realpath folds symlinks (macOS /tmp -> /private/tmp) and "..";
+     * dev+inode then covers a case-insensitive volume, where two spellings of
+     * one directory realpath to different strings. */
+    char a[PATH_MAX];
+    char b[PATH_MAX];
+    if (realpath(recorded, a) && realpath(dir, b) && strcmp(a, b) == 0) {
+        return true;
+    }
+    struct stat sa;
+    struct stat sb;
+    return stat(recorded, &sa) == 0 && stat(dir, &sb) == 0 && sa.st_dev == sb.st_dev &&
+           sa.st_ino == sb.st_ino;
+#endif
 }

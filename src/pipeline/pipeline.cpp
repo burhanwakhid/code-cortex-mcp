@@ -2102,7 +2102,7 @@ static void pipeline_branch_switch(cbm_pipeline_t *p) {
     p->artifact_stale = false;
     p->branch_action = cbm_branch_slots_switch(
         p->db_path, p->project_name, cbm_branch_slug_from_qn(p->branch_qn, p->project_name),
-        p->branch_keep, &p->branch_from);
+        p->repo_path, p->branch_keep, &p->branch_from);
     /* A restore replaced the live content; nothing has exported it yet. */
     p->artifact_stale = p->branch_action == CBM_BRANCH_SWITCH_RESTORED;
 }
@@ -2267,11 +2267,21 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
          * run exports twice, and an unchanged run never exports. The
          * export's own files under .code-cortex/ move neither HEAD nor the
          * branch, so the next run's stamp writes nothing: no loop. */
-        if (p->artifact_stale && (p->persistence || cbm_artifact_exists(p->repo_path)) &&
-            cbm_artifact_export(db_path, p->repo_path, p->project_name,
-                                p->persistence ? CBM_ARTIFACT_BEST : CBM_ARTIFACT_FAST) != 0) {
-            const char *err = cbm_artifact_export_last_error();
-            cbm_log_error("pipeline.err", "phase", "artifact_export", "err", err ? err : "unknown");
+        if (p->artifact_stale && (p->persistence || cbm_artifact_exists(p->repo_path))) {
+            int arc = cbm_artifact_export(db_path, p->repo_path, p->project_name,
+                                          p->persistence ? CBM_ARTIFACT_BEST : CBM_ARTIFACT_FAST);
+            if (arc != 0) {
+                const char *err = cbm_artifact_export_last_error();
+                cbm_log_error("pipeline.err", "phase", "artifact_export", "err",
+                              err ? err : "unknown");
+                /* As the full-index path: an export the caller asked for
+                 * fails the run. Refreshing an artifact nobody asked for this
+                 * run (persistence off) stays best-effort, like the
+                 * incremental path's. */
+                if (p->persistence) {
+                    rc = arc;
+                }
+            }
         }
         free(db_path);
         pipeline_note_checkout_moved(p);

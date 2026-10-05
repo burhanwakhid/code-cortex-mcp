@@ -172,6 +172,14 @@ const char *cbm_resolve_cache_dir(void);
 /* Check if a path exists. */
 bool cbm_file_exists(const char *path);
 
+/* Whether a database's recorded project root `recorded` is the directory
+ * `dir`: same string, same realpath, or same device+inode (a case-insensitive
+ * volume); case-insensitive string compare on Windows. True when either is
+ * empty -- a legacy database records no root. Project names derived from
+ * paths collide (separators fold to '-'), so every lookup by derived name
+ * that must not answer from another directory checks this. */
+bool cbm_root_matches(const char *recorded, const char *dir);
+
 /* Check if path is a directory. */
 bool cbm_is_dir(const char *path);
 

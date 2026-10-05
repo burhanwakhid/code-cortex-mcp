@@ -485,8 +485,30 @@ static cbm_branch_switch_t switch_from(const char *db_path, const char *project,
                                        const char *indexed, const char *dir, const char *incoming,
                                        bool have_incoming, int keep);
 
+/* Whether the database at path was indexed from root (cbm_root_matches): a
+ * derived project name can be another directory's, and so can its slots. A
+ * database with no project row or no recorded root is accepted. */
+static bool db_root_matches(const char *path, const char *project, const char *root) {
+    if (!root || !root[0]) {
+        return true;
+    }
+    cbm_store_t *s = cbm_store_open_path_query(path);
+    cbm_project_t proj = {0};
+    bool ok = true;
+    if (s && cbm_store_get_project(s, project, &proj) == CBM_STORE_OK) {
+        ok = cbm_root_matches(proj.root_path, root);
+        cbm_project_free_fields(&proj);
+    }
+    cbm_store_close(s);
+    if (!ok) {
+        cbm_log_warn("branch.foreign_db", "path", path, "root", root);
+    }
+    return ok;
+}
+
 cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *project,
-                                            const char *slug, int keep, char **from) {
+                                            const char *slug, const char *root, int keep,
+                                            char **from) {
     if (from) {
         *from = NULL;
     }
@@ -506,7 +528,10 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
      * copied into place the way a fresh database is installed (stale
      * sidecars removed, then one rename). */
     if (!cbm_file_exists(db_path)) {
-        if (have_incoming && copy_db(incoming, db_path)) {
+        /* A slot parked by another directory under the same derived name is
+         * not this checkout's: leave it where it is and build fresh. */
+        if (have_incoming && db_root_matches(incoming, project, root) &&
+            copy_db(incoming, db_path)) {
             unlink_slot(incoming);
             cbm_log_info("branch.switch", "action", "restored", "to", slug, "from", "");
             return CBM_BRANCH_SWITCH_RESTORED;
@@ -520,10 +545,17 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
          * the normal routing, which rebuilds what it cannot use. */
         return CBM_BRANCH_SWITCH_NONE;
     }
-    cbm_branch_switch_t action =
-        strcmp(indexed, slug) == 0
-            ? CBM_BRANCH_SWITCH_NONE
-            : switch_from(db_path, project, slug, indexed, dir, incoming, have_incoming, keep);
+    /* On a switch, the live database must be this checkout's to be parked
+     * under its slots, and the incoming slot must be too. A live database
+     * from another directory (a derived-name collision) is left to the
+     * normal routing, which reindexes over it as it always has; no slot is
+     * touched. Checked only when a switch is due, so a run on the same
+     * branch opens nothing extra. */
+    cbm_branch_switch_t action = CBM_BRANCH_SWITCH_NONE;
+    if (strcmp(indexed, slug) != 0 && db_root_matches(db_path, project, root)) {
+        have_incoming = have_incoming && db_root_matches(incoming, project, root);
+        action = switch_from(db_path, project, slug, indexed, dir, incoming, have_incoming, keep);
+    }
     if (from) {
         *from = indexed;
     } else {

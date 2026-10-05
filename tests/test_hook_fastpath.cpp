@@ -9,6 +9,7 @@
 #include "../src/cli/cli.h"
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/platform.h" /* cbm_root_matches */
 #include "test_framework.h"
 #include "test_helpers.h" /* th_mktempdir / th_rmtree */
 #include <git/git_context.h>
@@ -1140,7 +1141,7 @@ TEST(resolvers_reject_colliding_project_names) {
     free(resp);
     cbm_mcp_server_free(srv);
 
-    ASSERT_TRUE(cbm_mcp_root_matches("", other)); /* legacy: no recorded root */
+    ASSERT_TRUE(cbm_root_matches("", other)); /* legacy: no recorded root */
 
     free(name);
     free(name2);

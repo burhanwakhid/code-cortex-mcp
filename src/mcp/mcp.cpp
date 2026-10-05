@@ -1066,7 +1066,7 @@ static char *normalize_project_arg(char *project) {
     char *normalized = cbm_project_name_from_path(project);
     if (normalized) {
         /* The path names the directory; the derived name alone may belong to
-         * another one (see cbm_mcp_root_matches). */
+         * another one (see cbm_root_matches). */
         cbm_mcp_expect_project_root(project);
         free(project);
         return normalized;
@@ -1402,31 +1402,6 @@ static bool project_db_exists(const char *project) {
  * indexed from THAT directory before answering from it -- otherwise an
  * unindexed checkout is silently answered from another one. */
 
-bool cbm_mcp_root_matches(const char *recorded, const char *dir) {
-    if (!dir || !dir[0] || !recorded || !recorded[0]) {
-        return true; /* nothing expected, or a legacy database with no root */
-    }
-    if (strcmp(recorded, dir) == 0) {
-        return true;
-    }
-#ifdef _WIN32
-    return _stricmp(recorded, dir) == 0;
-#else
-    /* realpath folds symlinks (macOS /tmp -> /private/tmp) and "..";
-     * dev+inode then covers a case-insensitive volume, where two spellings of
-     * one directory realpath to different strings. */
-    char a[PATH_MAX];
-    char b[PATH_MAX];
-    if (realpath(recorded, a) && realpath(dir, b) && strcmp(a, b) == 0) {
-        return true;
-    }
-    struct stat sa;
-    struct stat sb;
-    return stat(recorded, &sa) == 0 && stat(dir, &sb) == 0 && sa.st_dev == sb.st_dev &&
-           sa.st_ino == sb.st_ino;
-#endif
-}
-
 /* The directory the current tool call's project must have been indexed from,
  * or "": set by a walk-up level (cbm_mcp_expect_project_root) or by a project
  * argument given as a path, cleared at the start of every tool call. Per
@@ -1452,13 +1427,13 @@ static bool project_db_owned_by(const char *project, const char *dir, cbm_store_
     }
     cbm_store_meta_row_t row;
     if (meta && cbm_store_meta_get(meta, path, &gen, &row) && strcmp(row.project, project) == 0) {
-        return cbm_mcp_root_matches(row.root_path, dir);
+        return cbm_root_matches(row.root_path, dir);
     }
     cbm_store_t *s = cbm_store_open_path_query(path);
     cbm_project_t proj = {0};
     bool owned = true;
     if (s && cbm_store_get_project(s, project, &proj) == CBM_STORE_OK) {
-        owned = cbm_mcp_root_matches(proj.root_path, dir);
+        owned = cbm_root_matches(proj.root_path, dir);
         store_meta_note_project(path, project, proj.root_path);
         cbm_project_free_fields(&proj);
     }
@@ -1764,7 +1739,7 @@ static cbm_store_t *resolve_store_open(cbm_mcp_server_t *srv, const char *projec
     if (store && g_expected_root[0]) {
         cbm_project_t proj = {0};
         if (cbm_store_get_project(store, project, &proj) == CBM_STORE_OK) {
-            bool owned = cbm_mcp_root_matches(proj.root_path, g_expected_root);
+            bool owned = cbm_root_matches(proj.root_path, g_expected_root);
             if (!owned) {
                 cbm_log_info("project.name_collision", "project", project, "indexed_root",
                              proj.root_path ? proj.root_path : "", "wanted", g_expected_root);
@@ -12940,7 +12915,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         if (cbm_file_size(db_check) >= 0 &&
             !project_db_owned_by(srv->session_project, srv->session_root, NULL)) {
             /* The derived name belongs to a database indexed from another
-             * directory (cbm_mcp_root_matches). Watching or auto-indexing this
+             * directory (cbm_root_matches). Watching or auto-indexing this
              * root under that name would overwrite the other checkout's
              * index, so do neither; an explicit index_repository with a
              * name override is the way out. */
