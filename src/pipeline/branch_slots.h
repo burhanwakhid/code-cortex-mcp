@@ -87,6 +87,13 @@ bool cbm_branch_id_from_head(const char *root, cbm_branch_id_t *out);
  * (the slug when a name is not recorded), detached versus attached, or
  * another HEAD commit when both sides know theirs. */
 bool cbm_branch_id_same(const cbm_branch_id_t *indexed, const cbm_branch_id_t *current);
+/* cbm_branch_id_same, except that an indexed identity with no recorded commit
+ * does NOT match a checkout that has one: the graph's age is unknown. For
+ * decisions that may cost a pass (content verification) or that report
+ * (index_status); session start keeps the lenient form, which must stay quiet
+ * where HEAD cannot be read from files. An unknown indexed identity never
+ * matches a known checkout. */
+bool cbm_branch_id_same_strict(const cbm_branch_id_t *indexed, const cbm_branch_id_t *current);
 
 /* <dir of db_path>/branches/<project>. Returns false when it does not fit. */
 bool cbm_branch_slots_dir(const char *db_path, const char *project, char *buf, size_t bufsz);

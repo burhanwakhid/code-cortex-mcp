@@ -165,9 +165,7 @@ int cbm_tool_server_serve(FILE *in, FILE *out) {
             cbm_nanosleep(&ts, NULL);
         }
 #endif
-        /* A re-index or delete may have replaced the file behind the cached
-         * store since the last call; never answer from a stale generation. */
-        cbm_mcp_server_revalidate_store(srv);
+        /* cbm_mcp_handle_tool revalidates the cached store first. */
         char *result = cbm_mcp_handle_tool(srv, tool, args);
         free(args);
         const char *body = result ? result : "";

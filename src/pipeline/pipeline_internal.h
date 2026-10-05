@@ -818,6 +818,8 @@ void cbm_pipeline_test_after_extract(void (*callback)(void *), void *data);
 /* Write this checkout's branch onto the Branch node of the database at
  * db_path when it names another (pipeline.cpp). */
 void cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path);
+/* The same on a store the caller has open read-write. */
+void cbm_pipeline_stamp_branch_store(cbm_pipeline_t *p, cbm_store_t *s);
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);

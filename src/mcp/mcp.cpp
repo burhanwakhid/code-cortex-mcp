@@ -2183,14 +2183,15 @@ static void add_branch_index_json(yyjson_mut_doc *doc, yyjson_mut_val *git, cbm_
         char name[CBM_SZ_512];
         if (cbm_store_get_branch(store, project, NULL, 0, name, sizeof(name)) == CBM_STORE_OK) {
             yyjson_mut_obj_add_strcpy(doc, git, "indexed_branch", name);
-            /* The same identity session start checks: branch name and HEAD
-             * commit, not the slug two branches can share. */
+            /* Branch name and HEAD commit, not the slug two branches can
+             * share; a graph with no recorded commit is not claimed current
+             * (the strict form the content check uses). */
             cbm_branch_id_t indexed;
             cbm_branch_id_t current;
             cbm_branch_id_from_context(ctx, &current);
             if (cbm_branch_id_indexed(store, project, &indexed) && current.known) {
                 yyjson_mut_obj_add_bool(doc, git, "index_matches_checkout",
-                                        cbm_branch_id_same(&indexed, &current));
+                                        cbm_branch_id_same_strict(&indexed, &current));
             }
         }
     }
@@ -12527,6 +12528,12 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
 
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     g_project_note[0] = '\0';
+    /* Every tool call starts here -- tool-server worker, in-process stdio
+     * server, CLI, hooks -- and none is nested inside another's statement
+     * loop: a re-index or delete may have replaced the file behind the
+     * cached store, or written into it in place, since the last call, so
+     * never answer from a stale generation or snapshot. */
+    cbm_mcp_server_revalidate_store(srv);
     if (!tool_name) {
         return cbm_mcp_text_result("missing tool name", true);
     }

@@ -772,7 +772,6 @@ static void dump_and_persist(cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const char *db
                  itoa_buf((int)elapsed_ms(t)));
 
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
-    bool persisted = hash_store != NULL;
     if (hash_store) {
         /* #769: this path DELETES and re-dumps the DB, so the format stamp has
          * to be re-applied here as well as on the full-index dump. Without it
@@ -803,15 +802,17 @@ static void dump_and_persist(cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const char *db
          * writer, so a node re-dumped here keeps its prose `body` column. */
         (void)cbm_store_fts_rebuild(hash_store);
 
+        /* The stored structure names the checkout of the last full rebuild;
+         * name this one before the artifact below copies the database. After
+         * the FTS rebuild, so the stamp finds the Branch node's entry and
+         * replaces it (cbm_store_set_branch). */
+        if (dump_rc == 0 && !atomic_load(cbm_pipeline_cancelled_ptr(p))) {
+            cbm_pipeline_stamp_branch_store(p, hash_store);
+        }
+
         cbm_store_close(hash_store);
     }
     free(saved_adr);
-
-    /* The stored structure names the branch of the last full rebuild; name
-     * this checkout's before the artifact below copies the database. */
-    if (dump_rc == 0 && persisted && !atomic_load(cbm_pipeline_cancelled_ptr(p))) {
-        cbm_pipeline_stamp_branch(p, db_path);
-    }
 
     /* Auto-update artifact if one already exists (persistence was enabled previously) */
     if (repo_path && cbm_artifact_exists(repo_path)) {

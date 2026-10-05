@@ -3337,43 +3337,132 @@ int cbm_store_get_branch_props(cbm_store_t *s, const char *project, char *qn_buf
     return result;
 }
 
+/* Step one statement on the project's Branch row(s): ?1 project, then the
+ * optional ?2..?4 texts. SQLITE_DONE/ROW as an int, or -1 when it would not
+ * prepare. */
+static int branch_exec(cbm_store_t *s, const char *sql, const char *project, const char *a,
+                       const char *b, const char *c) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    if (a) {
+        bind_text(stmt, ST_COL_2, a);
+    }
+    if (b) {
+        bind_text(stmt, ST_COL_3, b);
+    }
+    if (c) {
+        bind_text(stmt, ST_COL_4, c);
+    }
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+/* Remove (del) or add the Branch row's nodes_fts entry. nodes_fts is
+ * contentless: a delete must repeat the values the entry was indexed with,
+ * so this computes them exactly as cbm_store_fts_rebuild does, trying the
+ * same capability ladder in the same order. */
+static bool fts_branch_row(cbm_store_t *s, const char *project, bool del) {
+    const bool with_body = fts_has_body_column(s);
+    static const struct {
+        bool body;
+        bool camel;
+    } ladder[] = {{true, true}, {true, false}, {false, true}, {false, false}};
+    for (const auto &step : ladder) {
+        if (step.body && !with_body) {
+            continue;
+        }
+        char sql[FTS_SQL_BUF * 2];
+        int n = snprintf(sql, sizeof(sql),
+                         "INSERT INTO nodes_fts (%srowid, name, qualified_name, label, file_path%s)"
+                         " SELECT %sid, %s, qualified_name, label, file_path%s FROM nodes"
+                         " WHERE project = ?1 AND label = 'Branch';",
+                         del ? "nodes_fts, " : "", step.body ? ", body" : "",
+                         del ? "'delete', " : "", step.camel ? "cbm_camel_split(name)" : "name",
+                         step.body ? ", " FTS_BODY_EXPR : "");
+        if (n <= 0 || (size_t)n >= sizeof(sql)) {
+            return false;
+        }
+        if (branch_exec(s, sql, project, NULL, NULL, NULL) == SQLITE_DONE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Whether the Branch row has a nodes_fts entry to keep in step. None when
+ * FTS5 is absent or the index was never backfilled (a legacy database opened
+ * read-write gets an empty nodes_fts); a contentless 'delete' of an entry
+ * that is not there reports corruption, and adding just this one row would
+ * make an empty index look populated. */
+static bool fts_branch_indexed(cbm_store_t *s, const char *project) {
+    return branch_exec(s,
+                       "SELECT 1 FROM nodes_fts WHERE rowid = (SELECT id FROM nodes WHERE "
+                       "project = ?1 AND label = 'Branch' ORDER BY id LIMIT 1);",
+                       project, NULL, NULL, NULL) == SQLITE_ROW;
+}
+
 int cbm_store_set_branch(cbm_store_t *s, const char *project, const char *qn, const char *name,
                          const char *props_json) {
     if (!s || !s->db || !project || !qn || !name) {
         return CBM_STORE_ERR;
     }
     const char *props = props_json && props_json[0] ? props_json : "{}";
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db,
+    /* Node, edge and full-text entry change together or not at all: a torn
+     * stamp would leave search or traversal naming another branch. */
+    if (exec_sql(s, "BEGIN IMMEDIATE;") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    int result = CBM_STORE_ERR;
+    bool fts = fts_branch_indexed(s, project);
+    if (fts && !fts_branch_row(s, project, true)) {
+        store_set_error_sqlite(s, "set_branch_fts");
+    } else if (branch_exec(s,
                            "UPDATE nodes SET qualified_name = ?2, name = ?3, properties = ?4 "
                            "WHERE project = ?1 AND label = 'Branch';",
-                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        return CBM_STORE_ERR;
-    }
-    bind_text(stmt, SKIP_ONE, project);
-    bind_text(stmt, ST_COL_2, qn);
-    bind_text(stmt, ST_COL_3, name);
-    bind_text(stmt, ST_COL_4, props);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    if (rc != SQLITE_DONE) {
+                           project, qn, name, props) != SQLITE_DONE) {
         store_set_error_sqlite(s, "set_branch");
-        return CBM_STORE_ERR;
-    }
-    if (sqlite3_changes(s->db) == 0) {
-        return CBM_STORE_NOT_FOUND;
-    }
-    if (sqlite3_prepare_v2(s->db,
+    } else if (sqlite3_changes(s->db) == 0) {
+        result = CBM_STORE_NOT_FOUND;
+    } else if (branch_exec(s,
                            "UPDATE edges SET properties = ?2 "
                            "WHERE project = ?1 AND type = 'HAS_BRANCH';",
-                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        return CBM_STORE_ERR;
+                           project, props, NULL, NULL) != SQLITE_DONE ||
+               (fts && !fts_branch_row(s, project, false))) {
+        store_set_error_sqlite(s, "set_branch_edge");
+    } else {
+        result = CBM_STORE_OK;
     }
-    bind_text(stmt, SKIP_ONE, project);
-    bind_text(stmt, ST_COL_2, props);
-    rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE ? CBM_STORE_OK : CBM_STORE_ERR;
+    if (result == CBM_STORE_OK) {
+        if (exec_sql(s, "COMMIT;") != CBM_STORE_OK) {
+            (void)exec_sql(s, "ROLLBACK;");
+            result = CBM_STORE_ERR;
+        }
+    } else {
+        (void)exec_sql(s, "ROLLBACK;");
+    }
+    return result;
+}
+
+bool cbm_store_branch_is(cbm_store_t *s, const char *project, const char *qn, const char *name,
+                         const char *props_json) {
+    if (!s || !s->db || !project || !qn || !name) {
+        return false;
+    }
+    const char *props = props_json && props_json[0] ? props_json : "{}";
+    /* Any Branch row or HAS_BRANCH edge that differs -- including the edge of
+     * a stamp torn before stamps were transactional. */
+    int rc = branch_exec(s,
+                         "SELECT 1 WHERE EXISTS (SELECT 1 FROM nodes WHERE project = ?1 AND "
+                         "label = 'Branch') AND NOT EXISTS (SELECT 1 FROM nodes WHERE project = "
+                         "?1 AND label = 'Branch' AND (qualified_name IS NOT ?2 OR name IS NOT "
+                         "?3 OR properties IS NOT ?4)) AND NOT EXISTS (SELECT 1 FROM edges WHERE "
+                         "project = ?1 AND type = 'HAS_BRANCH' AND properties IS NOT ?4);",
+                         project, qn, name, props);
+    return rc == SQLITE_ROW;
 }
 
 /* ── Node neighbor names ──────────────────────────────────────── */

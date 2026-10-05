@@ -130,6 +130,17 @@ bool cbm_branch_id_from_head(const char *root, cbm_branch_id_t *out) {
     return out->known;
 }
 
+bool cbm_branch_id_same_strict(const cbm_branch_id_t *indexed, const cbm_branch_id_t *current) {
+    if (!current || !current->known) {
+        return true;
+    }
+    if (!indexed || !indexed->known) {
+        return false;
+    }
+    bool indexed_sha = indexed->has_sha && indexed->head_sha[0] != '\0';
+    return cbm_branch_id_same(indexed, current) && (indexed_sha || current->head_sha[0] == '\0');
+}
+
 bool cbm_branch_id_same(const cbm_branch_id_t *indexed, const cbm_branch_id_t *current) {
     if (!indexed || !current || !indexed->known || !current->known) {
         return true;

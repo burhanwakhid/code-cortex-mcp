@@ -23,6 +23,7 @@
 #include <foundation/platform.h>
 
 #include <stdio.h>
+#include "sqlite3.h"
 #include <stdlib.h>
 #include <string.h>
 #ifndef _WIN32
@@ -598,8 +599,6 @@ TEST(branch_index_config_applies_in_process) {
 static int bi_status_matches(cbm_mcp_server_t *srv) {
     char args[1200];
     snprintf(args, sizeof(args), "{\"project\":\"%s\"}", g_bi_project);
-    /* As the tool server does before every request. */
-    cbm_mcp_server_revalidate_store(srv);
     char *resp = cbm_mcp_handle_tool(srv, "index_status", args);
     int r = !resp                                                  ? -1
             : strstr(resp, "\\\"index_matches_checkout\\\":true")  ? 1
@@ -1071,10 +1070,133 @@ TEST(branch_switch_rehashes_same_size_same_mtime) {
     r = bi_index(repo, -1);
     ASSERT_EQ(r.reparsed, 0);
 
+    /* A legacy Branch node with no properties records no commit: the graph's
+     * age is unknown, so the next run after a pull verifies too. */
+    char db[1024];
+    char qn[1024];
+    cbm_store_t *s = cbm_store_open_path(bi_db_path(db, sizeof(db)));
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_get_branch(s, g_bi_project, qn, sizeof(qn), NULL, 0), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_set_branch(s, g_bi_project, qn, "feature", "{}"), CBM_STORE_OK);
+    cbm_store_close(s);
+    th_write_file(x, "def ddd():\n    return 1\n");
+    ASSERT_EQ(bi_git(repo, "commit -q -am pull2"), 0);
+    ASSERT_EQ(bi_pin_mtime(x), 0);
+    r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_EQ(r.reparsed, 1);
+    ASSERT_EQ(bi_count("ddd"), 1);
+    r = bi_index(repo, -1);
+    ASSERT_EQ(r.reparsed, 0); /* stamped with a commit now: fast path again */
+
     bi_cleanup(repo);
     PASS();
 }
 #endif
+
+/* Rows of nodes_fts matching term (a full-text query), -1 on error. */
+static int bi_fts_hits(const char *term) {
+    char db[1024];
+    cbm_store_t *s = cbm_store_open_path_query(bi_db_path(db, sizeof(db)));
+    sqlite3 *h = cbm_store_get_db(s);
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (h && sqlite3_prepare_v2(h, "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH ?1", -1,
+                                &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, term, -1, SQLITE_TRANSIENT);
+        n = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
+    }
+    sqlite3_finalize(st);
+    cbm_store_close(s);
+    return n;
+}
+
+/* The Branch node's full-text entry follows the stamp: on a switch whose
+ * incremental pass changes nothing (the stamp is the only write) and on one
+ * that re-dumps, free-text search finds the new branch and not the old. */
+TEST(branch_stamp_keeps_fts_in_step) {
+    char *repo = th_mktempdir("cbm_bi_fts");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    ASSERT_EQ(bi_git(repo, "init -q -b alphaone"), 0);
+    th_write_file(TH_PATH(repo, "src/x.py"), "def aaa():\n    return 1\n");
+    /* Enough files that adding one stays an incremental pass. */
+    th_write_file(TH_PATH(repo, "src/z1.py"), "def zz1():\n    return 1\n");
+    th_write_file(TH_PATH(repo, "src/z2.py"), "def zz2():\n    return 1\n");
+    ASSERT_EQ(bi_git(repo, "add ."), 0);
+    ASSERT_EQ(bi_git(repo, "commit -q -m one"), 0);
+    ASSERT_EQ(bi_git(repo, "branch -q betatwo"), 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q -b gammathree"), 0);
+    th_write_file(TH_PATH(repo, "src/y.py"), "def yyy():\n    return 2\n");
+    ASSERT_EQ(bi_git(repo, "add ."), 0);
+    ASSERT_EQ(bi_git(repo, "commit -q -m three"), 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q alphaone"), 0);
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_fts_hits("alphaone"), 1);
+
+    ASSERT_EQ(bi_git(repo, "checkout -q betatwo"), 0); /* same commit */
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_STR_EQ(r.action, "seeded");
+    ASSERT_EQ(r.reparsed, 0);
+    ASSERT_EQ(bi_fts_hits("betatwo"), 1);
+    ASSERT_EQ(bi_fts_hits("alphaone"), 0);
+
+    ASSERT_EQ(bi_git(repo, "checkout -q gammathree"), 0); /* re-dumps */
+    r = bi_index(repo, -1);
+    ASSERT_STR_EQ(r.action, "seeded");
+    ASSERT_EQ(r.reparsed, 1);
+    ASSERT_EQ(bi_fts_hits("gammathree"), 1);
+    ASSERT_EQ(bi_fts_hits("betatwo"), 0);
+
+    bi_cleanup(repo);
+    PASS();
+}
+
+/* A Branch node whose HAS_BRANCH edge was left behind (a stamp torn before
+ * stamps were one transaction) is repaired by the next run, even though the
+ * node itself already names the checkout. */
+TEST(branch_stamp_repairs_torn_edge) {
+    char *repo = bi_make_repo("cbm_bi_torn");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+
+    char db[1024];
+    cbm_store_t *s = cbm_store_open_path(bi_db_path(db, sizeof(db)));
+    ASSERT_NOT_NULL(s);
+    char sql[1400];
+    snprintf(sql, sizeof(sql),
+             "UPDATE edges SET properties = '{\"branch\":\"stale\"}' WHERE project = '%s' AND "
+             "type = 'HAS_BRANCH';",
+             g_bi_project);
+    ASSERT_EQ(cbm_store_exec(s, sql), CBM_STORE_OK);
+    cbm_store_close(s);
+
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_EQ(r.reparsed, 0);
+    s = cbm_store_open_path_query(bi_db_path(db, sizeof(db)));
+    ASSERT_NOT_NULL(s);
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(s),
+                                 "SELECT count(*) FROM edges e JOIN nodes n ON n.id = e.target_id "
+                                 "WHERE e.type = 'HAS_BRANCH' AND e.properties = n.properties",
+                                 -1, &st, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+    int in_step = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    cbm_store_close(s);
+    ASSERT_EQ(in_step, 1);
+
+    bi_cleanup(repo);
+    PASS();
+}
 
 SUITE(branch_index) {
     char probe[64];
@@ -1105,4 +1227,6 @@ SUITE(branch_index) {
 #ifndef _WIN32
     RUN_TEST(branch_switch_rehashes_same_size_same_mtime);
 #endif
+    RUN_TEST(branch_stamp_keeps_fts_in_step);
+    RUN_TEST(branch_stamp_repairs_torn_edge);
 }

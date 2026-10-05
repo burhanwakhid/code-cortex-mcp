@@ -880,7 +880,7 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_stem_marks_t *marks,
     cbm_gbuf_upsert_node(p->gbuf, "Project", p->project_name, p->project_name, NULL, 0, 0, "{}");
     const char *branch_qn = p->branch_qn ? p->branch_qn : p->project_name;
     const char *branch_name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
-    char branch_props[CBM_SZ_2K];
+    char branch_props[CBM_SZ_4K]; /* the same size the stamp writes with */
     const char *branch_props_json = "{}";
     if (cbm_git_context_props_json(&p->git_ctx, branch_props, sizeof(branch_props)) > 0) {
         branch_props_json = branch_props;
@@ -2079,37 +2079,51 @@ static void pipeline_branch_switch(cbm_pipeline_t *p) {
 
 /* Record the checkout this run indexed on the Branch node: the QN (the slot
  * the next run's park step reads) and the properties (branch name, HEAD
- * commit -- the identity session start and index_status compare). A full run
- * builds the node from the current checkout already; an incremental (or
- * no-op) run keeps the stored structure, which names whichever checkout last
- * ran a full rebuild. Written only when something differs, so a no-op run on
- * an unmoved HEAD still leaves the file untouched. The incremental dump also
- * calls this before it refreshes the artifact. */
-void cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
-    if (!p || !p->branch_qn || !db_path) {
+ * commit -- the identity session start and index_status compare), with the
+ * HAS_BRANCH edge and the node's full-text entry (cbm_store_set_branch). A
+ * full run builds the node from the current checkout already; an incremental
+ * (or no-op) run keeps the stored structure, which names whichever checkout
+ * last ran a full rebuild. Written only when the node or an edge differs, so
+ * a no-op run on an unmoved HEAD leaves the file untouched and a torn earlier
+ * stamp is repaired. s is open read-write. */
+void cbm_pipeline_stamp_branch_store(cbm_pipeline_t *p, cbm_store_t *s) {
+    if (!p || !p->branch_qn || !s) {
         return;
     }
     char props[CBM_SZ_4K];
     const char *props_json =
         cbm_git_context_props_json(&p->git_ctx, props, sizeof(props)) > 0 ? props : "{}";
     const char *name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
-    char stored_qn[CBM_SZ_1K] = "";
-    char stored_name[CBM_SZ_1K] = "";
-    char stored_props[CBM_SZ_4K] = "";
+    if (cbm_store_get_branch(s, p->project_name, NULL, 0, NULL, 0) != CBM_STORE_OK ||
+        cbm_store_branch_is(s, p->project_name, p->branch_qn, name, props_json)) {
+        return;
+    }
+    if (cbm_store_set_branch(s, p->project_name, p->branch_qn, name, props_json) != CBM_STORE_OK) {
+        cbm_log_warn("pipeline.err", "phase", "branch_stamp", "project", p->project_name, "err",
+                     cbm_store_error(s));
+    }
+}
+
+void cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
+    if (!p || !p->branch_qn || !db_path) {
+        return;
+    }
+    /* Check on a read-only connection first: opening read-write is itself a
+     * write (WAL setup), which a no-op run must not do. */
+    char props[CBM_SZ_4K];
+    const char *props_json =
+        cbm_git_context_props_json(&p->git_ctx, props, sizeof(props)) > 0 ? props : "{}";
+    const char *name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
     cbm_store_t *s = cbm_store_open_path_query(db_path);
-    int get_rc = s ? cbm_store_get_branch_props(s, p->project_name, stored_qn, sizeof(stored_qn),
-                                                stored_name, sizeof(stored_name), stored_props,
-                                                sizeof(stored_props))
-                   : CBM_STORE_ERR;
+    bool needed = s && cbm_store_get_branch(s, p->project_name, NULL, 0, NULL, 0) == CBM_STORE_OK &&
+                  !cbm_store_branch_is(s, p->project_name, p->branch_qn, name, props_json);
     cbm_store_close(s);
-    if (get_rc == CBM_STORE_OK &&
-        (strcmp(stored_qn, p->branch_qn) != 0 || strcmp(stored_name, name) != 0 ||
-         strcmp(stored_props, props_json) != 0)) {
+    if (needed) {
         s = cbm_store_open_path(db_path);
-        if (!s || cbm_store_set_branch(s, p->project_name, p->branch_qn, name, props_json) !=
-                      CBM_STORE_OK) {
+        if (!s) {
             cbm_log_warn("pipeline.err", "phase", "branch_stamp", "project", p->project_name);
         }
+        cbm_pipeline_stamp_branch_store(p, s);
         cbm_store_close(s);
     }
 }
@@ -2156,7 +2170,8 @@ static void pipeline_note_checkout_moved(const cbm_pipeline_t *p) {
  * graph older than its branch, a pull. So compare the identity the database
  * records -- read after the switch, so a restored graph is judged by its own
  * stamp, and before this run stamps anything -- with the checkout now. An
- * unrecorded identity counts as different; a non-git checkout has none. */
+ * unrecorded identity or commit counts as different; a non-git checkout has
+ * none. */
 static void pipeline_decide_content_check(cbm_pipeline_t *p) {
     p->verify_content = false;
     cbm_branch_id_t current;
@@ -2165,8 +2180,16 @@ static void pipeline_decide_content_check(cbm_pipeline_t *p) {
     cbm_store_t *s = db_path ? cbm_store_open_path_query(db_path) : NULL;
     if (s) {
         cbm_branch_id_t indexed;
-        bool known = cbm_branch_id_indexed(s, p->project_name, &indexed);
-        p->verify_content = !known || !cbm_branch_id_same(&indexed, &current);
+        /* Strict: the lenient comparison calls a side without a commit a
+         * match, which here would accept a graph of unknown age on the same
+         * branch (a legacy node with no properties, after a pull) and let the
+         * stamp vouch for it. This side comes from git itself
+         * (cbm_git_context_resolve), which has a commit on any born branch,
+         * reftable included; only an unborn branch has none, and there both
+         * sides are empty and nothing can have moved -- so no repository is
+         * verified on every run. */
+        (void)cbm_branch_id_indexed(s, p->project_name, &indexed);
+        p->verify_content = !cbm_branch_id_same_strict(&indexed, &current);
         cbm_store_close(s);
     }
     free(db_path);
