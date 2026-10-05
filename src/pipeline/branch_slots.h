@@ -107,6 +107,12 @@ bool cbm_branch_slots_dir(const char *db_path, const char *project, char *buf, s
 cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *project,
                                             const char *slug, int keep, char *from, size_t from_sz);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Callback run when a restore starts, before it takes the live database's
+ * write lock: a write made here must survive the restore. NULL clears. */
+void cbm_branch_slots_test_before_restore(void (*callback)(void *), void *data);
+#endif
+
 /* Sorted slugs of the parked databases for project. Returns the count (0 when
  * none); *out is a malloc'd array of malloc'd strings, free with
  * cbm_branch_slots_free_list. */

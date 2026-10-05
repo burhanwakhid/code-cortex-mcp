@@ -241,40 +241,6 @@ static bool copy_db(const char *src, const char *dest) {
     return rc == CBM_STORE_OK;
 }
 
-/* Replace the CONTENT of the live database at db_path with the slot's, as
- * one ordinary SQLite write transaction (backup API into db_path's own
- * connection). The file, its WAL and its shared memory stay in place: a
- * reader mid-query keeps its snapshot, the next read transaction sees the
- * whole restored database, a crash before the commit leaves the outgoing
- * database intact, and nothing is renamed over a file another process has
- * open. Swapping the file in instead would leave a window -- and after a
- * crash, a permanent state -- in which db_path's old WAL sits beside the new
- * main file and is replayed onto it. The price is the copy going through the
- * WAL (the slot's size written twice, and the WAL keeps that size on disk
- * until the next re-dump replaces the file). Fails, leaving db_path as it
- * was, when the page sizes differ (a WAL database cannot change its page
- * size) or the write lock is not granted in time. */
-static bool restore_into(const char *slot, const char *db_path) {
-    cbm_store_t *src = cbm_store_open_path_query(slot);
-    cbm_store_t *dst = src ? cbm_store_open_path(db_path) : NULL;
-    sqlite3 *sdb = cbm_store_get_db(src);
-    sqlite3 *ddb = cbm_store_get_db(dst);
-    bool ok = false;
-    if (sdb && ddb) {
-        sqlite3_backup *bk = sqlite3_backup_init(ddb, "main", sdb, "main");
-        if (bk) {
-            int rc = sqlite3_backup_step(bk, -1);
-            ok = rc == SQLITE_DONE && sqlite3_backup_finish(bk) == SQLITE_OK;
-            if (rc != SQLITE_DONE) {
-                (void)sqlite3_backup_finish(bk);
-            }
-        }
-    }
-    cbm_store_close(dst);
-    cbm_store_close(src);
-    return ok;
-}
-
 typedef struct {
     char name[CBM_DIRENT_NAME_MAX];
     int64_t mtime;
@@ -403,6 +369,75 @@ static bool carry_adr(const char *db_path, const char *project, const char *slot
     return ok;
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void (*before_restore_cb)(void *) = nullptr;
+static void *before_restore_data = nullptr;
+
+void cbm_branch_slots_test_before_restore(void (*callback)(void *), void *data) {
+    before_restore_cb = callback;
+    before_restore_data = data;
+}
+#endif
+
+/* Replace the CONTENT of the live database at db_path with the slot's, as
+ * one ordinary SQLite write transaction (backup API into db_path's own
+ * connection). The file, its WAL and its shared memory stay in place: a
+ * reader mid-query keeps its snapshot, the next read transaction sees the
+ * whole restored database, a crash before the commit leaves the outgoing
+ * database intact, and nothing is renamed over a file another process has
+ * open. Swapping the file in instead would leave a window -- and after a
+ * crash, a permanent state -- in which db_path's old WAL sits beside the new
+ * main file and is replayed onto it. The price is the copy going through the
+ * WAL (the slot's size written twice, and the WAL keeps that size on disk
+ * until the next re-dump replaces the file).
+ *
+ * The ADR is carried INSIDE that transaction's write lock. The first backup
+ * step takes db_path's write lock and holds it until the backup completes;
+ * only then is the live ADR read (on another connection, which sees every
+ * commit made before the lock) and written into the slot, and the rest of
+ * the backup copies it. A manage_adr write from another process therefore
+ * either committed before the lock and is carried, or waits on the lock and
+ * lands on top of the restored database -- never lost in between. Writing
+ * the slot restarts the copy (it is the backup's source), still under the
+ * same lock.
+ *
+ * Fails, leaving db_path as it was, when the ADR cannot be carried, the page
+ * sizes differ (a WAL database cannot change its page size) or the write lock
+ * is not granted in time. */
+static bool restore_into(const char *slot, const char *db_path, const char *project) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (before_restore_cb) {
+        before_restore_cb(before_restore_data);
+    }
+#endif
+    cbm_store_t *src = cbm_store_open_path_query(slot);
+    cbm_store_t *dst = src ? cbm_store_open_path(db_path) : NULL;
+    sqlite3 *sdb = cbm_store_get_db(src);
+    sqlite3 *ddb = cbm_store_get_db(dst);
+    bool ok = false;
+    sqlite3_backup *bk = sdb && ddb ? sqlite3_backup_init(ddb, "main", sdb, "main") : NULL;
+    if (bk) {
+        int rc = sqlite3_backup_step(bk, 1);
+        if (rc == SQLITE_OK) {
+            /* Write lock held, nothing committed yet. */
+            if (carry_adr(db_path, project, slot)) {
+                rc = sqlite3_backup_step(bk, -1);
+                ok = rc == SQLITE_DONE;
+            }
+        } else if (rc == SQLITE_DONE) {
+            /* A one-page database: no index database is that small (its
+             * schema alone spans several pages), so nothing to carry into. */
+            cbm_log_warn("branch.restore_tiny", "project", project);
+            ok = true;
+        }
+        /* Before SQLITE_DONE, finish rolls the destination back. */
+        ok = sqlite3_backup_finish(bk) == SQLITE_OK && ok;
+    }
+    cbm_store_close(dst);
+    cbm_store_close(src);
+    return ok;
+}
+
 cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *project,
                                             const char *slug, int keep, char *from,
                                             size_t from_sz) {
@@ -458,7 +493,7 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
      * nothing had been parked for this branch. */
     cbm_branch_switch_t action = CBM_BRANCH_SWITCH_SEEDED;
     if (have_incoming) {
-        if (carry_adr(db_path, project, incoming) && restore_into(incoming, db_path)) {
+        if (restore_into(incoming, db_path, project)) {
             action = CBM_BRANCH_SWITCH_RESTORED;
             unlink_slot(incoming);
         } else {

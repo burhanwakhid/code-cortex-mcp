@@ -2098,10 +2098,10 @@ static void pipeline_branch_switch(cbm_pipeline_t *p) {
  * (or no-op) run keeps the stored structure, which names whichever checkout
  * last ran a full rebuild. Written only when the node or an edge differs, so
  * a no-op run on an unmoved HEAD leaves the file untouched and a torn earlier
- * stamp is repaired. s is open read-write. */
-void cbm_pipeline_stamp_branch_store(cbm_pipeline_t *p, cbm_store_t *s) {
+ * stamp is repaired. s is open read-write. True when it wrote. */
+bool cbm_pipeline_stamp_branch_store(cbm_pipeline_t *p, cbm_store_t *s) {
     if (!p || !p->branch_qn || !s) {
-        return;
+        return false;
     }
     char props[CBM_SZ_4K];
     const char *props_json =
@@ -2109,17 +2109,19 @@ void cbm_pipeline_stamp_branch_store(cbm_pipeline_t *p, cbm_store_t *s) {
     const char *name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
     if (cbm_store_get_branch(s, p->project_name, NULL, 0, NULL, 0) != CBM_STORE_OK ||
         cbm_store_branch_is(s, p->project_name, p->branch_qn, name, props_json)) {
-        return;
+        return false;
     }
     if (cbm_store_set_branch(s, p->project_name, p->branch_qn, name, props_json) != CBM_STORE_OK) {
         cbm_log_warn("pipeline.err", "phase", "branch_stamp", "project", p->project_name, "err",
                      cbm_store_error(s));
+        return false;
     }
+    return true;
 }
 
-void cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
+bool cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
     if (!p || !p->branch_qn || !db_path) {
-        return;
+        return false;
     }
     /* Check on a read-only connection first: opening read-write is itself a
      * write (WAL setup), which a no-op run must not do. */
@@ -2131,14 +2133,16 @@ void cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
     bool needed = s && cbm_store_get_branch(s, p->project_name, NULL, 0, NULL, 0) == CBM_STORE_OK &&
                   !cbm_store_branch_is(s, p->project_name, p->branch_qn, name, props_json);
     cbm_store_close(s);
+    bool wrote = false;
     if (needed) {
         s = cbm_store_open_path(db_path);
         if (!s) {
             cbm_log_warn("pipeline.err", "phase", "branch_stamp", "project", p->project_name);
         }
-        cbm_pipeline_stamp_branch_store(p, s);
+        wrote = cbm_pipeline_stamp_branch_store(p, s);
         cbm_store_close(s);
     }
+    return wrote;
 }
 
 static int pipeline_run_claimed(cbm_pipeline_t *p);
@@ -2231,7 +2235,20 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     int rc = pipeline_run_claimed(p);
     if (rc == 0 && !check_cancel(p)) {
         char *db_path = resolve_db_path(p);
-        cbm_pipeline_stamp_branch(p, db_path);
+        /* A run whose only write is the stamp (a switch to a branch with the
+         * same indexed contents ends as an incremental no-op) exported
+         * nothing, so an existing artifact still names the outgoing branch:
+         * export again, as the incremental path would have. Only when the
+         * stamp wrote, so an unchanged run never re-exports; the export's
+         * own files under .code-cortex/ do not move HEAD, so the next run's
+         * stamp writes nothing and this cannot repeat on its own. */
+        if (cbm_pipeline_stamp_branch(p, db_path) &&
+            (p->persistence || cbm_artifact_exists(p->repo_path)) &&
+            cbm_artifact_export(db_path, p->repo_path, p->project_name,
+                                p->persistence ? CBM_ARTIFACT_BEST : CBM_ARTIFACT_FAST) != 0) {
+            const char *err = cbm_artifact_export_last_error();
+            cbm_log_error("pipeline.err", "phase", "artifact_export", "err", err ? err : "unknown");
+        }
         free(db_path);
         pipeline_note_checkout_moved(p);
     }

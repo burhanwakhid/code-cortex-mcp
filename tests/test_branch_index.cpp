@@ -1216,11 +1216,15 @@ TEST(branch_unreadable_adr_blocks_restore) {
     ASSERT_EQ(bi_index(repo, -1).rc, 0); /* main parked with "OLD" */
     ASSERT_TRUE(bi_is_parked("main"));
 
-    /* The live ADR becomes unreadable (its table is gone). */
+    /* The live ADR becomes unreadable: a view of the wrong shape stands in
+     * for its table, which a read-write open (CREATE TABLE IF NOT EXISTS)
+     * leaves in place. */
     char db[1024];
     cbm_store_t *s = cbm_store_open_path(bi_db_path(db, sizeof(db)));
     ASSERT_NOT_NULL(s);
-    ASSERT_EQ(cbm_store_exec(s, "DROP TABLE project_summaries;"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(s, "DROP TABLE project_summaries;"
+                                "CREATE VIEW project_summaries AS SELECT 1 AS x;"),
+              CBM_STORE_OK);
     cbm_store_close(s);
 
     ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
@@ -1275,6 +1279,89 @@ TEST(branch_switch_recomputes_session_brief) {
 }
 #endif
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* manage_adr in another process, committing just as a restore starts. */
+static void bi_write_adr_new(void *data) {
+    (void)data;
+    (void)bi_adr_put("NEW");
+}
+
+/* An ADR written while a switch is under way, before the restore takes the
+ * live database's write lock, survives the restore. */
+TEST(branch_restore_keeps_concurrent_adr_write) {
+    char *repo = bi_make_repo("cbm_bi_adrrace");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char adr[256];
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_adr_put("A"), CBM_STORE_OK);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* main parked with "A" */
+
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    cbm_branch_slots_test_before_restore(bi_write_adr_new, NULL);
+    bi_run_t r = bi_index(repo, -1);
+    cbm_branch_slots_test_before_restore(NULL, NULL);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "restored");
+    ASSERT_STR_EQ(bi_adr(adr, sizeof(adr)), "NEW");
+
+    bi_cleanup(repo);
+    PASS();
+}
+#endif
+
+/* A switch to a branch with the same indexed contents writes only the stamp;
+ * an existing artifact must still be re-exported under the new branch. */
+TEST(branch_stamp_only_switch_reexports_artifact) {
+    char *repo = bi_make_repo("cbm_bi_artstamp");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    snprintf(g_bi_project, sizeof(g_bi_project), "%s", cbm_pipeline_project_name(p));
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    ASSERT_TRUE(cbm_artifact_exists(repo));
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* take in the .code-cortex/ files */
+
+    ASSERT_EQ(bi_git(repo, "branch -q twin"), 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q twin"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "seeded");
+    ASSERT_EQ(r.reparsed, 0); /* nothing but the stamp changed */
+
+    char *dir = th_mktempdir("cbm_bi_artstamp_import");
+    ASSERT_NOT_NULL(dir);
+    char imported[1024];
+    snprintf(imported, sizeof(imported), "%s/imported.db", dir);
+    ASSERT_EQ(cbm_artifact_import(repo, imported), 0);
+    cbm_store_t *s = cbm_store_open_path_query(imported);
+    ASSERT_NOT_NULL(s);
+    char qn[1024] = "";
+    ASSERT_EQ(cbm_store_get_branch(s, g_bi_project, qn, sizeof(qn), NULL, 0), CBM_STORE_OK);
+    cbm_store_close(s);
+    ASSERT_STR_EQ(cbm_branch_slug_from_qn(qn, g_bi_project), "twin");
+
+    /* The next run on twin writes no stamp. (It still re-extracts the
+     * artifact's own metadata file under .code-cortex/ and re-exports through
+     * the incremental path, as every run after an export already did.) */
+    r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+
+    th_rmtree(dir);
+    bi_cleanup(repo);
+    PASS();
+}
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -1309,5 +1396,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_unreadable_adr_blocks_restore);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(branch_switch_recomputes_session_brief);
+    RUN_TEST(branch_restore_keeps_concurrent_adr_write);
 #endif
+    RUN_TEST(branch_stamp_only_switch_reexports_artifact);
 }
