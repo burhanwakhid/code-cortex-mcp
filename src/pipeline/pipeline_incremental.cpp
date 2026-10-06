@@ -120,6 +120,16 @@ static bool stored_sha_valid(const cbm_file_hash_t *h) {
     return valid;
 }
 
+/* An empty file on disk where the stored row is an empty file too: the same
+ * bytes, whatever the mtime. Extraction records no digest for an empty file
+ * (its row's sha256 is ""), so the content check below cannot settle it; a
+ * checkout that deletes and recreates an empty __init__.py would otherwise
+ * re-extract it, and with it run the whole incremental pass, on every switch
+ * back to a parked branch. */
+static bool empty_both(const cbm_file_hash_t *h, const struct stat *st) {
+    return h->size == 0 && st->st_size == 0;
+}
+
 /* SHA-256 of a file's bytes, the same digest extraction records over the
  * buffer it parses. False when the file cannot be read in full. */
 static bool file_sha256_hex(const char *path, char out[CBM_SHA256_HEX_LEN + 1]) {
@@ -201,9 +211,10 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
             changed[i] = true;
             n_changed++;
         } else if (stat_mtime_ns(&st) != h->mtime_ns || verify_content) {
-            char digest[CBM_SHA256_HEX_LEN + 1];
-            if (stored_sha_valid(h) && file_sha256_hex(files[i].path, digest) &&
-                strcmp(digest, h->sha256) == 0) {
+            char digest[CBM_SHA256_HEX_LEN + 1] = "";
+            if (empty_both(h, &st) ||
+                (stored_sha_valid(h) && file_sha256_hex(files[i].path, digest) &&
+                 strcmp(digest, h->sha256) == 0)) {
                 snprintf(versions[i].sha256, sizeof(versions[i].sha256), "%s", digest);
                 if (refreshed && stat_mtime_ns(&st) != h->mtime_ns) {
                     refreshed[i] = true;
@@ -333,7 +344,7 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
                  * purged rather than kept with the other checkout's symbols
                  * (the next run that discovers it extracts it afresh). */
                 char digest[CBM_SHA256_HEX_LEN + 1];
-                preserve = !verify_content ||
+                preserve = !verify_content || empty_both(&stored[i], &st) ||
                            (stored_sha_valid(&stored[i]) && file_sha256_hex(abs_path, digest) &&
                             strcmp(digest, stored[i].sha256) == 0);
             } else if (errno != ENOENT && errno != ENOTDIR) {

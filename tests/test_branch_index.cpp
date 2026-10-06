@@ -282,6 +282,39 @@ TEST(branch_switch_parks_and_restores) {
     PASS();
 }
 
+/* An empty file only one branch has (a new package's __init__.py) is deleted
+ * and recreated by each checkout, so it comes back under a new mtime. Its
+ * stored row has no digest, and the restore used to re-extract it, running
+ * the whole incremental pass on every switch back. Soak finding (django). */
+TEST(branch_restore_keeps_recreated_empty_file) {
+    char *repo = bi_make_repo("cbm_bi_empty");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    th_write_file(TH_PATH(repo, "src/pkg/__init__.py"), "");
+    ASSERT_EQ(bi_git(repo, "add ."), 0);
+    ASSERT_EQ(bi_git(repo, "commit -q -m pkg"), 0);
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "seeded");
+
+    /* Let the recreated file's mtime differ from the stored one even on a
+     * file system with coarse timestamps. */
+    cbm_usleep(1100000);
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "restored");
+    ASSERT_EQ(r.reparsed, 0);
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 /* Every detached HEAD shares one "detached" slot. */
 TEST(branch_switch_detached_shares_one_slot) {
     char *repo = bi_make_repo("cbm_bi_detached");
@@ -2177,6 +2210,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_slug_from_qn);
     RUN_TEST(branch_git_head_slug_reads_head_file);
     RUN_TEST(branch_switch_parks_and_restores);
+    RUN_TEST(branch_restore_keeps_recreated_empty_file);
     RUN_TEST(branch_switch_detached_shares_one_slot);
     RUN_TEST(branch_parked_hidden_status_and_delete);
     RUN_TEST(branch_park_cap_evicts_oldest);
