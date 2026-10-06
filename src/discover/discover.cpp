@@ -802,6 +802,50 @@ static bool is_safety_core_dir(const char *name) {
     return str_in_list(name, SAFETY_CORE_DIRS);
 }
 
+/* Whether dir is the root of a linked git worktree: its .git is a gitlink
+ * file "gitdir: <common dir>/worktrees/<name>". A worktree added anywhere
+ * inside the checkout (not only under .worktrees) is a parallel copy of the
+ * repository with an index of its own; walking into it duplicated every
+ * symbol in the parent's graph. A submodule's gitlink names
+ * ".../modules/<name>" and is still walked, as is a nested clone (.git
+ * directory). Mirrors cbm_git_is_linked_worktree, which discover does not
+ * link against. One open attempt per directory: it fails where there is no
+ * .git, and reading a .git directory yields no "gitdir:" line. */
+static bool is_linked_worktree_root(const char *dir) {
+    char dot_git[CBM_SZ_4K];
+    if (snprintf(dot_git, sizeof(dot_git), "%s/.git", dir) >= (int)sizeof(dot_git)) {
+        return false;
+    }
+    FILE *f = cbm_fopen(dot_git, "r");
+    if (!f) {
+        return false;
+    }
+    char line[CBM_SZ_4K];
+    bool got = fgets(line, sizeof(line), f) != NULL;
+    (void)fclose(f);
+    if (!got || strncmp(line, "gitdir:", 7) != 0) {
+        return false;
+    }
+    char *val = line + 7;
+    size_t n = strlen(val);
+    for (size_t i = 0; i < n; i++) {
+        if (val[i] == '\\') {
+            val[i] = '/';
+        }
+    }
+    while (n > 0 &&
+           (val[n - 1] == '\n' || val[n - 1] == '\r' || val[n - 1] == ' ' || val[n - 1] == '/')) {
+        val[--n] = '\0';
+    }
+    char *name = strrchr(val, '/');
+    if (!name) {
+        return false;
+    }
+    *name = '\0';
+    const char *parent = strrchr(val, '/');
+    return parent && strcmp(parent + 1, "worktrees") == 0;
+}
+
 /* What the ignore rules say about a directory. DIR_GIT_IGNORED comes from
  * git's own rules (.gitignore files, info/exclude, the global excludes file),
  * which yield to tracked content; built-in skips and .cbmignore never do. */
@@ -1120,8 +1164,9 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
         if (verdict == DIR_KEEP && frame->git_ignored) {
             verdict = DIR_GIT_IGNORED; /* below a git-ignored directory, as in git */
         }
-        if (verdict == DIR_KEEP ||
-            (verdict == DIR_GIT_IGNORED && tracked_has_dir(out->tracked, rel_path))) {
+        if ((verdict == DIR_KEEP ||
+             (verdict == DIR_GIT_IGNORED && tracked_has_dir(out->tracked, rel_path))) &&
+            !is_linked_worktree_root(abs_path)) {
             if (!walk_push_subdir(ws, abs_path, rel_path, frame, verdict == DIR_GIT_IGNORED)) {
                 /* Growth failed (OOM). This tree has no discover-level failure
                  * flag, so record the subtree as dropped rather than skipping

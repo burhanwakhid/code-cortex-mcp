@@ -474,6 +474,48 @@ TEST(discover_skips_worktrees) {
     PASS();
 }
 
+/* A linked worktree added anywhere inside the checkout (git worktree add
+ * ./wt) has its own index; the parent's walk must not take in its files. A
+ * submodule (gitlink to .../modules/<name>) and a nested clone (.git
+ * directory) are still walked, as before. */
+TEST(discover_skips_nested_linked_worktree) {
+    char *base = th_mktempdir("cbm_disc_nwt");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "wt-feature/.git"),
+                  "gitdir: /repo/.git/worktrees/wt-feature\n");
+    th_write_file(TH_PATH(base, "wt-feature/src/app.go"), "package app\n");
+    th_write_file(TH_PATH(base, "deps/lib/.git"), "gitdir: ../../.git/modules/deps/lib\n");
+    th_write_file(TH_PATH(base, "deps/lib/lib.go"), "package lib\n");
+    th_write_file(TH_PATH(base, "clone/.git/HEAD"), "ref: refs/heads/main\n");
+    th_write_file(TH_PATH(base, "clone/c.go"), "package c\n");
+
+    cbm_discover_opts_t opts = {};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    bool found_main = false;
+    bool found_lib = false;
+    bool found_clone = false;
+    for (int i = 0; i < count; i++) {
+        ASSERT_NULL(strstr(files[i].rel_path, "wt-feature"));
+        found_main = found_main || strcmp(files[i].rel_path, "src/main.go") == 0;
+        found_lib = found_lib || strcmp(files[i].rel_path, "deps/lib/lib.go") == 0;
+        found_clone = found_clone || strcmp(files[i].rel_path, "clone/c.go") == 0;
+    }
+    ASSERT_TRUE(found_main);
+    ASSERT_TRUE(found_lib);
+    ASSERT_TRUE(found_clone);
+    ASSERT_EQ(count, 3);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 TEST(discover_cbmignore) {
     char *base = th_mktempdir("cbm_disc_cbmi");
     ASSERT(base != NULL);
@@ -1390,6 +1432,7 @@ SUITE(discover) {
 
     /* Go test ports (cross-platform) */
     RUN_TEST(discover_skips_worktrees);
+    RUN_TEST(discover_skips_nested_linked_worktree);
     RUN_TEST(discover_cbmignore);
     RUN_TEST(discover_cbmignore_stacks);
     RUN_TEST(discover_symlink_skipped);
