@@ -1539,6 +1539,26 @@ static char *ha_walk_symbol(cbm_mcp_server_t *srv, const char *start, const char
     return NULL;
 }
 
+/* The brief describes the graph as indexed. When the checkout at root has
+ * moved since (a branch switch, pull or commit while no server watched), say
+ * so: the server refreshes the index on its first poll, but this text is read
+ * before that, and on a large repository the refresh takes minutes. Takes
+ * and returns ownership of brief. */
+static char *ha_append_checkout_note(char *brief, const char *root, const char *project) {
+    char db_path[4096];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cbm_resolve_cache_dir(), project);
+    char *note = cbm_mcp_checkout_mismatch_note(root, project, db_path);
+    if (!note) {
+        return brief;
+    }
+    std::string text = brief;
+    text += "\n";
+    text += note;
+    free(note);
+    free(brief);
+    return strdup(text.c_str());
+}
+
 /* *indexed reports whether some level resolved; when none did and the walk
  * stopped at a checkout root, that root is copied to stop_root (else ""). */
 static char *ha_walk_session(cbm_mcp_server_t *srv, const char *start, bool *indexed,
@@ -1553,6 +1573,9 @@ static char *ha_walk_session(cbm_mcp_server_t *srv, const char *start, bool *ind
         if (project) {
             bool resolved = false;
             char *ctx = ha_session_brief(srv, project, &resolved);
+            if (ctx) {
+                ctx = ha_append_checkout_note(ctx, dir, project);
+            }
             free(project);
             if (ctx || resolved) {
                 *indexed = true;

@@ -159,6 +159,11 @@ void cbm_mcp_expect_project_root(const char *dir);
 bool cbm_mcp_checkout_differs_from_index(const char *root, const char *project,
                                          const char *db_path);
 
+/* The same comparison for the SessionStart hook: when the checkout differs
+ * from the indexed identity, one sentence naming both (branch or detached
+ * HEAD, short commit) for the brief to carry; else NULL. Caller frees. */
+char *cbm_mcp_checkout_mismatch_note(const char *root, const char *project, const char *db_path);
+
 /* The in-process fallback of the above: a full index of root_path in THIS
  * process, with the persisted index config (branch_index, branch_index_keep)
  * applied exactly as index_repository applies it. The caller holds the

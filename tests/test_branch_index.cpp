@@ -2116,6 +2116,57 @@ TEST(branch_session_pending_legacy_once) {
     PASS();
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* SessionStart after a checkout made while no server ran: the stored brief
+ * describes the indexed branch, so the text says the checkout moved, naming
+ * both sides, until an index run catches up. Soak finding: the brief used to
+ * read as current. */
+TEST(branch_session_start_notes_moved_checkout) {
+    char *repo = bi_make_repo("cbm_bi_ssnote");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    char *text = cbm_session_start_text_for_testing(repo);
+    ASSERT_NOT_NULL(text);
+    bool brief = strstr(text, "this repository is indexed as") != NULL;
+    bool quiet = strstr(text, "this index was built for") == NULL;
+    free(text);
+    ASSERT_TRUE(brief);
+    ASSERT_TRUE(quiet);
+
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    text = cbm_session_start_text_for_testing(repo);
+    ASSERT_NOT_NULL(text);
+    brief = strstr(text, "this repository is indexed as") != NULL;
+    bool names_indexed = strstr(text, "this index was built for branch `main` at ") != NULL;
+    bool names_checkout = strstr(text, "the checkout is now branch `feature` at ") != NULL;
+    free(text);
+    ASSERT_TRUE(brief);
+    ASSERT_TRUE(names_indexed);
+    ASSERT_TRUE(names_checkout);
+
+    ASSERT_EQ(bi_git(repo, "checkout -q --detach main"), 0);
+    text = cbm_session_start_text_for_testing(repo);
+    ASSERT_NOT_NULL(text);
+    /* Same commit as indexed, but detached: still another checkout. */
+    bool detached = strstr(text, "the checkout is now a detached HEAD at ") != NULL;
+    free(text);
+    ASSERT_TRUE(detached);
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    text = cbm_session_start_text_for_testing(repo);
+    ASSERT_NOT_NULL(text);
+    quiet = strstr(text, "this index was built for") == NULL;
+    free(text);
+    ASSERT_TRUE(quiet);
+
+    bi_cleanup(repo);
+    PASS();
+}
+#endif
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -2171,4 +2222,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_artifact_bootstrap_adopted_by_importer);
 #endif
     RUN_TEST(branch_session_pending_legacy_once);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(branch_session_start_notes_moved_checkout);
+#endif
 }

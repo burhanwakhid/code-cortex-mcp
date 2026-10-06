@@ -12886,8 +12886,35 @@ static void *autoindex_thread(void *arg) {
  * over the changed files. One SQLite read and a few small file reads (HEAD,
  * the branch ref or packed-refs): initialize stays free of git subprocesses.
  * When HEAD's commit cannot be read from files, only the branch is compared. */
+static bool checkout_differs_from_index(const char *root, const char *project,
+                                        const char *db_path, std::string *note);
+
 bool cbm_mcp_checkout_differs_from_index(const char *root, const char *project,
                                          const char *db_path) {
+    return checkout_differs_from_index(root, project, db_path, nullptr);
+}
+
+char *cbm_mcp_checkout_mismatch_note(const char *root, const char *project, const char *db_path) {
+    std::string note;
+    return checkout_differs_from_index(root, project, db_path, &note) ? strdup(note.c_str())
+                                                                      : NULL;
+}
+
+/* "branch `x` at abc1234" / "a detached HEAD at abc1234" for the note. */
+static std::string checkout_label(const cbm_branch_id_t *id) {
+    std::string s = id->is_detached || !(id->branch || id->slug)
+                        ? std::string("a detached HEAD")
+                        : "branch `" + std::string(id->branch ? id->branch : id->slug) + "`";
+    if (id->has_sha && id->head_sha[0]) {
+        s += " at " + std::string(id->head_sha, strnlen(id->head_sha, 7));
+    }
+    return s;
+}
+
+/* note: when set, the comparison is the hook's (no log line) and a
+ * difference fills it with one sentence naming both sides. */
+static bool checkout_differs_from_index(const char *root, const char *project,
+                                        const char *db_path, std::string *note) {
     cbm_branch_id_t current;
     if (!cbm_branch_id_from_head(root, &current)) {
         cbm_branch_id_free(&current);
@@ -12906,7 +12933,13 @@ bool cbm_mcp_checkout_differs_from_index(const char *root, const char *project,
      * would record one, so marking it would repeat every session. */
     bool other = known && !(current.has_sha ? cbm_branch_id_same_strict(&indexed, &current)
                                             : cbm_branch_id_same(&indexed, &current));
-    if (other) {
+    if (other && note) {
+        *note = "Note: this index was built for " + checkout_label(&indexed) +
+                ", but the checkout is now " + checkout_label(&current) +
+                ". Until the next index run (the MCP server's watcher starts one on its first "
+                "poll; or call index_repository), graph answers describe the indexed code, not "
+                "the files on disk.";
+    } else if (other) {
         cbm_log_info("autoindex.checkout_changed", "project", project, "indexed", indexed.slug,
                      "indexed_head", indexed.head_sha, "checkout", current.slug, "checkout_head",
                      current.head_sha);
