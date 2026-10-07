@@ -139,6 +139,7 @@ def cli(binary, cache, tool, args, cwd, env_extra=None, timeout=7200, watch=()):
     r = subprocess.run([binary, "cli", "--json", tool], input=json.dumps(args), cwd=cwd,
                        capture_output=True, text=True, env=env, timeout=timeout)
     wall = time.monotonic() - t0
+    cli.last_stderr = r.stderr
     if sampler:
         cli.last_peak = sampler.stop()
     out = tool_text(r.stdout)
@@ -187,11 +188,12 @@ def fsize(path):
 
 
 def slot_sizes(cache):
+    """Parked slots: compressed <slot>.db.zst, or <slot>.db from earlier builds."""
     out = {}
     base = os.path.join(cache, "branches")
     for root, _, files in os.walk(base):
         for f in files:
-            if f.endswith(".db"):
+            if f.endswith(".db") or f.endswith(".db.zst"):
                 out[os.path.relpath(os.path.join(root, f), base)] = fsize(os.path.join(root, f))
     return out
 
@@ -317,20 +319,49 @@ def brief_counts(text):
         return None
 
 
+def branch_log(stderr):
+    """The branch.park / branch.restore lines of an in-process run, as dicts."""
+    out = {}
+    for ln in stderr.splitlines():
+        for key in ("branch.park", "branch.restore"):
+            if "msg=%s " % key in ln:
+                kv = dict(tok.split("=", 1) for tok in ln.split() if "=" in tok)
+                out[key.split(".")[1]] = {k: int(v) for k, v in kv.items()
+                                          if k not in ("level", "msg") and v.lstrip("-").isdigit()}
+    return out
+
+
 def index_once(a, cache, mode, repo, branch_off):
     env = {"CBM_BRANCH_INDEX": "0"} if branch_off else {}
+    if a.measure and mode == "on":
+        # In process, so the park/restore log lines reach this stderr.
+        env["CBM_INDEX_SUPERVISOR"] = "0"
     os.makedirs(cache, exist_ok=True)
     # The project name is the path-derived one; read it from an earlier run
     # of this cache when there is one, so the live WAL can be sampled.
     known = [f[:-3] for f in os.listdir(cache) if f.endswith(".db") and f != "_config.db"]
     watch = [db_path(cache, known[0]) + "-wal"] if len(known) == 1 else []
+    # --hold-reader: another process keeps the live database open across the
+    # run (a server's cached store), so the WAL is not removed at the last
+    # close and its size after the run is what stays on disk.
+    reader = None
+    if a.hold_reader and mode == "on" and len(known) == 1:
+        reader = sqlite3.connect("file:%s?mode=ro" % db_path(cache, known[0]), uri=True)
+        reader.execute("SELECT count(*) FROM projects").fetchall()
     cli.last_peak = {}
     res, wall = cli(a.bin, cache, "index_repository", {"repo_path": repo}, repo, env,
                     watch=watch)
+    held_wal = fsize(db_path(cache, known[0]) + "-wal") if reader else None
+    if reader:
+        reader.close()
     project = res.get("project")
     row = {"mode": mode, "wall_s": round(wall, 2), "rc": res["_rc"], "project": project,
            "status": res.get("status"), "nodes": res.get("nodes"), "edges": res.get("edges"),
            "branch": res.get("branch")}
+    if a.measure and mode == "on":
+        row["switch_log"] = branch_log(cli.last_stderr)
+    if held_wal is not None:
+        row["wal_with_reader_bytes"] = held_wal
     if res["_rc"] != 0 or not project:
         row["error"] = res
         return row
@@ -644,6 +675,27 @@ def table(results):
     return "\n".join(lines)
 
 
+def measure_table(results):
+    """Park and restore costs per step (--measure)."""
+    lines = ["| # | switch | DB MB | park s | slot MB | restore s | restore WAL MB | WAL peak MB "
+             "| WAL after, reader open MB | slots MB |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
+    mb = lambda b: "%.1f" % (b / 1e6) if isinstance(b, int) and b >= 0 else "-"
+    sec = lambda ms: "%.2f" % (ms / 1e3) if isinstance(ms, int) else "-"
+    for r in results["steps"]:
+        on = r["on"]
+        lg = on.get("switch_log") or {}
+        park = lg.get("park", {})
+        rest = lg.get("restore", {})
+        lines.append("| %d | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+            r["i"], (on.get("branch") or {}).get("switch", "-"), mb(on.get("db_bytes")),
+            sec(park.get("elapsed_ms")), mb(park.get("slot_bytes")),
+            sec(rest.get("elapsed_ms")), mb(rest.get("wal_bytes")),
+            mb(on.get("wal_peak_bytes")), mb(on.get("wal_with_reader_bytes")),
+            mb(sum(on.get("slots", {}).values()))))
+    return "\n".join(lines)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -653,6 +705,10 @@ def main():
     ap.add_argument("--steps", default="")
     ap.add_argument("--no-off", action="store_true", help="skip the CBM_BRANCH_INDEX=0 run")
     ap.add_argument("--no-ground-truth", action="store_true")
+    ap.add_argument("--measure", action="store_true",
+                    help="run the on index in process and record park/restore timings")
+    ap.add_argument("--hold-reader", action="store_true",
+                    help="keep a reader connection open on the live database during on runs")
     ap.add_argument("--gt-twice", action="store_true",
                     help="full-index step 0 twice to measure full-vs-full nondeterminism")
     ap.add_argument("--offline", metavar="BRANCH", help="run the offline-checkout scenario")
@@ -684,6 +740,9 @@ def main():
     save(a, results)
     if results["steps"]:
         print(table(results))
+        if a.measure:
+            print()
+            print(measure_table(results))
     fails = [f for r in results["steps"] for f in r["failures"]]
     print("sanitizer: %s" % ("clean" if not results["sanitizer"]
                              else "%d report lines" % len(results["sanitizer"])))
