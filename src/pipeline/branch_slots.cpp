@@ -746,10 +746,17 @@ void cbm_branch_slots_test_before_restore(void (*callback)(void *), void *data) 
  * makes SQLite restart the WAL from its start and, under journal_size_limit
  * = 0, truncate the file to what that commit wrote. SQLite restarts the WAL
  * only when no reader is using its frames, so a reader mid-query keeps its
- * snapshot and the shrink waits for the next restore. This is SQLite's own
- * WAL reset, not a TRUNCATE or RESTART checkpoint: nothing waits on readers,
- * and the -wal file is never memory-mapped, so no process can fault on the
- * shorter file (cbm_store_checkpoint). */
+ * snapshot and the shrink waits. This is SQLite's own WAL reset, not a
+ * TRUNCATE or RESTART checkpoint: nothing waits on readers, and the -wal file
+ * is read with pread, never memory-mapped, so no process can fault on the
+ * shorter file (cbm_store_checkpoint).
+ *
+ * Best effort: with readers that keep starting transactions it rarely finds
+ * the WAL free (measured: 0-3% of restores on Linux, 5-15% on macOS, with
+ * readers looping), and journal_size_limit = 0 lives only on this short-lived
+ * connection. The backstop is the journal_size_limit every write connection
+ * sets (cbm_store_resolve_journal_size_limit, 256 MiB): the next write after
+ * a full checkpoint, on any connection, cuts the file back to it. */
 static void shrink_wal(sqlite3 *db) {
     int frames = 0;
     int copied = 0;

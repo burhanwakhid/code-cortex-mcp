@@ -273,9 +273,20 @@ unchanged `user_version` with `journal_size_limit = 0`. SQLite then restarts the
 start and truncates the file to what that commit wrote (`shrink_wal`).
 
 SQLite restarts the WAL only when no reader uses its frames. A reader mid-query keeps its
-snapshot, and the space then comes back at the next restore or the last close instead. This is
-not a `TRUNCATE` or `RESTART` checkpoint. Nothing waits on readers. SQLite never memory-maps the
-`-wal` file, so no process can fault on the shorter file.
+snapshot, and the space then comes back later. This is not a `TRUNCATE` or `RESTART` checkpoint:
+nothing waits on readers. Truncating the `-wal` is safe for other processes: SQLite reads it with
+`pread` and never memory-maps it, and it truncates it only under the WAL read locks that exclude
+every reader still using the removed part. A separate investigation confirmed this in the vendored
+SQLite 3.51.3 sources and in 100-iteration multi-process runs on Linux and macOS: 0 `SIGBUS`,
+0 errors.
+
+The restore's own shrink is opportunistic. With readers that loop over transactions it found the
+WAL free in only 0 to 3% of restores on Linux and 5 to 15% on macOS (measured), because the reset
+needs a moment with no reader mark, and `journal_size_limit = 0` exists only on the restore's
+short-lived connection. The backstop is a 256 MiB `journal_size_limit` on every write connection
+(upstream #1083, `CBM_SQLITE_JOURNAL_SIZE_LIMIT`): the next write after a full checkpoint, on any
+connection, cuts the `-wal` back to 256 MiB. A WAL left at the database's size therefore shrinks
+to at most 256 MiB at the next write that finds the log free, and to nothing at the last close.
 
 ### Alternatives for slot storage
 
