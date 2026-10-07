@@ -34,6 +34,16 @@ file discovery -> tree-sitter extraction -> registries -> call and type resoluti
 The persistent tool worker keeps the graph database open between calls. A supervisor applies a
 deadline and contains a failed tool process.
 
+## One index per checkout and per branch
+
+Each checkout directory, linked git worktrees included, has its own graph at
+`<cache>/<project>.db`. Project resolution stops at a git checkout boundary, so a worktree or
+nested repository never answers from its parent's graph. When an index run finds the checkout
+on another branch, it parks the outgoing graph as a compressed slot under
+`<cache>/branches/<project>/<root key>/` and restores the incoming branch's graph by content, in
+one SQLite write transaction on the unchanged live file. [Branch index](BRANCH_INDEX.md) records
+the decisions, the alternatives, the measurements and the known limits.
+
 ## Scale redesign
 
 | Area | Previous path | Current bounded path |
