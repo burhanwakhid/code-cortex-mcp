@@ -87,6 +87,83 @@ TEST(store_open_with_mmap_disabled) {
     PASS();
 }
 
+/* #1083: the WAL bound on write connections. */
+TEST(journal_size_limit_default_and_env) {
+    cbm_unsetenv("CBM_SQLITE_JOURNAL_SIZE_LIMIT");
+    ASSERT_EQ(cbm_store_resolve_journal_size_limit(), 268435456LL);
+    cbm_setenv("CBM_SQLITE_JOURNAL_SIZE_LIMIT", "1048576", 1);
+    ASSERT_EQ(cbm_store_resolve_journal_size_limit(), 1048576LL);
+    cbm_setenv("CBM_SQLITE_JOURNAL_SIZE_LIMIT", "-5", 1);
+    ASSERT_EQ(cbm_store_resolve_journal_size_limit(), -1LL);
+    cbm_setenv("CBM_SQLITE_JOURNAL_SIZE_LIMIT", "12x", 1);
+    ASSERT_EQ(cbm_store_resolve_journal_size_limit(), 268435456LL);
+    cbm_unsetenv("CBM_SQLITE_JOURNAL_SIZE_LIMIT");
+    PASS();
+}
+
+static void jsl_unlink_all(const char *path) {
+    char side[300];
+    unlink(path);
+    snprintf(side, sizeof(side), "%s-wal", path);
+    unlink(side);
+    snprintf(side, sizeof(side), "%s-shm", path);
+    unlink(side);
+}
+
+static long long jsl_wal_size(const char *path) {
+    char wal[300];
+    snprintf(wal, sizeof(wal), "%s-wal", path);
+    FILE *f = fopen(wal, "rb");
+    if (!f) {
+        return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    long long n = ftell(f);
+    fclose(f);
+    return n;
+}
+
+/* A write connection reports the limit, and a WAL that grew past it is cut
+ * back at the first write after a checkpoint that copied every frame. */
+TEST(journal_size_limit_trims_wal_after_checkpoint) {
+    cbm_unsetenv("CBM_SQLITE_JOURNAL_SIZE_LIMIT");
+    char tmp_path[256];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/cbm_test_jsl_%d.db", cbm_tmpdir(), (int)getpid());
+    jsl_unlink_all(tmp_path);
+    cbm_store_t *s = cbm_store_open_path(tmp_path);
+    ASSERT(s != NULL);
+    ASSERT_EQ(cbm_store_journal_size_limit(s), 268435456LL);
+    cbm_store_close(s);
+    jsl_unlink_all(tmp_path);
+
+    enum { LIMIT = 1048576 };
+    cbm_setenv("CBM_SQLITE_JOURNAL_SIZE_LIMIT", "1048576", 1);
+    s = cbm_store_open_path(tmp_path);
+    ASSERT(s != NULL);
+    ASSERT_EQ(cbm_store_journal_size_limit(s), (long long)LIMIT);
+    sqlite3 *db = cbm_store_get_db(s);
+    ASSERT_EQ(sqlite3_exec(db,
+                           "CREATE TABLE big(b BLOB); BEGIN;"
+                           "INSERT INTO big SELECT zeroblob(1048576) FROM "
+                           "(SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 "
+                           "UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL "
+                           "SELECT 8); COMMIT;",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    ASSERT_GT(jsl_wal_size(tmp_path), 4LL * LIMIT);
+    int frames = -1;
+    int copied = -1;
+    ASSERT_EQ(sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_PASSIVE, &frames, &copied),
+              SQLITE_OK);
+    ASSERT_EQ(frames, copied);
+    ASSERT_EQ(sqlite3_exec(db, "DELETE FROM big WHERE rowid = 1;", NULL, NULL, NULL), SQLITE_OK);
+    ASSERT_LTE(jsl_wal_size(tmp_path), (long long)LIMIT);
+    cbm_store_close(s);
+    jsl_unlink_all(tmp_path);
+    cbm_unsetenv("CBM_SQLITE_JOURNAL_SIZE_LIMIT");
+    PASS();
+}
+
 
 /* #896: a row-scan that dies mid-stream (SQLITE_CORRUPT) must surface a
  * loud store error, not masquerade as a clean end of results. Counts are
@@ -316,4 +393,6 @@ SUITE(store_pragmas) {
     RUN_TEST(store_open_with_mmap_disabled);
     RUN_TEST(store_read_batch_snapshot_renews);
     RUN_TEST(store_role_pragmas_issue1419);
+    RUN_TEST(journal_size_limit_default_and_env);
+    RUN_TEST(journal_size_limit_trims_wal_after_checkpoint);
 }

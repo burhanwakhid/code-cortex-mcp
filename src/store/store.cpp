@@ -561,6 +561,36 @@ int64_t cbm_store_resolve_mmap_size(void) {
  * django index). 64 MiB = 1024 pages, the budget bulk mode already used; the
  * cache only grows as pages are touched. Query connections keep the default. */
 static const char ST_WRITE_CACHE_SQL[] = "PRAGMA cache_size = -65536;";
+int64_t cbm_store_resolve_journal_size_limit(void) {
+    enum { BASE_10 = 10 };
+    const int64_t jsl_default = (int64_t)256 * 1024 * 1024; /* 256 MiB */
+    char buf[ST_BUF_64];
+    if (cbm_safe_getenv("CBM_SQLITE_JOURNAL_SIZE_LIMIT", buf, sizeof(buf), NULL) == NULL) {
+        return jsl_default;
+    }
+    char *end = NULL;
+    long long parsed = strtoll(buf, &end, BASE_10);
+    if (end == buf || *end != '\0') {
+        return jsl_default; /* malformed: the default, never a failed open */
+    }
+    return parsed < 0 ? -1 : (int64_t)parsed;
+}
+
+int64_t cbm_store_journal_size_limit(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, "PRAGMA journal_size_limit;", -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    int64_t limit = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        limit = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return limit;
+}
 
 /* Configure connection pragmas.
  *   in_memory  — :memory: DB (synchronous OFF, no journal file).
@@ -603,15 +633,31 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory, bool read_only) {
         if (rc != CBM_STORE_OK) {
             return rc;
         }
-        /* Recover stale WAL from previous crash (best-effort).
-         * PASSIVE never blocks readers and never ftruncates.
-         * May fail with SQLITE_BUSY if another process holds a lock. */
+        /* Recover stale WAL from previous crash (best-effort). PASSIVE
+         * copies what it can without waiting for or blocking readers; it
+         * may fail with SQLITE_BUSY if another process holds a lock. See
+         * cbm_store_checkpoint for which shrinks of the files are safe. */
         (void)sqlite3_exec(s->db, "PRAGMA wal_checkpoint(PASSIVE)", NULL, NULL, NULL);
         rc = exec_sql(s, "PRAGMA synchronous = NORMAL;");
         if (rc != CBM_STORE_OK) {
             return rc;
         }
         rc = exec_sql(s, ST_WRITE_CACHE_SQL);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+        /* #1083: bound the -wal file. Without a limit SQLite never shrinks
+         * it while the database is open, so a log that grew while readers
+         * starved the checkpoint (or a branch restore, which commits the
+         * whole database through the WAL) keeps its peak size on disk. With
+         * one, the first write after a full checkpoint resets the log and
+         * truncates the file to the limit. The default (256 MiB) is far
+         * above the healthy WAL (one autocheckpoint, ~66 MB at this page
+         * size), so normal runs never truncate and regrow. */
+        char jsl_sql[ST_BUF_64];
+        snprintf(jsl_sql, sizeof(jsl_sql), "PRAGMA journal_size_limit = %lld;",
+                 (long long)cbm_store_resolve_journal_size_limit());
+        rc = exec_sql(s, jsl_sql);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
@@ -1391,11 +1437,17 @@ int cbm_store_checkpoint(cbm_store_t *s) {
     if (!s) {
         return CBM_STORE_ERR;
     }
-    /* PASSIVE never blocks readers and never ftruncate()s either file.
-     * SQLite recommends PASSIVE for shared databases — TRUNCATE shrinks
-     * the WAL via ftruncate(fd, 0) on success, which on macOS can raise
-     * SIGBUS in a sibling process that has the DB mmap'd through SQLite
-     * when it next faults a page in the now-shorter region.
+    /* PASSIVE: copies what it can without waiting for or blocking readers
+     * (TRUNCATE/RESTART would wait on readers via the busy handler). Any
+     * mode may shrink the main db file when the whole WAL is backfilled,
+     * and a WAL reset may truncate the -wal under journal_size_limit; both
+     * are safe for other processes: SQLite reads the -wal with pread (it is
+     * never mmap'd) and shrinks either file only under locks that exclude
+     * every reader still using the removed part. What does raise SIGBUS
+     * ("cluster_pagein past EOF", v0.6.0) is a non-SQLite truncate of the
+     * main db while another process has it mmap'd (mmap_size /
+     * CBM_SQLITE_MMAP_SIZE): never rewrite a live db in place -- publish
+     * via temp file + rename (cbm_write_db).
      * See https://www.sqlite.org/c3ref/c_checkpoint_full.html */
     int rc = sqlite3_wal_checkpoint_v2(s->db, NULL, SQLITE_CHECKPOINT_PASSIVE, NULL, NULL);
     if (rc != SQLITE_OK) {

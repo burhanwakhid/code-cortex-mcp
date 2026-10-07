@@ -374,6 +374,16 @@ int cbm_store_checkpoint(cbm_store_t *s);
  * testability. */
 int64_t cbm_store_resolve_mmap_size(void);
 
+/* Resolve the journal_size_limit pragma applied to on-disk write
+ * connections (#1083) from CBM_SQLITE_JOURNAL_SIZE_LIMIT, in bytes.
+ * Defaults to 268435456 (256 MiB) when unset or malformed; a negative value
+ * gives -1 (no limit, SQLite's default). Exposed for testability. */
+int64_t cbm_store_resolve_journal_size_limit(void);
+
+/* The journal_size_limit of this connection, in bytes; -1 = unlimited. The
+ * pragma is per connection and not persisted. */
+int64_t cbm_store_journal_size_limit(cbm_store_t *s);
+
 /* ── Dump / Restore ─────────────────────────────────────────────── */
 
 /* Dump in-memory database to a file. */
