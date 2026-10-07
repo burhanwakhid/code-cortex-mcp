@@ -1,0 +1,722 @@
+/*
+ * test_cache_expiry.cpp — Removal of stale index databases (mcp/cache_expiry.h).
+ *
+ * Each test runs the sweep against its own cache directory (CBM_CACHE_DIR)
+ * with an explicit clock, on hand-made project databases that hold only the
+ * projects table the sweep reads.
+ */
+#include "../src/foundation/compat.h"
+#include "test_framework.h"
+#include "test_helpers.h"
+#include <cli/cli.h>
+#include <foundation/compat_fs.h>
+#include <foundation/platform.h>
+#include <mcp/cache_expiry.h>
+#include <mcp/mcp.h>
+#include <pipeline/branch_slots.h>
+#include <pipeline/pipeline.h>
+
+#include "sqlite3.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <utime.h>
+#endif
+
+enum { CE_DAY = 86400 };
+
+typedef struct {
+    char cache[512];
+    char base[512];
+    char old_cache[1024];
+    bool had_cache;
+} ce_env_t;
+
+/* A fresh cache dir (with _config.db) and a scratch base for roots. */
+static bool ce_setup(ce_env_t *e, const char *prefix) {
+    memset(e, 0, sizeof(*e));
+    char *b = th_mktempdir(prefix);
+    if (!b) {
+        return false;
+    }
+    snprintf(e->base, sizeof(e->base), "%s", b);
+    snprintf(e->cache, sizeof(e->cache), "%s/cache", e->base);
+    cbm_mkdir_p(e->cache, 0755);
+    e->had_cache = cbm_safe_getenv("CBM_CACHE_DIR", e->old_cache, sizeof(e->old_cache), NULL);
+    cbm_setenv("CBM_CACHE_DIR", e->cache, 1);
+    cbm_config_t *cfg = cbm_config_open(e->cache);
+    cbm_config_close(cfg);
+    return true;
+}
+
+static void ce_teardown(ce_env_t *e) {
+    if (e->had_cache) {
+        cbm_setenv("CBM_CACHE_DIR", e->old_cache, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(e->base);
+}
+
+/* <cache>/<name>.db recording root, in WAL mode. */
+static void ce_make_db(const ce_env_t *e, const char *name, const char *root, char *path,
+                       size_t n) {
+    snprintf(path, n, "%s/%s.db", e->cache, name);
+    sqlite3 *db = NULL;
+    sqlite3_open(path, &db);
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+    char sql[2048];
+    snprintf(sql, sizeof(sql),
+             "CREATE TABLE projects(name TEXT PRIMARY KEY, indexed_at TEXT, root_path TEXT);"
+             "INSERT INTO projects VALUES('%s','2026-01-01','%s');",
+             name, root);
+    sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_close(db);
+}
+
+static void ce_cfg(cbm_cache_expiry_cfg_t *cfg) {
+    cbm_cache_expiry_cfg_load(cfg, NULL);
+    cfg->enabled = true;
+}
+
+static int ce_sweep(const cbm_cache_expiry_cfg_t *cfg, int64_t now, bool dry,
+                    cbm_cache_sweep_result_t *res, const char *keep = NULL) {
+    cbm_cache_sweep_opts_t o = {};
+    o.now = now;
+    o.dry_run = dry;
+    o.keep_project = keep;
+    return cbm_cache_expiry_sweep(cfg, &o, res);
+}
+
+static int ce_trash_count(const ce_env_t *e) {
+    char t[700];
+    snprintf(t, sizeof(t), "%s/trash", e->cache);
+    cbm_dir_t *d = cbm_opendir(t);
+    if (!d) {
+        return 0;
+    }
+    int n = 0;
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        n += ent->is_dir && ent->name[0] != '.';
+    }
+    cbm_closedir(d);
+    return n;
+}
+
+/* The usage row's last_used and missing_checks (-1 when absent). */
+static void ce_usage(const ce_env_t *e, const char *name, int64_t *last_used, int *checks) {
+    *last_used = -1;
+    *checks = -1;
+    char p[700];
+    snprintf(p, sizeof(p), "%s/_config.db", e->cache);
+    sqlite3 *db = NULL;
+    sqlite3_open(p, &db);
+    sqlite3_stmt *st = NULL;
+    char key[300];
+    snprintf(key, sizeof(key), "%s.db", name);
+    if (sqlite3_prepare_v2(db, "SELECT last_used, missing_checks FROM cache_usage WHERE db_name=?1",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, key, -1, SQLITE_STATIC);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            *last_used = sqlite3_column_int64(st, 0);
+            *checks = sqlite3_column_int(st, 1);
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+}
+
+#ifndef _WIN32
+static void ce_age(const char *path, int64_t when) {
+    struct utimbuf ut = {(time_t)when, (time_t)when};
+    utime(path, &ut);
+}
+#endif
+
+/* A removed checkout expires only after N sweeps spread over the grace
+ * period, and only once nothing used its database for that long. */
+TEST(cache_root_gone_needs_streak_and_grace) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_gone"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    ce_make_db(&e, "gone", root, db, sizeof(db));
+    th_rmtree(root); /* git worktree remove */
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    int64_t t0 = (int64_t)time(NULL);
+    int64_t lu;
+    int checks;
+
+    for (int day = 0; day < 3; day++) { /* three sweeps, inside the grace */
+        ASSERT_EQ(ce_sweep(&cfg, t0 + day * CE_DAY, false, &r), 0);
+        ASSERT_EQ(r.projects, 0);
+        ASSERT_TRUE(cbm_file_exists(db));
+    }
+    ce_usage(&e, "gone", &lu, &checks);
+    ASSERT_EQ(checks, 3);
+    ASSERT_EQ(lu, t0); /* first sight starts the clock */
+    ASSERT_EQ(ce_sweep(&cfg, t0 + 8 * CE_DAY, false, &r), 0);
+    ASSERT_EQ(r.projects, 1);
+    ASSERT_FALSE(cbm_file_exists(db));
+    ASSERT_EQ(ce_trash_count(&e), 1);
+    ce_usage(&e, "gone", &lu, &checks);
+    ASSERT_EQ(lu, -1); /* the row went with the database */
+    ce_teardown(&e);
+    PASS();
+}
+
+/* A use inside the grace period keeps a database whose root is gone (a
+ * project queried by name after its checkout moved). */
+TEST(cache_root_gone_but_used_is_kept) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_used"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    ce_make_db(&e, "used", root, db, sizeof(db)); /* root never existed */
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    int64_t t0 = (int64_t)time(NULL);
+    for (int day = 0; day < 3; day++) {
+        ASSERT_EQ(ce_sweep(&cfg, t0 + day * CE_DAY, false, &r), 0);
+    }
+    ASSERT_TRUE(cbm_cache_usage_set(db, t0 + 6 * CE_DAY, NULL)); /* also resets the streak */
+    ASSERT_EQ(ce_sweep(&cfg, t0 + 8 * CE_DAY, false, &r), 0);
+    ASSERT_EQ(r.projects, 0);
+    ASSERT_TRUE(cbm_file_exists(db));
+    ce_teardown(&e);
+    PASS();
+}
+
+/* A root that comes back restarts the streak. */
+TEST(cache_root_back_resets_streak) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_back"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    ce_make_db(&e, "back", root, db, sizeof(db));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    int64_t t0 = (int64_t)time(NULL);
+    int64_t lu;
+    int checks;
+    ASSERT_EQ(ce_sweep(&cfg, t0, false, &r), 0);
+    ASSERT_EQ(ce_sweep(&cfg, t0 + CE_DAY, false, &r), 0);
+    ce_usage(&e, "back", &lu, &checks);
+    ASSERT_EQ(checks, 2);
+    cbm_mkdir_p(root, 0755); /* the volume came back */
+    ASSERT_EQ(ce_sweep(&cfg, t0 + 2 * CE_DAY, false, &r), 0);
+    ce_usage(&e, "back", &lu, &checks);
+    ASSERT_EQ(checks, 0);
+    ce_teardown(&e);
+    PASS();
+}
+
+/* A root under a volume mount point or "/" itself (an unmounted disk), and
+ * a relative root, never count as missing. */
+TEST(cache_root_uncertain_never_counts) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_vol"));
+    char db[800];
+    ce_make_db(&e, "vol", "/Volumes/cbm-no-such-volume/repo", db, sizeof(db));
+    ce_make_db(&e, "mnt", "/mnt/cbm-no-such-mount/work/repo", db, sizeof(db));
+    ce_make_db(&e, "top", "/cbm-no-such-top-dir/repo", db, sizeof(db));
+    ce_make_db(&e, "rel", "relative/repo", db, sizeof(db));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    int64_t t0 = (int64_t)time(NULL);
+    for (int day = 0; day <= 30; day += 3) {
+        ASSERT_EQ(ce_sweep(&cfg, t0 + day * CE_DAY, false, &r), 0);
+        ASSERT_EQ(r.projects, 0);
+    }
+    int64_t lu;
+    int checks;
+    const char *names[] = {"vol", "mnt", "top", "rel"};
+    for (const char *n : names) {
+        ce_usage(&e, n, &lu, &checks);
+        ASSERT_EQ(checks, 0);
+    }
+    ce_teardown(&e);
+    PASS();
+}
+
+/* Every recorded root missing at once (a moved HOME, a copied cache) counts
+ * nothing; so does a sweep from another HOME. */
+TEST(cache_mass_missing_and_env_change_count_nothing) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_mass"));
+    char db[800];
+    char root[700];
+    for (int i = 0; i < 5; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "m%d", i);
+        snprintf(root, sizeof(root), "%s/gone%d", e.base, i);
+        ce_make_db(&e, name, root, db, sizeof(db));
+    }
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    int64_t t0 = (int64_t)time(NULL);
+    int64_t lu;
+    int checks;
+    ASSERT_EQ(ce_sweep(&cfg, t0, false, &r), 0);
+    ce_usage(&e, "m0", &lu, &checks);
+    ASSERT_EQ(checks, 0);
+
+    /* One root present: the others count. */
+    snprintf(root, sizeof(root), "%s/gone4", e.base);
+    cbm_mkdir_p(root, 0755);
+    ASSERT_EQ(ce_sweep(&cfg, t0 + CE_DAY, false, &r), 0);
+    ce_usage(&e, "m0", &lu, &checks);
+    ASSERT_EQ(checks, 1);
+
+    /* Another HOME: streaks restart, nothing counted. */
+    char old_home[1024] = "";
+    cbm_safe_getenv("HOME", old_home, sizeof(old_home), NULL);
+    char home2[700];
+    snprintf(home2, sizeof(home2), "%s/home2", e.base);
+    cbm_mkdir_p(home2, 0755);
+    cbm_setenv("HOME", home2, 1);
+    ASSERT_EQ(ce_sweep(&cfg, t0 + 2 * CE_DAY, false, &r), 0);
+    cbm_setenv("HOME", old_home, 1);
+    ce_usage(&e, "m0", &lu, &checks);
+    ASSERT_EQ(checks, 0);
+    ce_teardown(&e);
+    PASS();
+}
+
+/* No _config.db: not this user's cache, or a fresh one. */
+TEST(cache_refuses_unknown_cache_dir) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_refuse"));
+    char cfgdb[800];
+    snprintf(cfgdb, sizeof(cfgdb), "%s/_config.db", e.cache);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg); /* before: loading the config creates _config.db */
+    ASSERT_EQ(cbm_unlink(cfgdb), 0);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, 0, false, &r), -1);
+    ASSERT_TRUE(r.refused);
+    ce_teardown(&e);
+    PASS();
+}
+
+/* Unused for the threshold: trashed. Used recently, or first seen now:
+ * kept. Disabled rule (0 days): kept. */
+TEST(cache_unused_expires) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_unused"));
+    char root[700];
+    char stale[800];
+    char fresh[800];
+    char unseen[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "stale", root, stale, sizeof(stale));
+    ce_make_db(&e, "fresh", root, fresh, sizeof(fresh));
+    ce_make_db(&e, "unseen", root, unseen, sizeof(unseen));
+#ifndef _WIN32
+    ce_age(unseen, now - 400 * CE_DAY); /* an old file: its age is not use */
+#endif
+    ASSERT_TRUE(cbm_cache_usage_set(stale, now - 91 * CE_DAY, NULL));
+    ASSERT_TRUE(cbm_cache_usage_set(fresh, now - 10 * CE_DAY, NULL));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    cfg.unused_s = 0;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.projects, 0);
+    ce_cfg(&cfg);
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.projects, 1);
+    ASSERT_FALSE(cbm_file_exists(stale));
+    ASSERT_TRUE(cbm_file_exists(fresh));
+    ASSERT_TRUE(cbm_file_exists(unseen));
+    ce_teardown(&e);
+    PASS();
+}
+
+/* The session's project and the watched ones are never expired. */
+static bool ce_keep_w(const char *project, void *ud) {
+    return strcmp(project, (const char *)ud) == 0;
+}
+
+TEST(cache_keeps_session_and_watched) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_keep"));
+    char root[700];
+    char a[800];
+    char b[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "sess", root, a, sizeof(a));
+    ce_make_db(&e, "watched", root, b, sizeof(b));
+    ASSERT_TRUE(cbm_cache_usage_set(a, now - 200 * CE_DAY, NULL));
+    ASSERT_TRUE(cbm_cache_usage_set(b, now - 200 * CE_DAY, NULL));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_opts_t o = {};
+    o.now = now;
+    o.keep_project = "sess";
+    o.keep = ce_keep_w;
+    o.keep_ud = (void *)"watched";
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(cbm_cache_expiry_sweep(&cfg, &o, &r), 0);
+    ASSERT_EQ(r.projects, 0);
+    ASSERT_EQ(r.skipped, 2);
+    ASSERT_TRUE(cbm_file_exists(a));
+    ASSERT_TRUE(cbm_file_exists(b));
+    ce_teardown(&e);
+    PASS();
+}
+
+/* A project being indexed (its lease held) is skipped, and expired by a
+ * later sweep once the lease is free. */
+TEST(cache_skips_leased_project) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_lease"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "busy", root, db, sizeof(db));
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 100 * CE_DAY, NULL));
+    cbm_db_lease_t *lease = NULL;
+    ASSERT_EQ(cbm_db_lease_try_acquire(db, &lease), 0);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.projects, 0);
+    ASSERT_EQ(r.skipped, 1);
+    ASSERT_TRUE(cbm_file_exists(db));
+    cbm_db_lease_release(lease);
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.projects, 1);
+    ASSERT_FALSE(cbm_file_exists(db));
+    ce_teardown(&e);
+    PASS();
+}
+
+/* A reader holding a snapshot that pins WAL frames keeps the database. */
+TEST(cache_skips_database_with_open_reader) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_reader"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "read", root, db, sizeof(db));
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 100 * CE_DAY, NULL));
+    sqlite3 *w = NULL;
+    sqlite3 *rd = NULL;
+    sqlite3_open(db, &w);
+    sqlite3_exec(w, "PRAGMA wal_autocheckpoint=0; CREATE TABLE t(x); INSERT INTO t VALUES(1);",
+                 NULL, NULL, NULL);
+    sqlite3_open(db, &rd);
+    sqlite3_exec(rd, "BEGIN; SELECT count(*) FROM t;", NULL, NULL, NULL);
+    sqlite3_exec(w, "INSERT INTO t VALUES(2);", NULL, NULL, NULL);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.projects, 0);
+    ASSERT_EQ(r.skipped, 1);
+    ASSERT_TRUE(cbm_file_exists(db));
+    sqlite3_exec(rd, "COMMIT;", NULL, NULL, NULL);
+    sqlite3_close(rd);
+    sqlite3_close(w);
+    ce_teardown(&e);
+    PASS();
+}
+
+/* A dry run reports what would go, with its size, and changes nothing. */
+static void ce_count_report(const cbm_cache_expiry_item_t *it, void *ud) {
+    if (it->kind == CBM_EXPIRE_UNUSED && !it->removed && !it->skipped && it->bytes > 0) {
+        (*(int *)ud)++;
+    }
+}
+
+TEST(cache_dry_run_changes_nothing) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_dry"));
+    char root[700];
+    char db[800];
+    char gone[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "old", root, db, sizeof(db));
+    ce_make_db(&e, "unseen", "/x-cbm-nowhere/r", gone, sizeof(gone));
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 100 * CE_DAY, NULL));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_opts_t o = {};
+    o.now = now;
+    o.dry_run = true;
+    int seen = 0;
+    o.report = ce_count_report;
+    o.report_ud = &seen;
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(cbm_cache_expiry_sweep(&cfg, &o, &r), 0);
+    ASSERT_EQ(r.projects, 1);
+    ASSERT_EQ(seen, 1);
+    ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_EQ(ce_trash_count(&e), 0);
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "unseen", &lu, &checks);
+    ASSERT_EQ(lu, -1); /* no state written */
+    ASSERT_TRUE(cbm_cache_expiry_due(&cfg, now)); /* and no sweep recorded */
+    ce_teardown(&e);
+    PASS();
+}
+
+/* Trash: an expired database with its parked slots can be restored; the
+ * next sweep a day later purges what is left in the trash. */
+TEST(cache_trash_restore_and_purge) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_trash"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "tp", root, db, sizeof(db));
+    char sdir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(db, "tp", root, sdir, sizeof(sdir)));
+    char slot[1300];
+    snprintf(slot, sizeof(slot), "%s/feature.db.zst", sdir);
+    ASSERT_EQ(th_write_file(slot, "zstd"), 0);
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 100 * CE_DAY, NULL));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.projects, 1);
+    ASSERT_FALSE(cbm_file_exists(db));
+    ASSERT_FALSE(cbm_file_exists(slot));
+
+    char msg[512];
+    ASSERT_EQ(cbm_cache_trash_restore("tp", msg, sizeof(msg)), 0);
+    ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_TRUE(cbm_file_exists(slot));
+    ASSERT_EQ(ce_trash_count(&e), 0);
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "tp", &lu, &checks);
+    ASSERT_GTE(lu, now); /* restored: the clock restarts */
+    /* A second restore finds nothing; a live database blocks one. */
+    ASSERT_NEQ(cbm_cache_trash_restore("tp", msg, sizeof(msg)), 0);
+
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 100 * CE_DAY, NULL));
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(ce_trash_count(&e), 1);
+    ASSERT_EQ(ce_sweep(&cfg, now + 3600, false, &r), 0); /* too soon */
+    ASSERT_EQ(r.purged, 0);
+    ASSERT_EQ(ce_trash_count(&e), 1);
+    ASSERT_EQ(ce_sweep(&cfg, now + 2 * CE_DAY, false, &r), 0);
+    ASSERT_EQ(r.purged, 1);
+    ASSERT_EQ(ce_trash_count(&e), 0);
+    ce_teardown(&e);
+    PASS();
+}
+
+#ifndef _WIN32
+/* A parked slot older than the slot age goes (database or not); a newer one
+ * stays; old scratch of an interrupted park goes. */
+TEST(cache_old_slots_expire) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_slots"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "sp", root, db, sizeof(db));
+    char sdir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(db, "sp", root, sdir, sizeof(sdir)));
+    char old_slot[1300];
+    char new_slot[1300];
+    char legacy[1300];
+    char scratch[1300];
+    snprintf(old_slot, sizeof(old_slot), "%s/deleted-branch.db.zst", sdir);
+    snprintf(new_slot, sizeof(new_slot), "%s/main.db.zst", sdir);
+    snprintf(legacy, sizeof(legacy), "%s/older.db", sdir);
+    snprintf(scratch, sizeof(scratch), "%s/x.db.unz", sdir);
+    th_write_file(old_slot, "a");
+    th_write_file(new_slot, "b");
+    th_write_file(legacy, "c");
+    th_write_file(scratch, "d");
+    ce_age(old_slot, now - 31 * CE_DAY);
+    ce_age(legacy, now - 45 * CE_DAY);
+    ce_age(new_slot, now - 29 * CE_DAY);
+    ce_age(scratch, now - 2 * 3600);
+    /* An orphan project directory (its database already gone). */
+    char odb[800];
+    snprintf(odb, sizeof(odb), "%s/orphan.db", e.cache);
+    char odir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(odb, "orphan", root, odir, sizeof(odir)));
+    char oslot[1300];
+    snprintf(oslot, sizeof(oslot), "%s/main.db.zst", odir);
+    th_write_file(oslot, "e");
+    ce_age(oslot, now - 60 * CE_DAY);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.slots, 3);
+    ASSERT_EQ(r.sidecars, 1);
+    ASSERT_FALSE(cbm_file_exists(old_slot));
+    ASSERT_FALSE(cbm_file_exists(legacy));
+    ASSERT_FALSE(cbm_file_exists(scratch));
+    ASSERT_FALSE(cbm_file_exists(oslot));
+    ASSERT_FALSE(cbm_file_exists(odir));
+    ASSERT_TRUE(cbm_file_exists(new_slot));
+    ASSERT_TRUE(cbm_file_exists(db));
+    ce_teardown(&e);
+    PASS();
+}
+
+/* Orphan sidecars and temp files go; those of a live database, fresh ones,
+ * and every .index.lock stay. */
+TEST(cache_orphan_sidecars) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_side"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "live", root, db, sizeof(db));
+    const char *gone[] = {"gone.db-wal", "gone.db-shm", "gone.db.tmp", "gone.db.import_tmp"};
+    const char *stay[] = {"live.db-wal", "gone.db.index.lock", "fresh.db-wal", "notes.txt"};
+    char p[900];
+    for (const char *n : gone) {
+        snprintf(p, sizeof(p), "%s/%s", e.cache, n);
+        th_write_file(p, "x");
+        ce_age(p, now - 2 * 3600);
+    }
+    for (const char *n : stay) {
+        snprintf(p, sizeof(p), "%s/%s", e.cache, n);
+        th_write_file(p, "x");
+        ce_age(p, strcmp(n, "fresh.db-wal") == 0 ? now - 60 : now - 30 * CE_DAY);
+    }
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.sidecars, 4);
+    for (const char *n : gone) {
+        snprintf(p, sizeof(p), "%s/%s", e.cache, n);
+        ASSERT_FALSE(cbm_file_exists(p));
+    }
+    for (const char *n : stay) {
+        snprintf(p, sizeof(p), "%s/%s", e.cache, n);
+        ASSERT_TRUE(cbm_file_exists(p));
+    }
+    ce_teardown(&e);
+    PASS();
+}
+#endif
+
+/* Usage is written at most once an hour per database; an index run (with
+ * its root) always writes and clears a missing streak. */
+TEST(cache_usage_touch_is_throttled) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_touch"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    ce_make_db(&e, "touchy", root, db, sizeof(db));
+    int64_t now = (int64_t)time(NULL);
+    int64_t lu;
+    int checks;
+    cbm_cache_usage_touch(db, NULL);
+    ce_usage(&e, "touchy", &lu, &checks);
+    ASSERT_GTE(lu, now);
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 500, NULL));
+    cbm_cache_usage_touch(db, NULL); /* within the hour: nothing written */
+    ce_usage(&e, "touchy", &lu, &checks);
+    ASSERT_EQ(lu, now - 500);
+    cbm_cache_usage_touch(db, root);
+    ce_usage(&e, "touchy", &lu, &checks);
+    ASSERT_GTE(lu, now);
+    ce_teardown(&e);
+    PASS();
+}
+
+/* End to end through the server: an index run and a tool call record use;
+ * delete_project removes the usage row with the database. */
+TEST(cache_index_and_query_record_use) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_e2e"));
+    char repo[700];
+    snprintf(repo, sizeof(repo), "%s/repo", e.base);
+    char f[800];
+    snprintf(f, sizeof(f), "%s/a.py", repo);
+    ASSERT_EQ(th_write_file(f, "def a():\n    return 1\n"), 0);
+    ASSERT_EQ(cbm_mcp_index_in_process(repo), 0);
+    char *name = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(name);
+    int64_t lu;
+    int checks;
+    ce_usage(&e, name, &lu, &checks);
+    ASSERT_GT(lu, 0);
+    ASSERT_EQ(checks, 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char args[1200];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\"}", name);
+    char *resp = cbm_mcp_handle_tool(srv, "index_status", args);
+    free(resp);
+    resp = cbm_mcp_handle_tool(srv, "delete_project", args);
+    ASSERT_NOT_NULL(strstr(resp, "deleted"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    ce_usage(&e, name, &lu, &checks);
+    ASSERT_EQ(lu, -1);
+    free(name);
+    ce_teardown(&e);
+    PASS();
+}
+
+SUITE(cache_expiry) {
+    RUN_TEST(cache_root_gone_needs_streak_and_grace);
+    RUN_TEST(cache_root_gone_but_used_is_kept);
+    RUN_TEST(cache_root_back_resets_streak);
+    RUN_TEST(cache_root_uncertain_never_counts);
+    RUN_TEST(cache_mass_missing_and_env_change_count_nothing);
+    RUN_TEST(cache_refuses_unknown_cache_dir);
+    RUN_TEST(cache_unused_expires);
+    RUN_TEST(cache_keeps_session_and_watched);
+    RUN_TEST(cache_skips_leased_project);
+    RUN_TEST(cache_skips_database_with_open_reader);
+    RUN_TEST(cache_dry_run_changes_nothing);
+    RUN_TEST(cache_trash_restore_and_purge);
+#ifndef _WIN32
+    RUN_TEST(cache_old_slots_expire);
+    RUN_TEST(cache_orphan_sidecars);
+#endif
+    RUN_TEST(cache_usage_touch_is_throttled);
+    RUN_TEST(cache_index_and_query_record_use);
+}

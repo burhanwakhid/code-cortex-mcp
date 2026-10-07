@@ -63,6 +63,7 @@ enum {
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <condition_variable>
 #include <mutex>
@@ -98,6 +99,8 @@ enum {
 #include "foundation/compat_regex.h"
 #include "pipeline/artifact.h"
 #include "pipeline/branch_slots.h"
+#include "mcp/cache_expiry.h"
+#include "pipeline/pipeline_internal.h" /* cbm_pipeline_repo_path */
 
 static size_t trace_hash_file_max = MCP_PATH_HASH_FILE_MAX;
 static size_t trace_hash_request_max = MCP_PATH_HASH_REQUEST_MAX;
@@ -1195,6 +1198,11 @@ struct cbm_mcp_server {
     struct cbm_config *config;        /* external config ref (not owned) */
     cbm_thread_t autoindex_tid;
     bool autoindex_active;    /* true if auto-index thread was started */
+    /* Cache expiry sweep (cache_expiry.h): at most one thread at a time,
+     * joined before the next one starts and at server free. */
+    cbm_thread_t sweep_tid;
+    bool sweep_active;
+    std::atomic<bool> sweep_running;
     int autoindex_file_limit; /* auto_index_limit, read before the thread starts */
 
     /* Active pipeline tracking for cancellation support */
@@ -1255,6 +1263,9 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     }
     if (srv->autoindex_active) {
         cbm_thread_join(&srv->autoindex_tid);
+    }
+    if (srv->sweep_active) {
+        cbm_thread_join(&srv->sweep_tid);
     }
     if (srv->owns_store && srv->store) {
         cbm_store_close(srv->store);
@@ -1736,6 +1747,15 @@ static cbm_store_t *resolve_store_by_name(cbm_mcp_server_t *srv, const char *pro
  * the call needs anyway. */
 static cbm_store_t *resolve_store_open(cbm_mcp_server_t *srv, const char *project) {
     cbm_store_t *store = resolve_store_by_name(srv, project);
+    if (store && cbm_validate_project_name(project)) {
+        /* Usage for cache expiry (cache_expiry.h): throttled in process, so a
+         * repeat call costs a map lookup. */
+        char used[CBM_SZ_1K];
+        project_db_path(project, used, sizeof(used));
+        if (used[0] && cbm_file_exists(used)) {
+            cbm_cache_usage_touch(used, NULL);
+        }
+    }
     if (store && g_expected_root[0]) {
         cbm_project_t proj = {0};
         if (cbm_store_get_project(store, project, &proj) == CBM_STORE_OK) {
@@ -4111,42 +4131,26 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
         srv->current_project = NULL;
     }
 
-    /* Delete the .db file + WAL/SHM while both gates are held. */
-    char wal[CBM_SZ_1K];
-    char shm[CBM_SZ_1K];
-    snprintf(wal, sizeof(wal), "%s-wal", path);
-    snprintf(shm, sizeof(shm), "%s-shm", path);
-
-    bool exists = (access(path, F_OK) == 0);
+    /* Delete the .db file + WAL/SHM, its parked branches and its memo and
+     * usage rows while both gates are held -- the same removal cache expiry
+     * uses (cbm_cache_remove_project). Parked branches can outlive a main
+     * file that is already gone; they are kept when the main file could not
+     * be removed: the project still exists, and its branches with it. */
     const char *status = "not_found";
     const char *error_detail = NULL;
     bool is_error = false;
-
-    if (exists) {
-        int rc = cbm_unlink(path);
-        (void)cbm_unlink(wal);
-        (void)cbm_unlink(shm);
-        if (rc == 0) {
-            status = "deleted";
-            cbm_store_meta_db_t *meta = cbm_store_meta_open();
-            cbm_store_meta_forget(meta, path);
-            cbm_store_meta_close(meta);
-        } else {
-            status = "delete_failed";
-            error_detail = strerror(errno);
-            is_error = true;
-        }
+    int parked_deleted = 0;
+    int removed = cbm_cache_remove_project(path, name, NULL, &parked_deleted);
+    if (removed == 0) {
+        status = "deleted";
+    } else if (removed < 0) {
+        status = "delete_failed";
+        error_detail = strerror(errno);
+        is_error = true;
+    } else if (parked_deleted > 0) {
+        status = "deleted";
     } else {
         is_error = true;
-    }
-    /* The project's parked per-branch databases go with it, under the same
-     * lease; they can outlive a main file that is already gone. Not when the
-     * main file could not be removed: the project still exists, and its
-     * parked branches with it. */
-    int parked_deleted = !is_error || !exists ? cbm_branch_slots_delete_all(path, name) : 0;
-    if (!exists && parked_deleted > 0) {
-        status = "deleted";
-        is_error = false;
     }
 
     cbm_pipeline_unlock();
@@ -7621,6 +7625,16 @@ static void apply_branch_index_config(const cbm_mcp_server_t *srv, cbm_pipeline_
     }
 }
 
+/* An index run is a use, and it knows the checkout root exactly. */
+static void touch_indexed(const cbm_pipeline_t *p) {
+    const char *name = cbm_pipeline_project_name(p);
+    char path[CBM_SZ_1K];
+    project_db_path(name, path, sizeof(path));
+    if (path[0] && cbm_file_exists(path)) {
+        cbm_cache_usage_touch(path, cbm_pipeline_repo_path(p));
+    }
+}
+
 int cbm_mcp_index_in_process(const char *root_path) {
     cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
     if (!p) {
@@ -7628,6 +7642,9 @@ int cbm_mcp_index_in_process(const char *root_path) {
     }
     apply_branch_index_config(NULL, p);
     int rc = cbm_pipeline_run(p);
+    if (rc == 0) {
+        touch_indexed(p);
+    }
     cbm_pipeline_free(p);
     return rc;
 }
@@ -7813,6 +7830,7 @@ static char *index_repository_in_process(cbm_mcp_server_t *srv, const char *args
             yyjson_mut_obj_add_bool(doc, root, "format_migration", true);
         }
         add_branch_switch_json(doc, root, p);
+        touch_indexed(p);
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         /* #1665: a post-publish artifact export failure (read-only repo, etc.)
@@ -13123,6 +13141,51 @@ bool cbm_mcp_update_check_enabled(void) {
     return !value || strcmp(value, "0") != 0;
 }
 
+/* ── Cache expiry ───────────────────────────────────────────────── */
+
+static bool sweep_keep_watched(const char *project, void *ud) {
+    cbm_mcp_server_t *srv = (cbm_mcp_server_t *)ud;
+    return srv->watcher && cbm_watcher_is_watched(srv->watcher, project);
+}
+
+static void *sweep_thread(void *arg) {
+    cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
+    cbm_cache_expiry_cfg_t cfg;
+    cbm_cache_expiry_cfg_load(&cfg, NULL);
+    cbm_cache_sweep_opts_t opts = {};
+    opts.keep_project = srv->session_project[0] ? srv->session_project : NULL;
+    opts.keep = sweep_keep_watched;
+    opts.keep_ud = srv;
+    cbm_cache_sweep_result_t res;
+    (void)cbm_cache_expiry_sweep(&cfg, &opts, &res);
+    srv->sweep_running.store(false);
+    return NULL;
+}
+
+/* Start a background sweep when one is due (at most once a day per cache,
+ * recorded in _config.db). Called at initialize and after an index run; the
+ * due check is one read of _config.db. */
+static void maybe_sweep_cache(cbm_mcp_server_t *srv) {
+    cbm_cache_expiry_cfg_t cfg;
+    cbm_cache_expiry_cfg_load(&cfg, srv->config);
+    if (!cbm_cache_expiry_due(&cfg, (int64_t)time(NULL))) {
+        return;
+    }
+    if (srv->sweep_running.load()) {
+        return; /* the earlier sweep records last_sweep when it ends */
+    }
+    if (srv->sweep_active) {
+        cbm_thread_join(&srv->sweep_tid); /* finished: reap it */
+        srv->sweep_active = false;
+    }
+    srv->sweep_running.store(true);
+    if (cbm_thread_create(&srv->sweep_tid, 0, sweep_thread, srv) == 0) {
+        srv->sweep_active = true;
+    } else {
+        srv->sweep_running.store(false);
+    }
+}
+
 static void start_update_check(cbm_mcp_server_t *srv) {
     if (srv->update_checked || !cbm_mcp_update_check_enabled()) {
         return;
@@ -13208,6 +13271,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         start_update_check(srv);
         detect_session(srv);
         maybe_auto_index(srv);
+        maybe_sweep_cache(srv);
     } else if (strcmp(req.method, "ping") == 0) {
         result_json = heap_strdup("{}");
     } else if (strcmp(req.method, "tools/list") == 0) {
@@ -13309,6 +13373,9 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         request_logged = true;
 
         result_json = inject_update_notice(srv, result_json);
+        if (tool_name && strcmp(tool_name, "index_repository") == 0) {
+            maybe_sweep_cache(srv);
+        }
         free(tool_name);
         free(tool_args);
     } else {

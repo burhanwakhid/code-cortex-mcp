@@ -249,6 +249,7 @@ extern void suite_grammar_probe_f(void);
 extern void suite_grammar_probe_g(void);
 extern void suite_incremental(void);
 extern void suite_branch_index(void);
+extern void suite_cache_expiry(void);
 extern void suite_simhash(void);
 extern void suite_stack_overflow(void);
 
@@ -296,6 +297,9 @@ int main(int argc, char **argv) {
             snprintf(cache, sizeof(cache), "%s/.cache/code-cortex-mcp", home_tmp);
             cbm_mkdir(cache);
         }
+        /* No automatic cache sweeps from the servers suites create; the
+         * cache_expiry suite drives the sweep itself. */
+        cbm_setenv("CBM_CACHE_EXPIRY", "0", 1);
     }
 
     printf("\n  code-cortex-mcp  C test suite\n");
@@ -447,6 +451,7 @@ int main(int argc, char **argv) {
 
     RUN_SUITE(incremental);
     RUN_SUITE(branch_index);
+    RUN_SUITE(cache_expiry);
 
     /* Release process-lifetime caches so LeakSanitizer reports no leaks. */
     cbm_kind_in_set_free_cache();

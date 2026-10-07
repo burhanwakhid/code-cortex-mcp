@@ -1268,3 +1268,99 @@ int cbm_branch_slots_delete_all(const char *db_path, const char *project) {
     }
     return removed;
 }
+
+/* Expire the files of one slot directory (cbm_branch_slots_expire). */
+static int expire_dir(const char *dir, int64_t slot_before, int64_t scratch_before, bool dry_run,
+                      cbm_branch_slot_expire_cb cb, void *ud) {
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return 0;
+    }
+    int cap = 0;
+    int n = 0;
+    char **names = NULL;
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (ent->is_dir || !(slot_ext(ent->name) || is_scratch_name(ent->name))) {
+            continue;
+        }
+        if (n == cap) {
+            int next_cap = cap ? cap * 2 : 8;
+            char **grown = (char **)realloc(names, (size_t)next_cap * sizeof(char *));
+            if (!grown) {
+                break;
+            }
+            names = grown;
+            cap = next_cap;
+        }
+        if (!(names[n] = strdup(ent->name))) {
+            break;
+        }
+        n++;
+    }
+    cbm_closedir(d);
+    int removed = 0;
+    for (int i = 0; i < n; i++) {
+        char path[BS_PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+        /* A slot's own SQLite sidecars (legacy .db slots) go with the slot;
+         * they are not judged on their own. */
+        bool is_slot = slot_ext(names[i]) != NULL;
+        bool sidecar = !is_slot && (strstr(names[i], ".db-wal") || strstr(names[i], ".db-shm") ||
+                                    strstr(names[i], ".db-journal")) &&
+                       !strstr(names[i], BS_UNZ_EXT);
+        int64_t before = is_slot ? slot_before : scratch_before;
+        int64_t mt = file_mtime(path);
+        if (sidecar || before <= 0 || mt < 0 || mt >= before) {
+            free(names[i]);
+            continue;
+        }
+        int64_t bytes = file_size(path);
+        if (cb) {
+            cb(path, bytes, !is_slot, ud);
+        }
+        if (!dry_run) {
+            if (is_slot) {
+                unlink_slot(path);
+                cbm_log_info("cache.expire", "kind", "slot", "path", path);
+            } else {
+                (void)cbm_unlink(path);
+            }
+        }
+        removed += is_slot ? 1 : 0;
+        free(names[i]);
+    }
+    free(names);
+    return removed;
+}
+
+int cbm_branch_slots_expire(const char *db_path, const char *project, int64_t slot_before,
+                            int64_t scratch_before, bool dry_run, cbm_branch_slot_expire_cb cb,
+                            void *ud) {
+    char dir[BS_PATH_MAX];
+    if (!cbm_branch_slots_dir(db_path, project, NULL, dir, sizeof(dir))) {
+        return 0;
+    }
+    int removed = expire_dir(dir, slot_before, scratch_before, dry_run, cb, ud);
+    char **keys = NULL;
+    int nk = list_root_dirs(dir, &keys);
+    for (int i = 0; i < nk; i++) {
+        char sub[BS_PATH_MAX];
+        snprintf(sub, sizeof(sub), "%s/%s", dir, keys[i]);
+        removed += expire_dir(sub, slot_before, scratch_before, dry_run, cb, ud);
+        if (!dry_run) {
+            (void)cbm_rmdir(sub); /* only when empty */
+        }
+        free(keys[i]);
+    }
+    free(keys);
+    if (!dry_run) {
+        (void)cbm_rmdir(dir);
+        char *slash = strrchr(dir, '/');
+        if (slash) {
+            *slash = '\0';
+            (void)cbm_rmdir(dir);
+        }
+    }
+    return removed;
+}

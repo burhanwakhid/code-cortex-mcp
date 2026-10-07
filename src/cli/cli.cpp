@@ -14,6 +14,7 @@
 #include "mcp/mcp.h"             // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
 /* cbm_branch_slots_delete_all: an index reset drops parked branch indexes too. */
 #include "pipeline/branch_slots.h"
+#include "mcp/cache_expiry.h" /* cbm_cmd_cache */
 
 /* CLI buffer size constants. */
 enum {
@@ -3624,6 +3625,86 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
 
 /* ── Config CLI subcommand ────────────────────────────────────── */
 
+/* One line per item of a cache sweep. */
+static void cache_report(const cbm_cache_expiry_item_t *it, void *ud) {
+    bool dry = *(bool *)ud;
+    const char *verb = it->kind == CBM_EXPIRE_PENDING ? "watch"
+                       : it->skipped                  ? "kept"
+                       : it->removed                  ? (it->kind == CBM_EXPIRE_ROOT_GONE ||
+                                         it->kind == CBM_EXPIRE_UNUSED
+                                                             ? "trashed"
+                                                             : "removed")
+                       : dry                          ? "would remove"
+                                                      : "kept";
+    printf("  %-12s %-11s %-40s %8.1f MB  %s%s%s%s\n", verb, cbm_cache_expiry_kind_str(it->kind),
+           it->name, (double)it->bytes / (1024.0 * 1024.0), it->reason,
+           it->skipped ? " [" : "", it->skipped ? it->skipped : "", it->skipped ? "]" : "");
+}
+
+int cbm_cmd_cache(int argc, char **argv) {
+    if (argc < 1 || !argv) {
+        printf("Usage: code-cortex-mcp cache <command>\n\n"
+               "Commands:\n"
+               "  expire [--dry-run] [--now EPOCH]  Move stale indexes to the trash, drop old\n"
+               "                                    parked branches and orphan files\n"
+               "  trash                             List trashed indexes\n"
+               "  restore <entry|project>           Put a trashed index back\n");
+        return 0;
+    }
+    if (strcmp(argv[0], "expire") == 0) {
+        bool dry = false;
+        int64_t now = 0;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--dry-run") == 0 || strcmp(argv[i], "-n") == 0) {
+                dry = true;
+            } else if (strcmp(argv[i], "--now") == 0 && i + 1 < argc) {
+                now = strtoll(argv[++i], NULL, 10);
+            } else {
+                (void)fprintf(stderr, "unknown option: %s\n", argv[i]);
+                return CLI_TRUE;
+            }
+        }
+        cbm_cache_expiry_cfg_t cfg;
+        cbm_cache_expiry_cfg_load(&cfg, NULL);
+        cbm_cache_sweep_opts_t opts = {};
+        opts.now = now;
+        opts.dry_run = dry;
+        opts.report = cache_report;
+        opts.report_ud = &dry;
+        cbm_cache_sweep_result_t res;
+        printf("%s %s\n", dry ? "Cache expiry preview for" : "Cache expiry in",
+               cbm_resolve_cache_dir());
+        if (cbm_cache_expiry_sweep(&cfg, &opts, &res) != 0) {
+            (void)fprintf(stderr, "not swept: %s\n", res.refused_reason);
+            return CLI_TRUE;
+        }
+        printf("%s: %d index(es), %d parked branch(es), %d orphan file(s), %d trash "
+               "entr%s; %.1f MB; %d kept\n",
+               dry ? "Would remove" : "Removed", res.projects, res.slots, res.sidecars,
+               res.purged, res.purged == 1 ? "y" : "ies", (double)res.bytes / (1024.0 * 1024.0),
+               res.skipped);
+        if (!dry && res.projects > 0) {
+            printf("Trashed indexes are deleted by the next sweep a day or more later; "
+                   "`code-cortex-mcp cache restore <project>` puts one back.\n");
+        }
+        return 0;
+    }
+    if (strcmp(argv[0], "trash") == 0) {
+        if (cbm_cache_trash_list(stdout) == 0) {
+            printf("  (trash is empty)\n");
+        }
+        return 0;
+    }
+    if (strcmp(argv[0], "restore") == 0 && argc >= 2) {
+        char msg[CLI_BUF_1K];
+        int rc = cbm_cache_trash_restore(argv[1], msg, sizeof(msg));
+        (void)fprintf(rc == 0 ? stdout : stderr, "%s\n", msg);
+        return rc == 0 ? 0 : CLI_TRUE;
+    }
+    (void)fprintf(stderr, "unknown cache command: %s\n", argv[0]);
+    return CLI_TRUE;
+}
+
 int cbm_cmd_config(int argc, char **argv) {
     /* NULL argv with a nonzero argc previously slipped past this guard and
      * dereferenced argv[0] below -- caught by the clang-analyzer lane. */
@@ -3647,6 +3728,14 @@ int cbm_cmd_config(int argc, char **argv) {
                "Parked branch indexes kept per project (oldest dropped)");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_BRANCH_INDEX_BUDGET, "2G",
                "Disk budget of a project's parked branch indexes (0: no size cap)");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_CACHE_EXPIRY, "true",
+               "Daily sweep that moves stale indexes to the trash");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_CACHE_EXPIRY_UNUSED_DAYS, "90",
+               "Expire an index nothing used for this many days (0: never)");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_CACHE_EXPIRY_ROOT_GRACE_DAYS, "7",
+               "Expire an index whose checkout is gone this long (0: never)");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_CACHE_EXPIRY_SLOT_DAYS, "30",
+               "Drop a parked branch index not restored for this many days (0: never)");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
                "Pin graph UI language: en, zh, or auto");
         return 0;
@@ -3682,6 +3771,14 @@ int cbm_cmd_config(int argc, char **argv) {
                cbm_config_get(cfg, CBM_CONFIG_BRANCH_INDEX_KEEP, "8"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_BRANCH_INDEX_BUDGET,
                cbm_config_get(cfg, CBM_CONFIG_BRANCH_INDEX_BUDGET, "2G"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_CACHE_EXPIRY,
+               cbm_config_get(cfg, CBM_CONFIG_CACHE_EXPIRY, "true"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_CACHE_EXPIRY_UNUSED_DAYS,
+               cbm_config_get(cfg, CBM_CONFIG_CACHE_EXPIRY_UNUSED_DAYS, "90"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_CACHE_EXPIRY_ROOT_GRACE_DAYS,
+               cbm_config_get(cfg, CBM_CONFIG_CACHE_EXPIRY_ROOT_GRACE_DAYS, "7"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_CACHE_EXPIRY_SLOT_DAYS,
+               cbm_config_get(cfg, CBM_CONFIG_CACHE_EXPIRY_SLOT_DAYS, "30"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
                cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto"));
     } else if (strcmp(argv[0], "get") == 0) {

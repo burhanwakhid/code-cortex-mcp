@@ -202,6 +202,22 @@ void cbm_branch_slots_free_info(cbm_branch_slot_info_t *info, int count);
  * the number of databases removed. */
 int cbm_branch_slots_delete_all(const char *db_path, const char *project);
 
+/* Called by cbm_branch_slots_expire for each file it removes (or, in a dry
+ * run, would remove): `path` the file, `bytes` its size, `scratch` true for a
+ * scratch or temp file of an interrupted park or restore, false for a slot. */
+typedef void (*cbm_branch_slot_expire_cb)(const char *path, int64_t bytes, bool scratch, void *ud);
+
+/* Remove project's parked slots (every root's, and legacy ones) whose file
+ * was last written -- parked -- before slot_before (epoch seconds; <= 0 skips
+ * slots), and scratch files written before scratch_before (<= 0 skips them),
+ * then the directories left empty. A restore deletes the slot it restores,
+ * so a slot's mtime is the time it was parked and it has not been restored
+ * since. The caller MUST hold the index lease of db_path. dry_run removes
+ * nothing. Returns the number of slot files removed (or due). */
+int cbm_branch_slots_expire(const char *db_path, const char *project, int64_t slot_before,
+                            int64_t scratch_before, bool dry_run, cbm_branch_slot_expire_cb cb,
+                            void *ud);
+
 #ifdef __cplusplus
 }
 #endif

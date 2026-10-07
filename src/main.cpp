@@ -579,6 +579,7 @@ static void print_help(void) {
     printf("  code-cortex-mcp update [-y|-n]\n");
     printf("  code-cortex-mcp config <list|get|set|reset>\n");
     printf("  code-cortex-mcp doctor       Check install, hooks, and whether cwd is indexed\n");
+    printf("  code-cortex-mcp cache <expire [--dry-run]|trash|restore <entry>>\n");
     printf("  code-cortex-mcp task-context Read {project|repo_path,symbol|request,max_bytes?} JSON "
            "from stdin; "
            "emit optional source context\n");
@@ -636,6 +637,9 @@ static int handle_subcommand(int argc, char **argv) {
         }
         if (strcmp(argv[i], "config") == 0) {
             return cbm_cmd_config(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
+        }
+        if (strcmp(argv[i], "cache") == 0) {
+            return cbm_cmd_cache(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "doctor") == 0) {
             cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));

@@ -329,6 +329,10 @@ code-cortex-mcp config set auto_watch false       # default: true
 code-cortex-mcp config set branch_index false     # one index per git branch; default: true
 code-cortex-mcp config set branch_index_keep 8     # parked branch indexes per project
 code-cortex-mcp config set branch_index_budget 2G  # disk budget of those parked indexes; 0: no cap
+code-cortex-mcp config set cache_expiry true       # daily sweep of stale indexes; default: true
+code-cortex-mcp config set cache_expiry_unused_days 90      # 0: never expire unused indexes
+code-cortex-mcp config set cache_expiry_root_grace_days 7   # checkout gone this long; 0: never
+code-cortex-mcp config set cache_expiry_slot_days 30        # parked branch not restored; 0: never
 code-cortex-mcp config set ui-lang en              # auto, en, or zh; default: auto
 ```
 
@@ -342,6 +346,12 @@ code-cortex-mcp config set ui-lang en              # auto, en, or zh; default: a
   `index_matches_checkout` is false until the next index run after a checkout.
   `CBM_BRANCH_INDEX=0` turns this off for one process, and `CBM_BRANCH_INDEX_BUDGET` sets the
   budget for one process. Design and trade-offs: [docs/BRANCH_INDEX.md](docs/BRANCH_INDEX.md).
+- **Expiry** — once a day the MCP server moves stale indexes into `trash/` in the cache: those
+  whose checkout is gone (missing on 3 sweeps over 7 days, and unused that long) and those unused
+  for 90 days. It also drops parked branch indexes older than 30 days and orphan temp files. A
+  later sweep deletes the trash. `code-cortex-mcp cache expire --dry-run` shows what would go and
+  why; `cache restore <project>` puts a trashed index back. `CBM_CACHE_EXPIRY=0` turns the
+  automatic sweep off for one process. Design: [docs/CACHE_EXPIRY.md](docs/CACHE_EXPIRY.md).
 - **Parallelism** — auto-detected (cgroup-aware); override with `CBM_WORKERS` (1–256).
 - **Ignore rules** — `.gitignore`, then `.cbmignore` (gitignore syntax). The indexer skips symlinks.
 - **Custom extensions** — `.code-cortex.json`: `{"extra_extensions": {".mjs": "javascript"}}`.

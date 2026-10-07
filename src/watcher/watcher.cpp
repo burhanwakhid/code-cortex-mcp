@@ -609,6 +609,16 @@ int cbm_watcher_watch_count(cbm_watcher_t *w) {
     return count;
 }
 
+bool cbm_watcher_is_watched(cbm_watcher_t *w, const char *project_name) {
+    if (!w || !project_name) {
+        return false;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    bool hit = cbm_ht_get(w->projects, project_name) != NULL;
+    cbm_mutex_unlock(&w->projects_lock);
+    return hit;
+}
+
 /* ── Single poll cycle ──────────────────────────────────────────── */
 
 /* Init baseline for a project: check if git, get HEAD, count files */
