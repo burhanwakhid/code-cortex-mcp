@@ -315,6 +315,26 @@ static int64_t file_mtime(const char *path) {
     return (int64_t)st.st_mtime;
 }
 
+static int64_t file_size(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 ? (int64_t)st.st_size : -1;
+}
+
+static int64_t wal_size(const char *db_path) {
+    char wal[BS_PATH_MAX];
+    snprintf(wal, sizeof(wal), "%s-wal", db_path);
+    return file_size(wal);
+}
+
+/* One info line with two integer fields (timings and sizes the soak reads). */
+static void log_bytes(const char *msg, const char *k1, int64_t v1, const char *k2, int64_t v2) {
+    char b1[32];
+    char b2[32];
+    snprintf(b1, sizeof(b1), "%lld", (long long)v1);
+    snprintf(b2, sizeof(b2), "%lld", (long long)v2);
+    cbm_log_info(msg, k1, b1, k2, b2);
+}
+
 static int bs_entry_cmp_oldest(const void *a, const void *b) {
     const bs_entry_t *ea = (const bs_entry_t *)a;
     const bs_entry_t *eb = (const bs_entry_t *)b;
@@ -616,19 +636,25 @@ static cbm_branch_switch_t switch_from(const char *db_path, const char *project,
                                        const char *indexed, const char *dir, const char *incoming,
                                        bool have_incoming, int keep) {
     char outgoing[BS_PATH_MAX];
+    uint64_t t0 = cbm_now_ms();
     if (!slot_path(dir, indexed, outgoing, sizeof(outgoing)) || !cbm_mkdir_p(dir, 0755) ||
         !copy_db(db_path, outgoing)) {
         cbm_log_warn("branch.park_failed", "from", indexed, "to", slug, "action", "in_place");
         return CBM_BRANCH_SWITCH_IN_PLACE;
     }
+    log_bytes("branch.park", "elapsed_ms", (int64_t)(cbm_now_ms() - t0), "slot_bytes",
+              file_size(outgoing));
 
     /* Restore by content (restore_into). A failure at any step leaves the
      * outgoing database in place, already parked: it becomes the seed, as if
      * nothing had been parked for this branch. */
     cbm_branch_switch_t action = CBM_BRANCH_SWITCH_SEEDED;
     if (have_incoming) {
+        t0 = cbm_now_ms();
         if (restore_into(incoming, db_path, project)) {
             action = CBM_BRANCH_SWITCH_RESTORED;
+            log_bytes("branch.restore", "elapsed_ms", (int64_t)(cbm_now_ms() - t0), "wal_bytes",
+                      wal_size(db_path));
             unlink_slot(incoming);
         } else {
             cbm_log_warn("branch.restore_failed", "to", slug, "action", "seeded");
