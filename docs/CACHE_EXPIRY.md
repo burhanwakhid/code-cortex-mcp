@@ -1,0 +1,226 @@
+# Cache expiry
+
+This page records why and how Code Cortex removes index databases that nobody uses any more,
+and which alternatives lost. The code is in `src/mcp/cache_expiry.{h,cpp}`, with the slot part
+in `cbm_branch_slots_expire` (`src/pipeline/branch_slots.cpp`) and the command in
+`code-cortex-mcp cache` (`src/cli/cli.cpp`).
+
+## Problem
+
+The cache directory only grew. Three kinds of files stayed forever:
+
+- `<cache>/<project>.db` of a checkout that no longer exists. A `git worktree remove`, a deleted
+  scratch clone or a benchmark directory under `/tmp` leaves its index behind, and nothing points
+  at it again. One developer cache held more than 500 databases, and every scan of the cache
+  directory (the `list_projects` fallback scan, the memo refill) paid for each of them.
+- Parked branch slots (see [Branch index](BRANCH_INDEX.md)). They are bounded per checkout by
+  count and size, but a branch deleted in git keeps its slot until the cap pushes it out, and the
+  slots of a project whose database is gone are never pushed out at all.
+- SQLite sidecars and temp files of a database that is gone, and scratch files of an
+  interrupted park or restore.
+
+The design has these requirements:
+
+1. Remove only what is very likely dead, and say why.
+2. Never remove the index of a project that a session is in, that is being indexed or watched,
+   or that a reader is using.
+3. Cost nothing measurable on the hot paths: tool calls and the hook processes.
+4. Make a mistake recoverable for some time, and make every decision visible before it happens.
+
+## What counts as stale
+
+The rules, in order of confidence:
+
+| Kind | Rule | Default |
+|---|---|---|
+| `root_gone` | The recorded checkout root is missing on at least 3 sweeps, the first of them at least the grace period ago, and nothing used the database in the grace period. | 7 days |
+| `unused` | No tool call, hook or index run used the database for the threshold. | 90 days |
+| `slot` | A parked slot was parked longer ago than the threshold. | 30 days |
+| `sidecar` | A `-wal`, `-shm`, `-journal`, `.db.tmp` or `.db.import_tmp` file whose database is gone, or a scratch file (`.db.unz*`, `.db.zst.tmp`) beside the slots. | older than 1 hour |
+
+### Root gone
+
+The root comes from the database's own `projects` row, read once and then kept in the usage
+table. An index run records it exactly, from the checkout it indexed.
+
+A missing path is not always a deleted checkout. The sweep classifies each root as present,
+missing or uncertain (`root_state`):
+
+- **Present**: the directory exists. Any streak restarts.
+- **Missing**: `stat` says "no such file", and the nearest existing ancestor is an ordinary
+  directory. This is what `git worktree remove` or deleting a clone looks like.
+- **Uncertain**: any other error (permission, a network mount timing out), a relative path, or a
+  nearest existing ancestor that is `/` or a mount parent (`/Volumes`, `/mnt`, `/media`,
+  `/media/<user>`, `/run/media/<user>`, `/net`, `/Network`, `/System/Volumes`, automount
+  directories, a Windows drive root). An external disk that is not mounted looks like this. An
+  uncertain root never counts.
+
+A root must be missing on 3 sweeps, and the first of those must be at least 7 days old. Sweeps
+run at most once a day, so the 3 sweeps are at least 2 days apart, and a single bad moment (a
+remount, a checkout that is moved and moved back) does not count 3 times. The database must also
+be unused for the same 7 days: a project that someone queries by name after its checkout moved
+stays.
+
+Two guards protect against a cache that is judged from the wrong place:
+
+- **Environment change.** The sweep records HOME and the cache directory. When either differs
+  from the previous sweep (a copied cache, a moved home, a sweep from another account), no root
+  is judged on that sweep, and every streak restarts.
+- **Mass absence.** When 5 or more roots are judged and every one is missing, the sweep counts
+  nothing (`cache.expire.suspect` in the log). A cache whose checkouts all vanished at once is
+  more likely a renamed home directory than a cleanup.
+
+A root recorded by another machine (an artifact imported before its root was rebound) is missing
+on this machine. It expires like a deleted checkout, unless it is used within the grace period.
+`cbm_artifact_import` rebinds the root at import, so this is rare.
+
+### Unused
+
+`last_used` is recorded in table `cache_usage` of `<cache>/_config.db`, beside the
+`store_meta` memo. Three events record it:
+
+- `resolve_store`, which every tool call and every hook (SessionStart, the prompt and read hooks)
+  goes through to open a project's database;
+- every index run (`index_repository`, the watcher's in-process run), which also records the
+  root and clears a missing streak;
+- `code-cortex-mcp cache restore`.
+
+The write is throttled twice. A process remembers, per database, when it last recorded use and
+skips the next hour of calls with one map lookup. The first call of a process (each hook is its
+own process) reads the row from `_config.db` and writes only when the row is an hour old. A read
+never takes `_config.db`'s write lock, so a hook pays one SQLite open and one indexed read, once
+per database it opens.
+
+A database seen for the first time starts its clock at that sweep. Its file mtime is not used:
+the mtime is the last index run, and a database queried daily but indexed long ago would then
+expire on the first sweep after an upgrade. With the clock starting at first sight, nothing
+expires as unused before it has had 90 days to be used under a build that records use.
+
+### Parked slots
+
+A restore deletes the slot it restores, so a slot that exists has not been restored since it
+was parked, and its file mtime is the park time. A slot older than 30 days goes. This is how the
+slot of a branch deleted in git goes away. Git branches are not enumerated: a deleted branch can
+be recreated, a remote branch can be checked out again later, and a time rule needs no git
+subprocess. Slots of a project whose database is already gone go by the same rule.
+
+### Sidecars
+
+The sweep removes a sidecar or temp file only when its database is absent, when it is older than
+1 hour, and while it holds that database's lease, so an index run that is about to create the
+database cannot race it. `<x>.db.index.lock` files stay: the lease contract (`compat_fs.h`)
+says that the lock file is never unlinked, because a process that opens the path after an unlink
+locks a new file and both processes would own the lease. The lock files are empty.
+
+## Where the sweep runs
+
+A sweep is due when the last one recorded in `_config.db` is at least a day old. The MCP server
+checks this at `initialize` and after each `index_repository` call, and starts the sweep on a
+background thread, so neither the handshake nor the index reply waits for it. The check is one
+read of `_config.db`. One sweep thread runs per server; the server joins it before it frees
+itself. Across processes, a sweep holds the index lease of `_config.db` (a lease nothing else
+takes), so a second server skips its sweep.
+
+The tool workers and hook processes never sweep. The CLI command `code-cortex-mcp cache expire`
+runs a sweep on demand, whatever the interval.
+
+A sweep is one scan of the cache directory, one usage-table read per database (in one
+transaction) and a `stat` of each recorded root. It opens a project database only to learn a
+root the usage table does not have yet (first from the `store_meta` memo, else one read of its
+`projects` row) and to quiesce a database it is about to remove.
+
+## Removal
+
+A database that expires is removed under its index lease, so it is never removed while it is
+being indexed. Before the move, the sweep opens it and runs a `PASSIVE` checkpoint. When the
+checkpoint cannot copy every WAL frame, a reader holds a snapshot: the database is in use, and
+the sweep skips it. Otherwise the main file is the whole database.
+
+The removal is `cbm_cache_remove_project`, which `delete_project` also uses: the database, its
+WAL and SHM, its parked slots of every root, its `store_meta` row and its usage row go together.
+The one difference is the destination.
+
+### Trash
+
+An expired database is moved, not deleted, into `<cache>/trash/<epoch>-<project>/` with its WAL
+and its slot directory, beside a file `EXPIRED` that records the reason. A sweep at least a day
+later deletes the entry. Until then, `code-cortex-mcp cache restore <project>` puts the
+database and its slots back, if the project has no new database, and restarts its usage clock.
+
+We chose a trash step because the two costly mistakes are an uncertain root that the guards did
+not catch (an unusual mount layout) and a threshold set too low by hand. A trash entry costs disk
+space for one more day. Slots and sidecars are deleted directly: they are caches of something
+that still exists (the project's graph) or of nothing.
+
+`trash/` is a subdirectory, so scans of top-level `*.db` files never see trashed databases.
+
+### Never removed
+
+- The project of the server's own session, and every project its watcher watches.
+- A project whose index lease is held (being indexed or deleted elsewhere).
+- A database with a reader holding a WAL snapshot.
+- Anything when the cache directory has no `_config.db`, when HOME is not a directory, or when
+  another sweep runs.
+- `_config.db`, `.index.lock` files, and files whose names this module does not write.
+
+## Alternatives that lost
+
+- **File atime as the last-used time.** Most systems mount with `noatime` or `relatime`, and
+  every scan and backup touches it. It says nothing reliable.
+- **A `last_used` column in `store_meta_v2`.** That table is a cache keyed by the file's
+  generation: a re-index replaces the row, and a stale row is dropped. Usage must survive both,
+  so it has its own table.
+- **Writing `last_used` on every tool call.** That is a `_config.db` write lock per call, shared
+  by every hook process. The two-level throttle makes the cost a map lookup in the steady state.
+- **Using `projects.indexed_at` or the file mtime.** Both record the last index, not the last
+  use. A stable repository is indexed rarely and queried daily.
+- **Deleting immediately when the root is missing.** A disk that is not mounted, a network mount,
+  or a checkout moved and moved back would lose its index at once. The watcher already prunes a
+  watched root that stays missing for 10 minutes; that is a watched project, with a server
+  observing it the whole time. The sweep judges unwatched projects, so it waits days.
+- **Enumerating git branches to expire slots.** A deleted branch can come back, and it needs a
+  git subprocess per checkout. Age is enough.
+- **A global size cap for the whole cache.** It would evict the least recently used project of
+  a user who simply has many, which is a policy decision the user did not make. The per-checkout
+  slot budget and the time rules bound growth without it.
+
+## Operations
+
+| Setting | Default | Effect |
+|---|---|---|
+| `cache_expiry` (config) | `true` | `false` turns the automatic daily sweep off. `cache expire` still runs on demand. |
+| `cache_expiry_unused_days` (config) | `90` | Days without use before a database expires. `0` turns the rule off. |
+| `cache_expiry_root_grace_days` (config) | `7` | Grace period of the missing-root rule. `0` turns the rule off. |
+| `cache_expiry_slot_days` (config) | `30` | Days after which a parked slot goes. `0` turns the rule off. |
+| `CBM_CACHE_EXPIRY=0` (environment) | unset | No automatic sweep in this process. |
+
+Fixed values: 3 missing-root sweeps, a sweep interval of 1 day, trash kept for at least 1 day,
+and sidecars and scratch files older than 1 hour.
+
+Commands:
+
+```sh
+code-cortex-mcp cache expire --dry-run   # what a sweep would do now, with reasons and sizes
+code-cortex-mcp cache expire             # sweep now
+code-cortex-mcp cache trash              # list trashed databases
+code-cortex-mcp cache restore <project>  # put the newest trashed database of <project> back
+```
+
+`--dry-run` decides with the same rules and writes nothing: no removal, no usage rows, no
+missing streaks, no sweep time. It also lists the roots that are missing but still in their
+grace period (`watch`). `--now EPOCH` judges as of another time, for tests and for previewing.
+
+Each removal logs one `cache.expire` line (kind, name, path, reason), each skip a
+`cache.expire.skip` line, and each sweep a `cache.expire.done` summary.
+
+## Known limitations
+
+- A long-running server sweeps only at `initialize` and after index runs; a server that does
+  neither for days does not sweep. Another session or `cache expire` does.
+- A project whose server stays up and idle for 90 days, with nothing queried and nothing
+  re-indexed, is excluded only from that server's own sweep (as its session or watched
+  project). A sweep from another process can expire it as unused.
+- The watcher's own prune of a watched root that stays missing for 10 minutes (`watcher.cpp`)
+  still deletes directly, not through the trash, and leaves the database's usage row behind (a
+  few bytes in `_config.db`).
+- Windows is not verified. Root classification treats a drive root as a mount parent.

@@ -42,7 +42,9 @@ nested repository never answers from its parent's graph. When an index run finds
 on another branch, it parks the outgoing graph as a compressed slot under
 `<cache>/branches/<project>/<root key>/` and restores the incoming branch's graph by content, in
 one SQLite write transaction on the unchanged live file. [Branch index](BRANCH_INDEX.md) records
-the decisions, the alternatives, the measurements and the known limits.
+the decisions, the alternatives, the measurements and the known limits. Indexes whose checkout
+is gone or that nothing used for months are moved to a trash and deleted a day later; see
+[Cache expiry](CACHE_EXPIRY.md).
 
 ## Scale redesign
 
