@@ -712,13 +712,14 @@ void cbm_branch_slots_test_before_restore(void (*callback)(void *), void *data) 
  * crash, a permanent state -- in which db_path's old WAL sits beside the new
  * main file and is replayed onto it. The price is the copy going through the
  * WAL: the database's size written twice, and a WAL as large as the database
- * on disk until SQLite removes it at the last connection's close.
+ * on disk until the restore's own checkpoint can reset it (shrink_wal) or
+ * SQLite removes it at the last connection's close.
  *
  * That WAL peak is not bounded by stepping the backup in page batches: the
  * destination keeps one write transaction (and its lock) open from the first
- * step to the last, so every page is in the WAL before the commit (measured:
- * 33 steps of 100 pages into a 216 MB database grew the WAL steadily to
- * 216 MB). Copying table by table in several transactions would bound it, but
+ * step to the last, so every page is in the WAL before the commit (measured
+ * with SQLite 3.53.1: 33 steps of 100 pages into a 216 MB database grew the
+ * WAL steadily to 216 MB). Copying table by table in several transactions would bound it, but
  * readers would then see, and a crash would leave, a mix of two branches'
  * graphs. The single transaction is kept; see docs/BRANCH_INDEX.md.
  *
@@ -735,6 +736,44 @@ void cbm_branch_slots_test_before_restore(void (*callback)(void *), void *data) 
  * Fails, leaving db_path as it was, when the ADR cannot be carried, the page
  * sizes differ (a WAL database cannot change its page size) or the write lock
  * is not granted in time. */
+/* After a restore, give the WAL's disk space back when no reader needs it.
+ * The restore committed the whole database into the WAL. SQLite removes the
+ * file at the last connection's close, but a process that keeps the database
+ * open (a server's cached store) holds it at the database's size for as long
+ * as it stays open. So: a PASSIVE checkpoint, which copies the frames into
+ * the database file without blocking or waiting for anyone; if it copied
+ * them all, one write transaction that rewrites the unchanged user_version
+ * makes SQLite restart the WAL from its start and, under journal_size_limit
+ * = 0, truncate the file to what that commit wrote. SQLite restarts the WAL
+ * only when no reader is using its frames, so a reader mid-query keeps its
+ * snapshot and the shrink waits for the next restore. This is SQLite's own
+ * WAL reset, not a TRUNCATE or RESTART checkpoint: nothing waits on readers,
+ * and the -wal file is never memory-mapped, so no process can fault on the
+ * shorter file (cbm_store_checkpoint). */
+static void shrink_wal(sqlite3 *db) {
+    int frames = 0;
+    int copied = 0;
+    if (sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_PASSIVE, &frames, &copied) !=
+            SQLITE_OK ||
+        frames <= 0 || copied != frames) {
+        return;
+    }
+    sqlite3_stmt *st = NULL;
+    int version = -1;
+    if (sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        version = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    if (version < 0) {
+        return;
+    }
+    char sql[96];
+    snprintf(sql, sizeof(sql), "PRAGMA journal_size_limit = 0; PRAGMA user_version = %d;",
+             version);
+    (void)sqlite3_exec(db, sql, NULL, NULL, NULL);
+}
+
 static bool restore_into(const char *slot, const char *db_path, const char *project) {
 #ifdef CBM_ENABLE_TEST_SEAMS
     if (before_restore_cb) {
@@ -763,6 +802,9 @@ static bool restore_into(const char *slot, const char *db_path, const char *proj
         }
         /* Before SQLITE_DONE, finish rolls the destination back. */
         ok = sqlite3_backup_finish(bk) == SQLITE_OK && ok;
+    }
+    if (ok) {
+        shrink_wal(ddb);
     }
     cbm_store_close(dst);
     cbm_store_close(src);

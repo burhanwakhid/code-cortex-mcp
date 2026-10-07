@@ -2625,6 +2625,42 @@ TEST(branch_switch_sweeps_scratch) {
     PASS();
 }
 
+/* A restore writes the whole database through the WAL. With another
+ * connection holding the database open (a server's cached store), SQLite
+ * cannot remove the WAL at close; the restore's own checkpoint and WAL reset
+ * give the space back instead of leaving a database-sized -wal behind. */
+TEST(branch_restore_shrinks_wal_under_open_reader) {
+    char *repo = bi_make_repo("cbm_bi_walshrink");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char db[1024];
+    char wal[1100];
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+
+    bi_db_path(db, sizeof(db));
+    snprintf(wal, sizeof(wal), "%s-wal", db);
+    cbm_store_t *reader = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(reader);
+    ASSERT_EQ(bi_count("only_feature"), 1);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_STR_EQ(r.action, "restored");
+    int64_t live = bi_fsize(db);
+    int64_t w = bi_fsize(wal);
+    ASSERT_GT(live, 0);
+    ASSERT_LT(w, live / 2);
+    cbm_store_close(reader);
+    ASSERT_EQ(bi_count("only_main"), 1);
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -2691,4 +2727,5 @@ SUITE(branch_index) {
     RUN_TEST(branch_budget_parse);
     RUN_TEST(branch_budget_config_and_env);
     RUN_TEST(branch_switch_sweeps_scratch);
+    RUN_TEST(branch_restore_shrinks_wal_under_open_reader);
 }
