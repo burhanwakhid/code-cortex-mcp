@@ -149,6 +149,7 @@ struct cbm_pipeline {
     /* Per-branch databases (branch_slots.h). branch_keep < 1 disables
      * parking; the outcome of this run's switch is reported back. */
     int branch_keep;
+    int64_t branch_budget; /* bytes of parked slots per checkout; <= 0 no size cap */
     cbm_branch_switch_t branch_action;
     char *branch_from;            /* slug the database was built for; NULL unknown */
     int files_reparsed;           /* source files extracted this run; -1 unknown */
@@ -391,6 +392,14 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     char bi_env[CBM_SZ_32] = "";
     cbm_safe_getenv("CBM_BRANCH_INDEX", bi_env, sizeof(bi_env), NULL);
     p->branch_keep = strcmp(bi_env, "0") == 0 ? 0 : CBM_BRANCH_SLOTS_DEFAULT_KEEP;
+    /* CBM_BRANCH_INDEX_BUDGET (e.g. "4G") overrides the default size budget
+     * for the same paths; the MCP server applies the config key over it. */
+    p->branch_budget = CBM_BRANCH_SLOTS_DEFAULT_BUDGET;
+    char budget_env[CBM_SZ_32] = "";
+    if (cbm_safe_getenv("CBM_BRANCH_INDEX_BUDGET", budget_env, sizeof(budget_env), NULL) &&
+        !cbm_branch_budget_parse(budget_env, &p->branch_budget)) {
+        cbm_log_warn("branch.budget_invalid", "value", budget_env);
+    }
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -589,6 +598,12 @@ bool cbm_pipeline_verify_content(const cbm_pipeline_t *p) {
 void cbm_pipeline_set_branch_keep(cbm_pipeline_t *p, int keep) {
     if (p) {
         p->branch_keep = keep;
+    }
+}
+
+void cbm_pipeline_set_branch_budget(cbm_pipeline_t *p, int64_t budget) {
+    if (p) {
+        p->branch_budget = budget;
     }
 }
 
@@ -2111,7 +2126,7 @@ static void pipeline_branch_switch(cbm_pipeline_t *p) {
     p->artifact_stale = false;
     p->branch_action = cbm_branch_slots_switch(
         p->db_path, p->project_name, cbm_branch_slug_from_qn(p->branch_qn, p->project_name),
-        p->repo_path, p->branch_keep, &p->branch_from);
+        p->repo_path, p->branch_keep, p->branch_budget, &p->branch_from);
     /* A restore replaced the live content; nothing has exported it yet. */
     p->artifact_stale = p->branch_action == CBM_BRANCH_SWITCH_RESTORED;
 }

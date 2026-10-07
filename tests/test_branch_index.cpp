@@ -22,6 +22,7 @@
 #include <pipeline/pipeline_internal.h> /* cbm_pipeline_test_set_brief_recompute_max */
 #include <store/store.h>
 #include <foundation/platform.h>
+#include <foundation/sha256.h>
 
 #include <stdio.h>
 #include "sqlite3.h"
@@ -372,6 +373,12 @@ TEST(branch_parked_hidden_status_and_delete) {
     ASSERT_NOT_NULL(strstr(resp, "\\\"indexed_branch\\\":\\\"feature\\\""));
     ASSERT_NOT_NULL(strstr(resp, "\\\"index_matches_checkout\\\":true"));
     ASSERT_NOT_NULL(strstr(resp, "\\\"parked_branches\\\":[\\\"main\\\"]"));
+    /* Slot sizes, their total and the limits. */
+    ASSERT_NOT_NULL(strstr(resp, "\\\"parked_slots\\\":[{\\\"branch\\\":\\\"main\\\""));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"compressed\\\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"parked_bytes\\\":"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"branch_index_keep\\\":8"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"branch_index_budget_bytes\\\":2147483648"));
     free(resp);
 
     /* Checked out but not yet reindexed: the mismatch is visible. */
@@ -949,9 +956,14 @@ TEST(branch_reset_clears_orphaned_slots) {
     bool had_cache = cbm_safe_getenv("CBM_CACHE_DIR", old_cache, sizeof(old_cache), NULL) != NULL;
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
 
-    const char *files[] = {"live.db", "branches/live/main.db", "branches/orphan/main.db",
-                           "branches/orphan/feature.db", "branches/busy/main.db"};
-    for (int i = 0; i < 5; i++) {
+    const char *files[] = {"live.db",
+                           "branches/live/main.db",
+                           "branches/orphan/main.db",
+                           "branches/orphan/feature.db",
+                           "branches/busy/main.db",
+                           "branches/orphan/k1/zst.db.zst",
+                           "branches/orphan/k1/zst.db.unz"};
+    for (int i = 0; i < 7; i++) {
         char path[1024];
         snprintf(path, sizeof(path), "%s/%s", cache, files[i]);
         ASSERT_EQ(th_write_file(path, "x"), 0);
@@ -961,8 +973,9 @@ TEST(branch_reset_clears_orphaned_slots) {
     cbm_db_lease_t *lease = NULL;
     ASSERT_EQ(cbm_db_lease_try_acquire(busy, &lease), 0);
 
-    /* live.db, its parked main.db, and orphan's two parked databases. */
-    ASSERT_EQ(cbm_remove_indexes(NULL), 4);
+    /* live.db, its parked main.db, and orphan's three parked databases (one
+     * compressed, under a root key, beside a scratch file). */
+    ASSERT_EQ(cbm_remove_indexes(NULL), 5);
     char path[1024];
     snprintf(path, sizeof(path), "%s/branches/live", cache);
     ASSERT_FALSE(cbm_file_exists(path));
@@ -1513,12 +1526,16 @@ TEST(branch_index_prompt_counts_parked_only_cache) {
     char slot[1024];
     snprintf(slot, sizeof(slot), "%s/branches/gone/main.db", cache);
     ASSERT_EQ(th_write_file(slot, "x"), 0);
+    char zslot[1024];
+    snprintf(zslot, sizeof(zslot), "%s/branches/gone/0123456789ab/feature.db.zst", cache);
+    ASSERT_EQ(th_write_file(zslot, "x"), 0);
 
     cbm_set_auto_answer_for_test(1);
     int rc = cbm_install_handle_existing_indexes(NULL, true, false);
     cbm_set_auto_answer_for_test(0);
     ASSERT_EQ(rc, 1);
     ASSERT_FALSE(cbm_file_exists(slot));
+    ASSERT_FALSE(cbm_file_exists(zslot));
 
     if (had_cache) {
         cbm_setenv("CBM_CACHE_DIR", old_cache, 1);
@@ -1719,14 +1736,22 @@ static void bi_slot_root(const char *root, const char *slug, char *buf, size_t n
     if (!cbm_branch_slots_dir(bi_db_path(db, sizeof(db)), g_bi_project, root, dir, sizeof(dir))) {
         return;
     }
-    snprintf(slot, sizeof(slot), "%s/%s.db", dir, slug);
-    cbm_store_t *s = cbm_store_open_path_query(slot);
+    snprintf(slot, sizeof(slot), "%s/%s.db.zst", dir, slug);
+    char *tmp = th_mktempdir("cbm_bi_unpack");
+    char unpacked[1300];
+    snprintf(unpacked, sizeof(unpacked), "%s/slot.db", tmp ? tmp : "");
+    cbm_store_t *s = tmp && cbm_branch_slot_decompress(slot, unpacked)
+                         ? cbm_store_open_path_query(unpacked)
+                         : NULL;
     cbm_project_t proj = {0};
     if (s && cbm_store_get_project(s, g_bi_project, &proj) == CBM_STORE_OK) {
         snprintf(buf, n, "%s", proj.root_path ? proj.root_path : "");
         cbm_project_free_fields(&proj);
     }
     cbm_store_close(s);
+    if (tmp) {
+        th_rmtree(tmp);
+    }
 }
 
 /* Two checkouts whose paths derive the same project name share its slots
@@ -1865,9 +1890,11 @@ TEST(branch_legacy_slot_adopted) {
     bi_db_path(db, sizeof(db));
     ASSERT_TRUE(cbm_branch_slots_dir(db, g_bi_project, repo, ns, sizeof(ns)));
     ASSERT_TRUE(cbm_branch_slots_dir(db, g_bi_project, NULL, flat, sizeof(flat)));
-    snprintf(from, sizeof(from), "%s/main.db", ns);
+    snprintf(from, sizeof(from), "%s/main.db.zst", ns);
     snprintf(to, sizeof(to), "%s/main.db", flat);
-    ASSERT_EQ(rename(from, to), 0); /* the old, shared layout */
+    /* The old, shared layout, from before slots were compressed. */
+    ASSERT_TRUE(cbm_branch_slot_decompress(from, to));
+    ASSERT_EQ(cbm_unlink(from), 0);
 
     ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
     bi_run_t r = bi_index(repo, -1);
@@ -2200,6 +2227,404 @@ TEST(branch_session_start_notes_moved_checkout) {
 }
 #endif
 
+/* ── Compressed slots, size budget ─────────────────────────────── */
+
+/* Index repo with explicit parking limits. */
+static bi_run_t bi_index_lim(const char *repo, int keep, int64_t budget) {
+    bi_run_t r = {CBM_NOT_FOUND, "", "", -1};
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, CBM_MODE_FULL);
+    if (!p) {
+        return r;
+    }
+    cbm_pipeline_set_branch_keep(p, keep);
+    cbm_pipeline_set_branch_budget(p, budget);
+    snprintf(g_bi_project, sizeof(g_bi_project), "%s", cbm_pipeline_project_name(p));
+    snprintf(g_bi_root, sizeof(g_bi_root), "%s", cbm_pipeline_repo_path(p));
+    r.rc = cbm_pipeline_run(p);
+    const char *action = NULL;
+    cbm_pipeline_get_branch_switch(p, &action, NULL, NULL, &r.reparsed);
+    snprintf(r.action, sizeof(r.action), "%s", action ? action : "");
+    cbm_pipeline_free(p);
+    return r;
+}
+
+/* SHA-256 over the project's sorted nodes (label, QN, file, lines) and edges
+ * (type, source QN, target QN, properties): equal digests mean the same
+ * graph. "" when unreadable. */
+static const char *bi_graph_sig(char *buf, size_t n) {
+    buf[0] = '\0';
+    char db[1024];
+    sqlite3 *h = NULL;
+    if (sqlite3_open_v2(bi_db_path(db, sizeof(db)), &h, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(h);
+        return buf;
+    }
+    const char *sql[] = {
+        "SELECT label||'|'||qualified_name||'|'||file_path||'|'||start_line||'|'||end_line "
+        "FROM nodes WHERE project=?1 ORDER BY 1",
+        "SELECT e.type||'|'||a.qualified_name||'|'||b.qualified_name||'|'||"
+        "coalesce(e.properties,'') FROM edges e JOIN nodes a ON a.id=e.source_id "
+        "JOIN nodes b ON b.id=e.target_id WHERE e.project=?1 ORDER BY 1"};
+    size_t cap = 1 << 16;
+    size_t len = 0;
+    char *all = (char *)malloc(cap);
+    for (int q = 0; all && q < 2; q++) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(h, sql[q], -1, &st, NULL) != SQLITE_OK) {
+            free(all);
+            all = NULL;
+            break;
+        }
+        sqlite3_bind_text(st, 1, g_bi_project, -1, SQLITE_STATIC);
+        while (all && sqlite3_step(st) == SQLITE_ROW) {
+            const char *t = (const char *)sqlite3_column_text(st, 0);
+            size_t tl = t ? strlen(t) : 0;
+            while (len + tl + 2 > cap) {
+                cap *= 2;
+                char *g = (char *)realloc(all, cap);
+                if (!g) {
+                    free(all);
+                    all = NULL;
+                    break;
+                }
+                all = g;
+            }
+            if (all) {
+                memcpy(all + len, t ? t : "", tl);
+                len += tl;
+                all[len++] = '\n';
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(h);
+    if (all && n > CBM_SHA256_HEX_LEN) {
+        cbm_sha256_hex(all, len, buf);
+    }
+    free(all);
+    return buf;
+}
+
+/* <slots dir of the last-indexed root>/<slug><ext>. */
+static const char *bi_slot_file(const char *slug, const char *ext, char *buf, size_t n) {
+    char db[1024];
+    char dir[1100];
+    buf[0] = '\0';
+    if (cbm_branch_slots_dir(bi_db_path(db, sizeof(db)), g_bi_project, g_bi_root, dir,
+                             sizeof(dir))) {
+        snprintf(buf, n, "%s/%s%s", dir, slug, ext);
+    }
+    return buf;
+}
+
+static int64_t bi_fsize(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 ? (int64_t)st.st_size : -1;
+}
+
+/* A parked slot is one compressed file, smaller than the database; restoring
+ * it brings back exactly the graph that was parked, and leaves no scratch
+ * file behind. */
+TEST(branch_compressed_slot_round_trip) {
+    char *repo = bi_make_repo("cbm_bi_zst");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char sig_main[CBM_SHA256_HEX_LEN + 1];
+    char sig[CBM_SHA256_HEX_LEN + 1];
+    char path[1400];
+    char db[1024];
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(strlen(bi_graph_sig(sig_main, sizeof(sig_main))), CBM_SHA256_HEX_LEN);
+    int64_t live = bi_fsize(bi_db_path(db, sizeof(db)));
+
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    {
+        bi_run_t rr = bi_index(repo, -1);
+        ASSERT_STR_EQ(rr.action, "seeded");
+    }
+    ASSERT_TRUE(cbm_file_exists(bi_slot_file("main", ".db.zst", path, sizeof(path))));
+    int64_t slot = bi_fsize(path);
+    ASSERT_GT(slot, 0);
+    ASSERT_LT(slot, live / 4); /* an index database compresses well */
+    ASSERT_FALSE(cbm_file_exists(bi_slot_file("main", ".db", path, sizeof(path))));
+    ASSERT_FALSE(cbm_file_exists(bi_slot_file("main", ".db.unz", path, sizeof(path))));
+    ASSERT_FALSE(cbm_file_exists(bi_slot_file("main", ".db.zst.tmp", path, sizeof(path))));
+
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_STR_EQ(r.action, "restored");
+    ASSERT_EQ(r.reparsed, 0);
+    ASSERT_STR_EQ(bi_graph_sig(sig, sizeof(sig)), sig_main);
+    ASSERT_FALSE(cbm_file_exists(bi_slot_file("main", ".db.zst", path, sizeof(path))));
+    ASSERT_FALSE(cbm_file_exists(bi_slot_file("main", ".db.unz", path, sizeof(path))));
+    ASSERT_TRUE(cbm_file_exists(bi_slot_file("feature", ".db.zst", path, sizeof(path))));
+
+    bi_cleanup(repo);
+    PASS();
+}
+
+/* An uncompressed <slot>.db that an earlier build of this feature parked in
+ * the root's directory restores as it is; the next park of that branch
+ * writes a .db.zst and drops the .db. */
+TEST(branch_legacy_uncompressed_slot_restores) {
+    char *repo = bi_make_repo("cbm_bi_legacy_db");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char sig_main[CBM_SHA256_HEX_LEN + 1];
+    char sig[CBM_SHA256_HEX_LEN + 1];
+    char zst[1400];
+    char legacy[1400];
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    bi_graph_sig(sig_main, sizeof(sig_main));
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    bi_slot_file("main", ".db.zst", zst, sizeof(zst));
+    bi_slot_file("main", ".db", legacy, sizeof(legacy));
+    ASSERT_TRUE(cbm_branch_slot_decompress(zst, legacy));
+    ASSERT_EQ(cbm_unlink(zst), 0);
+    ASSERT_TRUE(bi_is_parked("main"));
+
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_STR_EQ(r.action, "restored");
+    ASSERT_EQ(r.reparsed, 0);
+    ASSERT_STR_EQ(bi_graph_sig(sig, sizeof(sig)), sig_main);
+    ASSERT_FALSE(cbm_file_exists(legacy));
+
+    /* A legacy feature.db beside a fresh park of feature: superseded. */
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    {
+        bi_run_t rr = bi_index(repo, -1);
+        ASSERT_STR_EQ(rr.action, "restored");
+    }
+    bi_slot_file("feature", ".db", legacy, sizeof(legacy));
+    bi_slot_file("main", ".db.zst", zst, sizeof(zst));
+    ASSERT_TRUE(cbm_branch_slot_decompress(zst, legacy)); /* any database */
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    {
+        bi_run_t rr = bi_index(repo, -1);
+        ASSERT_STR_EQ(rr.action, "restored");
+    }
+    ASSERT_FALSE(cbm_file_exists(legacy));
+    ASSERT_TRUE(cbm_file_exists(bi_slot_file("feature", ".db.zst", zst, sizeof(zst))));
+    char **list = NULL;
+    int n = bi_parked(&list);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(list[0], "feature");
+    cbm_branch_slots_free_list(list, n);
+
+    bi_cleanup(repo);
+    PASS();
+}
+
+/* A slot that does not decompress (truncated) is not restored: the outgoing
+ * graph stays in place as the seed and the run reindexes the difference. */
+TEST(branch_corrupt_slot_seeds) {
+    char *repo = bi_make_repo("cbm_bi_corrupt");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char zst[1400];
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    bi_slot_file("main", ".db.zst", zst, sizeof(zst));
+    int64_t sz = bi_fsize(zst);
+    ASSERT_GT(sz, 64);
+#ifndef _WIN32
+    ASSERT_EQ(truncate(zst, sz / 2), 0);
+#else
+    ASSERT_EQ(th_write_file(zst, "not a zstd frame"), 0);
+#endif
+
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "seeded");
+    ASSERT_EQ(bi_count("only_main"), 1);
+    ASSERT_EQ(bi_count("only_feature"), 0);
+    char path[1400];
+    ASSERT_FALSE(cbm_file_exists(bi_slot_file("main", ".db.unz", path, sizeof(path))));
+
+    bi_cleanup(repo);
+    PASS();
+}
+
+/* The size budget evicts the least recently parked slots until the rest
+ * fit, but never the one just parked. */
+TEST(branch_budget_evicts_oldest) {
+    char *repo = bi_make_repo("cbm_bi_budget");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    ASSERT_EQ(bi_git(repo, "branch -q b1"), 0);
+    ASSERT_EQ(bi_git(repo, "branch -q b2"), 0);
+
+    /* No size cap: three slots. */
+    ASSERT_EQ(bi_index_lim(repo, 8, 0).rc, 0); /* main */
+    const char *order[] = {"b1", "b2", "feature"};
+    for (int i = 0; i < 3; i++) {
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), "checkout -q %s", order[i]);
+        ASSERT_EQ(bi_git(repo, cmd), 0);
+        cbm_usleep(600000);
+        cbm_usleep(600000);
+        ASSERT_EQ(bi_index_lim(repo, 8, 0).rc, 0);
+    }
+    char **list = NULL;
+    int n = bi_parked(&list);
+    ASSERT_EQ(n, 3); /* main, b1, b2 */
+    cbm_branch_slots_free_list(list, n);
+    char path[1400];
+    int64_t one = bi_fsize(bi_slot_file("b2", ".db.zst", path, sizeof(path)));
+    ASSERT_GT(one, 0);
+
+    /* Room for about two slots: parking feature drops main, then b1. */
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    cbm_usleep(600000);
+    cbm_usleep(600000);
+    {
+        bi_run_t rr = bi_index_lim(repo, 8, one * 2 + one / 2);
+        ASSERT_STR_EQ(rr.action, "restored");
+    }
+    n = bi_parked(&list);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(list[0], "b2");
+    ASSERT_STR_EQ(list[1], "feature");
+    cbm_branch_slots_free_list(list, n);
+
+    /* A budget below one slot keeps only the slot just parked. */
+    ASSERT_EQ(bi_git(repo, "checkout -q b1"), 0);
+    cbm_usleep(600000);
+    cbm_usleep(600000);
+    {
+        bi_run_t rr = bi_index_lim(repo, 8, 1);
+        ASSERT_STR_EQ(rr.action, "seeded");
+    }
+    n = bi_parked(&list);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(list[0], "main");
+    cbm_branch_slots_free_list(list, n);
+
+    bi_cleanup(repo);
+    PASS();
+}
+
+/* Budget values: bytes with an optional binary suffix. */
+TEST(branch_budget_parse) {
+    int64_t v = -1;
+    ASSERT_TRUE(cbm_branch_budget_parse("0", &v));
+    ASSERT_EQ(v, 0);
+    ASSERT_TRUE(cbm_branch_budget_parse("1048576", &v));
+    ASSERT_EQ(v, 1048576);
+    ASSERT_TRUE(cbm_branch_budget_parse("2G", &v));
+    ASSERT_EQ(v, (int64_t)2 << 30);
+    ASSERT_TRUE(cbm_branch_budget_parse("512MiB", &v));
+    ASSERT_EQ(v, (int64_t)512 << 20);
+    ASSERT_TRUE(cbm_branch_budget_parse("3gb", &v));
+    ASSERT_EQ(v, (int64_t)3 << 30);
+    ASSERT_TRUE(cbm_branch_budget_parse("1T", &v));
+    ASSERT_EQ(v, (int64_t)1 << 40);
+    v = 7;
+    ASSERT_FALSE(cbm_branch_budget_parse("", &v));
+    ASSERT_FALSE(cbm_branch_budget_parse("-1", &v));
+    ASSERT_FALSE(cbm_branch_budget_parse("2X", &v));
+    ASSERT_FALSE(cbm_branch_budget_parse("2Gi", &v));
+    ASSERT_FALSE(cbm_branch_budget_parse("G", &v));
+    ASSERT_FALSE(cbm_branch_budget_parse("99999999999T", &v));
+    ASSERT_EQ(v, 7);
+    PASS();
+}
+
+/* The budget reaches an index_repository run from the config key and from
+ * CBM_BRANCH_INDEX_BUDGET (which wins). */
+TEST(branch_budget_config_and_env) {
+    char *repo = bi_make_repo("cbm_bi_budget_cfg");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    ASSERT_EQ(bi_git(repo, "branch -q b1"), 0);
+
+    cbm_config_t *cfg = cbm_config_open(cbm_resolve_cache_dir());
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_BRANCH_INDEX_BUDGET, "1"), 0);
+    cbm_config_close(cfg);
+
+    ASSERT_EQ(cbm_mcp_index_in_process(repo), 0); /* main */
+    snprintf(g_bi_root, sizeof(g_bi_root), "%s", repo);
+    char *name = cbm_project_name_from_path(repo);
+    snprintf(g_bi_project, sizeof(g_bi_project), "%s", name);
+    free(name);
+    ASSERT_EQ(bi_git(repo, "checkout -q b1"), 0);
+    ASSERT_EQ(cbm_mcp_index_in_process(repo), 0); /* main parked */
+    cbm_usleep(600000);
+    cbm_usleep(600000);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(cbm_mcp_index_in_process(repo), 0); /* b1 parked, main evicted */
+    char **list = NULL;
+    int n = bi_parked(&list);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(list[0], "b1");
+    cbm_branch_slots_free_list(list, n);
+
+    /* The environment overrides the config: no size cap. */
+    cbm_setenv("CBM_BRANCH_INDEX_BUDGET", "0", 1);
+    cbm_usleep(600000);
+    cbm_usleep(600000);
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    ASSERT_EQ(cbm_mcp_index_in_process(repo), 0); /* feature parked, b1 kept */
+    cbm_unsetenv("CBM_BRANCH_INDEX_BUDGET");
+    n = bi_parked(&list);
+    ASSERT_EQ(n, 2);
+    cbm_branch_slots_free_list(list, n);
+
+    cfg = cbm_config_open(cbm_resolve_cache_dir());
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_BRANCH_INDEX_BUDGET, ""), 0);
+    cbm_config_close(cfg);
+    bi_cleanup(repo);
+    PASS();
+}
+
+/* Scratch files a crashed park or restore left beside the slots are swept
+ * by the next switch; slots are not. */
+TEST(branch_switch_sweeps_scratch) {
+    char *repo = bi_make_repo("cbm_bi_sweep");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char unz[1400];
+    char ztmp[1400];
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(th_write_file(bi_slot_file("gone", ".db.unz", unz, sizeof(unz)), "x"), 0);
+    ASSERT_EQ(th_write_file(bi_slot_file("gone", ".db.zst.tmp", ztmp, sizeof(ztmp)), "x"), 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    {
+        bi_run_t rr = bi_index(repo, -1);
+        ASSERT_STR_EQ(rr.action, "restored");
+    }
+    ASSERT_FALSE(cbm_file_exists(unz));
+    ASSERT_FALSE(cbm_file_exists(ztmp));
+    ASSERT_TRUE(bi_is_parked("feature"));
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -2259,4 +2684,11 @@ SUITE(branch_index) {
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(branch_session_start_notes_moved_checkout);
 #endif
+    RUN_TEST(branch_compressed_slot_round_trip);
+    RUN_TEST(branch_legacy_uncompressed_slot_restores);
+    RUN_TEST(branch_corrupt_slot_seeds);
+    RUN_TEST(branch_budget_evicts_oldest);
+    RUN_TEST(branch_budget_parse);
+    RUN_TEST(branch_budget_config_and_env);
+    RUN_TEST(branch_switch_sweeps_scratch);
 }

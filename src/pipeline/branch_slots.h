@@ -7,9 +7,11 @@
  * checked out at the last index run. When a run starts on another branch, the
  * outgoing branch's database is PARKED as
  *
- *     <cache_dir>/branches/<project>/<slug>.db
+ *     <cache_dir>/branches/<project>/<root key>/<slot>.db.zst
  *
- * and, if the incoming branch was parked earlier, its content is copied back
+ * (a zstd-compressed snapshot of the whole database, indexes included) and,
+ * if the incoming branch was parked earlier, its content is decompressed
+ * beside it and copied back
  * into <project>.db as one SQLite write transaction -- the file is never
  * swapped under a reader, and its WAL is never checkpointed or truncated
  * here. Otherwise the outgoing graph stays in place as the seed, so the
@@ -30,6 +32,14 @@
  * Branch node's properties record (real branch name, detached, HEAD commit),
  * never on the slug, so a shared slot costs re-work, not a missed switch.
  *
+ * Parked slots are capped per checkout by count and by total size; the least
+ * recently parked go first. Earlier builds of this feature parked plain
+ * <slot>.db files: those are still restored (and listed, counted, evicted and
+ * deleted) as they are, and replaced by a .db.zst the next time that branch
+ * is parked.
+ *
+ * The design and its trade-offs: docs/BRANCH_INDEX.md.
+ *
  * Depends on: store, git (git_context), foundation (compat_fs, platform, log)
  */
 #ifndef CBM_BRANCH_SLOTS_H
@@ -40,15 +50,27 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 enum {
-    /* Parked databases kept per project; the least recently parked go first. */
+    /* Parked databases kept per checkout; the least recently parked go first. */
     CBM_BRANCH_SLOTS_DEFAULT_KEEP = 8,
 };
+
+/* Default size budget of one checkout's parked slots, in bytes (2 GiB). At
+ * the measured 4.5x-6.4x zstd ratios that keeps all 8 slots of a repository
+ * whose index is up to about 1.2 GB, and one slot of LLVM's 7 GB index
+ * (1.1 GB compressed). <= 0 means no size cap (the count cap still holds). */
+#define CBM_BRANCH_SLOTS_DEFAULT_BUDGET ((int64_t)2 * 1024 * 1024 * 1024)
+
+/* Parse a size budget: a non-negative integer of bytes with an optional
+ * K, M, G or T suffix (powers of 1024; "B" or "iB" may follow, any case),
+ * e.g. "2G", "512MiB", "1073741824". False (out untouched) when malformed. */
+bool cbm_branch_budget_parse(const char *text, int64_t *out);
 
 typedef enum {
     CBM_BRANCH_SWITCH_NONE = 0, /* same branch, no stamp, or nothing to do */
@@ -81,7 +103,7 @@ void cbm_branch_id_free(cbm_branch_id_t *id);
 
 enum {
     /* Longest slot file name stem: one path component (NAME_MAX 255) less
-     * room for every suffix written beside it (".db.tmp-journal"). */
+     * room for every suffix written beside it (".db.unz.tmp-journal"). */
     CBM_BRANCH_SLOT_NAME_MAX = 200,
 };
 
@@ -138,7 +160,13 @@ bool cbm_branch_slots_dir(const char *db_path, const char *project, const char *
  * (NULL when unknown); the caller frees it. */
 cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *project,
                                             const char *slug, const char *root, int keep,
-                                            char **from);
+                                            int64_t budget, char **from);
+
+/* Decompress the parked slot file `slot` (a .db.zst) to the database file
+ * out_path, through out_path.tmp and a rename, after removing out_path's
+ * SQLite sidecars. False on a corrupt, truncated or unreadable slot. For
+ * inspection and tests; a restore does this itself. */
+bool cbm_branch_slot_decompress(const char *slot, const char *out_path);
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* Callback run when a restore starts, before it takes the live database's
@@ -153,6 +181,21 @@ void cbm_branch_slots_test_before_restore(void (*callback)(void *), void *data);
  * cbm_branch_slots_free_list. */
 int cbm_branch_slots_list(const char *db_path, const char *project, const char *root, char ***out);
 void cbm_branch_slots_free_list(char **list, int count);
+
+/* One parked slot file. */
+typedef struct {
+    char *name;      /* stem, as cbm_branch_slots_list reports it */
+    char *file;      /* path relative to the project's slot directory */
+    int64_t bytes;   /* size on disk */
+    bool compressed; /* <slot>.db.zst; false for a legacy <slot>.db */
+} cbm_branch_slot_info_t;
+
+/* Every slot FILE of root's (root NULL: every root's) parked databases,
+ * sorted by file; a branch can have two (both formats) after a crash.
+ * Returns the count; free with cbm_branch_slots_free_info. */
+int cbm_branch_slots_info(const char *db_path, const char *project, const char *root,
+                          cbm_branch_slot_info_t **out);
+void cbm_branch_slots_free_info(cbm_branch_slot_info_t *info, int count);
 
 /* Delete every parked database of project -- every root's, and legacy ones
  * -- (plus sidecars and temp files) and the then-empty directories. Returns

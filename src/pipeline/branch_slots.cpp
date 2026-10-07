@@ -23,9 +23,29 @@
 
 #define SLEN(s) (sizeof(s) - 1)
 
-enum { BS_PATH_MAX = CBM_PATH_MAX, BS_DB_EXT = 3 /* strlen(".db") */ };
+#include "zstd_store.h"
+
+enum {
+    BS_PATH_MAX = CBM_PATH_MAX,
+    /* zstd level of a parked slot. Measured on two index databases (zstd
+     * 1.5.7, one thread): level 3 gave 9.0x (redis, 216 MB) and 5.9x (opencv,
+     * 462 MB) at about 600 MB/s; level 9 gave 10.0x and 6.7x at a fifth of
+     * the speed. Parking sits on the branch-switch path, so the fast level. */
+    BS_ZSTD_LEVEL = 3,
+    BS_ZSTD_WORKERS = 4,
+};
+
+/* A decompressed slot is a database the index wrote; nothing near this has
+ * been seen (the Linux kernel's index is ~14 GB). Bounds a corrupt frame. */
+#define BS_MAX_UNPACKED_BYTES ((uint64_t)256 * 1024 * 1024 * 1024)
 
 static const char BS_BRANCH_MARK[] = ".__branch__.";
+/* Slot files: <name>.db.zst (compressed) and, from earlier builds of this
+ * feature, <name>.db (a plain database). <name>.db.unz is the scratch copy a
+ * park compresses from and a restore installs from. */
+static const char BS_ZST_EXT[] = ".db.zst";
+static const char BS_DB_EXT_S[] = ".db";
+static const char BS_UNZ_EXT[] = ".db.unz";
 
 const char *cbm_branch_switch_str(cbm_branch_switch_t action) {
     switch (action) {
@@ -39,6 +59,67 @@ const char *cbm_branch_switch_str(cbm_branch_switch_t action) {
     default:
         return "none";
     }
+}
+
+bool cbm_branch_budget_parse(const char *text, int64_t *out) {
+    if (!text || !out) {
+        return false;
+    }
+    const char *p = text;
+    while (*p == ' ') {
+        p++;
+    }
+    if (*p < '0' || *p > '9') {
+        return false;
+    }
+    uint64_t v = 0;
+    for (; *p >= '0' && *p <= '9'; p++) {
+        if (v > (UINT64_MAX - 9) / 10) {
+            return false;
+        }
+        v = v * 10 + (uint64_t)(*p - '0');
+    }
+    int shift = 0;
+    switch (*p) {
+    case 'k':
+    case 'K':
+        shift = 10;
+        break;
+    case 'm':
+    case 'M':
+        shift = 20;
+        break;
+    case 'g':
+    case 'G':
+        shift = 30;
+        break;
+    case 't':
+    case 'T':
+        shift = 40;
+        break;
+    default:
+        break;
+    }
+    if (shift) {
+        p++;
+        if (*p == 'i' || *p == 'I') {
+            p++;
+            if (*p != 'b' && *p != 'B') {
+                return false;
+            }
+        }
+    }
+    if (*p == 'b' || *p == 'B') {
+        p++;
+    }
+    while (*p == ' ') {
+        p++;
+    }
+    if (*p || v > ((uint64_t)INT64_MAX >> shift)) {
+        return false;
+    }
+    *out = (int64_t)(v << shift);
+    return true;
 }
 
 const char *cbm_branch_slug_from_qn(const char *qn, const char *project) {
@@ -252,18 +333,39 @@ bool cbm_branch_slots_dir(const char *db_path, const char *project, const char *
     return true;
 }
 
-static bool slot_path(const char *dir, const char *slug, char *buf, size_t bufsz) {
+/* <dir>/<slot name of slug><ext>. */
+static bool slot_file(const char *dir, const char *slug, const char *ext, char *buf, size_t bufsz) {
     char name[CBM_BRANCH_SLOT_NAME_MAX + 1];
     if (!cbm_branch_slot_name(slug, name, sizeof(name))) {
         return false;
     }
-    int n = snprintf(buf, bufsz, "%s/%s.db", dir, name);
+    int n = snprintf(buf, bufsz, "%s/%s%s", dir, name, ext);
     return n > 0 && (size_t)n < bufsz;
 }
 
-static bool is_slot_db_name(const char *name) {
+static bool ends_with(const char *name, const char *suffix) {
     size_t len = strlen(name);
-    return len > BS_DB_EXT && strcmp(name + len - BS_DB_EXT, ".db") == 0;
+    size_t slen = strlen(suffix);
+    return len > slen && strcmp(name + len - slen, suffix) == 0;
+}
+
+/* The extension of a slot file name -- BS_ZST_EXT or BS_DB_EXT_S -- or NULL
+ * for anything else in a slot directory (scratch, sidecars). */
+static const char *slot_ext(const char *name) {
+    if (ends_with(name, BS_ZST_EXT)) {
+        return BS_ZST_EXT;
+    }
+    return ends_with(name, BS_DB_EXT_S) ? BS_DB_EXT_S : NULL;
+}
+
+/* Files this module writes beside the slots and removes again: the park and
+ * restore scratch copy (<name>.db.unz, its dump temp and SQLite sidecars),
+ * the compressor's <name>.db.zst.tmp, the dump temp <name>.db.tmp of the
+ * uncompressed layout, and the sidecars of a legacy <name>.db. */
+static bool is_scratch_name(const char *name) {
+    return strstr(name, BS_UNZ_EXT) != NULL || ends_with(name, ".db.zst.tmp") ||
+           ends_with(name, ".db.tmp") || strstr(name, ".db-wal") || strstr(name, ".db-shm") ||
+           strstr(name, ".db-journal");
 }
 
 /* The slug the database at db_path was built for, from its Branch node;
@@ -302,11 +404,6 @@ static bool copy_db(const char *src, const char *dest) {
     return rc == CBM_STORE_OK;
 }
 
-typedef struct {
-    char name[CBM_DIRENT_NAME_MAX];
-    int64_t mtime;
-} bs_entry_t;
-
 static int64_t file_mtime(const char *path) {
     struct stat st;
     if (stat(path, &st) != 0) {
@@ -326,14 +423,141 @@ static int64_t wal_size(const char *db_path) {
     return file_size(wal);
 }
 
-/* One info line with two integer fields (timings and sizes the soak reads). */
-static void log_bytes(const char *msg, const char *k1, int64_t v1, const char *k2, int64_t v2) {
+static void log_kv(const char *msg, const char *k1, int64_t v1, const char *k2, int64_t v2,
+                   const char *k3, int64_t v3) {
     char b1[32];
     char b2[32];
+    char b3[32];
     snprintf(b1, sizeof(b1), "%lld", (long long)v1);
     snprintf(b2, sizeof(b2), "%lld", (long long)v2);
-    cbm_log_info(msg, k1, b1, k2, b2);
+    snprintf(b3, sizeof(b3), "%lld", (long long)v3);
+    cbm_log_info(msg, k1, b1, k2, b2, k3, b3);
 }
+
+static void unlink_slot(const char *path) {
+    (void)cbm_unlink(path);
+    cbm_remove_db_sidecars(path);
+}
+
+/* Remove a scratch database and everything SQLite or the dump put beside it. */
+static void unlink_scratch(const char *path) {
+    char tmp[BS_PATH_MAX];
+    unlink_slot(path);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    unlink_slot(tmp);
+    snprintf(tmp, sizeof(tmp), "%s-journal", path);
+    (void)cbm_unlink(tmp);
+}
+
+/* Compress the file at src into dst (one zstd frame with a checksum),
+ * through dst.tmp and a rename, so dst is complete or absent. */
+static bool compress_file(const char *src, const char *dst) {
+    char tmp[BS_PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", dst);
+    FILE *in = cbm_fopen(src, "rb");
+    FILE *out = in ? cbm_fopen(tmp, "wb") : NULL;
+    int64_t n = out ? cbm_zstd_compress_stream(in, out, file_size(src), BS_ZSTD_LEVEL,
+                                               BS_ZSTD_WORKERS)
+                    : -1;
+    bool ok = n > 0;
+    if (out && fclose(out) != 0) {
+        ok = false;
+    }
+    if (in) {
+        (void)fclose(in);
+    }
+    if (ok && cbm_rename_replace(tmp, dst) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        (void)cbm_unlink(tmp);
+    }
+    return ok;
+}
+
+bool cbm_branch_slot_decompress(const char *slot, const char *out_path) {
+    if (!slot || !out_path) {
+        return false;
+    }
+    char tmp[BS_PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", out_path);
+    FILE *in = cbm_fopen(slot, "rb");
+    FILE *out = in ? cbm_fopen(tmp, "wb") : NULL;
+    int64_t n = out ? cbm_zstd_decompress_stream(in, out, BS_MAX_UNPACKED_BYTES) : -1;
+    bool ok = n > 0;
+    if (out && fclose(out) != 0) {
+        ok = false;
+    }
+    if (in) {
+        (void)fclose(in);
+    }
+    if (ok) {
+        /* No SQLite sidecar of an earlier file at out_path may be replayed
+         * onto this one (#897). */
+        cbm_remove_db_sidecars(out_path);
+        ok = cbm_rename_replace(tmp, out_path) == 0;
+    }
+    if (!ok) {
+        (void)cbm_unlink(tmp);
+    }
+    return ok;
+}
+
+/* Park the live database at db_path as dir/<slot of slug>.db.zst: a
+ * consistent snapshot (copy_db: one read transaction through the backup API,
+ * which neither blocks readers nor needs a checkpoint) into the scratch file
+ * <slot>.db.unz, compressed to <slot>.db.zst.tmp and renamed into place. A
+ * legacy <slot>.db of the same branch is superseded and removed. *slot_bytes
+ * receives the compressed size. */
+static bool park_db(const char *db_path, const char *dir, const char *slug, char *zst,
+                    size_t zst_sz, int64_t *slot_bytes) {
+    char scratch[BS_PATH_MAX];
+    char legacy[BS_PATH_MAX];
+    if (!slot_file(dir, slug, BS_ZST_EXT, zst, zst_sz) ||
+        !slot_file(dir, slug, BS_UNZ_EXT, scratch, sizeof(scratch)) ||
+        !slot_file(dir, slug, BS_DB_EXT_S, legacy, sizeof(legacy)) || !cbm_mkdir_p(dir, 0755)) {
+        return false;
+    }
+    unlink_scratch(scratch);
+    bool ok = copy_db(db_path, scratch) && compress_file(scratch, zst);
+    unlink_scratch(scratch);
+    if (ok) {
+        unlink_slot(legacy);
+        *slot_bytes = file_size(zst);
+    }
+    return ok;
+}
+
+/* Remove scratch files a crashed park or restore left in dir. The caller
+ * holds the index lease, so no other run is using them. */
+static void sweep_scratch(const char *dir) {
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return;
+    }
+    char *names[64];
+    int n = 0;
+    cbm_dirent_t *ent;
+    while (n < 64 && (ent = cbm_readdir(d)) != NULL) {
+        if (!ent->is_dir && (strstr(ent->name, BS_UNZ_EXT) || ends_with(ent->name, ".db.zst.tmp"))) {
+            names[n] = strdup(ent->name);
+            n += names[n] ? 1 : 0;
+        }
+    }
+    cbm_closedir(d);
+    for (int i = 0; i < n; i++) {
+        char path[BS_PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+        (void)cbm_unlink(path);
+        free(names[i]);
+    }
+}
+
+typedef struct {
+    char name[CBM_DIRENT_NAME_MAX];
+    int64_t mtime;
+    int64_t bytes;
+} bs_entry_t;
 
 static int bs_entry_cmp_oldest(const void *a, const void *b) {
     const bs_entry_t *ea = (const bs_entry_t *)a;
@@ -344,51 +568,69 @@ static int bs_entry_cmp_oldest(const void *a, const void *b) {
     return strcmp(ea->name, eb->name);
 }
 
-static void unlink_slot(const char *path) {
-    (void)cbm_unlink(path);
-    cbm_remove_db_sidecars(path);
-}
-
-/* Keep at most `keep` parked databases: drop the least recently parked. */
-static void evict_slots(const char *dir, int keep) {
+/* The slot files in dir (both formats), with mtime and size. *n gets the
+ * count; returns NULL when there are none or on allocation failure. */
+static bs_entry_t *scan_slots(const char *dir, int *n) {
+    *n = 0;
     cbm_dir_t *d = cbm_opendir(dir);
     if (!d) {
-        return;
+        return NULL;
     }
-    int cap = 16;
-    int n = 0;
-    bs_entry_t *items = (bs_entry_t *)malloc((size_t)cap * sizeof(bs_entry_t));
+    int cap = 0;
+    bs_entry_t *items = NULL;
     cbm_dirent_t *ent;
-    while (items && (ent = cbm_readdir(d)) != NULL) {
-        if (ent->is_dir || !is_slot_db_name(ent->name)) {
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (ent->is_dir || !slot_ext(ent->name)) {
             continue;
         }
-        if (n == cap) {
-            cap *= 2;
-            bs_entry_t *grown = (bs_entry_t *)realloc(items, (size_t)cap * sizeof(bs_entry_t));
+        if (*n == cap) {
+            int next_cap = cap ? cap * 2 : 16;
+            bs_entry_t *grown = (bs_entry_t *)realloc(items, (size_t)next_cap * sizeof(bs_entry_t));
             if (!grown) {
                 break;
             }
             items = grown;
+            cap = next_cap;
         }
         char path[BS_PATH_MAX];
         snprintf(path, sizeof(path), "%s/%s", dir, ent->name);
-        snprintf(items[n].name, sizeof(items[n].name), "%s", ent->name);
-        items[n].mtime = file_mtime(path);
-        n++;
+        bs_entry_t *e = &items[*n];
+        snprintf(e->name, sizeof(e->name), "%s", ent->name);
+        e->mtime = file_mtime(path);
+        e->bytes = file_size(path);
+        (*n)++;
     }
     cbm_closedir(d);
+    return items;
+}
+
+/* Keep at most `keep` parked databases whose files total at most `budget`
+ * bytes (budget <= 0: no size cap), dropping the least recently parked
+ * first. The slot named `newest` (the one just parked, or NULL) is never
+ * dropped, so a single slot larger than the budget still serves one switch
+ * back. */
+static void evict_slots(const char *dir, int keep, int64_t budget, const char *newest) {
+    int n = 0;
+    bs_entry_t *items = scan_slots(dir, &n);
     if (!items) {
         return;
     }
-    if (n > keep) {
-        qsort(items, (size_t)n, sizeof(bs_entry_t), bs_entry_cmp_oldest);
-        for (int i = 0; i < n - keep; i++) {
-            char path[BS_PATH_MAX];
-            snprintf(path, sizeof(path), "%s/%s", dir, items[i].name);
-            unlink_slot(path);
-            cbm_log_info("branch.evict", "slot", items[i].name);
+    int64_t total = 0;
+    for (int i = 0; i < n; i++) {
+        total += items[i].bytes > 0 ? items[i].bytes : 0;
+    }
+    qsort(items, (size_t)n, sizeof(bs_entry_t), bs_entry_cmp_oldest);
+    int count = n;
+    for (int i = 0; i < n && (count > keep || (budget > 0 && total > budget)); i++) {
+        if (newest && strcmp(items[i].name, newest) == 0) {
+            continue;
         }
+        char path[BS_PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", dir, items[i].name);
+        unlink_slot(path);
+        count--;
+        total -= items[i].bytes > 0 ? items[i].bytes : 0;
+        cbm_log_info("branch.evict", "slot", items[i].name);
     }
     free(items);
 }
@@ -469,8 +711,16 @@ void cbm_branch_slots_test_before_restore(void (*callback)(void *), void *data) 
  * open. Swapping the file in instead would leave a window -- and after a
  * crash, a permanent state -- in which db_path's old WAL sits beside the new
  * main file and is replayed onto it. The price is the copy going through the
- * WAL (the slot's size written twice, and the WAL keeps that size on disk
- * until the next re-dump replaces the file).
+ * WAL: the database's size written twice, and a WAL as large as the database
+ * on disk until SQLite removes it at the last connection's close.
+ *
+ * That WAL peak is not bounded by stepping the backup in page batches: the
+ * destination keeps one write transaction (and its lock) open from the first
+ * step to the last, so every page is in the WAL before the commit (measured:
+ * 33 steps of 100 pages into a 216 MB database grew the WAL steadily to
+ * 216 MB). Copying table by table in several transactions would bound it, but
+ * readers would then see, and a crash would leave, a mix of two branches'
+ * graphs. The single transaction is kept; see docs/BRANCH_INDEX.md.
  *
  * The ADR is carried INSIDE that transaction's write lock. The first backup
  * step takes db_path's write lock and holds it until the backup completes;
@@ -519,9 +769,14 @@ static bool restore_into(const char *slot, const char *db_path, const char *proj
     return ok;
 }
 
+typedef struct {
+    int keep;
+    int64_t budget;
+} bs_limits_t;
+
 static cbm_branch_switch_t switch_from(const char *db_path, const char *project, const char *slug,
                                        const char *indexed, const char *dir, const char *incoming,
-                                       bool have_incoming, int keep);
+                                       bs_limits_t lim);
 
 /* Whether the database at path was indexed from root (cbm_root_matches): a
  * derived project name can be another directory's, and so can its slots. A
@@ -545,16 +800,18 @@ static bool db_root_matches(const char *path, const char *project, const char *r
 }
 
 /* Earlier builds parked slots directly under branches/<project>/, shared by
- * every root with that derived name. Move such a slot into this root's
- * directory when it records this root; otherwise leave it (delete_project
- * and the index reset still find it). */
+ * every root with that derived name, always uncompressed. Move such a slot
+ * into this root's directory (as <slot>.db, `incoming`) when it records this
+ * root; otherwise leave it (delete_project and the index reset still find
+ * it). */
 static bool adopt_legacy_slot(const char *db_path, const char *project, const char *root,
                               const char *slug, const char *dir, const char *incoming) {
     char legacy_dir[BS_PATH_MAX];
     char legacy[BS_PATH_MAX];
     if (!root || !root[0] ||
         !cbm_branch_slots_dir(db_path, project, NULL, legacy_dir, sizeof(legacy_dir)) ||
-        !slot_path(legacy_dir, slug, legacy, sizeof(legacy)) || !cbm_file_exists(legacy)) {
+        !slot_file(legacy_dir, slug, BS_DB_EXT_S, legacy, sizeof(legacy)) ||
+        !cbm_file_exists(legacy)) {
         return false;
     }
     cbm_store_t *s = cbm_store_open_path_query(legacy);
@@ -574,21 +831,52 @@ static bool adopt_legacy_slot(const char *db_path, const char *project, const ch
     return true;
 }
 
+/* The incoming slot for slug in dir: <slot>.db.zst, else an uncompressed
+ * <slot>.db an earlier build parked. False when neither exists. */
+static bool find_slot(const char *dir, const char *slug, char *buf, size_t bufsz) {
+    if (slot_file(dir, slug, BS_ZST_EXT, buf, bufsz) && cbm_file_exists(buf)) {
+        return true;
+    }
+    return slot_file(dir, slug, BS_DB_EXT_S, buf, bufsz) && cbm_file_exists(buf);
+}
+
+/* The uncompressed database to install from `incoming`: the slot itself when
+ * it is a legacy <slot>.db, else a decompressed scratch copy written to
+ * `scratch` (the caller removes it with unlink_scratch). */
+static const char *open_incoming(const char *incoming, const char *dir, const char *slug,
+                                 char *scratch, size_t scratch_sz, int64_t *unpack_ms) {
+    if (!ends_with(incoming, BS_ZST_EXT)) {
+        return incoming;
+    }
+    uint64_t t0 = cbm_now_ms();
+    if (!slot_file(dir, slug, BS_UNZ_EXT, scratch, scratch_sz)) {
+        return NULL;
+    }
+    unlink_scratch(scratch);
+    if (!cbm_branch_slot_decompress(incoming, scratch)) {
+        cbm_log_warn("branch.slot_unreadable", "slot", incoming);
+        unlink_scratch(scratch);
+        return NULL;
+    }
+    *unpack_ms = (int64_t)(cbm_now_ms() - t0);
+    return scratch;
+}
+
 cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *project,
                                             const char *slug, const char *root, int keep,
-                                            char **from) {
+                                            int64_t budget, char **from) {
     if (from) {
         *from = NULL;
     }
     char dir[BS_PATH_MAX];
     char incoming[BS_PATH_MAX];
     if (keep < 1 || !slug_is_safe(slug) ||
-        !cbm_branch_slots_dir(db_path, project, root, dir, sizeof(dir)) ||
-        !slot_path(dir, slug, incoming, sizeof(incoming))) {
+        !cbm_branch_slots_dir(db_path, project, root, dir, sizeof(dir))) {
         return CBM_BRANCH_SWITCH_NONE;
     }
-    bool have_incoming = cbm_file_exists(incoming);
-    if (!have_incoming) {
+    sweep_scratch(dir);
+    bool have_incoming = find_slot(dir, slug, incoming, sizeof(incoming));
+    if (!have_incoming && slot_file(dir, slug, BS_DB_EXT_S, incoming, sizeof(incoming))) {
         have_incoming = adopt_legacy_slot(db_path, project, root, slug, dir, incoming);
     }
 
@@ -596,10 +884,25 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
      * manual delete): this branch's parked database is a better start than
      * nothing, and the incremental pass corrects whatever moved since it was
      * parked. With no main file there is no reader to protect, so it is
-     * copied into place the way a fresh database is installed (stale
-     * sidecars removed, then one rename). */
+     * installed the way a fresh database is (stale sidecars removed, then one
+     * rename): a compressed slot is decompressed beside it and renamed in, a
+     * legacy one copied. */
     if (!cbm_file_exists(db_path)) {
-        if (have_incoming && copy_db(incoming, db_path)) {
+        if (!have_incoming) {
+            return CBM_BRANCH_SWITCH_NONE;
+        }
+        char scratch[BS_PATH_MAX];
+        int64_t unpack_ms = 0;
+        const char *src = open_incoming(incoming, dir, slug, scratch, sizeof(scratch), &unpack_ms);
+        bool ok = false;
+        if (src == incoming) {
+            ok = copy_db(incoming, db_path);
+        } else if (src) {
+            cbm_remove_db_sidecars(db_path);
+            ok = cbm_rename_replace(src, db_path) == 0;
+            unlink_scratch(scratch);
+        }
+        if (ok) {
             unlink_slot(incoming);
             cbm_log_info("branch.switch", "action", "restored", "to", slug, "from", "");
             return CBM_BRANCH_SWITCH_RESTORED;
@@ -621,7 +924,9 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
      * so a run on the same branch opens nothing extra. */
     cbm_branch_switch_t action = CBM_BRANCH_SWITCH_NONE;
     if (strcmp(indexed, slug) != 0 && db_root_matches(db_path, project, root)) {
-        action = switch_from(db_path, project, slug, indexed, dir, incoming, have_incoming, keep);
+        bs_limits_t lim = {keep, budget};
+        action = switch_from(db_path, project, slug, indexed, dir,
+                             have_incoming ? incoming : NULL, lim);
     }
     if (from) {
         *from = indexed;
@@ -631,73 +936,95 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
     return action;
 }
 
-/* The switch proper, once the database is known to be another branch's. */
+/* The switch proper, once the database is known to be another branch's.
+ * incoming is the slot to restore, NULL when none is parked. */
 static cbm_branch_switch_t switch_from(const char *db_path, const char *project, const char *slug,
                                        const char *indexed, const char *dir, const char *incoming,
-                                       bool have_incoming, int keep) {
+                                       bs_limits_t lim) {
     char outgoing[BS_PATH_MAX];
     uint64_t t0 = cbm_now_ms();
-    if (!slot_path(dir, indexed, outgoing, sizeof(outgoing)) || !cbm_mkdir_p(dir, 0755) ||
-        !copy_db(db_path, outgoing)) {
+    int64_t slot_bytes = -1;
+    if (!park_db(db_path, dir, indexed, outgoing, sizeof(outgoing), &slot_bytes)) {
         cbm_log_warn("branch.park_failed", "from", indexed, "to", slug, "action", "in_place");
         return CBM_BRANCH_SWITCH_IN_PLACE;
     }
-    log_bytes("branch.park", "elapsed_ms", (int64_t)(cbm_now_ms() - t0), "slot_bytes",
-              file_size(outgoing));
+    log_kv("branch.park", "elapsed_ms", (int64_t)(cbm_now_ms() - t0), "slot_bytes", slot_bytes,
+           "db_bytes", file_size(db_path));
 
     /* Restore by content (restore_into). A failure at any step leaves the
      * outgoing database in place, already parked: it becomes the seed, as if
      * nothing had been parked for this branch. */
     cbm_branch_switch_t action = CBM_BRANCH_SWITCH_SEEDED;
-    if (have_incoming) {
+    if (incoming) {
         t0 = cbm_now_ms();
-        if (restore_into(incoming, db_path, project)) {
+        char scratch[BS_PATH_MAX];
+        int64_t unpack_ms = 0;
+        const char *src = open_incoming(incoming, dir, slug, scratch, sizeof(scratch), &unpack_ms);
+        if (src && restore_into(src, db_path, project)) {
             action = CBM_BRANCH_SWITCH_RESTORED;
-            log_bytes("branch.restore", "elapsed_ms", (int64_t)(cbm_now_ms() - t0), "wal_bytes",
-                      wal_size(db_path));
+            log_kv("branch.restore", "elapsed_ms", (int64_t)(cbm_now_ms() - t0), "unpack_ms",
+                   unpack_ms, "wal_bytes", wal_size(db_path));
             unlink_slot(incoming);
         } else {
             cbm_log_warn("branch.restore_failed", "to", slug, "action", "seeded");
         }
+        if (src && src != incoming) {
+            unlink_scratch(scratch);
+        }
     }
-    evict_slots(dir, keep);
+    const char *newest = strrchr(outgoing, '/');
+    evict_slots(dir, lim.keep, lim.budget, newest ? newest + 1 : outgoing);
     cbm_log_info("branch.switch", "action", cbm_branch_switch_str(action), "from", indexed, "to",
                  slug);
     return action;
 }
 
-/* Append the slot stems in dir, each prefixed with prefix, to *list. */
-static void list_dir_slots(const char *dir, const char *prefix, char ***list, int *n, int *cap) {
-    cbm_dir_t *d = cbm_opendir(dir);
-    if (!d) {
-        return;
+typedef struct {
+    cbm_branch_slot_info_t *items;
+    int n;
+    int cap;
+} bs_info_list_t;
+
+static char *join2(const char *a, const char *b, size_t blen) {
+    size_t alen = strlen(a);
+    char *out = (char *)malloc(alen + blen + 1);
+    if (out) {
+        memcpy(out, a, alen);
+        memcpy(out + alen, b, blen);
+        out[alen + blen] = '\0';
     }
-    cbm_dirent_t *ent;
-    while ((ent = cbm_readdir(d)) != NULL) {
-        if (ent->is_dir || !is_slot_db_name(ent->name)) {
-            continue;
-        }
-        if (*n == *cap) {
-            int next_cap = *cap ? *cap * 2 : 8;
-            char **grown = (char **)realloc(*list, (size_t)next_cap * sizeof(char *));
+    return out;
+}
+
+/* Append the slot files in dir, each name prefixed with prefix. */
+static void info_dir_slots(const char *dir, const char *prefix, bs_info_list_t *l) {
+    int n = 0;
+    bs_entry_t *items = scan_slots(dir, &n);
+    for (int i = 0; i < n; i++) {
+        if (l->n == l->cap) {
+            int next_cap = l->cap ? l->cap * 2 : 8;
+            cbm_branch_slot_info_t *grown = (cbm_branch_slot_info_t *)realloc(
+                l->items, (size_t)next_cap * sizeof(cbm_branch_slot_info_t));
             if (!grown) {
                 break;
             }
-            *list = grown;
-            *cap = next_cap;
+            l->items = grown;
+            l->cap = next_cap;
         }
-        size_t plen = strlen(prefix);
-        size_t len = strlen(ent->name) - BS_DB_EXT;
-        char *slug = (char *)malloc(plen + len + 1);
-        if (!slug) {
+        const char *ext = slot_ext(items[i].name);
+        cbm_branch_slot_info_t *e = &l->items[l->n];
+        e->name = join2(prefix, items[i].name, strlen(items[i].name) - strlen(ext));
+        e->file = join2(prefix, items[i].name, strlen(items[i].name));
+        e->bytes = items[i].bytes;
+        e->compressed = ext == BS_ZST_EXT;
+        if (!e->name || !e->file) {
+            free(e->name);
+            free(e->file);
             break;
         }
-        memcpy(slug, prefix, plen);
-        memcpy(slug + plen, ent->name, len);
-        slug[plen + len] = '\0';
-        (*list)[(*n)++] = slug;
+        l->n++;
     }
-    cbm_closedir(d);
+    free(items);
 }
 
 /* The root-key subdirectories of a project's slot directory. */
@@ -732,7 +1059,8 @@ static int list_root_dirs(const char *pdir, char ***out) {
     return n;
 }
 
-int cbm_branch_slots_list(const char *db_path, const char *project, const char *root, char ***out) {
+int cbm_branch_slots_info(const char *db_path, const char *project, const char *root,
+                          cbm_branch_slot_info_t **out) {
     if (out) {
         *out = NULL;
     }
@@ -740,10 +1068,8 @@ int cbm_branch_slots_list(const char *db_path, const char *project, const char *
     if (!out || !cbm_branch_slots_dir(db_path, project, root, dir, sizeof(dir))) {
         return 0;
     }
-    int cap = 0;
-    int n = 0;
-    char **list = NULL;
-    list_dir_slots(dir, "", &list, &n, &cap);
+    bs_info_list_t l = {NULL, 0, 0};
+    info_dir_slots(dir, "", &l);
     if (!root || !root[0]) {
         /* Every root's slots, as "<root-key>/<slot>" (plus legacy ones). */
         char **keys = NULL;
@@ -753,18 +1079,62 @@ int cbm_branch_slots_list(const char *db_path, const char *project, const char *
             char prefix[CBM_DIRENT_NAME_MAX + 2];
             snprintf(sub, sizeof(sub), "%s/%s", dir, keys[i]);
             snprintf(prefix, sizeof(prefix), "%s/", keys[i]);
-            list_dir_slots(sub, prefix, &list, &n, &cap);
+            info_dir_slots(sub, prefix, &l);
             free(keys[i]);
         }
         free(keys);
     }
-    if (n > 1) {
-        qsort(list, (size_t)n, sizeof(char *), [](const void *a, const void *b) {
-            return strcmp(*(const char *const *)a, *(const char *const *)b);
+    if (l.n > 1) {
+        qsort(l.items, (size_t)l.n, sizeof(cbm_branch_slot_info_t), [](const void *a, const void *b) {
+            return strcmp(((const cbm_branch_slot_info_t *)a)->file,
+                          ((const cbm_branch_slot_info_t *)b)->file);
         });
     }
-    *out = list;
-    return n;
+    *out = l.items;
+    return l.n;
+}
+
+void cbm_branch_slots_free_info(cbm_branch_slot_info_t *info, int count) {
+    for (int i = 0; i < count; i++) {
+        free(info[i].name);
+        free(info[i].file);
+    }
+    free(info);
+}
+
+int cbm_branch_slots_list(const char *db_path, const char *project, const char *root, char ***out) {
+    if (out) {
+        *out = NULL;
+    }
+    cbm_branch_slot_info_t *info = NULL;
+    int n = out ? cbm_branch_slots_info(db_path, project, root, &info) : 0;
+    char **list = n > 0 ? (char **)malloc((size_t)n * sizeof(char *)) : NULL;
+    int m = 0;
+    for (int i = 0; list && i < n; i++) {
+        list[m++] = info[i].name;
+        info[i].name = NULL;
+    }
+    cbm_branch_slots_free_info(info, n);
+    if (m > 1) {
+        qsort(list, (size_t)m, sizeof(char *), [](const void *a, const void *b) {
+            return strcmp(*(const char *const *)a, *(const char *const *)b);
+        });
+        /* One entry per branch: a crash between a park and its removal of
+         * the superseded uncompressed slot can leave both formats. */
+        int w = 1;
+        for (int i = 1; i < m; i++) {
+            if (strcmp(list[i], list[w - 1]) == 0) {
+                free(list[i]);
+            } else {
+                list[w++] = list[i];
+            }
+        }
+        m = w;
+    }
+    if (out) {
+        *out = list;
+    }
+    return m;
 }
 
 void cbm_branch_slots_free_list(char **list, int count) {
@@ -810,14 +1180,12 @@ static int delete_dir_slots(const char *dir) {
     }
     cbm_closedir(d);
     for (int i = 0; i < n; i++) {
-        /* Only what this module writes: <slug>.db, its -wal/-shm, and the
-         * dump's <slug>.db.tmp. Anything else in the directory is left. */
+        /* Only what this module writes: <slot>.db.zst or a legacy
+         * <slot>.db, and the scratch and temp files beside them. Anything
+         * else in the directory is left. */
         const char *name = names[i];
-        size_t len = strlen(name);
-        bool is_db = is_slot_db_name(name);
-        bool is_side =
-            strstr(name, ".db-wal") || strstr(name, ".db-shm") ||
-            (len > SLEN(".db.tmp") && strcmp(name + len - SLEN(".db.tmp"), ".db.tmp") == 0);
+        bool is_db = slot_ext(name) != NULL;
+        bool is_side = is_scratch_name(name);
         if (is_db || is_side) {
             char path[BS_PATH_MAX];
             snprintf(path, sizeof(path), "%s/%s", dir, name);

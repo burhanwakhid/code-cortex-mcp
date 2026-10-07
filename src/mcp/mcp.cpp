@@ -2247,9 +2247,18 @@ static void add_git_context_string(yyjson_mut_doc *doc, yyjson_mut_val *obj, con
  * not), whether that matches the checkout, and the parked branch databases (a
  * directory read). A mismatch means the graph answers for another branch
  * until the next index run swaps it. */
+typedef struct {
+    int keep;
+    int64_t budget;
+} branch_limits_t;
+static branch_limits_t branch_index_limits(const cbm_mcp_server_t *srv);
+
 static void add_branch_index_json(yyjson_mut_doc *doc, yyjson_mut_val *git, cbm_store_t *store,
                                   const char *project, const char *root_path,
                                   const cbm_git_context_t *ctx) {
+    /* The per-slot detail is index_status's (it has the store open);
+     * list_projects keeps to the names. */
+    bool detail = store != NULL;
     if (!project || !ctx->is_git) {
         return;
     }
@@ -2276,15 +2285,39 @@ static void add_branch_index_json(yyjson_mut_doc *doc, yyjson_mut_val *git, cbm_
     project_db_path(project, db_path, sizeof(db_path));
     char **parked = NULL;
     /* This checkout's slots only: a derived name can be several roots'. */
-    int n = db_path[0] && root_path && root_path[0]
-                ? cbm_branch_slots_list(db_path, project, root_path, &parked)
-                : 0;
+    bool here = db_path[0] && root_path && root_path[0];
+    int n = here ? cbm_branch_slots_list(db_path, project, root_path, &parked) : 0;
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
     for (int i = 0; i < n; i++) {
         yyjson_mut_arr_add_strcpy(doc, arr, parked[i]);
     }
     cbm_branch_slots_free_list(parked, n);
     yyjson_mut_obj_add_val(doc, git, "parked_branches", arr);
+    if (!detail) {
+        return;
+    }
+    /* Each slot file with its size, their total, and the limits the next
+     * park enforces. */
+    cbm_branch_slot_info_t *info = NULL;
+    int ni = here ? cbm_branch_slots_info(db_path, project, root_path, &info) : 0;
+    yyjson_mut_val *files = yyjson_mut_arr(doc);
+    int64_t total = 0;
+    for (int i = 0; i < ni; i++) {
+        yyjson_mut_val *o = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, o, "branch", info[i].name);
+        yyjson_mut_obj_add_int(doc, o, "bytes", info[i].bytes);
+        yyjson_mut_obj_add_bool(doc, o, "compressed", info[i].compressed);
+        yyjson_mut_arr_append(files, o);
+        total += info[i].bytes > 0 ? info[i].bytes : 0;
+    }
+    cbm_branch_slots_free_info(info, ni);
+    yyjson_mut_obj_add_val(doc, git, "parked_slots", files);
+    yyjson_mut_obj_add_int(doc, git, "parked_bytes", total);
+    branch_limits_t lim = branch_index_limits(NULL);
+    yyjson_mut_obj_add_int(doc, git, "branch_index_keep",
+                           lim.keep >= 0 ? lim.keep : CBM_BRANCH_SLOTS_DEFAULT_KEEP);
+    yyjson_mut_obj_add_int(doc, git, "branch_index_budget_bytes",
+                           lim.budget >= 0 ? lim.budget : CBM_BRANCH_SLOTS_DEFAULT_BUDGET);
 }
 
 static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *root_path,
@@ -7533,16 +7566,20 @@ static char *resolved_repo_path_from_project_arg(const char *args) {
     return root_path;
 }
 
-/* Parked-branch budget for an index run (pipeline/branch_slots.h): config
- * branch_index (default true) and branch_index_keep (default 8); the
- * CBM_BRANCH_INDEX=0 environment switch wins. The supervised worker runs
- * without srv->config, so the store is opened just for this read. Returns -1
- * to keep the pipeline's own default. */
-static int branch_index_keep(const cbm_mcp_server_t *srv) {
+/* Parked-branch limits for an index run (pipeline/branch_slots.h): config
+ * branch_index (default true), branch_index_keep (default 8) and
+ * branch_index_budget (bytes, "2G" style; default 2 GiB). The environment
+ * wins: CBM_BRANCH_INDEX=0 turns parking off and CBM_BRANCH_INDEX_BUDGET sets
+ * the size budget. The supervised worker runs without srv->config, so the
+ * store is opened just for this read. A field left at -1 keeps the
+ * pipeline's own default. */
+static branch_limits_t branch_index_limits(const cbm_mcp_server_t *srv) {
+    branch_limits_t lim = {-1, -1};
     char env[CBM_SZ_32] = "";
     cbm_safe_getenv("CBM_BRANCH_INDEX", env, sizeof(env), NULL);
     if (strcmp(env, "0") == 0) {
-        return 0;
+        lim.keep = 0;
+        return lim;
     }
     cbm_config_t *cfg = srv ? srv->config : NULL;
     cbm_config_t *owned = NULL;
@@ -7551,21 +7588,36 @@ static int branch_index_keep(const cbm_mcp_server_t *srv) {
         owned = dir ? cbm_config_open(dir) : NULL;
         cfg = owned;
     }
-    int keep = -1;
     if (cfg) {
-        keep = cbm_config_get_bool(cfg, CBM_CONFIG_BRANCH_INDEX, true)
-                   ? cbm_config_get_int(cfg, CBM_CONFIG_BRANCH_INDEX_KEEP,
-                                        CBM_BRANCH_SLOTS_DEFAULT_KEEP)
-                   : 0;
+        lim.keep = cbm_config_get_bool(cfg, CBM_CONFIG_BRANCH_INDEX, true)
+                       ? cbm_config_get_int(cfg, CBM_CONFIG_BRANCH_INDEX_KEEP,
+                                            CBM_BRANCH_SLOTS_DEFAULT_KEEP)
+                       : 0;
+        const char *b = cbm_config_get(cfg, CBM_CONFIG_BRANCH_INDEX_BUDGET, "");
+        int64_t v = 0;
+        if (b && b[0] && cbm_branch_budget_parse(b, &v)) {
+            lim.budget = v;
+        } else if (b && b[0]) {
+            cbm_log_warn("branch.budget_invalid", "value", b);
+        }
     }
     cbm_config_close(owned);
-    return keep;
+    char benv[CBM_SZ_32] = "";
+    int64_t v = 0;
+    if (cbm_safe_getenv("CBM_BRANCH_INDEX_BUDGET", benv, sizeof(benv), NULL) &&
+        cbm_branch_budget_parse(benv, &v)) {
+        lim.budget = v;
+    }
+    return lim;
 }
 
 static void apply_branch_index_config(const cbm_mcp_server_t *srv, cbm_pipeline_t *p) {
-    int keep = branch_index_keep(srv);
-    if (keep >= 0) {
-        cbm_pipeline_set_branch_keep(p, keep);
+    branch_limits_t lim = branch_index_limits(srv);
+    if (lim.keep >= 0) {
+        cbm_pipeline_set_branch_keep(p, lim.keep);
+    }
+    if (lim.budget >= 0) {
+        cbm_pipeline_set_branch_budget(p, lim.budget);
     }
 }
 

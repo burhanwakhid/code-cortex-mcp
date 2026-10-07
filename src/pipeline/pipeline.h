@@ -107,6 +107,10 @@ void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int 
  * switch reindexes the one database in place. Default
  * CBM_BRANCH_SLOTS_DEFAULT_KEEP, or 0 when CBM_BRANCH_INDEX=0. Set before run. */
 void cbm_pipeline_set_branch_keep(cbm_pipeline_t *p, int keep);
+/* Total bytes the parked databases of this checkout may take on disk (<= 0:
+ * no size cap); the least recently parked go first. Default
+ * CBM_BRANCH_SLOTS_DEFAULT_BUDGET, or CBM_BRANCH_INDEX_BUDGET. Set before run. */
+void cbm_pipeline_set_branch_budget(cbm_pipeline_t *p, int64_t budget);
 
 /* After run: what the branch switch did ("none", "restored", "seeded",
  * "in_place"), the slug the database had been built for (NULL unknown), the

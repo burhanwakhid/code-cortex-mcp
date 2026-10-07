@@ -3322,12 +3322,13 @@ static int parked_indexes(const char *cache_dir, bool print) {
         }
         char db_path[CLI_BUF_1K];
         snprintf(db_path, sizeof(db_path), "%s/%s.db", cache_dir, ent->name);
-        char **slots = NULL;
-        int n = cbm_branch_slots_list(db_path, ent->name, NULL, &slots);
+        cbm_branch_slot_info_t *slots = NULL;
+        int n = cbm_branch_slots_info(db_path, ent->name, NULL, &slots);
         for (int i = 0; print && i < n; i++) {
-            printf("  %s/%s/%s.db (parked branch index)\n", dir, ent->name, slots[i]);
+            printf("  %s/%s/%s (parked branch index, %lld MB)\n", dir, ent->name, slots[i].file,
+                   (long long)(slots[i].bytes / (1024 * 1024)));
         }
-        cbm_branch_slots_free_list(slots, n);
+        cbm_branch_slots_free_info(slots, n);
         count += n;
     }
     cbm_closedir(d);
@@ -3644,6 +3645,8 @@ int cbm_cmd_config(int argc, char **argv) {
                "Keep one index per git branch (park/restore on checkout)");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_BRANCH_INDEX_KEEP, "8",
                "Parked branch indexes kept per project (oldest dropped)");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_BRANCH_INDEX_BUDGET, "2G",
+               "Disk budget of a project's parked branch indexes (0: no size cap)");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
                "Pin graph UI language: en, zh, or auto");
         return 0;
@@ -3677,6 +3680,8 @@ int cbm_cmd_config(int argc, char **argv) {
                cbm_config_get(cfg, CBM_CONFIG_BRANCH_INDEX, "true"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_BRANCH_INDEX_KEEP,
                cbm_config_get(cfg, CBM_CONFIG_BRANCH_INDEX_KEEP, "8"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_BRANCH_INDEX_BUDGET,
+               cbm_config_get(cfg, CBM_CONFIG_BRANCH_INDEX_BUDGET, "2G"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
                cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto"));
     } else if (strcmp(argv[0], "get") == 0) {
