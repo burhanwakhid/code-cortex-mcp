@@ -67,8 +67,10 @@ enum {
 #include <cctype>
 #include <condition_variable>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <new>
@@ -1199,7 +1201,10 @@ struct cbm_mcp_server {
     cbm_thread_t autoindex_tid;
     bool autoindex_active;    /* true if auto-index thread was started */
     /* Cache expiry sweep (cache_expiry.h): at most one thread at a time,
-     * joined before the next one starts and at server free. */
+     * joined before the next one starts, before the watcher changes
+     * (cbm_mcp_server_set_watcher) and at cbm_mcp_server_join_threads/free.
+     * The struct is calloc'd, so cbm_mcp_server_new constructs sweep_running
+     * in place; zeroed bytes are not a constructed std::atomic. */
     cbm_thread_t sweep_tid;
     bool sweep_active;
     std::atomic<bool> sweep_running;
@@ -1211,11 +1216,20 @@ struct cbm_mcp_server {
     char *active_request_id_str;     /* string JSON-RPC id of the in-progress tool call */
 };
 
+/* The server is calloc'd and released with free(): every member must be
+ * valid when zeroed except the ones cbm_mcp_server_new constructs in place,
+ * and none may need a destructor. */
+static_assert(std::is_trivially_destructible_v<cbm_mcp_server>,
+              "cbm_mcp_server is released with free(); members must not need destructors");
+
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)calloc(CBM_ALLOC_ONE, sizeof(*srv));
     if (!srv) {
         return NULL;
     }
+    /* calloc gives zeroed bytes, not objects: begin the atomic's lifetime. */
+    new (&srv->sweep_running) std::atomic<bool>(false);
+    srv->sweep_active = false;
 
     /* If a store_path is given, open that project directly.
      * Otherwise, create an in-memory store for test/embedded use. */
@@ -1242,10 +1256,36 @@ void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project) {
     srv->current_project = project ? heap_strdup(project) : NULL;
 }
 
+/* Join the cache sweep thread, if one was started. The sweep reads
+ * srv->watcher (sweep_keep_watched), so it must be gone before the watcher
+ * changes or is freed. */
+static void join_sweep(cbm_mcp_server_t *srv) {
+    if (srv->sweep_active) {
+        cbm_thread_join(&srv->sweep_tid);
+        srv->sweep_active = false;
+    }
+}
+
 void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w) {
     if (srv) {
+        join_sweep(srv);
         srv->watcher = w;
     }
+}
+
+void cbm_mcp_server_join_threads(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return;
+    }
+    if (srv->update_thread_active) {
+        cbm_thread_join(&srv->update_tid);
+        srv->update_thread_active = false;
+    }
+    if (srv->autoindex_active) {
+        cbm_thread_join(&srv->autoindex_tid);
+        srv->autoindex_active = false;
+    }
+    join_sweep(srv);
 }
 
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg) {
@@ -1258,15 +1298,7 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     if (!srv) {
         return;
     }
-    if (srv->update_thread_active) {
-        cbm_thread_join(&srv->update_tid);
-    }
-    if (srv->autoindex_active) {
-        cbm_thread_join(&srv->autoindex_tid);
-    }
-    if (srv->sweep_active) {
-        cbm_thread_join(&srv->sweep_tid);
-    }
+    cbm_mcp_server_join_threads(srv);
     if (srv->owns_store && srv->store) {
         cbm_store_close(srv->store);
     }
@@ -13143,6 +13175,24 @@ bool cbm_mcp_update_check_enabled(void) {
 
 /* ── Cache expiry ───────────────────────────────────────────────── */
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void (*sweep_test_cb)(int, void *) = nullptr;
+static void *sweep_test_data = nullptr;
+
+void cbm_mcp_test_sweep_hook(void (*callback)(int stage, void *data), void *data) {
+    sweep_test_cb = callback;
+    sweep_test_data = data;
+}
+#define SWEEP_TEST_HOOK(stage)                                                                     \
+    do {                                                                                           \
+        if (sweep_test_cb) {                                                                       \
+            sweep_test_cb((stage), sweep_test_data);                                               \
+        }                                                                                          \
+    } while (0)
+#else
+#define SWEEP_TEST_HOOK(stage) ((void)0)
+#endif
+
 static bool sweep_keep_watched(const char *project, void *ud) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)ud;
     return srv->watcher && cbm_watcher_is_watched(srv->watcher, project);
@@ -13150,6 +13200,7 @@ static bool sweep_keep_watched(const char *project, void *ud) {
 
 static void *sweep_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
+    SWEEP_TEST_HOOK(0);
     cbm_cache_expiry_cfg_t cfg;
     cbm_cache_expiry_cfg_load(&cfg, NULL);
     cbm_cache_sweep_opts_t opts = {};
@@ -13158,6 +13209,7 @@ static void *sweep_thread(void *arg) {
     opts.keep_ud = srv;
     cbm_cache_sweep_result_t res;
     (void)cbm_cache_expiry_sweep(&cfg, &opts, &res);
+    SWEEP_TEST_HOOK(1);
     srv->sweep_running.store(false);
     return NULL;
 }
@@ -13174,10 +13226,7 @@ static void maybe_sweep_cache(cbm_mcp_server_t *srv) {
     if (srv->sweep_running.load()) {
         return; /* the earlier sweep records last_sweep when it ends */
     }
-    if (srv->sweep_active) {
-        cbm_thread_join(&srv->sweep_tid); /* finished: reap it */
-        srv->sweep_active = false;
-    }
+    join_sweep(srv); /* finished: reap it */
     srv->sweep_running.store(true);
     if (cbm_thread_create(&srv->sweep_tid, 0, sweep_thread, srv) == 0) {
         srv->sweep_active = true;

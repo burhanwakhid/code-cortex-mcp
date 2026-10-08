@@ -117,8 +117,10 @@ locks a new file and both processes would own the lease. The lock files are empt
 A sweep is due when the last one recorded in `_config.db` is at least a day old. The MCP server
 checks this at `initialize` and after each `index_repository` call, and starts the sweep on a
 background thread, so neither the handshake nor the index reply waits for it. The check is one
-read of `_config.db`. One sweep thread runs per server; the server joins it before it frees
-itself. Across processes, a sweep holds the index lease of `_config.db` (a lease nothing else
+read of `_config.db`. One sweep thread runs per server. The sweep reads the watcher, which the
+server does not own, so the server joins the sweep before the watcher changes
+(`cbm_mcp_server_set_watcher`) and in `cbm_mcp_server_join_threads`. The stdio server calls
+`cbm_mcp_server_join_threads` before it frees the watcher and the config. Across processes, a sweep holds the index lease of `_config.db` (a lease nothing else
 takes), so a second server skips its sweep.
 
 The tool workers and hook processes never sweep. The CLI command `code-cortex-mcp cache expire`

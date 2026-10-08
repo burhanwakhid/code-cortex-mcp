@@ -15,8 +15,10 @@
 #include <mcp/mcp.h>
 #include <pipeline/branch_slots.h>
 #include <pipeline/pipeline.h>
+#include <watcher/watcher.h>
 
 #include "sqlite3.h"
+#include <atomic>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -700,6 +702,123 @@ TEST(cache_index_and_query_record_use) {
     PASS();
 }
 
+/* ── The server's background sweep ─────────────────────────────── */
+
+/* Enable automatic sweeps (test_main turns them off for the whole run) and
+ * the update check off; restore both afterwards. */
+typedef struct {
+    char expiry[64];
+    char update[64];
+    bool had_expiry;
+    bool had_update;
+} ce_srv_env_t;
+
+static void ce_srv_env_enter(ce_srv_env_t *s) {
+    s->had_expiry = cbm_safe_getenv("CBM_CACHE_EXPIRY", s->expiry, sizeof(s->expiry), NULL);
+    s->had_update = cbm_safe_getenv("CBM_UPDATE_CHECK", s->update, sizeof(s->update), NULL);
+    cbm_setenv("CBM_CACHE_EXPIRY", "1", 1);
+    cbm_setenv("CBM_UPDATE_CHECK", "0", 1);
+}
+
+static void ce_srv_env_leave(const ce_srv_env_t *s) {
+    if (s->had_expiry) {
+        cbm_setenv("CBM_CACHE_EXPIRY", s->expiry, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_EXPIRY");
+    }
+    if (s->had_update) {
+        cbm_setenv("CBM_UPDATE_CHECK", s->update, 1);
+    } else {
+        cbm_unsetenv("CBM_UPDATE_CHECK");
+    }
+}
+
+static const char CE_INITIALIZE[] =
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":"
+    "\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}";
+
+/* A fresh server (calloc'd struct, constructed sweep flag) starts a sweep on
+ * initialize, and join_threads waits for it to record last_sweep. */
+TEST(cache_server_initialize_runs_sweep) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_srv"));
+    ce_srv_env_t env;
+    ce_srv_env_enter(&env);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    ASSERT_TRUE(cbm_cache_expiry_due(&cfg, (int64_t)time(NULL)));
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv, CE_INITIALIZE);
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    cbm_mcp_server_join_threads(srv);
+    ASSERT_FALSE(cbm_cache_expiry_due(&cfg, (int64_t)time(NULL)));
+    cbm_mcp_server_join_threads(srv); /* idempotent */
+    cbm_mcp_server_free(srv);
+    ce_srv_env_leave(&env);
+    ce_teardown(&e);
+    PASS();
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef struct {
+    std::atomic<int> started;
+    std::atomic<int> finished;
+} ce_sweep_probe_t;
+
+static void ce_sweep_probe(int stage, void *data) {
+    ce_sweep_probe_t *p = (ce_sweep_probe_t *)data;
+    if (stage == 0) {
+        p->started.store(1);
+        cbm_usleep(300000); /* hold the sweep while the test drops the watcher */
+    } else {
+        p->finished.store(1);
+    }
+}
+
+/* The sweep reads the externally owned watcher. Dropping the watcher must
+ * wait for a running sweep, so the caller can free the watcher right after
+ * (main's shutdown order); the sweep still saw the watcher and kept its
+ * project. */
+TEST(cache_server_sweep_joined_before_watcher_drop) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_srvw"));
+    ce_srv_env_t env;
+    ce_srv_env_enter(&env);
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    ce_make_db(&e, "ce-watched", root, db, sizeof(db));
+    ASSERT_TRUE(cbm_cache_usage_set(db, (int64_t)time(NULL) - 200 * CE_DAY, NULL));
+
+    ce_sweep_probe_t probe;
+    probe.started.store(0);
+    probe.finished.store(0);
+    cbm_mcp_test_sweep_hook(ce_sweep_probe, &probe);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    cbm_watcher_watch(w, "ce-watched", root);
+    cbm_mcp_server_set_watcher(srv, w);
+    char *resp = cbm_mcp_server_handle(srv, CE_INITIALIZE);
+    free(resp);
+    for (int i = 0; i < 200 && !probe.started.load(); i++) {
+        cbm_usleep(10000);
+    }
+    ASSERT_EQ(probe.started.load(), 1);
+    cbm_mcp_server_set_watcher(srv, NULL);
+    ASSERT_EQ(probe.finished.load(), 1); /* joined, not still running */
+    cbm_watcher_free(w);
+    ASSERT_TRUE(cbm_file_exists(db)); /* the sweep consulted the watcher */
+    cbm_mcp_server_free(srv);
+    cbm_mcp_test_sweep_hook(NULL, NULL);
+    ce_srv_env_leave(&env);
+    ce_teardown(&e);
+    PASS();
+}
+#endif
+
 SUITE(cache_expiry) {
     RUN_TEST(cache_root_gone_needs_streak_and_grace);
     RUN_TEST(cache_root_gone_but_used_is_kept);
@@ -719,4 +838,8 @@ SUITE(cache_expiry) {
 #endif
     RUN_TEST(cache_usage_touch_is_throttled);
     RUN_TEST(cache_index_and_query_record_use);
+    RUN_TEST(cache_server_initialize_runs_sweep);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(cache_server_sweep_joined_before_watcher_drop);
+#endif
 }

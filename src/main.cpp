@@ -831,13 +831,18 @@ int main(int argc, char **argv) {
         cbm_watcher_stop(g_watcher);
         cbm_thread_join(&watcher_tid);
     }
-    cbm_watcher_free(g_watcher);
+    /* The server's background threads (auto-index, cache sweep) use the
+     * watcher and the config: join them before either is freed. */
+    cbm_mcp_server_join_threads(g_server);
+    cbm_mcp_server_set_watcher(g_server, NULL);
+    cbm_watcher_t *watcher = g_watcher;
+    g_watcher = NULL; /* the signal handler must not reach a freed watcher */
+    cbm_watcher_free(watcher);
     cbm_store_close(watch_store);
-    cbm_mcp_server_free(g_server);
-    cbm_config_close(runtime_config);
-
-    g_watcher = NULL;
+    cbm_mcp_server_t *server = g_server;
     g_server = NULL;
+    cbm_mcp_server_free(server);
+    cbm_config_close(runtime_config);
     cbm_diag_stop();
 
     return rc;

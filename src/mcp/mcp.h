@@ -117,8 +117,21 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path);
 /* Free an MCP server. */
 void cbm_mcp_server_free(cbm_mcp_server_t *srv);
 
-/* Set external watcher reference (for auto-index registration). Not owned. */
+/* Set external watcher reference (for auto-index registration). Not owned.
+ * Joins a running cache sweep first (it reads the watcher), so the caller
+ * may free the previous watcher once this returns. */
 void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w);
+
+/* Join the server's background threads (update check, auto-index, cache
+ * sweep). They use the external watcher and config, so call this before
+ * freeing either. Idempotent; cbm_mcp_server_free calls it too. */
+void cbm_mcp_server_join_threads(cbm_mcp_server_t *srv);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Callback run on the cache sweep thread: stage 0 before the sweep, stage 1
+ * after it. NULL clears. */
+void cbm_mcp_test_sweep_hook(void (*callback)(int stage, void *data), void *data);
+#endif
 
 /* Set external config store reference (for auto_index setting). Not owned. */
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg);
