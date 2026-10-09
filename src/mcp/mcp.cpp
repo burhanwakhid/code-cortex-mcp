@@ -13198,19 +13198,29 @@ static bool sweep_keep_watched(const char *project, void *ud) {
     return srv->watcher && cbm_watcher_is_watched(srv->watcher, project);
 }
 
+/* The sweep thread's view of the session: the project name is copied on the
+ * main thread before the sweep starts, because initialize may rewrite
+ * srv->session_project while a sweep is running. */
+struct sweep_job {
+    cbm_mcp_server_t *srv;
+    char keep_project[CBM_SZ_256];
+};
+
 static void *sweep_thread(void *arg) {
-    cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
+    sweep_job *job = (sweep_job *)arg;
+    cbm_mcp_server_t *srv = job->srv;
     SWEEP_TEST_HOOK(0);
     cbm_cache_expiry_cfg_t cfg;
     cbm_cache_expiry_cfg_load(&cfg, NULL);
     cbm_cache_sweep_opts_t opts = {};
-    opts.keep_project = srv->session_project[0] ? srv->session_project : NULL;
+    opts.keep_project = job->keep_project[0] ? job->keep_project : NULL;
     opts.keep = sweep_keep_watched;
     opts.keep_ud = srv;
     cbm_cache_sweep_result_t res;
     (void)cbm_cache_expiry_sweep(&cfg, &opts, &res);
     SWEEP_TEST_HOOK(1);
     srv->sweep_running.store(false);
+    free(job);
     return NULL;
 }
 
@@ -13227,11 +13237,18 @@ static void maybe_sweep_cache(cbm_mcp_server_t *srv) {
         return; /* the earlier sweep records last_sweep when it ends */
     }
     join_sweep(srv); /* finished: reap it */
+    sweep_job *job = (sweep_job *)calloc(1, sizeof(*job));
+    if (!job) {
+        return;
+    }
+    job->srv = srv;
+    snprintf(job->keep_project, sizeof(job->keep_project), "%s", srv->session_project);
     srv->sweep_running.store(true);
-    if (cbm_thread_create(&srv->sweep_tid, 0, sweep_thread, srv) == 0) {
+    if (cbm_thread_create(&srv->sweep_tid, 0, sweep_thread, job) == 0) {
         srv->sweep_active = true;
     } else {
         srv->sweep_running.store(false);
+        free(job);
     }
 }
 

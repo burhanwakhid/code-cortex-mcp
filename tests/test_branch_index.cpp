@@ -1646,7 +1646,9 @@ TEST(branch_long_names_park_and_restore) {
     PASS();
 }
 
-/* Index repo into the default cache database with persistence requested. */
+/* Index repo into the default cache database with persistence requested.
+ * Only the POSIX-only export tests below use it. */
+#ifndef _WIN32
 static int bi_index_persist(const char *repo) {
     cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, CBM_MODE_FULL);
     if (!p) {
@@ -1660,7 +1662,6 @@ static int bi_index_persist(const char *repo) {
     return rc;
 }
 
-#ifndef _WIN32
 /* An artifact export the run was asked for fails the run, also when it is
  * the end-of-run export (a restore with nothing re-extracted); refreshing an
  * existing artifact nobody asked for stays best-effort. */
