@@ -554,6 +554,37 @@ TEST(discover_walks_submodule_under_worktrees_path) {
     PASS();
 }
 
+/* The indexer's artifact directory is not un-skipped by a .cbmignore
+ * negation: indexed, every export would change a source of the next run. A
+ * negation still un-skips an ordinary built-in skip dir (#500). */
+TEST(discover_artifact_dir_not_negatable) {
+    char *base = th_mktempdir("cbm_disc_artneg");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".cbmignore"), "!.code-cortex/\n!vendor/\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, ".code-cortex/artifact.json"), "{\"schema_version\": 1}\n");
+    th_write_file(TH_PATH(base, "vendor/v.go"), "package v\n");
+
+    cbm_discover_opts_t opts = {};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    bool found_vendor = false;
+    for (int i = 0; i < count; i++) {
+        ASSERT_NULL(strstr(files[i].rel_path, ".code-cortex"));
+        found_vendor = found_vendor || strcmp(files[i].rel_path, "vendor/v.go") == 0;
+    }
+    ASSERT_TRUE(found_vendor);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 TEST(discover_cbmignore) {
     char *base = th_mktempdir("cbm_disc_cbmi");
     ASSERT(base != NULL);
@@ -1472,6 +1503,7 @@ SUITE(discover) {
     RUN_TEST(discover_skips_worktrees);
     RUN_TEST(discover_skips_nested_linked_worktree);
     RUN_TEST(discover_walks_submodule_under_worktrees_path);
+    RUN_TEST(discover_artifact_dir_not_negatable);
     RUN_TEST(discover_cbmignore);
     RUN_TEST(discover_cbmignore_stacks);
     RUN_TEST(discover_symlink_skipped);

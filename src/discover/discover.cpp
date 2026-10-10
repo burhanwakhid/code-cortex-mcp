@@ -795,10 +795,12 @@ static int gitignore_chain_result(const gitignore_link_t *link, const char *rel_
  * #489), node_modules explodes discovery, and the worktree-internal dirs
  * (.worktrees / .claude-worktrees, the worktree entries in ALWAYS_SKIP_DIRS)
  * contain parallel checkouts of the same repo whose indexing would duplicate
- * the whole codebase (#802). */
+ * the whole codebase (#802). The indexer's own artifact directory
+ * (CBM_ARTIFACT_DIR) too: indexed, every export would rewrite a source the
+ * next run sees changed, and that run would export again. */
 static bool is_safety_core_dir(const char *name) {
-    static const char *const SAFETY_CORE_DIRS[] = {".git", "node_modules", ".worktrees",
-                                                   ".claude-worktrees", NULL};
+    static const char *const SAFETY_CORE_DIRS[] = {
+        ".git", "node_modules", ".worktrees", ".claude-worktrees", ".code-cortex", NULL};
     return str_in_list(name, SAFETY_CORE_DIRS);
 }
 

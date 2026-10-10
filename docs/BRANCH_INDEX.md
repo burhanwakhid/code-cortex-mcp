@@ -182,6 +182,8 @@ database and exports when they differ. A failed export is therefore repaired by 
 and a count-preserving edit is not missed. An imported artifact records the importing checkout
 as its root, so the first run treats it as this checkout's graph and compares the exporter's
 identity with the checkout.
+The artifact directory is never indexed, and a `.cbmignore` negation cannot change that: an
+indexed `artifact.json` would change on every export and start another.
 
 ### Content verification after an identity change
 
