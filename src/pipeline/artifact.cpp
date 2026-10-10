@@ -36,6 +36,7 @@ enum {
 #include <sqlite3.h>
 #include <yyjson/yyjson.h>
 
+#include <atomic>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -44,6 +45,12 @@ enum {
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#ifdef _WIN32
+#include <process.h> /* _getpid */
+#define getpid _getpid
+#else
+#include <unistd.h> /* getpid */
+#endif
 #include <unistd.h>
 #ifdef _WIN32
 #include <windows.h>
@@ -465,8 +472,14 @@ static const char *DROP_INDEXES_SQL = "DROP INDEX IF EXISTS idx_nodes_label;"
  * committed transactions still in the -wal and can be mid-checkpoint torn
  * (#895). Only the index-stripping is BEST-only. */
 static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool strip_indexes) {
+    /* One snapshot file per export: the name carries the pid and a
+     * per-process counter, so two exports at once (two servers, a server
+     * and the CLI, two projects in one process) never VACUUM INTO, read
+     * and unlink the same file. */
+    static std::atomic<unsigned> seq{0};
     char tmp_path[CBM_SZ_4K];
-    snprintf(tmp_path, sizeof(tmp_path), "%s/cbm_artifact_tmp.db", cbm_tmpdir());
+    snprintf(tmp_path, sizeof(tmp_path), "%s/cbm_artifact_%ld_%u.db", cbm_tmpdir(),
+             (long)getpid(), seq.fetch_add(1, std::memory_order_relaxed));
     cbm_unlink(tmp_path);
 
     /* VACUUM INTO: clean compacted copy. Use raw sqlite3 to bypass store authorizer

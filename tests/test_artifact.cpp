@@ -10,6 +10,8 @@
 
 #include <sys/stat.h>
 #include <stdio.h>
+#include <thread>
+#include <vector>
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
@@ -55,6 +57,48 @@ static void cleanup_dir(const char *path) {
 }
 
 /* ── Tests ───────────────────────────────────────────────────────── */
+
+/* Two exports at once (two projects in one server, or a server and the
+ * CLI) must each snapshot into their own temp file: with one shared name,
+ * the second VACUUM INTO fails or reads the first one's bytes, and the
+ * first one's unlink pulls the file out from under the second. */
+TEST(artifact_concurrent_exports_do_not_collide) {
+    setup_artifact_test();
+    enum { N = 4 };
+    char repos[N][1024];
+    char dbs[N][1024];
+    for (int i = 0; i < N; i++) {
+        snprintf(repos[i], sizeof(repos[i]), "%s/repo%d", g_tmpdir, i);
+        snprintf(dbs[i], sizeof(dbs[i]), "%s/test%d.db", g_tmpdir, i);
+        cbm_mkdir_p(repos[i], 0755);
+        create_test_db(dbs[i]);
+    }
+
+    int rcs[N];
+    std::vector<std::thread> threads;
+    for (int i = 0; i < N; i++) {
+        threads.emplace_back([&, i] {
+            /* BEST strips indexes and VACUUMs the copy, the longer race window. */
+            rcs[i] = cbm_artifact_export(dbs[i], repos[i], "test-proj", CBM_ARTIFACT_BEST);
+        });
+    }
+    for (auto &t : threads) {
+        t.join();
+    }
+    for (int i = 0; i < N; i++) {
+        ASSERT_EQ(rcs[i], 0);
+        char import_db[1024];
+        snprintf(import_db, sizeof(import_db), "%s/imported%d.db", g_tmpdir, i);
+        ASSERT_EQ(cbm_artifact_import(repos[i], import_db), 0);
+        cbm_store_t *s = cbm_store_open_path(import_db);
+        ASSERT_NOT_NULL(s);
+        ASSERT_EQ(cbm_store_count_nodes(s, "test-proj"), 2);
+        ASSERT_EQ(cbm_store_count_edges(s, "test-proj"), 1);
+        cbm_store_close(s);
+    }
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
 
 TEST(artifact_export_fast_roundtrip) {
     setup_artifact_test();
@@ -395,6 +439,7 @@ TEST(artifact_roundtrip_non_ascii_paths) {
 SUITE(artifact) {
     RUN_TEST(artifact_fast_export_snapshots_live_wal_store);
     RUN_TEST(store_deep_integrity_detects_page_corruption);
+    RUN_TEST(artifact_concurrent_exports_do_not_collide);
     RUN_TEST(artifact_export_fast_roundtrip);
     RUN_TEST(artifact_export_best_roundtrip);
     RUN_TEST(artifact_exists_check);
