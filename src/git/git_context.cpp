@@ -559,10 +559,10 @@ int cbm_git_head_read(const char *root, cbm_git_head_t *out) {
      * up to the nearest directory holding a .git, as git itself does. */
     char top[GIT_OUTPUT_MAX];
     snprintf(top, sizeof(top), "%s", root);
-    struct stat st;
+    cbm_stat_t st; /* cbm_stat: non-ASCII and long checkout paths on Windows */
     for (;;) {
         int n = snprintf(path, sizeof(path), "%s/.git", top);
-        if (n > 0 && (size_t)n < sizeof(path) && stat(path, &st) == 0) {
+        if (n > 0 && (size_t)n < sizeof(path) && cbm_stat(path, &st) == 0) {
             break;
         }
         char *slash = strrchr(top, '/');

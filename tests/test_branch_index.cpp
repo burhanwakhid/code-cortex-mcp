@@ -14,6 +14,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
+#include <foundation/compat_fs.h>
 #include <git/git_context.h>
 #include <mcp/mcp.h>
 #include <pipeline/artifact.h>
@@ -223,6 +224,46 @@ TEST(branch_git_head_slug_reads_head_file) {
     th_rmtree(plain);
 
     th_rmtree(repo);
+    PASS();
+}
+
+/* A checkout under a non-ASCII directory: the walk up to .git and the HEAD
+ * and ref reads take the UTF-8 path as is (wide on Windows). */
+static bool bi_put(const char *path, const char *content) {
+    FILE *f = cbm_fopen(path, "wb");
+    if (!f) {
+        return false;
+    }
+    bool ok = fputs(content, f) >= 0;
+    return fclose(f) == 0 && ok;
+}
+
+TEST(branch_git_head_read_non_ascii_path) {
+    char *tmp = th_mktempdir("cbm_bi_utf8");
+    ASSERT_NOT_NULL(tmp);
+    char base[512];
+    snprintf(base, sizeof(base), "%s", tmp);
+    char repo[700];
+    char p[900];
+    /* "répo-日本" */
+    snprintf(repo, sizeof(repo), "%s/r\xc3\xa9po-\xe6\x97\xa5\xe6\x9c\xac", base);
+    snprintf(p, sizeof(p), "%s/.git/refs/heads", repo);
+    ASSERT_TRUE(cbm_mkdir_p(p, 0755));
+    snprintf(p, sizeof(p), "%s/sub/\xc3\xbc", repo); /* an index root below the checkout */
+    ASSERT_TRUE(cbm_mkdir_p(p, 0755));
+    snprintf(p, sizeof(p), "%s/.git/HEAD", repo);
+    ASSERT_TRUE(bi_put(p, "ref: refs/heads/main\n"));
+    static const char sha[] = "0123456789abcdef0123456789abcdef01234567";
+    snprintf(p, sizeof(p), "%s/.git/refs/heads/main", repo);
+    ASSERT_TRUE(bi_put(p, "0123456789abcdef0123456789abcdef01234567\n"));
+    snprintf(p, sizeof(p), "%s/sub/\xc3\xbc", repo);
+    cbm_git_head_t head;
+    ASSERT_EQ(cbm_git_head_read(p, &head), 0);
+    ASSERT_STR_EQ(head.branch, "main");
+    ASSERT_STR_EQ(head.head_sha, sha);
+    ASSERT_FALSE(head.is_detached);
+    cbm_git_head_free(&head);
+    th_rmtree(base);
     PASS();
 }
 
@@ -2683,6 +2724,7 @@ SUITE(branch_index) {
     }
     RUN_TEST(branch_slug_from_qn);
     RUN_TEST(branch_git_head_slug_reads_head_file);
+    RUN_TEST(branch_git_head_read_non_ascii_path);
     RUN_TEST(branch_switch_parks_and_restores);
     RUN_TEST(branch_restore_keeps_recreated_empty_file);
     RUN_TEST(branch_switch_detached_shares_one_slot);
