@@ -65,10 +65,11 @@ static void ce_teardown(ce_env_t *e) {
     th_rmtree(e->base);
 }
 
-/* <cache>/<name>.db recording root, in WAL mode. */
-static void ce_make_db(const ce_env_t *e, const char *name, const char *root, char *path,
-                       size_t n) {
-    snprintf(path, n, "%s/%s.db", e->cache, name);
+/* <cache>/<file>.db holding project `name` (a renamed or legacy file when
+ * they differ) recording root, in WAL mode. */
+static void ce_make_db_as(const ce_env_t *e, const char *file, const char *name, const char *root,
+                          char *path, size_t n) {
+    snprintf(path, n, "%s/%s.db", e->cache, file);
     sqlite3 *db = NULL;
     sqlite3_open(path, &db);
     sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
@@ -79,6 +80,12 @@ static void ce_make_db(const ce_env_t *e, const char *name, const char *root, ch
              name, root);
     sqlite3_exec(db, sql, NULL, NULL, NULL);
     sqlite3_close(db);
+}
+
+/* <cache>/<name>.db recording root, in WAL mode. */
+static void ce_make_db(const ce_env_t *e, const char *name, const char *root, char *path,
+                       size_t n) {
+    ce_make_db_as(e, name, name, root, path, n);
 }
 
 static void ce_cfg(cbm_cache_expiry_cfg_t *cfg) {
@@ -702,6 +709,137 @@ TEST(cache_index_and_query_record_use) {
     PASS();
 }
 
+/* A file named otherwise than the project it holds (renamed, or a legacy
+ * name the fallback scan still serves) is judged as that project: the
+ * session's and the watched one are kept by their project names. */
+TEST(cache_renamed_db_kept_by_project) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_rnkeep"));
+    char root[700];
+    char a[800];
+    char b[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db_as(&e, "old-sess", "sess", root, a, sizeof(a));
+    ce_make_db_as(&e, "old-watched", "watched", root, b, sizeof(b));
+    ASSERT_TRUE(cbm_cache_usage_set(a, now - 200 * CE_DAY, NULL));
+    ASSERT_TRUE(cbm_cache_usage_set(b, now - 200 * CE_DAY, NULL));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_opts_t o = {};
+    o.now = now;
+    o.keep_project = "sess";
+    o.keep = ce_keep_w;
+    o.keep_ud = (void *)"watched";
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(cbm_cache_expiry_sweep(&cfg, &o, &r), 0);
+    ASSERT_EQ(r.projects, 0);
+    ASSERT_EQ(r.skipped, 2);
+    ASSERT_TRUE(cbm_file_exists(a));
+    ASSERT_TRUE(cbm_file_exists(b));
+    ce_teardown(&e);
+    PASS();
+}
+
+static void ce_name_report(const cbm_cache_expiry_item_t *it, void *ud) {
+    if (it->kind == CBM_EXPIRE_UNUSED) {
+        snprintf((char *)ud, 256, "%s", it->name);
+    }
+}
+
+/* An expired renamed file: the dry run names the project and the file, its
+ * parked slots (filed under the project) go to the trash with it, and the
+ * restore puts it back as <project>.db, the name it is served under. */
+TEST(cache_renamed_db_expires_as_project) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_rntrash"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db_as(&e, "old-copy", "rp", root, db, sizeof(db));
+    char sdir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(db, "rp", root, sdir, sizeof(sdir)));
+    char slot[1300];
+    snprintf(slot, sizeof(slot), "%s/feature.db.zst", sdir);
+    ASSERT_EQ(th_write_file(slot, "zstd"), 0);
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 100 * CE_DAY, NULL));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_opts_t o = {};
+    o.now = now;
+    o.dry_run = true;
+    char shown[256] = "";
+    o.report = ce_name_report;
+    o.report_ud = shown;
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(cbm_cache_expiry_sweep(&cfg, &o, &r), 0);
+    ASSERT_EQ(r.projects, 1);
+    ASSERT_STR_EQ(shown, "rp (old-copy.db)");
+
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.projects, 1);
+    ASSERT_FALSE(cbm_file_exists(db));
+    ASSERT_FALSE(cbm_file_exists(slot));
+    ASSERT_EQ(ce_trash_count(&e), 1);
+
+    char msg[512];
+    ASSERT_EQ(cbm_cache_trash_restore("rp", msg, sizeof(msg)), 0);
+    char back[800];
+    snprintf(back, sizeof(back), "%s/rp.db", e.cache);
+    ASSERT_TRUE(cbm_file_exists(back));
+    ASSERT_TRUE(cbm_file_exists(slot));
+    ASSERT_EQ(ce_trash_count(&e), 0);
+    ce_teardown(&e);
+    PASS();
+}
+
+/* A query that the fallback scan answers from a renamed file records use on
+ * that file, so an actively used one is not "unused". */
+TEST(cache_query_on_renamed_db_records_use) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_rnuse"));
+    char repo[700];
+    snprintf(repo, sizeof(repo), "%s/repo", e.base);
+    char f[800];
+    snprintf(f, sizeof(f), "%s/a.py", repo);
+    ASSERT_EQ(th_write_file(f, "def a():\n    return 1\n"), 0);
+    ASSERT_EQ(cbm_mcp_index_in_process(repo), 0);
+    char *name = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(name);
+    char from[900];
+    char to[900];
+    snprintf(from, sizeof(from), "%s/%s.db", e.cache, name);
+    snprintf(to, sizeof(to), "%s/ce-renamed.db", e.cache);
+    ASSERT_EQ(cbm_rename_replace(from, to), 0);
+    int64_t now = (int64_t)time(NULL);
+    ASSERT_TRUE(cbm_cache_usage_set(to, now - 100 * CE_DAY, NULL));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char args[1200];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\"a\"}", name);
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "not found"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "ce-renamed", &lu, &checks);
+    ASSERT_GTE(lu, now);
+
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, true, &r), 0);
+    ASSERT_EQ(r.projects, 0);
+    free(name);
+    ce_teardown(&e);
+    PASS();
+}
+
 /* ── The server's background sweep ─────────────────────────────── */
 
 /* Enable automatic sweeps (test_main turns them off for the whole run) and
@@ -832,12 +970,15 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_skips_database_with_open_reader);
     RUN_TEST(cache_dry_run_changes_nothing);
     RUN_TEST(cache_trash_restore_and_purge);
+    RUN_TEST(cache_renamed_db_kept_by_project);
+    RUN_TEST(cache_renamed_db_expires_as_project);
 #ifndef _WIN32
     RUN_TEST(cache_old_slots_expire);
     RUN_TEST(cache_orphan_sidecars);
 #endif
     RUN_TEST(cache_usage_touch_is_throttled);
     RUN_TEST(cache_index_and_query_record_use);
+    RUN_TEST(cache_query_on_renamed_db_records_use);
     RUN_TEST(cache_server_initialize_runs_sweep);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(cache_server_sweep_joined_before_watcher_drop);

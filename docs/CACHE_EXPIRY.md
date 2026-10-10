@@ -80,7 +80,8 @@ on this machine. It expires like a deleted checkout, unless it is used within th
 `store_meta` memo. Three events record it:
 
 - `resolve_store`, which every tool call and every hook (SessionStart, the prompt and read hooks)
-  goes through to open a project's database;
+  goes through to open a project's database. It records use on the file it opened, which for a
+  renamed or legacy database that the fallback scan finds is not `<project>.db`;
 - every index run (`index_repository`, the watcher's in-process run), which also records the
   root and clears a missing streak;
 - `code-cortex-mcp cache restore`.
@@ -127,9 +128,14 @@ The tool workers and hook processes never sweep. The CLI command `code-cortex-mc
 runs a sweep on demand, whatever the interval.
 
 A sweep is one scan of the cache directory, one usage-table read per database (in one
-transaction) and a `stat` of each recorded root. It opens a project database only to learn a
-root the usage table does not have yet (first from the `store_meta` memo, else one read of its
-`projects` row) and to quiesce a database it is about to remove.
+transaction) and a `stat` of each recorded root. It opens a project database only to learn its
+project name or a root the usage table does not have yet (first from the `store_meta` memo, else
+one read of its `projects` row) and to quiesce a database it is about to remove.
+
+A file is judged as the project it holds, not as its filename. A renamed or legacy file
+`<cache>/<other>.db` that holds project `X` is served as `X` by the fallback scan, so the
+session, watch and slot checks use `X`, and its slots are those under `branches/X/`. Reports
+name it `X (<other>.db)`. When two files hold the same project, both keep their filenames.
 
 ## Removal
 
@@ -148,6 +154,7 @@ An expired database is moved, not deleted, into `<cache>/trash/<epoch>-<project>
 and its slot directory, beside a file `EXPIRED` that records the reason. A sweep at least a day
 later deletes the entry. Until then, `code-cortex-mcp cache restore <project>` puts the
 database and its slots back, if the project has no new database, and restarts its usage clock.
+A renamed file comes back as `<project>.db`, the name it is served under.
 
 We chose a trash step because the two costly mistakes are an uncertain root that the guards did
 not catch (an unusual mount layout) and a threshold set too low by hand. A trash entry costs disk

@@ -449,6 +449,40 @@ static std::string learn_root(const char *path, const char *project) {
     return root;
 }
 
+/* The project a database file holds: its one primary `projects` row, the
+ * rule the query-time fallback scan uses, else the filename stem. A legacy
+ * or renamed file is served under that internal name. */
+static std::string learn_project(const char *path, const std::string &stem) {
+    cbm_file_gen_t gen;
+    if (cbm_file_generation(path, &gen)) {
+        cbm_store_meta_db_t *meta = cbm_store_meta_open();
+        cbm_store_meta_row_t row;
+        bool hit = cbm_store_meta_get(meta, path, &gen, &row) && row.project[0];
+        cbm_store_meta_close(meta);
+        if (hit && cbm_validate_project_name(row.project)) {
+            return row.project;
+        }
+    }
+    std::string name;
+    int rows = 0;
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        sqlite3_busy_timeout(db, CE_BUSY_MS);
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT name FROM projects WHERE instr(name, '::') = 0 LIMIT 2;",
+                               -1, &st, NULL) == SQLITE_OK) {
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                const char *t = (const char *)sqlite3_column_text(st, 0);
+                name = t ? t : "";
+                rows++;
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return rows == 1 && cbm_validate_project_name(name.c_str()) ? name : stem;
+}
+
 /* ── Removal ────────────────────────────────────────────────────── */
 
 int cbm_cache_remove_project(const char *db_path, const char *project, const char *trash_entry,
@@ -597,8 +631,11 @@ static void slot_cb(const char *path, int64_t bytes, bool scratch, void *ud) {
     c->res->bytes += bytes;
 }
 
+/* name is the project (session, watch and slot identity, trash entry); stem
+ * is the filename without ".db". They differ for a legacy or renamed file. */
 typedef struct {
     std::string name;
+    std::string stem;
     std::string path;
     usage_row_t row;
     root_state_t state;
@@ -653,6 +690,11 @@ static bool kept(const cbm_cache_sweep_opts_t *o, const char *project) {
            (o->keep && o->keep(project, o->keep_ud));
 }
 
+/* The project, and its file when that is named otherwise. */
+static std::string label(const db_entry_t &e) {
+    return e.name == e.stem ? e.name : e.name + " (" + e.stem + ".db)";
+}
+
 /* Expire one project database (root_gone or unused) under its lease. */
 static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expiry_kind_t kind,
                            const std::string &reason, int64_t now, sweep_ctx_t *c) {
@@ -665,25 +707,25 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
     cbm_branch_slots_free_info(info, ni);
     std::string entry = std::string(cdir) + "/trash/" + std::to_string((long long)now) + "-" + e.name;
     if (kept(c->opts, e.name.c_str())) {
-        report(c, kind, e.name, e.path, bytes, reason, false, "in use by this session");
+        report(c, kind, label(e), e.path, bytes, reason, false, "in use by this session");
         c->res->skipped++;
         return;
     }
     if (c->opts->dry_run) {
-        report(c, kind, e.name, e.path, bytes, reason, false, NULL);
+        report(c, kind, label(e), e.path, bytes, reason, false, NULL);
         c->res->projects++;
         c->res->bytes += bytes;
         return;
     }
     cbm_db_lease_t *lease = NULL;
     if (cbm_db_lease_try_acquire(e.path.c_str(), &lease) != 0) {
-        report(c, kind, e.name, e.path, bytes, reason, false, "being indexed");
+        report(c, kind, label(e), e.path, bytes, reason, false, "being indexed");
         c->res->skipped++;
         return;
     }
     if (!quiesced(e.path.c_str())) {
         cbm_db_lease_release(lease);
-        report(c, kind, e.name, e.path, bytes, reason, false, "open in a read transaction");
+        report(c, kind, label(e), e.path, bytes, reason, false, "open in a read transaction");
         c->res->skipped++;
         return;
     }
@@ -697,11 +739,11 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
                     e.row.root.c_str());
             fclose(f);
         }
-        report(c, kind, e.name, entry, bytes, reason, true, NULL);
+        report(c, kind, label(e), entry, bytes, reason, true, NULL);
         c->res->projects++;
         c->res->bytes += bytes;
     } else if (rc < 0) {
-        report(c, kind, e.name, e.path, bytes, reason, false, "could not be moved");
+        report(c, kind, label(e), e.path, bytes, reason, false, "could not be moved");
         c->res->skipped++;
     }
 }
@@ -784,13 +826,26 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
             if (ends_with(ent->name, ".db") && strcmp(ent->name, "_config.db") != 0) {
                 std::string name(ent->name, strlen(ent->name) - 3);
                 if (cbm_validate_project_name(name.c_str())) {
-                    dbs.push_back({name, std::string(cdir) + "/" + ent->name, {}, ROOT_UNCERTAIN});
+                    std::string path = std::string(cdir) + "/" + ent->name;
+                    dbs.push_back({learn_project(path.c_str(), name), name, path, {},
+                                   ROOT_UNCERTAIN});
                 }
             } else if (is_sidecar_name(ent->name, &base) && base != "_config.db") {
                 sidecars.emplace_back(ent->name, base);
             }
         }
         cbm_closedir(d);
+    }
+    /* Two files claiming one project (a stale copy beside the real one) keep
+     * their filenames: one trash entry and one slot directory per project. */
+    std::unordered_map<std::string, int> claims;
+    for (const auto &e : dbs) {
+        claims[e.name]++;
+    }
+    for (auto &e : dbs) {
+        if (e.name != e.stem && claims[e.name] > 1) {
+            e.name = e.stem;
+        }
     }
 
     /* Usage rows; a database seen for the first time starts its clock now,
@@ -863,7 +918,7 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
             reasons.push_back("unused for " + fmt_days(idle) + " days (last used " +
                               fmt_time(e.row.last_used) + ")");
         } else if (e.state == ROOT_MISSING && e.row.missing_checks > 0) {
-            report(&c, CBM_EXPIRE_PENDING, e.name, e.path, 0,
+            report(&c, CBM_EXPIRE_PENDING, label(e), e.path, 0,
                    "root " + e.row.root + " missing since " + fmt_time(e.row.missing_since) +
                        " (" + std::to_string(e.row.missing_checks) + " of " +
                        std::to_string(cfg->root_checks) + " sweeps)",

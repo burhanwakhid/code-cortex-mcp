@@ -1779,15 +1779,6 @@ static cbm_store_t *resolve_store_by_name(cbm_mcp_server_t *srv, const char *pro
  * the call needs anyway. */
 static cbm_store_t *resolve_store_open(cbm_mcp_server_t *srv, const char *project) {
     cbm_store_t *store = resolve_store_by_name(srv, project);
-    if (store && cbm_validate_project_name(project)) {
-        /* Usage for cache expiry (cache_expiry.h): throttled in process, so a
-         * repeat call costs a map lookup. */
-        char used[CBM_SZ_1K];
-        project_db_path(project, used, sizeof(used));
-        if (used[0] && cbm_file_exists(used)) {
-            cbm_cache_usage_touch(used, NULL);
-        }
-    }
     if (store && g_expected_root[0]) {
         cbm_project_t proj = {0};
         if (cbm_store_get_project(store, project, &proj) == CBM_STORE_OK) {
@@ -1798,6 +1789,15 @@ static cbm_store_t *resolve_store_open(cbm_mcp_server_t *srv, const char *projec
                 store = NULL;
             }
             cbm_project_free_fields(&proj);
+        }
+    }
+    if (store && cbm_validate_project_name(project)) {
+        /* Usage for cache expiry (cache_expiry.h): throttled in process, so a
+         * repeat call costs a map lookup. The file actually opened, which the
+         * fallback scan may have found under another name than <project>.db. */
+        const char *used = cbm_store_db_path(store);
+        if (used && used[0] && cbm_file_exists(used)) {
+            cbm_cache_usage_touch(used, NULL);
         }
     }
     return store;
