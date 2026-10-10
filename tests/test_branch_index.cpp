@@ -42,11 +42,13 @@ static const char *bi_null_dev(void) {
 #endif
 }
 
+/* core.longpaths: the long-name tests create loose refs past MAX_PATH, which
+ * Git for Windows refuses unless told to use the long-path API. */
 static int bi_git(const char *repo, const char *args) {
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
              "git -C \"%s\" -c user.name=t -c user.email=t@t.io -c commit.gpgsign=false "
-             "-c init.defaultBranch=main %s >%s 2>&1",
+             "-c init.defaultBranch=main -c core.longpaths=true %s >%s 2>&1",
              repo, args, bi_null_dev());
     return system(cmd);
 }

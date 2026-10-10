@@ -258,10 +258,31 @@ static inline const char *tf_reset(void) {
 
 #define SUITE(name) void suite_##name(void)
 
-#define RUN_SUITE(name)                                            \
-    do {                                                           \
-        printf("\n%s=== %s ===%s\n", tf_dim(), #name, tf_reset()); \
-        suite_##name();                                            \
+/* CBM_TEST_SUITES=store_meta,branch_index runs only the named suites; unset
+ * or empty runs them all. */
+static inline bool tf_suite_selected(const char *name) {
+    const char *sel = getenv("CBM_TEST_SUITES");
+    if (!sel || !*sel) {
+        return true;
+    }
+    size_t n = strlen(name);
+    for (const char *p = sel; *p;) {
+        const char *end = strchr(p, ',');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len == n && strncmp(p, name, n) == 0) {
+            return true;
+        }
+        p = end ? end + 1 : p + len;
+    }
+    return false;
+}
+
+#define RUN_SUITE(name)                                                \
+    do {                                                               \
+        if (tf_suite_selected(#name)) {                                \
+            printf("\n%s=== %s ===%s\n", tf_dim(), #name, tf_reset()); \
+            suite_##name();                                            \
+        }                                                              \
     } while (0)
 
 /* ── Summary ───────────────────────────────────────────────────── */
