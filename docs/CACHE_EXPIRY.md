@@ -168,8 +168,11 @@ on `<x>.db.read.lock` beside the lease's `<x>.db.index.lock`:
 - `resolve_store`, the path of every tool call and hook, opens the project's database with
   `cbm_store_open_path_reader`, which takes the gate shared before the SQLite open and keeps
   it until `cbm_store_close`. A store the fallback scan adopts takes it after the read that
-  identified the file, and is dropped when the file has left its path by then. That is one
-  `flock` (or `LockFileEx`) per store open, nothing per query.
+  identified the file, and is dropped when the file has left its path by then. When the gate
+  is still held exclusive after the wait, the open fails: the reader gets no connection, and
+  the lookup reports `project lookup incomplete`, never a connection that the move could
+  leave on the trashed file. That is one `flock` (or `LockFileEx`) per store open, nothing
+  per query.
 - The sweep takes the gate exclusive, without waiting, after the lease and before the
   checkpoint. When a reader holds it, the database is skipped as `in use by a reader`. While
   the sweep holds it, a reader that opens waits (up to 2 seconds, polling) and then finds the
@@ -179,10 +182,10 @@ The gate is its own file, not a lock on `<x>.db`: SQLite's POSIX locks on the da
 process, so closing any other descriptor of that file would drop them, and on some systems
 (the BSDs) a `flock` and SQLite's `fcntl` locks on one file interact. Lock order is lease, then gate; every lease and
 every exclusive gate attempt is non-blocking, and only a shared gate waits, for a bounded time,
-so no cycle can form. A reader that cannot get the gate (a read-only cache directory without the
-lock file, a move that takes longer than the wait) opens without it, as before the gate
-existed. Short-lived reads that close at once (the ownership and branch-identity checks) are not
-gated: a move cannot strand them. On Windows the gate works the same way; there a move of an
+so no cycle can form. A reader that cannot open the gate's lock file at all (a read-only cache
+directory without it) opens without the gate, as before the gate existed: a sweep cannot take
+that gate either, so it moves nothing. Short-lived reads that close at once (the ownership and
+branch-identity checks) are not gated: a move cannot strand them. On Windows the gate works the same way; there a move of an
 open database also fails with a sharing violation, which the sweep reports as `could not be
 moved`.
 

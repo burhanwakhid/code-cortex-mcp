@@ -1098,10 +1098,15 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
 
 cbm_store_t *cbm_store_open_path_reader(const char *db_path) {
     /* Gate first: an open that waited on a move finds the file gone. A gate
-     * that cannot be had (read-only cache, a move that takes too long) leaves
-     * the connection ungated, as before the gate existed. */
+     * held exclusive past the wait is a move or delete still in progress:
+     * no connection, as an ungated one could be left reading the moved file.
+     * A gate that cannot be had at all (a read-only cache, no lock file)
+     * leaves the connection ungated, as before the gate existed: the sweep
+     * cannot take that gate either, so it moves nothing. */
     cbm_db_lease_t *gate = NULL;
-    (void)cbm_db_read_gate_acquire(db_path, false, &gate);
+    if (cbm_db_read_gate_acquire(db_path, false, &gate) == CBM_INDEX_BUSY) {
+        return NULL;
+    }
     cbm_store_t *s = cbm_store_open_path_query(db_path);
     if (!s) {
         cbm_db_lease_release(gate);
@@ -1116,7 +1121,11 @@ bool cbm_store_hold_read_gate(cbm_store_t *s) {
         return true;
     }
     cbm_db_lease_t *gate = NULL;
-    if (cbm_db_read_gate_acquire(s->db_path, false, &gate) != 0) {
+    int rc = cbm_db_read_gate_acquire(s->db_path, false, &gate);
+    if (rc == CBM_INDEX_BUSY) {
+        return false; /* a move in progress: the file may leave under us */
+    }
+    if (rc != 0) {
         return cbm_file_exists(s->db_path);
     }
     if (!cbm_file_exists(s->db_path)) {

@@ -2602,10 +2602,20 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project, bool *incom
             if (db_internal_project_name(hint_path, iname, sizeof(iname), &st, deadline_ms) ==
                 DB_PROJECT_FOUND) {
                 /* The gate comes after the read here: a file moved between
-                 * the two reads as gone. */
-                if (strcmp(iname, project) == 0 && cbm_store_hold_read_gate(st)) {
-                    cbm_store_meta_close(meta);
-                    return st; /* caller takes ownership */
+                 * the two reads as gone. One still there whose gate stays
+                 * held is being moved: the lookup is incomplete, not a miss,
+                 * and a scan would only wait on the same gate again. */
+                if (strcmp(iname, project) == 0) {
+                    if (cbm_store_hold_read_gate(st)) {
+                        cbm_store_meta_close(meta);
+                        return st; /* caller takes ownership */
+                    }
+                    if (cbm_file_exists(hint_path)) {
+                        cbm_store_close(st);
+                        cbm_store_meta_close(meta);
+                        *incomplete = true;
+                        return NULL;
+                    }
                 }
                 cbm_store_close(st);
             }
@@ -2669,9 +2679,17 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project, bool *incom
                 snprintf(row.project, sizeof(row.project), "%s", iname);
                 (void)cbm_store_meta_put(meta, &row);
             }
-            if (strcmp(iname, project) == 0 && cbm_store_hold_read_gate(st)) {
-                found = st; /* adopt — caller takes ownership */
-                break;
+            if (strcmp(iname, project) == 0) {
+                if (cbm_store_hold_read_gate(st)) {
+                    found = st; /* adopt — caller takes ownership */
+                    break;
+                }
+                if (cbm_file_exists(full_path)) {
+                    /* Its gate stays held: a move in progress. */
+                    *incomplete = true;
+                    cbm_log_warn("store.fallback.incomplete", "project", project, "path",
+                                 full_path, "reason", "read_gate_busy");
+                }
             }
             cbm_store_close(st);
         }

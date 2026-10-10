@@ -15,6 +15,7 @@
 #include <mcp/mcp.h>
 #include <pipeline/branch_slots.h>
 #include <pipeline/pipeline.h>
+#include <store/store.h>
 #include <watcher/watcher.h>
 
 #include "sqlite3.h"
@@ -1115,6 +1116,61 @@ TEST(cache_renamed_db_with_unsafe_stem_expires) {
     PASS();
 }
 
+/* A reader that finds the gate held exclusive past its wait (a sweep moving
+ * the file) gets no connection, never an ungated one that the move would
+ * leave on the trashed file. The fallback scan reports the lookup as
+ * incomplete rather than serving the file. */
+TEST(cache_busy_reader_gate_refuses_open) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_gatebusy"));
+    char repo[700];
+    snprintf(repo, sizeof(repo), "%s/repo", e.base);
+    char f[800];
+    snprintf(f, sizeof(f), "%s/a.py", repo);
+    ASSERT_EQ(th_write_file(f, "def a():\n    return 1\n"), 0);
+    ASSERT_EQ(cbm_mcp_index_in_process(repo), 0);
+    char *name = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(name);
+    char db[900];
+    snprintf(db, sizeof(db), "%s/%s.db", e.cache, name);
+
+    cbm_db_lease_t *gate = NULL;
+    ASSERT_EQ(cbm_db_read_gate_acquire(db, true, &gate), 0);
+    cbm_store_t *s = cbm_store_open_path_reader(db);
+    bool opened = s != NULL;
+    cbm_store_close(s);
+    s = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(s);
+    bool held = cbm_store_hold_read_gate(s);
+    cbm_store_close(s);
+    cbm_db_lease_release(gate);
+    ASSERT_FALSE(opened);
+    ASSERT_FALSE(held);
+
+    char to[900];
+    snprintf(to, sizeof(to), "%s/ce-busy.db", e.cache);
+    ASSERT_EQ(cbm_rename_replace(db, to), 0);
+    ASSERT_EQ(cbm_db_read_gate_acquire(to, true, &gate), 0);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char args[1200];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\"a\"}", name);
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph", args);
+    cbm_db_lease_release(gate);
+    ASSERT_NOT_NULL(resp);
+    bool incomplete = strstr(resp, "lookup incomplete") != NULL;
+    free(resp);
+    resp = cbm_mcp_handle_tool(srv, "search_graph", args); /* the gate is free again */
+    ASSERT_NOT_NULL(resp);
+    bool served = strstr(resp, "not found") == NULL && strstr(resp, "incomplete") == NULL;
+    free(resp);
+    cbm_mcp_server_free(srv);
+    ASSERT_TRUE(incomplete);
+    ASSERT_TRUE(served);
+    free(name);
+    ce_teardown(&e);
+    PASS();
+}
+
 /* ── The server's background sweep ─────────────────────────────── */
 
 /* Enable automatic sweeps (test_main turns them off for the whole run) and
@@ -1261,6 +1317,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_open_reader_keeps_renamed_database);
     RUN_TEST(cache_renamed_db_waits_for_project_lease);
     RUN_TEST(cache_renamed_db_with_unsafe_stem_expires);
+    RUN_TEST(cache_busy_reader_gate_refuses_open);
     RUN_TEST(cache_server_initialize_runs_sweep);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(cache_server_sweep_joined_before_watcher_drop);
