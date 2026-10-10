@@ -1042,7 +1042,8 @@ TEST(mcp_cwd_project_stops_at_unindexed_checkout_root) {
  *   a-b/repo   NOT indexed; derives the same name
  *   c/d-repo   indexed
  *   c-d/repo   a symlink to c/d-repo: same name, same directory
- * Every resolver -- hook walk-ups, the MCP cwd resolver, a project argument
+ * Every resolver -- hook walk-ups (SessionStart, Read coverage, the Bash/Grep
+ * symbol brief), the MCP cwd resolver, a project argument
  * given as a path -- must answer for the indexed directory and its alias and
  * never for its unindexed namesake. */
 TEST(resolvers_reject_colliding_project_names) {
@@ -1121,6 +1122,14 @@ TEST(resolvers_reject_colliding_project_names) {
         bool noted = note != NULL;
         free(note);
         ASSERT_EQ(noted, c.owned && c.root == owner);
+        /* The Bash/Grep symbol walk: its brief comes from inspect_symbol run
+         * through cbm_mcp_handle_tool, which must keep the level's
+         * expectation in force. */
+        snprintf(p, sizeof(p), "%s/src", c.root);
+        char *brief = cbm_hook_symbol_walk_for_testing(p, "alpha_fn");
+        bool briefed = brief != NULL;
+        free(brief);
+        ASSERT_EQ(briefed, c.owned);
     }
 
     /* The MCP cwd resolver. */

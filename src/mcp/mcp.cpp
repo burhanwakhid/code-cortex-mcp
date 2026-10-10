@@ -12787,11 +12787,15 @@ static char *handle_tool_impl(cbm_mcp_server_t *srv, const char *tool_name, cons
 
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     /* A project argument given as a path scopes lookups to that directory for
-     * this call only: clear it on the way in and out, so it never leaks into
-     * a later call or a direct cbm_mcp_* lookup. */
-    g_expected_root[0] = '\0';
+     * this call only, so the expectation is restored on the way out and never
+     * leaks into a later call or a direct cbm_mcp_* lookup. One the caller set
+     * (a hook walk-up level, cbm_mcp_expect_project_root) stays in force for
+     * the call: clearing it here answered a walk-up level from another
+     * checkout's database under the same derived name. */
+    char saved[sizeof(g_expected_root)];
+    memcpy(saved, g_expected_root, sizeof(saved));
     char *result = handle_tool_impl(srv, tool_name, args_json);
-    g_expected_root[0] = '\0';
+    memcpy(g_expected_root, saved, sizeof(saved));
     return result;
 }
 

@@ -1627,6 +1627,17 @@ char *cbm_session_start_text_for_testing(const char *cwd) {
     return text;
 }
 
+char *cbm_hook_symbol_walk_for_testing(const char *cwd, const char *token) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    cbm_mcp_server_set_scan_fallback(srv, false);
+    char *ctx = ha_walk_symbol(srv, cwd, token);
+    cbm_mcp_server_free(srv);
+    return ctx;
+}
+
 char *cbm_hook_coverage_walk_for_testing(const char *file_path) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     if (!srv) {

@@ -414,6 +414,8 @@ char *cbm_session_brief_format_for_testing(const char *project, const char *json
  * cwd, and the Read coverage note for an absolute file path. */
 char *cbm_session_start_text_for_testing(const char *cwd);
 char *cbm_hook_coverage_walk_for_testing(const char *file_path);
+/* The Bash/Grep PreToolUse symbol walk-up from cwd for one token. */
+char *cbm_hook_symbol_walk_for_testing(const char *cwd, const char *token);
 /* UserPromptSubmit context seams. Candidates: code-looking prose tokens joined
  * by '\n'. Targets: "intent=<callers|->[,chain]" then one
  * "name|qualifier|hint,hint" line per target. Resolve: the node(s) the first
