@@ -85,6 +85,13 @@ void cbm_git_head_free(cbm_git_head_t *head);
  * computes branch_slug ("detached" when detached). Caller frees. */
 char *cbm_git_branch_slug(const char *branch, bool detached);
 
+/* Append key=value to the configuration git reads from the environment
+ * (GIT_CONFIG_COUNT, GIT_CONFIG_KEY_<n>, GIT_CONFIG_VALUE_<n>, git 2.31+),
+ * after the entries already exported. A key already among them (compared
+ * case-insensitively, as git does) is left as set. False when the exported
+ * count is malformed: nothing changes. Not thread-safe (setenv). */
+bool cbm_git_config_env_append(const char *key, const char *value);
+
 #ifdef __cplusplus
 }
 #endif

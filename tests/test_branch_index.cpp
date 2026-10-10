@@ -154,6 +154,85 @@ static void bi_cleanup(const char *repo) {
     th_rmtree(repo);
 }
 
+/* GIT_CONFIG_COUNT and the first entries it names, saved and put back. */
+enum { BI_GIT_ENV_N = 4 };
+static const char *const BI_GIT_ENV[] = {
+    "GIT_CONFIG_COUNT",   "GIT_CONFIG_KEY_0",   "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_1",
+    "GIT_CONFIG_VALUE_1", "GIT_CONFIG_KEY_2",   "GIT_CONFIG_VALUE_2", "GIT_CONFIG_KEY_3",
+    "GIT_CONFIG_VALUE_3"};
+typedef struct {
+    char val[BI_GIT_ENV_N * 2 + 1][256];
+    bool had[BI_GIT_ENV_N * 2 + 1];
+} bi_git_env_t;
+
+static void bi_git_env_save(bi_git_env_t *s, bool clear) {
+    for (size_t i = 0; i < sizeof(BI_GIT_ENV) / sizeof(BI_GIT_ENV[0]); i++) {
+        s->had[i] = cbm_safe_getenv(BI_GIT_ENV[i], s->val[i], sizeof(s->val[i]), NULL) != NULL;
+        if (clear) {
+            cbm_unsetenv(BI_GIT_ENV[i]);
+        }
+    }
+}
+
+static void bi_git_env_restore(const bi_git_env_t *s) {
+    for (size_t i = 0; i < sizeof(BI_GIT_ENV) / sizeof(BI_GIT_ENV[0]); i++) {
+        if (s->had[i]) {
+            cbm_setenv(BI_GIT_ENV[i], s->val[i], 1);
+        } else {
+            cbm_unsetenv(BI_GIT_ENV[i]);
+        }
+    }
+}
+
+static const char *bi_env(const char *name) {
+    const char *v = getenv(name);
+    return v ? v : "";
+}
+
+/* The setting git runs with (core.longpaths on Windows) is appended to the
+ * GIT_CONFIG_* set a parent exports, not dropped because one exists, and a
+ * key the parent already set keeps the parent's value. */
+TEST(branch_git_config_env_append) {
+    bi_git_env_t saved;
+    bi_git_env_save(&saved, true);
+
+    ASSERT_TRUE(cbm_git_config_env_append("core.longpaths", "true"));
+    ASSERT_STR_EQ(bi_env("GIT_CONFIG_COUNT"), "1");
+    ASSERT_STR_EQ(bi_env("GIT_CONFIG_KEY_0"), "core.longpaths");
+    ASSERT_STR_EQ(bi_env("GIT_CONFIG_VALUE_0"), "true");
+
+    cbm_setenv("GIT_CONFIG_COUNT", "2", 1);
+    cbm_setenv("GIT_CONFIG_KEY_0", "user.name", 1);
+    cbm_setenv("GIT_CONFIG_VALUE_0", "ci", 1);
+    cbm_setenv("GIT_CONFIG_KEY_1", "safe.directory", 1);
+    cbm_setenv("GIT_CONFIG_VALUE_1", "*", 1);
+    ASSERT_TRUE(cbm_git_config_env_append("core.longpaths", "true"));
+    ASSERT_STR_EQ(bi_env("GIT_CONFIG_COUNT"), "3");
+    ASSERT_STR_EQ(bi_env("GIT_CONFIG_KEY_0"), "user.name");
+    ASSERT_STR_EQ(bi_env("GIT_CONFIG_KEY_1"), "safe.directory");
+    ASSERT_STR_EQ(bi_env("GIT_CONFIG_KEY_2"), "core.longpaths");
+    ASSERT_STR_EQ(bi_env("GIT_CONFIG_VALUE_2"), "true");
+
+    /* Already present (any case): unchanged. */
+    cbm_setenv("GIT_CONFIG_COUNT", "2", 1);
+    cbm_setenv("GIT_CONFIG_KEY_1", "Core.LongPaths", 1);
+    cbm_setenv("GIT_CONFIG_VALUE_1", "false", 1);
+    cbm_unsetenv("GIT_CONFIG_KEY_2");
+    cbm_unsetenv("GIT_CONFIG_VALUE_2");
+    ASSERT_TRUE(cbm_git_config_env_append("core.longpaths", "true"));
+    ASSERT_STR_EQ(bi_env("GIT_CONFIG_COUNT"), "2");
+    ASSERT_STR_EQ(bi_env("GIT_CONFIG_VALUE_1"), "false");
+    ASSERT_STR_EQ(bi_env("GIT_CONFIG_KEY_2"), "");
+
+    /* A count git would reject: left alone. */
+    cbm_setenv("GIT_CONFIG_COUNT", "two", 1);
+    ASSERT_FALSE(cbm_git_config_env_append("core.longpaths", "true"));
+    ASSERT_STR_EQ(bi_env("GIT_CONFIG_COUNT"), "two");
+
+    bi_git_env_restore(&saved);
+    PASS();
+}
+
 TEST(branch_slug_from_qn) {
     ASSERT_STR_EQ(cbm_branch_slug_from_qn("proj.__branch__.main", "proj"), "main");
     /* A branch whose name contains the marker keeps all of it. */
@@ -2788,6 +2867,7 @@ SUITE(branch_index) {
         printf("  (git unavailable — branch_index suite skipped)\n");
         return;
     }
+    RUN_TEST(branch_git_config_env_append);
     RUN_TEST(branch_slug_from_qn);
     RUN_TEST(branch_git_head_slug_reads_head_file);
     RUN_TEST(branch_git_head_read_non_ascii_path);

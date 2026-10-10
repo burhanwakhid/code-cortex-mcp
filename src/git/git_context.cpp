@@ -1,5 +1,6 @@
 #include "git/git_context.h"
 
+#include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/platform.h" /* cbm_is_dir — wide path on Windows */
@@ -12,18 +13,54 @@
 #include <string.h>
 #include <sys/stat.h>
 
+enum { GIT_CONFIG_ENV_MAX = 10000 };
+
+/* Config keys compare case-insensitively (section and variable names). */
+static bool git_config_key_equal(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+            return false;
+        }
+    }
+    return *a == *b;
+}
+
+bool cbm_git_config_env_append(const char *key, const char *value) {
+    const char *count = getenv("GIT_CONFIG_COUNT");
+    long n = 0;
+    if (count && count[0]) {
+        char *end = NULL;
+        n = strtol(count, &end, 10);
+        if (*end || n < 0 || n >= GIT_CONFIG_ENV_MAX) {
+            return false; /* git rejects it too: leave the caller's value alone */
+        }
+    }
+    char name[64];
+    for (long i = 0; i < n; i++) {
+        snprintf(name, sizeof(name), "GIT_CONFIG_KEY_%ld", i);
+        const char *k = getenv(name);
+        if (k && git_config_key_equal(k, key)) {
+            return true; /* the caller's own setting wins */
+        }
+    }
+    char num[24];
+    snprintf(name, sizeof(name), "GIT_CONFIG_KEY_%ld", n);
+    cbm_setenv(name, key, 1);
+    snprintf(name, sizeof(name), "GIT_CONFIG_VALUE_%ld", n);
+    cbm_setenv(name, value, 1);
+    snprintf(num, sizeof(num), "%ld", n + 1);
+    cbm_setenv("GIT_CONFIG_COUNT", num, 1);
+    return true;
+}
+
 #ifdef _WIN32
 /* Git for Windows refuses a ref whose loose file sits past MAX_PATH unless
  * core.longpaths is on, and a branch name is unbounded: without it the
  * identity git reports for such a checkout is "detached, no commit". Every
  * git this process runs gets the setting through the environment (git 2.31+
- * reads GIT_CONFIG_COUNT); a caller's own GIT_CONFIG_* set is left alone. */
+ * reads GIT_CONFIG_COUNT), appended to a caller's own GIT_CONFIG_* set. */
 static bool git_longpaths_env_init(void) {
-    if (!getenv("GIT_CONFIG_COUNT")) {
-        _putenv_s("GIT_CONFIG_COUNT", "1");
-        _putenv_s("GIT_CONFIG_KEY_0", "core.longpaths");
-        _putenv_s("GIT_CONFIG_VALUE_0", "true");
-    }
+    (void)cbm_git_config_env_append("core.longpaths", "true");
     return true;
 }
 static const bool g_git_longpaths_env = git_longpaths_env_init();
