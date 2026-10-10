@@ -71,11 +71,10 @@ static std::string fmt_time(int64_t t) {
 }
 
 /* How a walker that sizes or deletes treats one path. A link is never
- * followed: on Windows cbm_readdir and cbm_is_dir call a junction or a
- * directory symlink a directory, and descending into one would size, or
- * delete, whatever it points at -- outside the cache, or round a cycle.
- * Asked of the path, not the dirent, so a filesystem that reports no entry
- * type (DT_UNKNOWN) still has its directories walked. */
+ * followed: cbm_is_dir calls a junction or a directory symlink a directory,
+ * and descending into one would size, or delete, whatever it points at --
+ * outside the cache, or round a cycle. Asked of the path, not a dirent, so
+ * it also covers the entry a caller hands in (the trash entry itself). */
 typedef enum { WALK_FILE, WALK_DIR, WALK_LINK } walk_kind_t;
 
 static walk_kind_t walk_kind(const char *path) {

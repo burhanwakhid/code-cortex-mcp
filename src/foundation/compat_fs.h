@@ -25,10 +25,12 @@ typedef struct cbm_dir cbm_dir_t;
 
 typedef struct {
     char name[CBM_DIRENT_NAME_MAX];
-    bool is_dir;
+    bool is_dir;          /* a real directory: never a symlink, junction or other
+                           * link to one, and resolved by lstat when the
+                           * filesystem reports DT_UNKNOWN */
     unsigned char d_type; /* DT_REG, DT_DIR, DT_LNK, etc. (POSIX only, 0 on Windows) */
     /* A symbolic link (POSIX DT_LNK) or a reparse point (a Windows junction or
-     * directory symbolic link, which also sets is_dir there). A walk that must
+     * directory symbolic link; is_dir stays false for it). A walk that must
      * stay inside the repository never follows one. */
     bool is_link;
 } cbm_dirent_t;
@@ -118,9 +120,9 @@ bool cbm_is_regular_file(const char *path);
 
 /* Return true when the path itself (not what it points to) is a link: a
  * symlink on POSIX (lstat), any reparse point on Windows -- a directory
- * junction, a directory or file symlink, a mount point. cbm_readdir and
- * cbm_is_dir report a link to a directory as a directory on Windows, so a
- * walker that deletes must ask this before it descends. */
+ * junction, a directory or file symlink, a mount point. cbm_is_dir follows
+ * links on every platform, so a walker that classifies a path it built
+ * (rather than a cbm_readdir entry) must ask this before it descends. */
 bool cbm_is_link(const char *path);
 
 /* stat() by UTF-8 path; st_size and st_mtime (Unix seconds) as stat gives

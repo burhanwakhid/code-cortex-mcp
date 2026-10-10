@@ -229,9 +229,12 @@ that still exists (the project's graph) or of nothing.
 
 Sizing and deleting a trash entry never follows a link. A symlink (POSIX), or any reparse point
 on Windows (a directory junction, a directory or file symlink), is removed itself, and the walk
-does not descend into it: on Windows the directory listing reports a junction as a directory,
-and following one would delete files outside the cache, or loop on a cyclic junction. `cache
-trash` and `cache restore` do not list an entry that is itself a link.
+does not descend into it: following one would delete files outside the cache, or loop on a
+cyclic junction. The same holds for every other cache walk (branch-slot cleanup and expiry,
+the project and trash scans): a directory listing never reports a link as a directory, and a
+filesystem that reports no entry type (NFS, FUSE) has its entries classified by `lstat`, so
+parked slots on such a mount are still found. `cache trash` and `cache restore` do not list an
+entry that is itself a link.
 
 ### Never removed
 

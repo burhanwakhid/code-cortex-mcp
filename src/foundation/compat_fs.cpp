@@ -118,7 +118,11 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     memcpy(d->entry.name, u8, nlen);
     d->entry.name[nlen] = '\0';
     free(u8);
-    d->entry.is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    /* A junction or directory symlink carries FILE_ATTRIBUTE_DIRECTORY too;
+     * it is a link, not a directory a walker may descend into. */
+    DWORD attr = d->find_data.dwFileAttributes;
+    d->entry.is_dir =
+        (attr & FILE_ATTRIBUTE_DIRECTORY) != 0 && (attr & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
     d->entry.d_type = 0;
     d->entry.is_link = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
     return &d->entry;
@@ -756,9 +760,19 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
         }
         memcpy(d->entry.name, de->d_name, nlen);
         d->entry.name[nlen] = '\0';
-        d->entry.is_dir = (de->d_type == DT_DIR);
         d->entry.d_type = de->d_type;
-        d->entry.is_link = (de->d_type == DT_LNK);
+        if (de->d_type == DT_UNKNOWN) {
+            /* NFS, FUSE and some XFS/ReiserFS mounts leave d_type unset;
+             * ask the entry itself, without following a symlink, so the
+             * answer matches what DT_DIR / DT_LNK would have said. */
+            struct stat st;
+            bool got = fstatat(dirfd(d->dir), de->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0;
+            d->entry.is_dir = got && S_ISDIR(st.st_mode);
+            d->entry.is_link = got && S_ISLNK(st.st_mode);
+        } else {
+            d->entry.is_dir = (de->d_type == DT_DIR);
+            d->entry.is_link = (de->d_type == DT_LNK);
+        }
         return &d->entry;
     }
     return NULL;

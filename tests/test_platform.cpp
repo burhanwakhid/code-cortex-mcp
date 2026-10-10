@@ -723,6 +723,56 @@ TEST(regex_estimate_counts_brackets_and_escapes_literally) {
  * characters under the cache), and on Windows the wide APIs refuse such a
  * path unless it is given in the extended-length form. Elsewhere the same
  * steps run as an ordinary check: each component stays under NAME_MAX. */
+/* cbm_readdir calls an entry a directory only when it is one: a link to a
+ * directory is a link, so a walker that deletes never descends through it.
+ * (The DT_UNKNOWN and Windows-junction cases this guards cannot be staged on
+ * a local POSIX filesystem; they share the code path checked here.) */
+TEST(platform_readdir_reports_links_as_not_dirs) {
+    char *made = th_mktempdir("cbm_readdir_kind");
+    ASSERT_NOT_NULL(made);
+    char dir[512];
+    char file[512];
+    snprintf(dir, sizeof(dir), "%s/real", made);
+    snprintf(file, sizeof(file), "%s/plain", made);
+    ASSERT_TRUE(cbm_mkdir_p(dir, 0755));
+    FILE *f = cbm_fopen(file, "wb");
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(fclose(f), 0);
+#ifndef _WIN32
+    char lnk[512];
+    snprintf(lnk, sizeof(lnk), "%s/linked", made);
+    ASSERT_EQ(symlink(dir, lnk), 0);
+    ASSERT_TRUE(cbm_is_dir(lnk)); /* follows: what the walkers must not trust */
+#endif
+
+    int seen_real = 0;
+    int seen_plain = 0;
+    int seen_linked = 0;
+    cbm_dir_t *d = cbm_opendir(made);
+    ASSERT_NOT_NULL(d);
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (strcmp(ent->name, "real") == 0) {
+            seen_real++;
+            ASSERT_TRUE(ent->is_dir);
+        } else if (strcmp(ent->name, "plain") == 0) {
+            seen_plain++;
+            ASSERT_FALSE(ent->is_dir);
+        } else if (strcmp(ent->name, "linked") == 0) {
+            seen_linked++;
+            ASSERT_FALSE(ent->is_dir);
+        }
+    }
+    cbm_closedir(d);
+    ASSERT_EQ(seen_real, 1);
+    ASSERT_EQ(seen_plain, 1);
+#ifndef _WIN32
+    ASSERT_EQ(seen_linked, 1);
+#endif
+    th_rmtree(made);
+    PASS();
+}
+
 TEST(platform_file_helpers_long_path) {
     char *made = th_mktempdir("cbm_longpath");
     ASSERT_NOT_NULL(made);
@@ -808,6 +858,7 @@ SUITE(platform) {
     RUN_TEST(platform_file_size);
     RUN_TEST(platform_mmap);
     RUN_TEST(platform_mmap_nonexistent);
+    RUN_TEST(platform_readdir_reports_links_as_not_dirs);
     RUN_TEST(platform_file_helpers_long_path);
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);
