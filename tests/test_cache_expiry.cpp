@@ -940,6 +940,88 @@ TEST(cache_query_on_renamed_db_records_use) {
     PASS();
 }
 
+static void ce_skip_report(const cbm_cache_expiry_item_t *it, void *ud) {
+    if (it->kind == CBM_EXPIRE_UNUSED && it->skipped) {
+        snprintf((char *)ud, 256, "%s", it->skipped);
+    }
+}
+
+/* A server that holds a project's database open (its cached store, the
+ * reader gate shared) keeps it from the sweep of another process, though
+ * the usage row says unused and no read transaction is open: on POSIX the
+ * move would leave that connection on the trashed file and the next call
+ * without the project. Once the reader closes, the database goes. `file` is
+ * the database's filename stem: the project's own, or a renamed file that
+ * the fallback scan serves. */
+static int ce_reader_gate_case(const char *prefix, bool renamed) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, prefix));
+    char repo[700];
+    snprintf(repo, sizeof(repo), "%s/repo", e.base);
+    char f[800];
+    snprintf(f, sizeof(f), "%s/a.py", repo);
+    ASSERT_EQ(th_write_file(f, "def a():\n    return 1\n"), 0);
+    ASSERT_EQ(cbm_mcp_index_in_process(repo), 0);
+    char *name = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(name);
+    char db[900];
+    snprintf(db, sizeof(db), "%s/%s.db", e.cache, name);
+    if (renamed) {
+        char to[900];
+        snprintf(to, sizeof(to), "%s/ce-gated.db", e.cache);
+        ASSERT_EQ(cbm_rename_replace(db, to), 0);
+        snprintf(db, sizeof(db), "%s", to);
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char args[1200];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\"a\"}", name);
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "not found"));
+    free(resp);
+    int64_t now = (int64_t)time(NULL);
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 200 * CE_DAY, NULL));
+
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    char why[256] = "";
+    cbm_cache_sweep_opts_t o = {};
+    o.now = now;
+    o.report = ce_skip_report;
+    o.report_ud = why;
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(cbm_cache_expiry_sweep(&cfg, &o, &r), 0);
+    ASSERT_EQ(r.projects, 0);
+    ASSERT_EQ(r.skipped, 1);
+    ASSERT_STR_EQ(why, "in use by a reader");
+    ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_EQ(ce_trash_count(&e), 0);
+    /* The reader is still served from the file at its path. */
+    resp = cbm_mcp_handle_tool(srv, "search_graph", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "not found"));
+    free(resp);
+
+    cbm_mcp_server_free(srv); /* closes the cached store and its gate */
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 200 * CE_DAY, NULL));
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.projects, 1);
+    ASSERT_FALSE(cbm_file_exists(db));
+    ASSERT_EQ(ce_trash_count(&e), 1);
+    free(name);
+    ce_teardown(&e);
+    PASS();
+}
+
+TEST(cache_open_reader_keeps_database) {
+    return ce_reader_gate_case("cbm_ce_gate", false);
+}
+
+TEST(cache_open_reader_keeps_renamed_database) {
+    return ce_reader_gate_case("cbm_ce_gatern", true);
+}
+
 /* ── The server's background sweep ─────────────────────────────── */
 
 /* Enable automatic sweeps (test_main turns them off for the whole run) and
@@ -1082,6 +1164,8 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_used_since_scan_is_kept);
     RUN_TEST(cache_index_and_query_record_use);
     RUN_TEST(cache_query_on_renamed_db_records_use);
+    RUN_TEST(cache_open_reader_keeps_database);
+    RUN_TEST(cache_open_reader_keeps_renamed_database);
     RUN_TEST(cache_server_initialize_runs_sweep);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(cache_server_sweep_joined_before_watcher_drop);

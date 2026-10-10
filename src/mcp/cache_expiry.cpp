@@ -4,6 +4,7 @@
 
 #include "cli/cli.h" /* cbm_config_*, CBM_CONFIG_CACHE_EXPIRY* */
 #include "foundation/compat_fs.h"
+#include "foundation/constants.h" /* CBM_INDEX_BUSY */
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
@@ -760,15 +761,32 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
         c->res->skipped++;
         return;
     }
+    /* The lease keeps indexers out, not readers. A reader (a tool call, a
+     * hook) holds the file's reader gate shared for as long as it keeps the
+     * connection: on POSIX a move would leave it reading the trashed inode
+     * while the next call finds no project. Exclusive here means no reader
+     * has it open, and a reader that comes now waits until the move is done,
+     * then finds the file gone. */
+    cbm_db_lease_t *gate = NULL;
+    int grc = cbm_db_read_gate_acquire(e.path.c_str(), true, &gate);
+    if (grc != 0) {
+        cbm_db_lease_release(lease);
+        report(c, kind, label(e), e.path, bytes, reason, false,
+               grc == CBM_INDEX_BUSY ? "in use by a reader" : "reader gate unavailable");
+        c->res->skipped++;
+        return;
+    }
     if (!quiesced(e.path.c_str())) {
+        cbm_db_lease_release(gate);
         cbm_db_lease_release(lease);
         report(c, kind, label(e), e.path, bytes, reason, false, "open in a read transaction");
         c->res->skipped++;
         return;
     }
-    /* The lease keeps indexers out, not readers: a tool call or hook may have
-     * used the database since the scan. Judge by the row as it is now. */
+    /* Under the gate, so a reader that opened, recorded its use and closed
+     * since the scan is seen here: judge by the row as it is now. */
     if (used_since_scan(e)) {
+        cbm_db_lease_release(gate);
         cbm_db_lease_release(lease);
         report(c, kind, label(e), e.path, bytes, reason, false, "used since the scan");
         c->res->skipped++;
@@ -776,6 +794,7 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
     }
     int parked = 0;
     int rc = cbm_cache_remove_project(e.path.c_str(), e.name.c_str(), entry.c_str(), &parked);
+    cbm_db_lease_release(gate);
     cbm_db_lease_release(lease);
     if (rc == 0) {
         FILE *f = cbm_fopen((entry + "/EXPIRED").c_str(), "w");

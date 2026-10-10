@@ -114,9 +114,10 @@ subprocess. Slots of a project whose database is already gone go by the same rul
 
 The sweep removes a sidecar or temp file only when its database is absent, when it is older than
 1 hour, and while it holds that database's lease, so an index run that is about to create the
-database cannot race it. `<x>.db.index.lock` files stay: the lease contract (`compat_fs.h`)
-says that the lock file is never unlinked, because a process that opens the path after an unlink
-locks a new file and both processes would own the lease. The lock files are empty.
+database cannot race it. `<x>.db.index.lock` and `<x>.db.read.lock` files stay: the lease
+contract (`compat_fs.h`) says that a lock file is never unlinked, because a process that opens
+the path after an unlink locks a new file and both processes would own the lock. The lock files
+are empty.
 
 ## Where the sweep runs
 
@@ -149,11 +150,37 @@ being indexed. Before the move, the sweep opens it and runs a `PASSIVE` checkpoi
 checkpoint cannot copy every WAL frame, a reader holds a snapshot: the database is in use, and
 the sweep skips it. Otherwise the main file is the whole database.
 
-The lease keeps index runs out, not readers. A tool call in another process can use the database
-and record that use after the sweep read the usage rows. So, under the lease, the sweep reads the
-usage row again and skips the database when its `last_used` moved forward (or its missing-root
-streak went back) since the scan. When it cannot read the row, it also skips the database: the
-next sweep decides again.
+The lease keeps index runs out, not readers. A reader that keeps a connection open does not
+need a transaction to depend on the file: on POSIX a move leaves the connection on the moved
+inode, so a server that cached the project's store would read the trash, and its next open
+would find no project. Readers therefore hold the database's **reader gate**, an advisory lock
+on `<x>.db.read.lock` beside the lease's `<x>.db.index.lock`:
+
+- `resolve_store`, the path of every tool call and hook, opens the project's database with
+  `cbm_store_open_path_reader`, which takes the gate shared before the SQLite open and keeps
+  it until `cbm_store_close`. A store the fallback scan adopts takes it after the read that
+  identified the file, and is dropped when the file has left its path by then. That is one
+  `flock` (or `LockFileEx`) per store open, nothing per query.
+- The sweep takes the gate exclusive, without waiting, after the lease and before the
+  checkpoint. When a reader holds it, the database is skipped as `in use by a reader`. While
+  the sweep holds it, a reader that opens waits (up to 2 seconds, polling) and then finds the
+  file gone, which is what a removed project looks like.
+
+The gate is its own file, not a lock on `<x>.db`: SQLite's POSIX locks on the database are per
+process, so closing any other descriptor of that file would drop them, and on some systems
+(the BSDs) a `flock` and SQLite's `fcntl` locks on one file interact. Lock order is lease, then gate; every lease and
+every exclusive gate attempt is non-blocking, and only a shared gate waits, for a bounded time,
+so no cycle can form. A reader that cannot get the gate (a read-only cache directory without the
+lock file, a move that takes longer than the wait) opens without it, as before the gate
+existed. Short-lived reads that close at once (the ownership and branch-identity checks) are not
+gated: a move cannot strand them. On Windows the gate works the same way; there a move of an
+open database also fails with a sharing violation, which the sweep reports as `could not be
+moved`.
+
+Under the gate, the sweep reads the usage row again and skips the database when its `last_used`
+moved forward (or its missing-root streak went back) since the scan: a reader that opened,
+recorded its use and closed between the scan and the gate. When it cannot read the row, it also
+skips the database: the next sweep decides again.
 
 The removal is `cbm_cache_remove_project`, which `delete_project` also uses: the database, its
 WAL and SHM, its parked slots of every root, its `store_meta` row and its usage row go together.
@@ -178,11 +205,13 @@ that still exists (the project's graph) or of nothing.
 
 - The project of the server's own session, and every project its watcher watches.
 - A project whose index lease is held (being indexed or deleted elsewhere).
-- A database with a reader holding a WAL snapshot.
+- A database that a reader holds open (its reader gate), or with a reader holding a WAL
+  snapshot.
 - A database used after the sweep read the usage rows.
 - Anything when the cache directory has no `_config.db`, when HOME is not a directory, or when
   another sweep runs.
-- `_config.db`, `.index.lock` files, and files whose names this module does not write.
+- `_config.db`, `.index.lock` and `.read.lock` files, and files whose names this module does
+  not write.
 
 ## Alternatives that lost
 

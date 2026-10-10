@@ -264,6 +264,17 @@ cbm_store_t *cbm_store_open_path(const char *db_path);
  * exist — never creates a new .db file. */
 cbm_store_t *cbm_store_open_path_query(const char *db_path);
 
+/* cbm_store_open_path_query on a project's live cache database, holding the
+ * file's reader gate (cbm_db_read_gate_acquire, shared) until close: the
+ * cache expiry sweep does not move a database a connection reads. The gate
+ * is taken before the open, so a database moved meanwhile is not found. */
+cbm_store_t *cbm_store_open_path_reader(const char *db_path);
+
+/* The reader gate for a store opened without one (the fallback scan learns
+ * which file it keeps only after reading it). False when the file left its
+ * path before the gate was taken: the connection reads a moved database. */
+bool cbm_store_hold_read_gate(cbm_store_t *s);
+
 /* On-disk path of a file-backed store, or NULL for an in-memory (:memory:)
  * store. The returned pointer is owned by the store. */
 const char *cbm_store_db_path(const cbm_store_t *s);

@@ -1839,7 +1839,9 @@ static cbm_store_t *resolve_store_by_name(cbm_mcp_server_t *srv, const char *pro
      * internal name predates validation. */
     char path[CBM_SZ_1K];
     project_db_path(project, path, sizeof(path));
-    srv->store = path[0] ? cbm_store_open_path_query(path) : NULL;
+    /* A reader open: it holds the database's reader gate while cached, so the
+     * cache expiry sweep does not move the file under this connection. */
+    srv->store = path[0] ? cbm_store_open_path_reader(path) : NULL;
     if (srv->store) {
         /* Check DB integrity — back up (never silently delete) a corrupt DB.
          *
@@ -2599,7 +2601,9 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project, bool *incom
             cbm_store_t *st = NULL;
             if (db_internal_project_name(hint_path, iname, sizeof(iname), &st, deadline_ms) ==
                 DB_PROJECT_FOUND) {
-                if (strcmp(iname, project) == 0) {
+                /* The gate comes after the read here: a file moved between
+                 * the two reads as gone. */
+                if (strcmp(iname, project) == 0 && cbm_store_hold_read_gate(st)) {
                     cbm_store_meta_close(meta);
                     return st; /* caller takes ownership */
                 }
@@ -2665,7 +2669,7 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project, bool *incom
                 snprintf(row.project, sizeof(row.project), "%s", iname);
                 (void)cbm_store_meta_put(meta, &row);
             }
-            if (strcmp(iname, project) == 0) {
+            if (strcmp(iname, project) == 0 && cbm_store_hold_read_gate(st)) {
                 found = st; /* adopt — caller takes ownership */
                 break;
             }

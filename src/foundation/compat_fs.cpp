@@ -1376,3 +1376,90 @@ void cbm_db_lease_release(cbm_db_lease_t *lease) {
     free(lease->target);
     free(lease);
 }
+
+enum { DB_READ_GATE_WAIT_MS = 2000, DB_READ_GATE_POLL_MS = 5 };
+
+int cbm_db_read_gate_acquire(const char *db_path, bool exclusive, cbm_db_lease_t **out) {
+    if (!out) {
+        return CBM_NOT_FOUND;
+    }
+    *out = NULL;
+    // Only an existing database has readers to protect: never create a
+    // parent directory or a lock file for a path that holds nothing.
+    bool missing = false;
+    char *target = db_path && db_path[0] && strlen(db_path) < DB_LEASE_PATH_MAX - 32
+                       ? db_lease_real_path(db_path, &missing)
+                       : NULL;
+    if (!target) {
+        return CBM_NOT_FOUND;
+    }
+    char lock_path[DB_LEASE_PATH_MAX];
+    int n = snprintf(lock_path, sizeof(lock_path), "%s.read.lock", target);
+    if (n <= 0 || (size_t)n >= sizeof(lock_path)) {
+        free(target);
+        return CBM_NOT_FOUND;
+    }
+    cbm_db_lease_t *gate = (cbm_db_lease_t *)calloc(1, sizeof(*gate));
+    if (!gate) {
+        free(target);
+        return CBM_NOT_FOUND;
+    }
+    gate->target = target;
+#ifdef _WIN32
+    wchar_t *wide = cbm_utf8_to_wide_path(lock_path);
+    gate->handle =
+        wide ? CreateFileW(wide, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)
+             : INVALID_HANDLE_VALUE;
+    if (gate->handle == INVALID_HANDLE_VALUE && wide && !exclusive) {
+        // A read-only cache directory: lock an existing file read-only.
+        gate->handle = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+    free(wide);
+    if (gate->handle == INVALID_HANDLE_VALUE) {
+        cbm_db_lease_release(gate);
+        return CBM_NOT_FOUND;
+    }
+    DWORD flags = LOCKFILE_FAIL_IMMEDIATELY | (exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0);
+    for (int waited = 0;; waited += DB_READ_GATE_POLL_MS) {
+        OVERLAPPED overlap = {};
+        if (LockFileEx(gate->handle, flags, 0, 1, 0, &overlap)) {
+            break;
+        }
+        DWORD error = GetLastError();
+        if (error != ERROR_LOCK_VIOLATION || exclusive || waited >= DB_READ_GATE_WAIT_MS) {
+            cbm_db_lease_release(gate);
+            return error == ERROR_LOCK_VIOLATION ? CBM_INDEX_BUSY : CBM_NOT_FOUND;
+        }
+        Sleep(DB_READ_GATE_POLL_MS);
+    }
+#else
+    gate->fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (gate->fd < 0 && !exclusive) {
+        // A read-only cache directory: flock works on a read-only descriptor.
+        gate->fd = open(lock_path, O_RDONLY | O_CLOEXEC);
+    }
+    if (gate->fd < 0) {
+        cbm_db_lease_release(gate);
+        return CBM_NOT_FOUND;
+    }
+    // Polled, not blocking: a holder of the exclusive side never waits on
+    // anything, so the wait is short, and a bounded one cannot deadlock.
+    int op = (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB;
+    for (int waited = 0;; waited += DB_READ_GATE_POLL_MS) {
+        if (flock(gate->fd, op) == 0) {
+            break;
+        }
+        int error = errno;
+        bool busy = error == EWOULDBLOCK || error == EAGAIN;
+        if ((!busy && error != EINTR) || exclusive || waited >= DB_READ_GATE_WAIT_MS) {
+            cbm_db_lease_release(gate);
+            return busy ? CBM_INDEX_BUSY : CBM_NOT_FOUND;
+        }
+        usleep(DB_READ_GATE_POLL_MS * 1000);
+    }
+#endif
+    *out = gate;
+    return 0;
+}

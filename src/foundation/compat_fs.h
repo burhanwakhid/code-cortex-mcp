@@ -83,6 +83,17 @@ int cbm_db_lease_try_acquire(const char *db_path, cbm_db_lease_t **out);
 const char *cbm_db_lease_target(const cbm_db_lease_t *lease);
 void cbm_db_lease_release(cbm_db_lease_t *lease);
 
+/* Reader gate of an existing database file: a second lock file,
+ * <target>.read.lock, persistent like the lease's (NEVER unlink it). A
+ * connection that serves the live database holds it shared for its lifetime;
+ * whoever moves or deletes the file holds it exclusive across the move.
+ * Exclusive never waits; shared waits up to about 2 s for a move in progress.
+ * Returns 0, CBM_INDEX_BUSY (held the other way), or -1 (no such database, or
+ * no lock file can be opened). The lock is on its own file, never the .db:
+ * SQLite's POSIX locks there are per process, and closing any other
+ * descriptor of the file would drop them. Release with cbm_db_lease_release. */
+int cbm_db_read_gate_acquire(const char *db_path, bool exclusive, cbm_db_lease_t **out);
+
 /* Delete a file. Returns 0 on success. */
 int cbm_unlink(const char *path);
 /* Remove <db_path>-wal/-shm. Any path installing a fresh DB generation must

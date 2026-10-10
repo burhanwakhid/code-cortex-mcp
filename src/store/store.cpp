@@ -157,6 +157,8 @@ struct cbm_store {
     sqlite3_stmt *stmt_get_file_hashes;
     sqlite3_stmt *stmt_delete_file_hash;
     sqlite3_stmt *stmt_delete_file_hashes;
+
+    cbm_db_lease_t *read_gate; /* shared reader gate, or NULL (ungated) */
 };
 
 /* ── Helpers ────────────────────────────────────────────────────── */
@@ -1094,6 +1096,37 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     return s;
 }
 
+cbm_store_t *cbm_store_open_path_reader(const char *db_path) {
+    /* Gate first: an open that waited on a move finds the file gone. A gate
+     * that cannot be had (read-only cache, a move that takes too long) leaves
+     * the connection ungated, as before the gate existed. */
+    cbm_db_lease_t *gate = NULL;
+    (void)cbm_db_read_gate_acquire(db_path, false, &gate);
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        cbm_db_lease_release(gate);
+        return NULL;
+    }
+    s->read_gate = gate;
+    return s;
+}
+
+bool cbm_store_hold_read_gate(cbm_store_t *s) {
+    if (!s || !s->db_path || s->read_gate) {
+        return true;
+    }
+    cbm_db_lease_t *gate = NULL;
+    if (cbm_db_read_gate_acquire(s->db_path, false, &gate) != 0) {
+        return cbm_file_exists(s->db_path);
+    }
+    if (!cbm_file_exists(s->db_path)) {
+        cbm_db_lease_release(gate);
+        return false;
+    }
+    s->read_gate = gate;
+    return true;
+}
+
 /* ── Integrity check ───────────────────────────────────────────── */
 
 /* Deep integrity: the shallow check above only sanity-checks the projects
@@ -1368,6 +1401,7 @@ void cbm_store_close(cbm_store_t *s) {
     /* Use sqlite3_close_v2 — auto-deallocates when last statement finalizes.
      * Prevents ASan false-positive leaks from sqlite3 internal state. */
     sqlite3_close_v2(s->db);
+    cbm_db_lease_release(s->read_gate); /* after the connection is gone */
     safe_str_free(&s->db_path);
     free(s);
 }
