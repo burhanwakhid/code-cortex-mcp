@@ -674,6 +674,71 @@ TEST(cache_usage_touch_is_throttled) {
     PASS();
 }
 
+/* A touch that could not write (_config.db held by another writer, as a
+ * sweep's transaction holds it) is not throttled: the next touch writes. */
+TEST(cache_usage_touch_retries_after_busy) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_touchbusy"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    ce_make_db(&e, "touchbusy", root, db, sizeof(db));
+    int64_t now = (int64_t)time(NULL);
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 5000, NULL));
+    char cp[700];
+    snprintf(cp, sizeof(cp), "%s/_config.db", e.cache);
+    sqlite3 *w = NULL;
+    ASSERT_EQ(sqlite3_open(cp, &w), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(w, "BEGIN IMMEDIATE;", NULL, NULL, NULL), SQLITE_OK);
+    cbm_cache_usage_touch(db, NULL); /* busy: nothing written */
+    sqlite3_exec(w, "COMMIT;", NULL, NULL, NULL);
+    sqlite3_close(w);
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "touchbusy", &lu, &checks);
+    ASSERT_EQ(lu, now - 5000);
+    cbm_cache_usage_touch(db, NULL);
+    ce_usage(&e, "touchbusy", &lu, &checks);
+    ASSERT_GTE(lu, now);
+    ce_teardown(&e);
+    PASS();
+}
+
+/* A use recorded between the sweep's scan and the move (another process's
+ * tool call; the keep callback runs in that window) keeps the database. */
+static bool ce_touch_between(const char *project, void *ud) {
+    (void)project;
+    (void)cbm_cache_usage_set((const char *)ud, (int64_t)time(NULL), NULL);
+    return false;
+}
+
+TEST(cache_used_since_scan_is_kept) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_race"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "raced", root, db, sizeof(db));
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 200 * CE_DAY, NULL));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_opts_t o = {};
+    o.now = now;
+    o.keep = ce_touch_between;
+    o.keep_ud = db;
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(cbm_cache_expiry_sweep(&cfg, &o, &r), 0);
+    ASSERT_EQ(r.projects, 0);
+    ASSERT_EQ(r.skipped, 1);
+    ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_EQ(ce_trash_count(&e), 0);
+    ce_teardown(&e);
+    PASS();
+}
+
 /* End to end through the server: an index run and a tool call record use;
  * delete_project removes the usage row with the database. */
 TEST(cache_index_and_query_record_use) {
@@ -977,6 +1042,8 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_orphan_sidecars);
 #endif
     RUN_TEST(cache_usage_touch_is_throttled);
+    RUN_TEST(cache_usage_touch_retries_after_busy);
+    RUN_TEST(cache_used_since_scan_is_kept);
     RUN_TEST(cache_index_and_query_record_use);
     RUN_TEST(cache_query_on_renamed_db_records_use);
     RUN_TEST(cache_server_initialize_runs_sweep);

@@ -313,7 +313,6 @@ void cbm_cache_usage_touch(const char *db_path, const char *root_path) {
         if (!root_path && it != seen.end() && now - it->second < CBM_CACHE_USAGE_RESOLUTION_S) {
             return;
         }
-        seen[key] = now;
     }
     /* Read first: a hook process lands here once per database it opens, and
      * a read never takes _config.db's write lock. */
@@ -324,6 +323,7 @@ void cbm_cache_usage_touch(const char *db_path, const char *root_path) {
     usage_row_t r = usage_get(db, key);
     bool fresh = r.found && now - r.last_used < CBM_CACHE_USAGE_RESOLUTION_S;
     bool root_known = !root_path || (r.root == root_path && r.missing_checks == 0);
+    bool ok = true;
     if (!fresh || !root_known) {
         r.last_used = now;
         if (root_path) {
@@ -331,9 +331,15 @@ void cbm_cache_usage_touch(const char *db_path, const char *root_path) {
             r.missing_since = 0;
             r.missing_checks = 0;
         }
-        (void)usage_put(db, key, r);
+        ok = usage_put(db, key, r);
     }
     sqlite3_close(db);
+    /* Throttle only what reached _config.db: a write lost to a busy database
+     * (a sweep holding its transaction) is retried on the next touch. */
+    if (ok) {
+        std::lock_guard<std::mutex> g(mu);
+        seen[key] = now;
+    }
 }
 
 /* ── Root state ─────────────────────────────────────────────────── */
@@ -695,6 +701,34 @@ static std::string label(const db_entry_t &e) {
     return e.name == e.stem ? e.name : e.name + " (" + e.stem + ".db)";
 }
 
+/* Whether the database's usage row moved past the one the sweep judged.
+ * An unreadable row counts as used: the next sweep decides again. */
+static bool used_since_scan(const db_entry_t &e) {
+    sqlite3 *db = state_open(false);
+    if (!db) {
+        return true;
+    }
+    const char *key = cbm_store_meta_key(e.path.c_str());
+    sqlite3_stmt *st = NULL;
+    bool used = true;
+    if (sqlite3_prepare_v2(db,
+                           "SELECT last_used, missing_checks FROM cache_usage "
+                           "WHERE db_name = ?1;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+        int rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) {
+            used = sqlite3_column_int64(st, 0) > e.row.last_used ||
+                   sqlite3_column_int(st, 1) < e.row.missing_checks;
+        } else {
+            used = rc != SQLITE_DONE; /* no row: nothing recorded a use */
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return used;
+}
+
 /* Expire one project database (root_gone or unused) under its lease. */
 static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expiry_kind_t kind,
                            const std::string &reason, int64_t now, sweep_ctx_t *c) {
@@ -726,6 +760,14 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
     if (!quiesced(e.path.c_str())) {
         cbm_db_lease_release(lease);
         report(c, kind, label(e), e.path, bytes, reason, false, "open in a read transaction");
+        c->res->skipped++;
+        return;
+    }
+    /* The lease keeps indexers out, not readers: a tool call or hook may have
+     * used the database since the scan. Judge by the row as it is now. */
+    if (used_since_scan(e)) {
+        cbm_db_lease_release(lease);
+        report(c, kind, label(e), e.path, bytes, reason, false, "used since the scan");
         c->res->skipped++;
         return;
     }

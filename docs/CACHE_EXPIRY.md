@@ -90,7 +90,9 @@ The write is throttled twice. A process remembers, per database, when it last re
 skips the next hour of calls with one map lookup. The first call of a process (each hook is its
 own process) reads the row from `_config.db` and writes only when the row is an hour old. A read
 never takes `_config.db`'s write lock, so a hook pays one SQLite open and one indexed read, once
-per database it opens.
+per database it opens. The in-process throttle starts only after the row is current: when the
+write fails because `_config.db` is busy (a sweep holds its transaction), the next call tries
+again.
 
 A database seen for the first time starts its clock at that sweep. Its file mtime is not used:
 the mtime is the last index run, and a database queried daily but indexed long ago would then
@@ -144,6 +146,12 @@ being indexed. Before the move, the sweep opens it and runs a `PASSIVE` checkpoi
 checkpoint cannot copy every WAL frame, a reader holds a snapshot: the database is in use, and
 the sweep skips it. Otherwise the main file is the whole database.
 
+The lease keeps index runs out, not readers. A tool call in another process can use the database
+and record that use after the sweep read the usage rows. So, under the lease, the sweep reads the
+usage row again and skips the database when its `last_used` moved forward (or its missing-root
+streak went back) since the scan. When it cannot read the row, it also skips the database: the
+next sweep decides again.
+
 The removal is `cbm_cache_remove_project`, which `delete_project` also uses: the database, its
 WAL and SHM, its parked slots of every root, its `store_meta` row and its usage row go together.
 The one difference is the destination.
@@ -168,6 +176,7 @@ that still exists (the project's graph) or of nothing.
 - The project of the server's own session, and every project its watcher watches.
 - A project whose index lease is held (being indexed or deleted elsewhere).
 - A database with a reader holding a WAL snapshot.
+- A database used after the sweep read the usage rows.
 - Anything when the cache directory has no `_config.db`, when HOME is not a directory, or when
   another sweep runs.
 - `_config.db`, `.index.lock` files, and files whose names this module does not write.
