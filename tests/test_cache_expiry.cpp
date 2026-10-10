@@ -1444,6 +1444,50 @@ TEST(cache_busy_reader_gate_refuses_open) {
     PASS();
 }
 
+/* The fallback scan reads a database, then takes its gate. When expiry moved
+ * the file in between and a restore or re-index put another file at the
+ * path, the gate must not adopt the connection: it reads the moved file. A
+ * file that stayed (also one written in place) is still adopted. */
+TEST(cache_reader_gate_refuses_replaced_file) {
+#ifdef _WIN32
+    PASS(); /* an open database cannot be moved there; no inode to compare */
+#else
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_gaterepl"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    ce_make_db(&e, "rp", root, db, sizeof(db));
+
+    cbm_store_t *s = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(s);
+    sqlite3 *w = NULL; /* an index run writing the same file in place */
+    ASSERT_EQ(sqlite3_open(db, &w), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(w, "UPDATE projects SET indexed_at = '2026-02-02';", NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(w);
+    bool kept = cbm_store_hold_read_gate(s);
+    cbm_store_close(s);
+
+    s = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(s);
+    char moved[900];
+    snprintf(moved, sizeof(moved), "%s/rp.db.moved", e.base);
+    ASSERT_EQ(cbm_rename_replace(db, moved), 0);
+    char again[800]; /* a re-index: built aside, renamed onto the path */
+    ce_make_db_as(&e, "rp-new", "rp", root, again, sizeof(again));
+    ASSERT_EQ(cbm_rename_replace(again, db), 0);
+    bool adopted = cbm_store_hold_read_gate(s);
+    cbm_store_close(s);
+
+    ASSERT_TRUE(kept);
+    ASSERT_FALSE(adopted);
+    ce_teardown(&e);
+    PASS();
+#endif
+}
+
 /* ── The server's background sweep ─────────────────────────────── */
 
 /* Enable automatic sweeps (test_main turns them off for the whole run) and
@@ -1597,6 +1641,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_renamed_db_waits_for_project_lease);
     RUN_TEST(cache_renamed_db_with_unsafe_stem_expires);
     RUN_TEST(cache_busy_reader_gate_refuses_open);
+    RUN_TEST(cache_reader_gate_refuses_replaced_file);
     RUN_TEST(cache_server_initialize_runs_sweep);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(cache_server_sweep_joined_before_watcher_drop);

@@ -276,8 +276,10 @@ cbm_store_t *cbm_store_open_path_reader(const char *db_path);
 
 /* The reader gate for a store opened without one (the fallback scan learns
  * which file it keeps only after reading it). False when the file left its
- * path before the gate was taken (the connection reads a moved database), or
- * when the gate stays held exclusive past its wait (a move in progress). */
+ * path before the gate was taken (the connection reads a moved database),
+ * also when another file has taken that path since (a restore or re-index
+ * after the move: the open's device and inode no longer match the path's),
+ * or when the gate stays held exclusive past its wait (a move in progress). */
 bool cbm_store_hold_read_gate(cbm_store_t *s);
 
 /* On-disk path of a file-backed store, or NULL for an in-memory (:memory:)

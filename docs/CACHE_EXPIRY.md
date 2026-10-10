@@ -176,7 +176,10 @@ on `<x>.db.read.lock` beside the lease's `<x>.db.index.lock`:
 - `resolve_store`, the path of every tool call and hook, opens the project's database with
   `cbm_store_open_path_reader`, which takes the gate shared before the SQLite open and keeps
   it until `cbm_store_close`. A store the fallback scan adopts takes it after the read that
-  identified the file, and is dropped when the file has left its path by then. When the gate
+  identified the file, and is dropped when the file has left its path by then. It is also
+  dropped when another file is at the path by then (a restore or re-index after the move): the
+  device and inode taken around the open must still be those of the file at the path. When
+  the path changed files during the open itself, the store is dropped too. When the gate
   is still held exclusive after the wait, the open fails: the reader gets no connection, and
   the lookup reports `project lookup incomplete`, never a connection that the move could
   leave on the trashed file. That is one `flock` (or `LockFileEx`) per store open, nothing

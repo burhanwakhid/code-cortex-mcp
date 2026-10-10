@@ -2628,9 +2628,11 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project, bool *incom
             if (db_internal_project_name(hint_path, iname, sizeof(iname), &st, deadline_ms) ==
                 DB_PROJECT_FOUND) {
                 /* The gate comes after the read here: a file moved between
-                 * the two reads as gone. One still there whose gate stays
-                 * held is being moved: the lookup is incomplete, not a miss,
-                 * and a scan would only wait on the same gate again. */
+                 * the two reads as gone. A path still there either has its
+                 * gate held (a move in progress) or holds another file than
+                 * the one read (moved, then restored or re-indexed): the
+                 * lookup is incomplete, not a miss, and a scan would only
+                 * meet the same file again. */
                 if (strcmp(iname, project) == 0) {
                     if (cbm_store_hold_read_gate(st)) {
                         cbm_store_meta_close(meta);
@@ -2711,10 +2713,12 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project, bool *incom
                     break;
                 }
                 if (cbm_file_exists(full_path)) {
-                    /* Its gate stays held: a move in progress. */
+                    /* Its gate stays held (a move in progress), or another
+                     * file took the path since the read: the connection
+                     * would serve the moved one. */
                     *incomplete = true;
                     cbm_log_warn("store.fallback.incomplete", "project", project, "path",
-                                 full_path, "reason", "read_gate_busy");
+                                 full_path, "reason", "read_gate_busy_or_replaced");
                 }
             }
             cbm_store_close(st);

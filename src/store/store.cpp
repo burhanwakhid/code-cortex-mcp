@@ -159,6 +159,17 @@ struct cbm_store {
     sqlite3_stmt *stmt_delete_file_hashes;
 
     cbm_db_lease_t *read_gate; /* shared reader gate, or NULL (ungated) */
+
+    /* Identity (device, inode) of the file a query open read, taken around
+     * the open: cbm_store_hold_read_gate compares it with the file at the
+     * path. open_id_known is false where the platform has no inode (Windows,
+     * where an open database cannot be moved anyway); open_id_raced is true
+     * when the path changed files during the open, so which one the
+     * connection reads is unknown. */
+    uint64_t open_dev;
+    uint64_t open_ino;
+    bool open_id_known;
+    bool open_id_raced;
 };
 
 /* ── Helpers ────────────────────────────────────────────────────── */
@@ -1013,6 +1024,18 @@ static bool build_immutable_uri(const char *path, char *out, size_t out_sz) {
     return true;
 }
 
+/* (device, inode) of the file at path; false when it cannot be stat'ed or the
+ * platform reports no inode (st_ino is 0 on Windows). */
+static bool store_file_id(const char *path, uint64_t *dev, uint64_t *ino) {
+    cbm_stat_t st;
+    if (cbm_stat(path, &st) != 0 || st.st_ino == 0) {
+        return false;
+    }
+    *dev = (uint64_t)st.st_dev;
+    *ino = (uint64_t)st.st_ino;
+    return true;
+}
+
 cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     if (!db_path) {
         return NULL;
@@ -1022,6 +1045,10 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     if (!s) {
         return NULL;
     }
+    /* The file at the path before the open; compared after it below. */
+    uint64_t pre_dev = 0;
+    uint64_t pre_ino = 0;
+    bool pre_known = store_file_id(db_path, &pre_dev, &pre_ino);
 
     /* Query tools open the project DB READ-ONLY: a read query must never
      * mutate the DB (the previous READWRITE open + WAL write-pragmas did),
@@ -1072,6 +1099,17 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     }
 
     s->db_path = heap_strdup(db_path);
+    /* SQLite opened its descriptor between the two stats. The same file at
+     * both is the file it reads; different files mean it may read either. */
+    uint64_t post_dev = 0;
+    uint64_t post_ino = 0;
+    bool post_known = store_file_id(db_path, &post_dev, &post_ino);
+    if (pre_known && post_known) {
+        s->open_id_known = true;
+        s->open_id_raced = pre_dev != post_dev || pre_ino != post_ino;
+        s->open_dev = pre_dev;
+        s->open_ino = pre_ino;
+    }
 
     /* Security: block ATTACH/DETACH to prevent file creation via SQL injection. */
     sqlite3_set_authorizer(s->db, store_authorizer, NULL);
@@ -1116,6 +1154,23 @@ cbm_store_t *cbm_store_open_path_reader(const char *db_path) {
     return s;
 }
 
+/* Whether the file this connection reads is still the one at its path. A
+ * path that merely exists is not enough: a move to trash followed by a
+ * restore or re-index puts another file there, while the connection still
+ * reads the moved one. */
+static bool store_still_at_path(const cbm_store_t *s) {
+    if (!cbm_file_exists(s->db_path)) {
+        return false;
+    }
+    if (!s->open_id_known) {
+        return true; /* no inode (Windows): an open database cannot be moved */
+    }
+    uint64_t dev = 0;
+    uint64_t ino = 0;
+    return !s->open_id_raced && store_file_id(s->db_path, &dev, &ino) && dev == s->open_dev &&
+           ino == s->open_ino;
+}
+
 bool cbm_store_hold_read_gate(cbm_store_t *s) {
     if (!s || !s->db_path || s->read_gate) {
         return true;
@@ -1126,9 +1181,9 @@ bool cbm_store_hold_read_gate(cbm_store_t *s) {
         return false; /* a move in progress: the file may leave under us */
     }
     if (rc != 0) {
-        return cbm_file_exists(s->db_path);
+        return store_still_at_path(s);
     }
-    if (!cbm_file_exists(s->db_path)) {
+    if (!store_still_at_path(s)) {
         cbm_db_lease_release(gate);
         return false;
     }
