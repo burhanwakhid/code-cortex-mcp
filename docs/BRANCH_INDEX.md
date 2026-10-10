@@ -41,6 +41,10 @@ Derived names collide, because separators fold to `-`: `/x/a-b/repo` and `/x/a/b
 become `x-a-b-repo`. A derived-name hit is therefore accepted only from a database whose
 `projects.root_path` is that directory (`cbm_root_matches`: lexical comparison after
 normalization, then the canonical path). A legacy database without a recorded root is accepted.
+The MCP server memoizes its working-directory hit only for the generation of the database file
+that it checked (`cbm_file_generation`: size, mtime and inode). When that file is replaced, for
+example when it expired to trash and a colliding directory was then indexed under the same name,
+the next call walks up again and checks ownership against the new file.
 An index run that finds a live database of another directory under its name rebuilds in full. It
 carries nothing over from that database: no file hashes, no ADR (the architecture decision
 record that `manage_adr` stores) and no slot.

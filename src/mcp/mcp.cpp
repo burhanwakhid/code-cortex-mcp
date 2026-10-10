@@ -1427,6 +1427,11 @@ static bool g_cwd_project_probed;
 /* Cache dir the memo was computed against; a change (tests repoint
  * CBM_CACHE_DIR per fixture) invalidates it. */
 static char g_cwd_project_cache_dir[CBM_SZ_1K];
+/* Generation of the memoized project's database when the hit was accepted.
+ * The ownership check behind the hit judged THAT file: a replacement (an
+ * expiry and a re-index from a directory that derives the same name) is
+ * another file, and is judged again. */
+static cbm_file_gen_t g_cwd_project_gen;
 
 static bool project_db_exists(const char *project) {
     if (!project || !project[0]) {
@@ -1484,18 +1489,33 @@ static bool project_db_owned_by(const char *project, const char *dir, cbm_store_
     return owned;
 }
 
+/* Record the generation of <project>.db as the memo's; true when it exists. */
+static bool cwd_project_note_gen(const char *project) {
+    char path[CBM_SZ_1K];
+    project_db_path(project, path, sizeof(path));
+    return path[0] && cbm_file_generation(path, &g_cwd_project_gen);
+}
+
 /* Project name derived from cwd or one of its ancestors that has an indexed
  * db, or NULL. Cached for the life of the process (cwd does not change). */
 static const char *cwd_project_name(void) {
     char cdir[CBM_SZ_1K];
     cache_dir(cdir, sizeof(cdir));
-    /* Only a HIT is memoized, and only while its db still exists: a persistent
-     * worker started in an unindexed repository must pick the index up once
-     * index_repository has run, and a deleted project must not linger. A miss
-     * re-probes (eight stats and memo lookups), which is cheap. */
-    if (g_cwd_project_probed && strcmp(cdir, g_cwd_project_cache_dir) == 0 && g_cwd_project[0] &&
-        project_db_exists(g_cwd_project)) {
-        return g_cwd_project;
+    /* Only a HIT is memoized, and only while its db is the same generation
+     * that was checked: a persistent worker started in an unindexed repository
+     * must pick the index up once index_repository has run, a deleted project
+     * must not linger, and a database replaced by one indexed from another
+     * directory (derived names collide) must be checked for ownership again.
+     * A miss re-probes (eight stats and memo lookups), which is cheap; so does
+     * a re-index of the project itself, once. */
+    if (g_cwd_project_probed && strcmp(cdir, g_cwd_project_cache_dir) == 0 && g_cwd_project[0]) {
+        char path[CBM_SZ_1K];
+        project_db_path(g_cwd_project, path, sizeof(path));
+        cbm_file_gen_t now;
+        if (path[0] && cbm_file_generation(path, &now) &&
+            cbm_file_gen_equal(&now, &g_cwd_project_gen)) {
+            return g_cwd_project;
+        }
     }
     g_cwd_project_probed = true;
     g_cwd_project[0] = '\0';
@@ -1508,6 +1528,9 @@ static const char *cwd_project_name(void) {
     for (int level = 0; level < CWD_PROJECT_MAX_WALKUP; level++) {
         char *pname = cbm_project_name_from_path(dir);
         if (pname) {
+            /* The generation is taken before the checks: a file replaced
+             * after it is a changed generation on the next call. */
+            cwd_project_note_gen(pname);
             bool hit = project_db_exists(pname) && project_db_owned_by(pname, dir, meta);
             if (hit) {
                 snprintf(g_cwd_project, sizeof(g_cwd_project), "%s", pname);
@@ -1518,10 +1541,13 @@ static const char *cwd_project_name(void) {
                 return g_cwd_project;
             }
         }
-        /* A project indexed under a custom name: the memo records its root. */
+        /* A project indexed under a custom name: the memo records its root.
+         * The row may describe an earlier generation of the file, so the
+         * root is confirmed against the file as it is now. */
         cbm_store_meta_row_t row;
         if (meta && cbm_store_meta_find_root(meta, dir, &row) && row.project[0] &&
-            project_db_exists(row.project)) {
+            cwd_project_note_gen(row.project) && project_db_exists(row.project) &&
+            project_db_owned_by(row.project, dir, meta)) {
             snprintf(g_cwd_project, sizeof(g_cwd_project), "%s", row.project);
             cbm_store_meta_close(meta);
             return g_cwd_project;

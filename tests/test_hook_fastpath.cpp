@@ -1161,6 +1161,76 @@ TEST(resolvers_reject_colliding_project_names) {
     PASS();
 }
 
+/* The MCP cwd resolver memoizes a hit. When the database under that name is
+ * replaced by one indexed from a colliding directory (the first expired to
+ * trash, then a/b-repo's namesake a-b/repo indexed), the memo must not keep
+ * answering for the checkout it no longer covers. */
+TEST(mcp_cwd_project_memo_revalidates_ownership) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && !defined(_WIN32)
+    hf_env_t env;
+    if (!hf_env_open(&env, "cbm-cwdmemo-cache")) {
+        PASS();
+    }
+    char old_cwd[1024];
+    ASSERT_NOT_NULL(getcwd(old_cwd, sizeof(old_cwd)));
+    struct restore_t {
+        hf_env_t *env;
+        const char *cwd;
+        ~restore_t() {
+            (void)chdir(cwd);
+            cbm_mcp_reset_cwd_project_cache();
+            hf_env_close(env);
+        }
+    } restore{&env, old_cwd};
+    const char *made = th_mktempdir("cbm-cwdmemo");
+    char *base = made ? realpath(made, NULL) : NULL;
+    ASSERT_NOT_NULL(base);
+    char owner[1024];
+    char other[1024];
+    char p[1200];
+    snprintf(owner, sizeof(owner), "%s/a/b-repo", base);
+    snprintf(other, sizeof(other), "%s/a-b/repo", base);
+    const char *mk[] = {owner, other};
+    for (int i = 0; i < 2; i++) {
+        snprintf(p, sizeof(p), "%s/src", mk[i]);
+        ASSERT_TRUE(cbm_mkdir_p(p, 0755));
+    }
+    char *name = hf_index_dir(&env, owner);
+    ASSERT_NOT_NULL(name);
+
+    snprintf(p, sizeof(p), "%s/src", owner);
+    ASSERT_EQ(chdir(p), 0);
+    cbm_mcp_reset_cwd_project_cache();
+    ASSERT_NOT_NULL(cbm_mcp_cwd_project()); /* memoized */
+    ASSERT_STR_EQ(cbm_mcp_cwd_project(), name);
+
+    /* Expire the database (a move) and index the namesake under its name. */
+    char db[1200];
+    char moved[1300];
+    snprintf(db, sizeof(db), "%s/%s.db", env.dir, name);
+    snprintf(moved, sizeof(moved), "%s/expired.db.trash", env.dir);
+    ASSERT_EQ(cbm_rename_replace(db, moved), 0);
+    char *name2 = hf_index_dir(&env, other);
+    ASSERT_NOT_NULL(name2);
+    ASSERT_STR_EQ(name2, name);
+    bool still = cbm_mcp_cwd_project() != NULL; /* no reset: the memo path */
+
+    /* From the namesake itself the name resolves. */
+    snprintf(p, sizeof(p), "%s/src", other);
+    ASSERT_EQ(chdir(p), 0);
+    cbm_mcp_reset_cwd_project_cache();
+    const char *own = cbm_mcp_cwd_project();
+    bool resolves = own && strcmp(own, name) == 0;
+    free(name);
+    free(name2);
+    th_rmtree(base);
+    free(base);
+    ASSERT_FALSE(still);
+    ASSERT_TRUE(resolves);
+#endif
+    PASS();
+}
+
 void suite_hook_fastpath(void) {
     RUN_TEST(hook_scan_fallback_off_resolves_from_the_memo_only);
     RUN_TEST(hook_scan_fallback_defaults_on_and_toggles_back);
@@ -1177,4 +1247,5 @@ void suite_hook_fastpath(void) {
     RUN_TEST(hook_coverage_walk_stops_at_unindexed_checkout_root);
     RUN_TEST(mcp_cwd_project_stops_at_unindexed_checkout_root);
     RUN_TEST(resolvers_reject_colliding_project_names);
+    RUN_TEST(mcp_cwd_project_memo_revalidates_ownership);
 }
