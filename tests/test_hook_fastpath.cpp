@@ -804,6 +804,8 @@ static char *hf_make_checkouts(void) {
     bool ok = true;
     const char *dirs[] = {"/repo/.git/worktrees/wt",
                           "/repo/.git/modules/sub",
+                          "/repo/.git/modules/worktrees/sm",
+                          "/repo/worktrees/sm",
                           "/repo/src/deep",
                           "/repo/.worktrees/wt/src",
                           "/repo/nested/.git",
@@ -818,6 +820,11 @@ static char *hf_make_checkouts(void) {
     ok = ok && hf_write_file(p, text);
     snprintf(p, sizeof(p), "%s/repo/sub/.git", base);
     ok = ok && hf_write_file(p, "gitdir: ../.git/modules/sub\n");
+    snprintf(p, sizeof(p), "%s/repo/.git/worktrees/wt/commondir", base);
+    ok = ok && hf_write_file(p, "../..\n");
+    /* A submodule at worktrees/sm: its gitdir's parent is named "worktrees". */
+    snprintf(p, sizeof(p), "%s/repo/worktrees/sm/.git", base);
+    ok = ok && hf_write_file(p, "gitdir: ../../.git/modules/worktrees/sm\n");
     char *repo = nullptr;
     if (ok) {
         snprintf(p, sizeof(p), "%s/repo", base);
@@ -869,6 +876,9 @@ TEST(hook_walkup_stops_at_unindexed_checkout_root) {
     ASSERT_EQ(cbm_git_checkout_root_kind(p), CBM_GIT_CHECKOUT_GITLINK);
     ASSERT_TRUE(cbm_git_is_linked_worktree(p));
     snprintf(p, sizeof(p), "%s/sub", repo);
+    ASSERT_EQ(cbm_git_checkout_root_kind(p), CBM_GIT_CHECKOUT_GITLINK);
+    ASSERT_FALSE(cbm_git_is_linked_worktree(p));
+    snprintf(p, sizeof(p), "%s/worktrees/sm", repo);
     ASSERT_EQ(cbm_git_checkout_root_kind(p), CBM_GIT_CHECKOUT_GITLINK);
     ASSERT_FALSE(cbm_git_is_linked_worktree(p));
     snprintf(p, sizeof(p), "%s/src/deep", repo);

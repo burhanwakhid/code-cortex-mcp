@@ -45,9 +45,11 @@ An index run that finds a live database of another directory under its name rebu
 carries nothing over from that database: no file hashes, no ADR (the architecture decision
 record that `manage_adr` stores) and no slot.
 
-Discovery skips a directory whose `.git` file points into `<common dir>/worktrees/`, because
-that directory is a linked worktree with its own index. Submodules (`.../modules/...`) and
-nested clones (a `.git` directory) are walked as before.
+Discovery skips a directory whose `.git` file points into `<common dir>/worktrees/<name>`
+when that admin directory holds the `commondir` file git writes for every linked worktree,
+because that directory is a linked worktree with its own index. Submodules (`.../modules/...`,
+also one checked out at `worktrees/<name>`, whose git dir is `.git/modules/worktrees/<name>`)
+and nested clones (a `.git` directory) are walked as before.
 
 Alternatives that lost:
 

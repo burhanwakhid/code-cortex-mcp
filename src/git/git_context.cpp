@@ -820,8 +820,11 @@ bool cbm_git_is_linked_worktree(const char *dir) {
     if (!got || strncmp(line, "gitdir:", 7) != 0) {
         return false;
     }
-    /* "gitdir: <common>/worktrees/<name>" — a submodule's is ".../modules/<name>".
-     * Strip the line end and trailing separators, then the <name> component. */
+    /* "gitdir: <common>/worktrees/<name>" — a submodule's is ".../modules/<path>".
+     * Strip the line end and trailing separators, then the <name> component.
+     * The admin directory must hold the "commondir" file git writes for every
+     * linked worktree: a submodule at worktrees/foo has the gitdir
+     * .git/modules/worktrees/foo, whose parent is named "worktrees" too. */
     char *val = line + 7;
     size_t n = strlen(val);
     for (size_t i = 0; i < n; i++) {
@@ -832,6 +835,16 @@ bool cbm_git_is_linked_worktree(const char *dir) {
     while (n > 0 &&
            (val[n - 1] == '\n' || val[n - 1] == '\r' || val[n - 1] == ' ' || val[n - 1] == '/')) {
         val[--n] = '\0';
+    }
+    while (*val == ' ') {
+        val++;
+    }
+    char commondir[CBM_SZ_4K];
+    int cn = path_is_absolute(val) ? snprintf(commondir, sizeof(commondir), "%s/commondir", val)
+                                   : snprintf(commondir, sizeof(commondir), "%s/%s/commondir", dir,
+                                              val);
+    if (cn <= 0 || cn >= (int)sizeof(commondir) || !cbm_file_exists(commondir)) {
+        return false;
     }
     char *name = strrchr(val, '/');
     if (!name) {

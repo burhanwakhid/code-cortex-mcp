@@ -483,8 +483,10 @@ TEST(discover_skips_nested_linked_worktree) {
     ASSERT(base != NULL);
 
     th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
-    th_write_file(TH_PATH(base, "wt-feature/.git"),
-                  "gitdir: /repo/.git/worktrees/wt-feature\n");
+    th_write_file(TH_PATH(base, ".git/worktrees/wt-feature/commondir"), "../..\n");
+    char gitlink[1200];
+    snprintf(gitlink, sizeof(gitlink), "gitdir: %s/.git/worktrees/wt-feature\n", base);
+    th_write_file(TH_PATH(base, "wt-feature/.git"), gitlink);
     th_write_file(TH_PATH(base, "wt-feature/src/app.go"), "package app\n");
     th_write_file(TH_PATH(base, "deps/lib/.git"), "gitdir: ../../.git/modules/deps/lib\n");
     th_write_file(TH_PATH(base, "deps/lib/lib.go"), "package lib\n");
@@ -510,6 +512,42 @@ TEST(discover_skips_nested_linked_worktree) {
     ASSERT_TRUE(found_lib);
     ASSERT_TRUE(found_clone);
     ASSERT_EQ(count, 3);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* A submodule checked out at worktrees/<name> has the gitdir
+ * .git/modules/worktrees/<name>: the parent directory is named "worktrees",
+ * but it is no linked worktree (no commondir in its admin directory), so it
+ * is walked like any other submodule. A linked worktree whose gitlink is
+ * relative (worktree.useRelativePaths) is still skipped. */
+TEST(discover_walks_submodule_under_worktrees_path) {
+    char *base = th_mktempdir("cbm_disc_smwt");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    th_write_file(TH_PATH(base, ".git/modules/worktrees/foo/HEAD"), "ref: refs/heads/main\n");
+    th_write_file(TH_PATH(base, "worktrees/foo/.git"), "gitdir: ../../.git/modules/worktrees/foo\n");
+    th_write_file(TH_PATH(base, "worktrees/foo/foo.go"), "package foo\n");
+    th_write_file(TH_PATH(base, ".git/worktrees/rel/commondir"), "../..\n");
+    th_write_file(TH_PATH(base, "rel/.git"), "gitdir: ../.git/worktrees/rel\n");
+    th_write_file(TH_PATH(base, "rel/r.go"), "package r\n");
+
+    cbm_discover_opts_t opts = {};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    bool found_sub = false;
+    for (int i = 0; i < count; i++) {
+        ASSERT_NULL(strstr(files[i].rel_path, "rel/"));
+        found_sub = found_sub || strcmp(files[i].rel_path, "worktrees/foo/foo.go") == 0;
+    }
+    ASSERT_TRUE(found_sub);
+    ASSERT_EQ(count, 2);
 
     cbm_discover_free(files, count);
     th_cleanup(base);
@@ -1433,6 +1471,7 @@ SUITE(discover) {
     /* Go test ports (cross-platform) */
     RUN_TEST(discover_skips_worktrees);
     RUN_TEST(discover_skips_nested_linked_worktree);
+    RUN_TEST(discover_walks_submodule_under_worktrees_path);
     RUN_TEST(discover_cbmignore);
     RUN_TEST(discover_cbmignore_stacks);
     RUN_TEST(discover_symlink_skipped);

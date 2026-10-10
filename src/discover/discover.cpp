@@ -802,13 +802,18 @@ static bool is_safety_core_dir(const char *name) {
     return str_in_list(name, SAFETY_CORE_DIRS);
 }
 
+static bool discover_path_is_absolute(const char *path);
+
 /* Whether dir is the root of a linked git worktree: its .git is a gitlink
- * file "gitdir: <common dir>/worktrees/<name>". A worktree added anywhere
- * inside the checkout (not only under .worktrees) is a parallel copy of the
- * repository with an index of its own; walking into it duplicated every
- * symbol in the parent's graph. A submodule's gitlink names
- * ".../modules/<name>" and is still walked, as is a nested clone (.git
- * directory). Mirrors cbm_git_is_linked_worktree, which discover does not
+ * file "gitdir: <common dir>/worktrees/<name>" and that admin directory
+ * holds the "commondir" file git writes for every linked worktree. A
+ * worktree added anywhere inside the checkout (not only under .worktrees) is
+ * a parallel copy of the repository with an index of its own; walking into
+ * it duplicated every symbol in the parent's graph. A submodule's gitlink
+ * names ".../modules/<path>" and is still walked, as is a nested clone (.git
+ * directory). The parent name alone is not enough: a submodule at
+ * worktrees/foo has the gitdir .git/modules/worktrees/foo, which has no
+ * commondir. Mirrors cbm_git_is_linked_worktree, which discover does not
  * link against. One open attempt per directory: it fails where there is no
  * .git, and reading a .git directory yields no "gitdir:" line. */
 static bool is_linked_worktree_root(const char *dir) {
@@ -836,6 +841,16 @@ static bool is_linked_worktree_root(const char *dir) {
     while (n > 0 &&
            (val[n - 1] == '\n' || val[n - 1] == '\r' || val[n - 1] == ' ' || val[n - 1] == '/')) {
         val[--n] = '\0';
+    }
+    while (*val == ' ') {
+        val++;
+    }
+    char commondir[CBM_SZ_4K];
+    int cn = discover_path_is_absolute(val)
+                 ? snprintf(commondir, sizeof(commondir), "%s/commondir", val)
+                 : snprintf(commondir, sizeof(commondir), "%s/%s/commondir", dir, val);
+    if (cn <= 0 || cn >= (int)sizeof(commondir) || !cbm_file_exists(commondir)) {
+        return false;
     }
     char *name = strrchr(val, '/');
     if (!name) {
