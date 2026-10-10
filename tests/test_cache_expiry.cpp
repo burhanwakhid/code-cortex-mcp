@@ -19,6 +19,7 @@
 
 #include "sqlite3.h"
 #include <atomic>
+#include <string>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -259,6 +260,40 @@ TEST(cache_root_uncertain_never_counts) {
         ce_usage(&e, n, &lu, &checks);
         ASSERT_EQ(checks, 0);
     }
+    ce_teardown(&e);
+    PASS();
+}
+
+/* A root named with non-ASCII characters, and one past the Windows MAX_PATH,
+ * is present: the probe must not read either as "no such file" (the narrow
+ * Windows stat does) and start a missing streak on a live checkout. */
+TEST(cache_root_unicode_and_long_is_present) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_uni"));
+    char uni[700];
+    snprintf(uni, sizeof(uni), "%s/r\xC3\xA9po-\xE6\x97\xA5\xE6\x9C\xAC", e.base); /* répo-日本 */
+    ASSERT_TRUE(cbm_mkdir_p(uni, 0755));
+    std::string longroot = e.base;
+    while (longroot.size() < 300) {
+        longroot += "/segment-of-a-long-checkout-path";
+    }
+    ASSERT_TRUE(cbm_mkdir_p(longroot.c_str(), 0755));
+    char db[800];
+    ce_make_db(&e, "uni", uni, db, sizeof(db));
+    ce_make_db(&e, "long", longroot.c_str(), db, sizeof(db));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    int64_t t0 = (int64_t)time(NULL);
+    for (int day = 0; day < 3; day++) {
+        ASSERT_EQ(ce_sweep(&cfg, t0 + day * CE_DAY, false, &r), 0);
+    }
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "uni", &lu, &checks);
+    ASSERT_EQ(checks, 0);
+    ce_usage(&e, "long", &lu, &checks);
+    ASSERT_EQ(checks, 0);
     ce_teardown(&e);
     PASS();
 }
@@ -1027,6 +1062,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_root_gone_but_used_is_kept);
     RUN_TEST(cache_root_back_resets_streak);
     RUN_TEST(cache_root_uncertain_never_counts);
+    RUN_TEST(cache_root_unicode_and_long_is_present);
     RUN_TEST(cache_mass_missing_and_env_change_count_nothing);
     RUN_TEST(cache_refuses_unknown_cache_dir);
     RUN_TEST(cache_unused_expires);

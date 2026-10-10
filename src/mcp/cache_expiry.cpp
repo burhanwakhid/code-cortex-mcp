@@ -386,8 +386,11 @@ static root_state_t root_state(const std::string &root) {
     if (!absolute) {
         return ROOT_UNCERTAIN;
     }
-    struct stat st;
-    if (stat(root.c_str(), &st) == 0) {
+    /* cbm_stat, not stat: on Windows the narrow call cannot name a root with
+     * characters outside the ANSI code page or past MAX_PATH, and its
+     * "no such file" would count a live checkout as missing. */
+    cbm_stat_t st;
+    if (cbm_stat(root.c_str(), &st) == 0) {
         return S_ISDIR(st.st_mode) ? ROOT_PRESENT : ROOT_MISSING;
     }
     if (errno != ENOENT && errno != ENOTDIR) {
@@ -403,7 +406,7 @@ static root_state_t root_state(const std::string &root) {
             return ROOT_UNCERTAIN;
         }
         dir = slash == 0 ? "/" : dir.substr(0, slash);
-        if (stat(dir.c_str(), &st) == 0) {
+        if (cbm_stat(dir.c_str(), &st) == 0) {
             return is_mount_parent(dir) ? ROOT_UNCERTAIN : ROOT_MISSING;
         }
         if (errno != ENOENT && errno != ENOTDIR) {

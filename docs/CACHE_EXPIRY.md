@@ -48,7 +48,10 @@ missing or uncertain (`root_state`):
 
 - **Present**: the directory exists. Any streak restarts.
 - **Missing**: `stat` says "no such file", and the nearest existing ancestor is an ordinary
-  directory. This is what `git worktree remove` or deleting a clone looks like.
+  directory. This is what `git worktree remove` or deleting a clone looks like. The probe is
+  `cbm_stat`, which on Windows takes the wide-character path: the narrow `stat` there cannot
+  name a path with characters outside the ANSI code page or past `MAX_PATH`, and would call
+  such a live checkout missing.
 - **Uncertain**: any other error (permission, a network mount timing out), a relative path, or a
   nearest existing ancestor that is `/` or a mount parent (`/Volumes`, `/mnt`, `/media`,
   `/media/<user>`, `/run/media/<user>`, `/net`, `/Network`, `/System/Volumes`, automount
