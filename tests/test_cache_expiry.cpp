@@ -188,6 +188,42 @@ TEST(cache_root_gone_needs_streak_and_grace) {
     PASS();
 }
 
+/* A root that comes back between the scan and the move (a remount; the
+ * keep callback runs in that window) keeps the database: the verdict is
+ * checked again under the reader gate. */
+static bool ce_restore_root_between(const char *project, void *ud) {
+    (void)project;
+    cbm_mkdir_p((const char *)ud, 0755);
+    return false;
+}
+
+TEST(cache_root_back_before_move_is_kept) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_remount"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    ce_make_db(&e, "remounted", root, db, sizeof(db)); /* root absent */
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    int64_t t0 = (int64_t)time(NULL);
+    for (int day = 0; day < 3; day++) {
+        ASSERT_EQ(ce_sweep(&cfg, t0 + day * CE_DAY, false, &r), 0);
+    }
+    cbm_cache_sweep_opts_t o = {};
+    o.now = t0 + 8 * CE_DAY;
+    o.keep = ce_restore_root_between;
+    o.keep_ud = root;
+    ASSERT_EQ(cbm_cache_expiry_sweep(&cfg, &o, &r), 0);
+    ASSERT_EQ(r.projects, 0);
+    ASSERT_EQ(r.skipped, 1);
+    ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_EQ(ce_trash_count(&e), 0);
+    ce_teardown(&e);
+    PASS();
+}
+
 /* A use inside the grace period keeps a database whose root is gone (a
  * project queried by name after its checkout moved). */
 TEST(cache_root_gone_but_used_is_kept) {
@@ -1755,6 +1791,7 @@ TEST(cache_server_sweep_joined_before_watcher_drop) {
 SUITE(cache_expiry) {
     RUN_TEST(cache_root_gone_needs_streak_and_grace);
     RUN_TEST(cache_root_gone_but_used_is_kept);
+    RUN_TEST(cache_root_back_before_move_is_kept);
     RUN_TEST(cache_root_back_resets_streak);
     RUN_TEST(cache_root_uncertain_never_counts);
     RUN_TEST(cache_root_unicode_and_long_is_present);

@@ -208,7 +208,9 @@ moved`.
 Under the gate, the sweep reads the usage row again and skips the database when its `last_used`
 moved forward (or its missing-root streak went back) since the scan: a reader that opened,
 recorded its use and closed between the scan and the gate. When it cannot read the row, it also
-skips the database: the next sweep decides again.
+skips the database: the next sweep decides again. For a `root_gone` verdict it also judges the
+root again (one `stat`) and skips the database when the root is no longer missing: a volume
+remounted or a checkout restored since the scan.
 
 The removal is `cbm_cache_remove_project`, which `delete_project` also uses: the database, its
 WAL and SHM, its parked slots of every root, its `store_meta` row and its usage row go together.

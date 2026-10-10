@@ -898,6 +898,16 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
         c->res->skipped++;
         return;
     }
+    /* The root was judged missing at the scan; a volume remounted or a
+     * checkout restored since then is here again. One stat, under the gate. */
+    if (kind == CBM_EXPIRE_ROOT_GONE && root_state(e.row.root) != ROOT_MISSING) {
+        cbm_db_lease_release(gate);
+        cbm_db_lease_release(canon);
+        cbm_db_lease_release(lease);
+        report(c, kind, label(e), e.path, bytes, reason, false, "root present again");
+        c->res->skipped++;
+        return;
+    }
     int parked = 0;
     int rc = cbm_cache_remove_project(e.path.c_str(), e.name.c_str(), entry.c_str(), &parked);
     cbm_db_lease_release(gate);
