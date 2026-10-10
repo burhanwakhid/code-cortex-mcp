@@ -1311,11 +1311,24 @@ static int expire_dir(const char *dir, int64_t slot_before, int64_t scratch_befo
         char path[BS_PATH_MAX];
         snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
         /* A slot's own SQLite sidecars (legacy .db slots) go with the slot;
-         * they are not judged on their own. */
+         * they are not judged on their own while it exists. Once it is gone
+         * (an interrupted delete) nothing else removes them: they are
+         * scratch, judged by the scratch age. */
         bool is_slot = slot_ext(names[i]) != NULL;
-        bool sidecar = !is_slot && (strstr(names[i], ".db-wal") || strstr(names[i], ".db-shm") ||
-                                    strstr(names[i], ".db-journal")) &&
-                       !strstr(names[i], BS_UNZ_EXT);
+        bool sidecar = false;
+        static const char *const sidecar_ext[] = {"-wal", "-shm", "-journal"};
+        for (const char *ext : sidecar_ext) {
+            size_t nlen = strlen(names[i]);
+            size_t elen = strlen(ext);
+            if (is_slot || strstr(names[i], BS_UNZ_EXT) || nlen <= elen ||
+                !ends_with(names[i], ext)) {
+                continue;
+            }
+            char base[BS_PATH_MAX];
+            snprintf(base, sizeof(base), "%s/%.*s", dir, (int)(nlen - elen), names[i]);
+            sidecar = ends_with(base, BS_DB_EXT_S) && cbm_file_exists(base);
+            break;
+        }
         int64_t before = is_slot ? slot_before : scratch_before;
         int64_t mt = file_mtime(path);
         if (sidecar || before <= 0 || mt < 0 || mt >= before) {

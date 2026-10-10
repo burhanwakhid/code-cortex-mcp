@@ -734,6 +734,53 @@ TEST(cache_old_slots_expire) {
     PASS();
 }
 
+/* SQLite sidecars of a legacy .db slot stay while the slot does, however
+ * old; once the slot is gone (an interrupted delete) they are scratch and
+ * expire by the scratch age. */
+TEST(cache_orphan_slot_sidecars_expire) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_slotside"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "ss", root, db, sizeof(db));
+    char sdir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(db, "ss", root, sdir, sizeof(sdir)));
+    const char *gone[] = {"lost.db-wal", "lost.db-shm", "lost.db-journal"};
+    const char *stay[] = {"kept.db", "kept.db-wal", "kept.db-shm", "fresh.db-wal"};
+    char p[1300];
+    for (const char *n : gone) {
+        snprintf(p, sizeof(p), "%s/%s", sdir, n);
+        ASSERT_EQ(th_write_file(p, "x"), 0);
+        ce_age(p, now - 2 * 3600);
+    }
+    for (const char *n : stay) {
+        snprintf(p, sizeof(p), "%s/%s", sdir, n);
+        ASSERT_EQ(th_write_file(p, "x"), 0);
+        ce_age(p, strcmp(n, "fresh.db-wal") == 0 ? now - 60
+                  : strcmp(n, "kept.db") == 0    ? now - CE_DAY
+                                                 : now - 20 * CE_DAY);
+    }
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.slots, 0);
+    ASSERT_EQ(r.sidecars, 3);
+    for (const char *n : gone) {
+        snprintf(p, sizeof(p), "%s/%s", sdir, n);
+        ASSERT_FALSE(cbm_file_exists(p));
+    }
+    for (const char *n : stay) {
+        snprintf(p, sizeof(p), "%s/%s", sdir, n);
+        ASSERT_TRUE(cbm_file_exists(p));
+    }
+    ce_teardown(&e);
+    PASS();
+}
+
 /* Orphan sidecars and temp files go; those of a live database, fresh ones,
  * and every .index.lock stay. */
 TEST(cache_orphan_sidecars) {
@@ -1534,6 +1581,7 @@ SUITE(cache_expiry) {
 #ifndef _WIN32
     RUN_TEST(cache_trash_purge_never_follows_links);
     RUN_TEST(cache_old_slots_expire);
+    RUN_TEST(cache_orphan_slot_sidecars_expire);
     RUN_TEST(cache_orphan_sidecars);
 #endif
     RUN_TEST(cache_usage_touch_is_throttled);

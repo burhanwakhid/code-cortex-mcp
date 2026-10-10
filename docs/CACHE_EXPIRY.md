@@ -36,7 +36,7 @@ The rules, in order of confidence:
 | `root_gone` | The recorded checkout root is missing on at least 3 sweeps, the first of them at least the grace period ago, and nothing used the database in the grace period. | 7 days |
 | `unused` | No tool call, hook or index run used the database for the threshold. | 90 days |
 | `slot` | A parked slot was parked longer ago than the threshold. | 30 days |
-| `sidecar` | A `-wal`, `-shm`, `-journal`, `.db.tmp` or `.db.import_tmp` file whose database is gone, or a scratch file (`.db.unz*`, `.db.zst.tmp`) beside the slots | older than 1 hour |
+| `sidecar` | A `-wal`, `-shm`, `-journal`, `.db.tmp` or `.db.import_tmp` file whose database is gone, or a scratch file (`.db.unz*`, `.db.zst.tmp`) beside the slots, or the `-wal`, `-shm` or `-journal` file of a legacy `.db` slot that is gone. | older than 1 hour |
 
 ### Root gone
 
@@ -122,6 +122,10 @@ database cannot race it. `<x>.db.index.lock` and `<x>.db.read.lock` files stay: 
 contract (`compat_fs.h`) says that a lock file is never unlinked, because a process that opens
 the path after an unlink locks a new file and both processes would own the lock. The lock files
 are empty.
+
+Under `branches/`, the `-wal`, `-shm` and `-journal` files of a legacy uncompressed `<slot>.db`
+stay while the slot exists, whatever their age, and go with it when it expires. When the slot is
+already gone (an interrupted delete), they are scratch and go once they are older than 1 hour.
 
 ## Where the sweep runs
 
