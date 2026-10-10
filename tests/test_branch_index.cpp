@@ -2980,6 +2980,46 @@ TEST(branch_restore_shrinks_wal_under_open_reader) {
     PASS();
 }
 
+/* On a case-insensitive filesystem "Feature" and "feature" have one slot
+ * file: the park of the outgoing branch overwrites the incoming slot. The
+ * restore must not then copy the outgoing graph back, report it restored and
+ * delete the only park. Simulated on any POSIX filesystem: the incoming
+ * slot is a symlink to the outgoing branch's slot file. */
+TEST(branch_incoming_slot_same_file_as_outgoing) {
+#ifndef _WIN32
+    char *repo = bi_make_repo("cbm_bi_caseslot");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char main_zst[1400];
+    char feat_zst[1400];
+    char alias_zst[1400];
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* main parked */
+    bi_slot_file("main", ".db.zst", main_zst, sizeof(main_zst));
+    bi_slot_file("feature", ".db.zst", feat_zst, sizeof(feat_zst));
+    bi_slot_file("alias", ".db.zst", alias_zst, sizeof(alias_zst));
+    /* A stale park of feature, and "alias" naming the same file. */
+    ASSERT_EQ(link(main_zst, feat_zst), 0);
+    ASSERT_EQ(symlink("feature.db.zst", alias_zst), 0);
+
+    ASSERT_EQ(bi_git(repo, "checkout -q -b alias"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "seeded");
+    ASSERT_EQ(bi_count("only_feature"), 1);
+    ASSERT_TRUE(cbm_file_exists(feat_zst));
+    ASSERT_TRUE(bi_is_parked("feature"));
+
+    (void)cbm_unlink(alias_zst);
+    bi_cleanup(repo);
+#endif
+    PASS();
+}
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -3052,4 +3092,5 @@ SUITE(branch_index) {
     RUN_TEST(branch_budget_config_and_env);
     RUN_TEST(branch_switch_sweeps_scratch);
     RUN_TEST(branch_restore_shrinks_wal_under_open_reader);
+    RUN_TEST(branch_incoming_slot_same_file_as_outgoing);
 }

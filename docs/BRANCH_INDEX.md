@@ -422,6 +422,12 @@ between 0.3 and 3.3 s, against 1.6 to 47 s for the seeded runs of the same seque
 - **Park and restore need scratch space** equal to the database size, in the cache directory.
 - **Every detached HEAD shares one slot** (`detached`), and branch names that slug alike share
   one slot. Both cost re-work only.
+- **Branch names that differ only in case share one slot file on a case-insensitive
+  filesystem** (macOS and Windows defaults): `Feature` and `feature` both name
+  `Feature.db.zst`. A switch between them parks the outgoing graph over the incoming slot. The
+  switch detects that the incoming slot is now the same file as the one it just parked
+  (`same_file`: device and inode, or a case-insensitive name compare on Windows), skips the
+  restore and seeds. The incoming branch's earlier park is lost; that costs re-work only.
 - **The SessionStart text is read before the server's refresh.** After a switch made while no
   server ran, the brief names the indexed and the checked-out branch, and graph answers
   describe the indexed branch until the refresh finishes (about 6 minutes for a seeded LLVM
