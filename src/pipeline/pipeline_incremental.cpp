@@ -245,6 +245,8 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
  * A stored file is classified as:
  *   - "deleted"      — `stat()` returns ENOENT or ENOTDIR. Its nodes will
  *                       be purged and its hash row dropped.
+ *   - "deleted"      — also any file under CBM_ARTIFACT_DIR, which no mode
+ *                       discovers (an older build indexed it).
  *   - "mode-skipped" — `stat()` succeeds. The file exists on disk but the
  *                       current discovery pass didn't visit it (e.g. excluded
  *                       by FAST_SKIP_DIRS in fast/moderate mode). Its nodes
@@ -280,6 +282,20 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
  * deleted should be classified as deleted from the indexer's perspective
  * because the indexer follows symlinks during discovery — a stale symlink
  * has no source to parse. */
+/* Whether rel_path lies under the indexer's own artifact directory
+ * (CBM_ARTIFACT_DIR, at any depth, as discovery skips it). */
+static bool in_artifact_dir(const char *rel_path) {
+    static const size_t n = sizeof(CBM_ARTIFACT_DIR) - 1;
+    for (const char *s = rel_path; s && *s;) {
+        if (strncmp(s, CBM_ARTIFACT_DIR, n) == 0 && (s[n] == '/' || s[n] == '\\')) {
+            return true;
+        }
+        const char *sep = strpbrk(s, "/\\");
+        s = sep ? sep + 1 : NULL;
+    }
+    return false;
+}
+
 static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int file_count,
                               cbm_file_hash_t *stored, int stored_count, bool verify_content,
                               char ***out_deleted, cbm_file_hash_t **out_mode_skipped,
@@ -330,7 +346,11 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
         bool preserve = false;
         char abs_path[CBM_SZ_4K];
         int n = snprintf(abs_path, sizeof(abs_path), "%s/%s", repo_path, stored[i].rel_path);
-        if (n < 0 || n >= (int)sizeof(abs_path)) {
+        if (in_artifact_dir(stored[i].rel_path)) {
+            /* Discovery never visits the artifact directory in any mode; a
+             * row for it is left from a build that indexed it, so purge it
+             * whether or not the file is still there. */
+        } else if (n < 0 || n >= (int)sizeof(abs_path)) {
             /* Truncation or encoding error — can't reliably stat. Preserve. */
             cbm_log_warn("incremental.path_truncated", "rel_path", stored[i].rel_path);
             preserve = true;

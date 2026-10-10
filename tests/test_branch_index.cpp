@@ -2007,6 +2007,72 @@ TEST(branch_switch_purges_changed_mode_skipped_file) {
     PASS();
 }
 
+/* Rows an older build stored for the artifact directory (.code-cortex/,
+ * which discovery now skips) are purged by the next incremental run, even
+ * though the file is still on disk. */
+static int bi_artifact_rows(int *hashes) {
+    char db[1024];
+    cbm_store_t *s = cbm_store_open_path_query(bi_db_path(db, sizeof(db)));
+    if (!s) {
+        return -1;
+    }
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    cbm_store_find_nodes_by_file(s, g_bi_project, ".code-cortex/artifact.json", &nodes, &count);
+    cbm_store_free_nodes(nodes, count);
+    cbm_file_hash_t *fh = NULL;
+    int nfh = 0;
+    cbm_store_get_file_hashes(s, g_bi_project, &fh, &nfh);
+    *hashes = 0;
+    for (int i = 0; i < nfh; i++) {
+        *hashes += strcmp(fh[i].rel_path, ".code-cortex/artifact.json") == 0;
+    }
+    cbm_store_free_file_hashes(fh, nfh);
+    cbm_store_close(s);
+    return count;
+}
+
+TEST(incremental_purges_stale_artifact_dir_rows) {
+    char *repo = bi_make_repo("cbm_bi_artstale");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    ASSERT_EQ(bi_index_mode(repo, CBM_MODE_FULL).rc, 0);
+    th_write_file(TH_PATH(repo, ".code-cortex/artifact.json"), "{\"version\": 1}\n");
+
+    char db[1024];
+    cbm_store_t *s = cbm_store_open_path(bi_db_path(db, sizeof(db)));
+    ASSERT_NOT_NULL(s);
+    char qn[1200];
+    snprintf(qn, sizeof(qn), "%s..code-cortex.artifact.json", g_bi_project);
+    cbm_node_t n = {0};
+    n.project = g_bi_project;
+    n.label = "File";
+    n.name = "artifact.json";
+    n.qualified_name = qn;
+    n.file_path = ".code-cortex/artifact.json";
+    ASSERT_TRUE(cbm_store_upsert_node(s, &n) > 0);
+    char zeros[65];
+    memset(zeros, '0', 64);
+    zeros[64] = '\0';
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, g_bi_project, ".code-cortex/artifact.json", zeros, 1,
+                                         15),
+              CBM_STORE_OK);
+    cbm_store_close(s);
+    int hashes = 0;
+    ASSERT_EQ(bi_artifact_rows(&hashes), 1);
+    ASSERT_EQ(hashes, 1);
+
+    ASSERT_EQ(bi_index_mode(repo, CBM_MODE_FULL).rc, 0);
+    ASSERT_EQ(bi_artifact_rows(&hashes), 0);
+    ASSERT_EQ(hashes, 0);
+    ASSERT_EQ(bi_count("only_main"), 1); /* the rest of the graph is kept */
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 /* A live database another checkout indexed with the same branch, commit and
  * bytes is still not this checkout's index: the run rebuilds it, so it
  * records this root. */
@@ -2765,6 +2831,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_root_normalize_and_key);
     RUN_TEST(branch_legacy_slot_adopted);
     RUN_TEST(branch_switch_purges_changed_mode_skipped_file);
+    RUN_TEST(incremental_purges_stale_artifact_dir_rows);
     RUN_TEST(branch_foreign_live_db_same_identity_rebuilds);
 #ifndef _WIN32
     RUN_TEST(branch_artifact_behind_after_count_preserving_edit);
