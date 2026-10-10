@@ -714,8 +714,23 @@ static void purge_trash(const char *cdir, const cbm_cache_expiry_cfg_t *cfg, int
     for (const auto &e : due) {
         std::string p = tdir + "/" + e;
         int64_t bytes = tree_bytes(p.c_str());
+        /* cache restore moves an entry back under its project's lease, file
+         * by file (database, WAL, slots): a purge in between would leave a
+         * partial restore. Purge under the same lease, without waiting; a
+         * busy one (a restore, or an index run of the project) keeps the
+         * entry for the next sweep. */
+        cbm_db_lease_t *lease = NULL;
         if (!c->opts->dry_run) {
+            std::string dbp = std::string(cdir) + "/" + e.substr(e.find('-') + 1) + ".db";
+            if (cbm_db_lease_try_acquire(dbp.c_str(), &lease) != 0) {
+                report(c, CBM_EXPIRE_TRASH_PURGE, e, p, bytes,
+                       "in the trash since the previous sweep", false,
+                       "its project being restored or indexed");
+                c->res->skipped++;
+                continue;
+            }
             remove_tree(p.c_str());
+            cbm_db_lease_release(lease);
         }
         report(c, CBM_EXPIRE_TRASH_PURGE, e, p, bytes, "in the trash since the previous sweep",
                !c->opts->dry_run, NULL);
@@ -1224,7 +1239,7 @@ int cbm_cache_trash_restore(const char *which, char *msg, size_t msg_sz) {
     std::string dbp = std::string(cdir) + "/" + project + ".db";
     cbm_db_lease_t *lease = NULL;
     if (cbm_db_lease_try_acquire(dbp.c_str(), &lease) != 0) {
-        snprintf(msg, msg_sz, "%s is being indexed; retry later", project.c_str());
+        snprintf(msg, msg_sz, "%s is being indexed or purged; retry later", project.c_str());
         return -1;
     }
     int rc = -1;

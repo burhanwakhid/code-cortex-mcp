@@ -206,6 +206,12 @@ later deletes the entry. Until then, `code-cortex-mcp cache restore <project>` p
 database and its slots back, if the project has no new database, and restarts its usage clock.
 A renamed file comes back as `<project>.db`, the name it is served under.
 
+A restore moves the database, its WAL and its slots back one by one, under the project's index
+lease. A purge takes the same lease, without waiting, so it never deletes an entry in the
+middle of a restore. When the lease is held (a restore, or an index run of the project), the
+purge skips the entry as `its project being restored or indexed`, and the next sweep purges it.
+A restore that finds the lease held by a purge reports `being indexed or purged; retry later`.
+
 We chose a trash step because the two costly mistakes are an uncertain root that the guards did
 not catch (an unusual mount layout) and a threshold set too low by hand. A trash entry costs disk
 space for one more day. Slots and sidecars are deleted directly: they are caches of something
@@ -227,6 +233,7 @@ trash` and `cache restore` do not list an entry that is itself a link.
 - A database that a reader holds open (its reader gate), or with a reader holding a WAL
   snapshot.
 - A database used after the sweep read the usage rows.
+- A trash entry whose project's index lease is held (a restore or an index run in progress).
 - Anything when the cache directory has no `_config.db`, when HOME is not a directory, or when
   another sweep runs.
 - `_config.db`, `.index.lock` and `.read.lock` files, and files whose names this module does

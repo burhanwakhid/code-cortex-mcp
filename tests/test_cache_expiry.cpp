@@ -585,6 +585,41 @@ TEST(cache_trash_restore_and_purge) {
     PASS();
 }
 
+/* A purge waits out a restore of the same project: cache restore holds the
+ * project's lease while it moves the database, its WAL and its slots back,
+ * and a purge that deleted the entry in between would leave half of it. */
+TEST(cache_trash_purge_skips_leased_project) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_trlease"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "rs", root, db, sizeof(db));
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 100 * CE_DAY, NULL));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.projects, 1);
+    ASSERT_EQ(ce_trash_count(&e), 1);
+
+    cbm_db_lease_t *lease = NULL; /* what cache restore holds */
+    ASSERT_EQ(cbm_db_lease_try_acquire(db, &lease), 0);
+    ASSERT_EQ(ce_sweep(&cfg, now + 2 * CE_DAY, false, &r), 0);
+    ASSERT_EQ(r.purged, 0);
+    ASSERT_EQ(r.skipped, 1);
+    ASSERT_EQ(ce_trash_count(&e), 1);
+    cbm_db_lease_release(lease);
+
+    ASSERT_EQ(ce_sweep(&cfg, now + 2 * CE_DAY, false, &r), 0);
+    ASSERT_EQ(r.purged, 1);
+    ASSERT_EQ(ce_trash_count(&e), 0);
+    ce_teardown(&e);
+    PASS();
+}
+
 #ifndef _WIN32
 /* Purging a trash entry removes a link inside it and never follows it: a
  * link to a directory outside the cache keeps that directory's files, a
@@ -1359,6 +1394,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_skips_database_with_open_reader);
     RUN_TEST(cache_dry_run_changes_nothing);
     RUN_TEST(cache_trash_restore_and_purge);
+    RUN_TEST(cache_trash_purge_skips_leased_project);
     RUN_TEST(cache_renamed_db_kept_by_project);
     RUN_TEST(cache_renamed_db_expires_as_project);
 #ifndef _WIN32
