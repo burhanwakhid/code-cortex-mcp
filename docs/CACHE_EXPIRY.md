@@ -150,6 +150,12 @@ being indexed. Before the move, the sweep opens it and runs a `PASSIVE` checkpoi
 checkpoint cannot copy every WAL frame, a reader holds a snapshot: the database is in use, and
 the sweep skips it. Otherwise the main file is the whole database.
 
+A renamed file shares its slots, under `branches/X/`, with the project's own `<cache>/X.db`,
+which an index run of `X` writes under that file's lease. The sweep therefore also takes the
+lease of `X.db`, without waiting. It skips the renamed file as `its project being indexed`
+when another process holds that lease, and as `its project's own database appeared` when
+`X.db` exists by then (the next scan files the renamed one under its filename).
+
 The lease keeps index runs out, not readers. A reader that keeps a connection open does not
 need a transaction to depend on the file: on POSIX a move leaves the connection on the moved
 inode, so a server that cached the project's store would read the trash, and its next open
@@ -204,7 +210,8 @@ that still exists (the project's graph) or of nothing.
 ### Never removed
 
 - The project of the server's own session, and every project its watcher watches.
-- A project whose index lease is held (being indexed or deleted elsewhere).
+- A project whose index lease is held (being indexed or deleted elsewhere), also when the
+  database is a renamed file and the lease is that of the project's own `<project>.db`.
 - A database that a reader holds open (its reader gate), or with a reader holding a WAL
   snapshot.
 - A database used after the sweep read the usage rows.

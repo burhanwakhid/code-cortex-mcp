@@ -761,6 +761,28 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
         c->res->skipped++;
         return;
     }
+    /* A renamed file's parked slots are filed under its project, and so are
+     * those of the project's own <name>.db, which an index of the project
+     * writes under that file's lease, not this one: hold it too. A <name>.db
+     * that appeared since the scan owns the slots now; the next scan files
+     * this one under its stem. */
+    cbm_db_lease_t *canon = NULL;
+    if (e.name != e.stem) {
+        std::string cpath = std::string(cdir) + "/" + e.name + ".db";
+        const char *why = NULL;
+        if (cbm_db_lease_try_acquire(cpath.c_str(), &canon) != 0) {
+            why = "its project being indexed";
+        } else if (cbm_file_exists(cpath.c_str())) {
+            why = "its project's own database appeared";
+        }
+        if (why) {
+            cbm_db_lease_release(canon);
+            cbm_db_lease_release(lease);
+            report(c, kind, label(e), e.path, bytes, reason, false, why);
+            c->res->skipped++;
+            return;
+        }
+    }
     /* The lease keeps indexers out, not readers. A reader (a tool call, a
      * hook) holds the file's reader gate shared for as long as it keeps the
      * connection: on POSIX a move would leave it reading the trashed inode
@@ -770,6 +792,7 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
     cbm_db_lease_t *gate = NULL;
     int grc = cbm_db_read_gate_acquire(e.path.c_str(), true, &gate);
     if (grc != 0) {
+        cbm_db_lease_release(canon);
         cbm_db_lease_release(lease);
         report(c, kind, label(e), e.path, bytes, reason, false,
                grc == CBM_INDEX_BUSY ? "in use by a reader" : "reader gate unavailable");
@@ -778,6 +801,7 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
     }
     if (!quiesced(e.path.c_str())) {
         cbm_db_lease_release(gate);
+        cbm_db_lease_release(canon);
         cbm_db_lease_release(lease);
         report(c, kind, label(e), e.path, bytes, reason, false, "open in a read transaction");
         c->res->skipped++;
@@ -787,6 +811,7 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
      * since the scan is seen here: judge by the row as it is now. */
     if (used_since_scan(e)) {
         cbm_db_lease_release(gate);
+        cbm_db_lease_release(canon);
         cbm_db_lease_release(lease);
         report(c, kind, label(e), e.path, bytes, reason, false, "used since the scan");
         c->res->skipped++;
@@ -795,6 +820,7 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
     int parked = 0;
     int rc = cbm_cache_remove_project(e.path.c_str(), e.name.c_str(), entry.c_str(), &parked);
     cbm_db_lease_release(gate);
+    cbm_db_lease_release(canon);
     cbm_db_lease_release(lease);
     if (rc == 0) {
         FILE *f = cbm_fopen((entry + "/EXPIRED").c_str(), "w");

@@ -1022,6 +1022,53 @@ TEST(cache_open_reader_keeps_renamed_database) {
     return ce_reader_gate_case("cbm_ce_gatern", true);
 }
 
+/* A renamed file's parked slots are filed under its project, as are those of
+ * the project's own <project>.db, which an index of the project writes under
+ * that file's lease: while it is held, the renamed file and the slots stay. */
+TEST(cache_renamed_db_waits_for_project_lease) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_rnlease"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db_as(&e, "old-copy", "rp", root, db, sizeof(db));
+    char sdir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(db, "rp", root, sdir, sizeof(sdir)));
+    char slot[1300];
+    snprintf(slot, sizeof(slot), "%s/feature.db.zst", sdir);
+    ASSERT_EQ(th_write_file(slot, "zstd"), 0);
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 100 * CE_DAY, NULL));
+    char canon[800];
+    snprintf(canon, sizeof(canon), "%s/rp.db", e.cache);
+    cbm_db_lease_t *lease = NULL;
+    ASSERT_EQ(cbm_db_lease_try_acquire(canon, &lease), 0);
+
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    char why[256] = "";
+    cbm_cache_sweep_opts_t o = {};
+    o.now = now;
+    o.report = ce_skip_report;
+    o.report_ud = why;
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(cbm_cache_expiry_sweep(&cfg, &o, &r), 0);
+    ASSERT_EQ(r.projects, 0);
+    ASSERT_EQ(r.skipped, 1);
+    ASSERT_STR_EQ(why, "its project being indexed");
+    ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_TRUE(cbm_file_exists(slot));
+
+    cbm_db_lease_release(lease);
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.projects, 1);
+    ASSERT_FALSE(cbm_file_exists(db));
+    ASSERT_FALSE(cbm_file_exists(slot));
+    ce_teardown(&e);
+    PASS();
+}
+
 /* ── The server's background sweep ─────────────────────────────── */
 
 /* Enable automatic sweeps (test_main turns them off for the whole run) and
@@ -1166,6 +1213,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_query_on_renamed_db_records_use);
     RUN_TEST(cache_open_reader_keeps_database);
     RUN_TEST(cache_open_reader_keeps_renamed_database);
+    RUN_TEST(cache_renamed_db_waits_for_project_lease);
     RUN_TEST(cache_server_initialize_runs_sweep);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(cache_server_sweep_joined_before_watcher_drop);
