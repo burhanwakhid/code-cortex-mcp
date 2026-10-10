@@ -3645,7 +3645,7 @@ int cbm_cmd_cache(int argc, char **argv) {
     if (argc < 1 || !argv) {
         printf("Usage: code-cortex-mcp cache <command>\n\n"
                "Commands:\n"
-               "  expire [--dry-run] [--now EPOCH]  Move stale indexes to the trash, drop old\n"
+               "  expire [--dry-run [--now EPOCH]]  Move stale indexes to the trash, drop old\n"
                "                                    parked branches and orphan files\n"
                "  trash                             List trashed indexes\n"
                "  restore <entry|project>           Put a trashed index back\n");
@@ -3663,6 +3663,13 @@ int cbm_cmd_cache(int argc, char **argv) {
                 (void)fprintf(stderr, "unknown option: %s\n", argv[i]);
                 return CLI_TRUE;
             }
+        }
+        /* Another clock would also date the trash entries and the usage
+         * rows the sweep writes: a past one lets the next sweep purge them
+         * at once, a future one trashes everything. Previews only. */
+        if (now != 0 && !dry) {
+            (void)fprintf(stderr, "--now needs --dry-run\n");
+            return CLI_TRUE;
         }
         cbm_cache_expiry_cfg_t cfg;
         cbm_cache_expiry_cfg_load(&cfg, NULL);

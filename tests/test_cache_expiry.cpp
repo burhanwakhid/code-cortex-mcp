@@ -224,6 +224,37 @@ TEST(cache_root_back_before_move_is_kept) {
     PASS();
 }
 
+/* `cache expire --now` is a preview only: without --dry-run it is refused
+ * and nothing is swept (a sweep would date its trash entries and rows with
+ * that clock). */
+TEST(cache_cli_now_needs_dry_run) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_clinow"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    ce_make_db(&e, "clinow", root, db, sizeof(db));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    int64_t future = (int64_t)time(NULL) + 400 * CE_DAY;
+    char nowbuf[32];
+    snprintf(nowbuf, sizeof(nowbuf), "%lld", (long long)future);
+    char a0[] = "expire";
+    char a1[] = "--now";
+    char a2[] = "--dry-run";
+    char *real[] = {a0, a1, nowbuf};
+    ASSERT_NEQ(cbm_cmd_cache(3, real), 0);
+    ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_EQ(ce_trash_count(&e), 0);
+    ASSERT_TRUE(cbm_cache_expiry_due(&cfg, (int64_t)time(NULL))); /* nothing swept */
+    char *preview[] = {a0, a2, a1, nowbuf};
+    ASSERT_EQ(cbm_cmd_cache(4, preview), 0);
+    ASSERT_TRUE(cbm_file_exists(db));
+    ce_teardown(&e);
+    PASS();
+}
+
 /* A use inside the grace period keeps a database whose root is gone (a
  * project queried by name after its checkout moved). */
 TEST(cache_root_gone_but_used_is_kept) {
@@ -1792,6 +1823,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_root_gone_needs_streak_and_grace);
     RUN_TEST(cache_root_gone_but_used_is_kept);
     RUN_TEST(cache_root_back_before_move_is_kept);
+    RUN_TEST(cache_cli_now_needs_dry_run);
     RUN_TEST(cache_root_back_resets_streak);
     RUN_TEST(cache_root_uncertain_never_counts);
     RUN_TEST(cache_root_unicode_and_long_is_present);

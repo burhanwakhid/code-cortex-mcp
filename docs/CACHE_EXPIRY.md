@@ -308,7 +308,9 @@ code-cortex-mcp cache restore <project>  # put the newest trashed database of <p
 
 `--dry-run` decides with the same rules and writes nothing: no removal, no usage rows, no
 missing streaks, no sweep time. It also lists the roots that are missing but still in their
-grace period (`watch`). `--now EPOCH` judges as of another time, for tests and for previewing.
+grace period (`watch`). `--now EPOCH` previews a sweep as of another time and is accepted only
+with `--dry-run`: a real sweep dates its trash entries and usage rows with its clock, so a past
+time would let the next sweep purge the trash at once and a future time would trash everything.
 
 Each removal logs one `cache.expire` line (kind, name, path, reason), each skip a
 `cache.expire.skip` line, and each sweep a `cache.expire.done` summary.
