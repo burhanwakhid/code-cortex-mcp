@@ -6,6 +6,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "discover/discover.h"
+#include "git/git_context.h"
 
 /* ── Directory skip (always skipped) ───────────────────────────── */
 
@@ -550,6 +551,44 @@ TEST(discover_walks_submodule_under_worktrees_path) {
     ASSERT_EQ(count, 2);
 
     cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* A gitlink whose "gitdir:" path does not fit the reader's buffer cannot be
+ * checked for a commondir. Read cut short, the check missed it and the walk
+ * took in the linked worktree; it now fails closed and skips the directory.
+ * cbm_git_is_linked_worktree, which this check mirrors, agrees. */
+TEST(discover_skips_gitlink_too_long_to_check) {
+    char *base = th_mktempdir("cbm_disc_longwt");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    enum { NAME_LEN = 5000 };
+    char *gitlink = (char *)malloc(strlen(base) + NAME_LEN + 64);
+    ASSERT(gitlink != NULL);
+    int n = sprintf(gitlink, "gitdir: %s/.git/worktrees/", base);
+    memset(gitlink + n, 'w', NAME_LEN);
+    snprintf(gitlink + n + NAME_LEN, 2, "\n");
+    th_write_file(TH_PATH(base, "wt/.git"), gitlink);
+    free(gitlink);
+    th_write_file(TH_PATH(base, "wt/src/app.go"), "package app\n");
+
+    cbm_discover_opts_t opts = {};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    for (int i = 0; i < count; i++) {
+        ASSERT_NULL(strstr(files[i].rel_path, "wt/"));
+    }
+    ASSERT_EQ(count, 1);
+    cbm_discover_free(files, count);
+
+    char wt[1200];
+    snprintf(wt, sizeof(wt), "%s/wt", base);
+    ASSERT_TRUE(cbm_git_is_linked_worktree(wt));
+
     th_cleanup(base);
     PASS();
 }
@@ -1503,6 +1542,7 @@ SUITE(discover) {
     RUN_TEST(discover_skips_worktrees);
     RUN_TEST(discover_skips_nested_linked_worktree);
     RUN_TEST(discover_walks_submodule_under_worktrees_path);
+    RUN_TEST(discover_skips_gitlink_too_long_to_check);
     RUN_TEST(discover_artifact_dir_not_negatable);
     RUN_TEST(discover_cbmignore);
     RUN_TEST(discover_cbmignore_stacks);

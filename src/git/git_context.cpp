@@ -825,6 +825,7 @@ bool cbm_git_is_linked_worktree(const char *dir) {
     }
     char line[CBM_SZ_4K];
     bool got = fgets(line, sizeof(line), f) != NULL;
+    bool cut = got && !strchr(line, '\n') && fgetc(f) != EOF;
     fclose(f);
     if (!got || strncmp(line, "gitdir:", 7) != 0) {
         return false;
@@ -833,7 +834,13 @@ bool cbm_git_is_linked_worktree(const char *dir) {
      * Strip the line end and trailing separators, then the <name> component.
      * The admin directory must hold the "commondir" file git writes for every
      * linked worktree: a submodule at worktrees/foo has the gitdir
-     * .git/modules/worktrees/foo, whose parent is named "worktrees" too. */
+     * .git/modules/worktrees/foo, whose parent is named "worktrees" too.
+     * A gitdir path too long to check (the line or the commondir path does
+     * not fit the buffer) answers yes, as discover's mirror of this check
+     * does: a linked worktree taken for a submodule is indexed twice. */
+    if (cut) {
+        return true;
+    }
     char *val = line + 7;
     size_t n = strlen(val);
     for (size_t i = 0; i < n; i++) {
@@ -852,7 +859,10 @@ bool cbm_git_is_linked_worktree(const char *dir) {
     int cn = path_is_absolute(val) ? snprintf(commondir, sizeof(commondir), "%s/commondir", val)
                                    : snprintf(commondir, sizeof(commondir), "%s/%s/commondir", dir,
                                               val);
-    if (cn <= 0 || cn >= (int)sizeof(commondir) || !cbm_file_exists(commondir)) {
+    if (cn <= 0 || cn >= (int)sizeof(commondir)) {
+        return true;
+    }
+    if (!cbm_file_exists(commondir)) {
         return false;
     }
     char *name = strrchr(val, '/');

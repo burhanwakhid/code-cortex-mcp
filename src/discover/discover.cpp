@@ -817,7 +817,10 @@ static bool discover_path_is_absolute(const char *path);
  * worktrees/foo has the gitdir .git/modules/worktrees/foo, which has no
  * commondir. Mirrors cbm_git_is_linked_worktree, which discover does not
  * link against. One open attempt per directory: it fails where there is no
- * .git, and reading a .git directory yields no "gitdir:" line. */
+ * .git, and reading a .git directory yields no "gitdir:" line. A gitdir path
+ * too long to check (the line or the commondir path does not fit the
+ * buffer) fails closed: the directory is taken for a linked worktree and
+ * skipped, since walking a linked worktree indexes the repository twice. */
 static bool is_linked_worktree_root(const char *dir) {
     char dot_git[CBM_SZ_4K];
     if (snprintf(dot_git, sizeof(dot_git), "%s/.git", dir) >= (int)sizeof(dot_git)) {
@@ -829,9 +832,13 @@ static bool is_linked_worktree_root(const char *dir) {
     }
     char line[CBM_SZ_4K];
     bool got = fgets(line, sizeof(line), f) != NULL;
+    bool cut = got && !strchr(line, '\n') && fgetc(f) != EOF;
     (void)fclose(f);
     if (!got || strncmp(line, "gitdir:", 7) != 0) {
         return false;
+    }
+    if (cut) {
+        return true;
     }
     char *val = line + 7;
     size_t n = strlen(val);
@@ -851,7 +858,10 @@ static bool is_linked_worktree_root(const char *dir) {
     int cn = discover_path_is_absolute(val)
                  ? snprintf(commondir, sizeof(commondir), "%s/commondir", val)
                  : snprintf(commondir, sizeof(commondir), "%s/%s/commondir", dir, val);
-    if (cn <= 0 || cn >= (int)sizeof(commondir) || !cbm_file_exists(commondir)) {
+    if (cn <= 0 || cn >= (int)sizeof(commondir)) {
+        return true;
+    }
+    if (!cbm_file_exists(commondir)) {
         return false;
     }
     char *name = strrchr(val, '/');
