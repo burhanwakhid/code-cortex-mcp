@@ -3105,6 +3105,42 @@ TEST(branch_switch_syncs_before_unlink) {
     PASS();
 }
 
+/* A branch whose name ends like a scratch file the module writes
+ * ("fix.db.unz") has the slot fix.db.unz.db.zst: a slot, which the sweep of
+ * scratch files at every switch must leave. */
+TEST(branch_slot_named_like_scratch_survives_sweep) {
+    char *repo = bi_make_repo("cbm_bi_scratchname");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char path[1400];
+
+    ASSERT_EQ(bi_git(repo, "checkout -q -b fix.db.unz"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    {
+        bi_run_t rr = bi_index(repo, -1);
+        ASSERT_STR_EQ(rr.action, "seeded");
+    }
+    ASSERT_TRUE(cbm_file_exists(bi_slot_file("fix.db.unz", ".db.zst", path, sizeof(path))));
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    {
+        bi_run_t rr = bi_index(repo, -1); /* sweeps, parks feature, seeds main */
+        ASSERT_STR_EQ(rr.action, "seeded");
+    }
+    ASSERT_TRUE(cbm_file_exists(path));
+    ASSERT_TRUE(bi_is_parked("fix.db.unz"));
+    ASSERT_EQ(bi_git(repo, "checkout -q fix.db.unz"), 0);
+    {
+        bi_run_t rr = bi_index(repo, -1);
+        ASSERT_STR_EQ(rr.action, "restored");
+    }
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -3179,4 +3215,5 @@ SUITE(branch_index) {
     RUN_TEST(branch_restore_shrinks_wal_under_open_reader);
     RUN_TEST(branch_incoming_slot_same_file_as_outgoing);
     RUN_TEST(branch_switch_syncs_before_unlink);
+    RUN_TEST(branch_slot_named_like_scratch_survives_sweep);
 }

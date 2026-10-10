@@ -253,7 +253,10 @@ full-text tables and vectors (`park_db`):
 A restore decompresses the slot into `<slot>.db.unz` in the slot directory, carries the ADR into
 that copy, and installs it by content as before. A slot that does not decompress (truncated,
 corrupt, failed checksum) is not restored: the run seeds instead. The next switch removes
-scratch files that a crashed park or restore left behind (`sweep_scratch`).
+scratch files that a crashed park or restore left behind (`sweep_scratch`). Scratch files are
+matched by their exact suffix (`.db.unz`, `.db.unz.tmp` and their SQLite sidecars, and
+`.db.zst.tmp`), never by a substring: a branch named `fix.db.unz` has the slot
+`fix.db.unz.db.zst`, which the sweep keeps.
 
 Level 3 is the fast level. On two index databases (zstd 1.5.7, one thread, macOS, measured) it
 gave 9.0x on redis (216 MB) and 5.9x on opencv (462 MB) at about 600 MB/s. Level 9 gave 10.0x

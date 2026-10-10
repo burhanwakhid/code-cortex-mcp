@@ -385,14 +385,39 @@ static const char *slot_ext(const char *name) {
     return ends_with(name, BS_DB_EXT_S) ? BS_DB_EXT_S : NULL;
 }
 
+/* Whether name ends with base followed by one of SQLite's sidecar suffixes
+ * (or none, when bare is set). */
+static bool ends_with_db_file(const char *name, const char *base, bool bare) {
+    static const char *const sidecars[] = {"-wal", "-shm", "-journal"};
+    char suffix[32];
+    if (bare && ends_with(name, base)) {
+        return true;
+    }
+    for (const char *side : sidecars) {
+        snprintf(suffix, sizeof(suffix), "%s%s", base, side);
+        if (ends_with(name, suffix)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The scratch copy a park compresses from and a restore installs from:
+ * <name>.db.unz, its temp <name>.db.unz.tmp (dump and decompress), and their
+ * SQLite sidecars. Matched by suffix only: a branch may be named
+ * "fix.db.unz", and its slot fix.db.unz.db.zst is no scratch file. */
+static bool is_unz_scratch(const char *name) {
+    return ends_with_db_file(name, BS_UNZ_EXT, true) ||
+           ends_with_db_file(name, ".db.unz.tmp", true);
+}
+
 /* Files this module writes beside the slots and removes again: the park and
- * restore scratch copy (<name>.db.unz, its dump temp and SQLite sidecars),
- * the compressor's <name>.db.zst.tmp, the dump temp <name>.db.tmp of the
- * uncompressed layout, and the sidecars of a legacy <name>.db. */
+ * restore scratch copy (is_unz_scratch), the compressor's <name>.db.zst.tmp,
+ * the dump temp <name>.db.tmp of the uncompressed layout and its sidecars,
+ * and the sidecars of a legacy <name>.db. */
 static bool is_scratch_name(const char *name) {
-    return strstr(name, BS_UNZ_EXT) != NULL || ends_with(name, ".db.zst.tmp") ||
-           ends_with(name, ".db.tmp") || strstr(name, ".db-wal") || strstr(name, ".db-shm") ||
-           strstr(name, ".db-journal");
+    return is_unz_scratch(name) || ends_with(name, ".db.zst.tmp") ||
+           ends_with_db_file(name, ".db.tmp", true) || ends_with_db_file(name, BS_DB_EXT_S, false);
 }
 
 /* The slug the database at db_path was built for, from its Branch node;
@@ -652,7 +677,8 @@ static void sweep_scratch(const char *dir) {
     int n = 0;
     cbm_dirent_t *ent;
     while (n < 64 && (ent = cbm_readdir(d)) != NULL) {
-        if (!ent->is_dir && (strstr(ent->name, BS_UNZ_EXT) || ends_with(ent->name, ".db.zst.tmp"))) {
+        if (!ent->is_dir && !slot_ext(ent->name) &&
+            (is_unz_scratch(ent->name) || ends_with(ent->name, ".db.zst.tmp"))) {
             names[n] = strdup(ent->name);
             n += names[n] ? 1 : 0;
         }
@@ -1485,8 +1511,7 @@ static int expire_dir(const char *dir, int64_t slot_before, int64_t scratch_befo
         for (const char *ext : sidecar_ext) {
             size_t nlen = strlen(names[i]);
             size_t elen = strlen(ext);
-            if (is_slot || strstr(names[i], BS_UNZ_EXT) || nlen <= elen ||
-                !ends_with(names[i], ext)) {
+            if (is_slot || is_unz_scratch(names[i]) || nlen <= elen || !ends_with(names[i], ext)) {
                 continue;
             }
             char base[BS_PATH_MAX];
