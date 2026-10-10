@@ -885,6 +885,44 @@ TEST(cache_trash_purge_never_follows_links) {
     PASS();
 }
 
+/* A trash entry with a file that refuses to go (a read-only directory) is
+ * skipped, not reported purged, and purged by a later sweep once it can be. */
+TEST(cache_trash_purge_refused_is_skipped) {
+#ifndef _WIN32
+    if (geteuid() == 0) {
+        PASS(); /* root ignores directory permissions */
+    }
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_trro"));
+    int64_t now = (int64_t)time(NULL);
+    char entry[800];
+    snprintf(entry, sizeof(entry), "%s/trash/%lld-ro", e.cache, (long long)(now - 10 * CE_DAY));
+    char sub[900];
+    snprintf(sub, sizeof(sub), "%s/branches", entry);
+    ASSERT_TRUE(cbm_mkdir_p(sub, 0755));
+    char f[1000];
+    snprintf(f, sizeof(f), "%s/main.db.zst", sub);
+    ASSERT_EQ(th_write_file(f, "slot"), 0);
+    ASSERT_EQ(chmod(sub, 0555), 0);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.purged, 0);
+    ASSERT_EQ(r.skipped, 1);
+    ASSERT_EQ(r.bytes, 0);
+    ASSERT_TRUE(cbm_file_exists(f));
+    ASSERT_EQ(ce_trash_count(&e), 1);
+    chmod(sub, 0755);
+    ASSERT_EQ(ce_sweep(&cfg, now + CE_DAY, false, &r), 0);
+    ASSERT_EQ(r.purged, 1);
+    ASSERT_FALSE(cbm_file_exists(entry));
+    ASSERT_EQ(ce_trash_count(&e), 0);
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
 /* A parked slot older than the slot age goes (database or not); a newer one
  * stays; old scratch of an interrupted park goes. */
 TEST(cache_old_slots_expire) {
@@ -2032,6 +2070,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_renamed_db_expires_as_project);
 #ifndef _WIN32
     RUN_TEST(cache_trash_purge_never_follows_links);
+    RUN_TEST(cache_trash_purge_refused_is_skipped);
     RUN_TEST(cache_old_slots_expire);
     RUN_TEST(cache_orphan_slot_sidecars_expire);
     RUN_TEST(cache_orphan_sidecars);

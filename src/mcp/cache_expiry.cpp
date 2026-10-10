@@ -127,9 +127,17 @@ static void remove_link(const char *path) {
     }
 }
 
+/* Whether a path is there at all, a dangling link included. */
+static bool path_present(const char *path) {
+    cbm_stat_t st;
+    return cbm_is_link(path) || cbm_stat(path, &st) == 0;
+}
+
 /* Delete dir and everything under it. A link, dir itself included, is
- * removed and never followed. */
-static void remove_tree(const char *dir) {
+ * removed and never followed. True when nothing is left: a refused unlink
+ * (a read-only or open file inside) leaves the tree, and the caller must
+ * not count it as gone. */
+static bool remove_tree(const char *dir) {
     walk_kind_t self = walk_kind(dir);
     if (self != WALK_DIR) {
         if (self == WALK_LINK) {
@@ -137,7 +145,7 @@ static void remove_tree(const char *dir) {
         } else {
             (void)cbm_unlink(dir);
         }
-        return;
+        return !path_present(dir);
     }
     cbm_dir_t *d = cbm_opendir(dir);
     if (d) {
@@ -150,10 +158,10 @@ static void remove_tree(const char *dir) {
         }
         cbm_closedir(d);
         for (const auto &it : items) {
-            remove_tree(it.c_str());
+            (void)remove_tree(it.c_str());
         }
     }
-    (void)cbm_rmdir(dir);
+    return cbm_rmdir(dir) == 0 || !path_present(dir);
 }
 
 /* ── State in _config.db ────────────────────────────────────────── */
@@ -428,6 +436,12 @@ static bool is_mount_parent(const std::string &dir) {
     if (dir.size() <= 3 && dir.size() >= 2 && dir[1] == ':') {
         return true; /* a drive root */
     }
+    /* A UNC share root (//server/share, separators folded): a missing share
+     * is an unreachable server, not a removed checkout. */
+    if (dir.size() > 2 && dir[0] == '/' && dir[1] == '/' &&
+        std::count(dir.begin(), dir.end(), '/') <= 3) {
+        return true;
+    }
 #endif
     return false;
 }
@@ -441,7 +455,10 @@ static bool is_mount_parent(const std::string &dir) {
 static root_state_t root_state(const std::string &root) {
     bool absolute = !root.empty() && root[0] == '/';
 #ifdef _WIN32
-    absolute = absolute || (root.size() > 2 && root[1] == ':');
+    /* A drive path, or a UNC share (\\server\share\repo) on either separator. */
+    absolute = absolute || (root.size() > 2 && root[1] == ':') ||
+               (root.size() > 2 && (root[0] == '\\' || root[0] == '/') &&
+                (root[1] == '\\' || root[1] == '/'));
 #endif
     if (!absolute) {
         return ROOT_UNCERTAIN;
@@ -779,8 +796,20 @@ static void purge_trash(const char *cdir, const cbm_cache_expiry_cfg_t *cfg, int
                 c->res->skipped++;
                 continue;
             }
-            remove_tree(p.c_str());
+            bool gone = remove_tree(p.c_str());
             cbm_db_lease_release(lease);
+            if (!gone) {
+                /* Something inside refused to go (a read-only or open
+                 * file): the entry stays for the next sweep, and is not
+                 * counted as reclaimed. */
+                cbm_log_warn("cache.expire.skipped", "kind", "trash", "path", p.c_str(), "reason",
+                             "remove_failed");
+                report(c, CBM_EXPIRE_TRASH_PURGE, e, p, bytes,
+                       "in the trash since the previous sweep", false,
+                       "a file in it could not be removed");
+                c->res->skipped++;
+                continue;
+            }
         }
         report(c, CBM_EXPIRE_TRASH_PURGE, e, p, bytes, "in the trash since the previous sweep",
                !c->opts->dry_run, NULL);
@@ -1236,12 +1265,13 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
             if (cbm_db_lease_try_acquire(dbp.c_str(), &lease) != 0) {
                 continue;
             }
-            bool still = !cbm_file_exists(dbp.c_str());
-            if (still) {
-                (void)cbm_unlink(sp.c_str());
-            }
+            /* Reported only once the sidecar is gone: its database must
+             * still be absent under the lease, and the unlink must have
+             * taken (a read-only cache refuses it). */
+            bool gone = !cbm_file_exists(dbp.c_str()) &&
+                        (cbm_unlink(sp.c_str()) == 0 || !cbm_file_exists(sp.c_str()));
             cbm_db_lease_release(lease);
-            if (!still) {
+            if (!gone) {
                 continue;
             }
         }
@@ -1343,9 +1373,9 @@ int cbm_cache_trash_remove_all(void) {
                 continue;
             }
         }
-        remove_tree(p.c_str());
+        bool gone = remove_tree(p.c_str());
         cbm_db_lease_release(lease);
-        removed += entry;
+        removed += entry && gone;
     }
     (void)cbm_rmdir(tdir.c_str()); /* only when empty */
     return removed;
@@ -1418,7 +1448,7 @@ int cbm_cache_trash_restore(const char *which, char *msg, size_t msg_sz) {
             /* The clock restarts: it was used just now, by this restore. */
             (void)cbm_cache_usage_set(dbp.c_str(), (int64_t)time(NULL), NULL);
             if (slots_back) {
-                remove_tree(edir.c_str());
+                (void)remove_tree(edir.c_str()); /* a leftover entry is purged later */
             }
             snprintf(msg, msg_sz, "restored %s%s", project.c_str(),
                      slots_back ? "" : " (its parked branches stay in the trash)");

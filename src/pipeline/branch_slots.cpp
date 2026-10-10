@@ -770,7 +770,13 @@ static void evict_slots(const char *dir, int keep, int64_t budget, const char *n
         }
         char path[BS_PATH_MAX];
         snprintf(path, sizeof(path), "%s/%s", dir, items[i].name);
-        unlink_slot(path);
+        /* The cap and the budget count what is still there: a slot that
+         * refuses to go (a sharing violation) stays in both, so the loop
+         * goes on to the next oldest rather than stopping short. */
+        if (!unlink_slot(path)) {
+            cbm_log_warn("branch.evict_failed", "slot", items[i].name);
+            continue;
+        }
         count--;
         total -= items[i].bytes > 0 ? items[i].bytes : 0;
         cbm_log_info("branch.evict", "slot", items[i].name);
