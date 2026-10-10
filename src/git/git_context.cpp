@@ -12,6 +12,23 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#ifdef _WIN32
+/* Git for Windows refuses a ref whose loose file sits past MAX_PATH unless
+ * core.longpaths is on, and a branch name is unbounded: without it the
+ * identity git reports for such a checkout is "detached, no commit". Every
+ * git this process runs gets the setting through the environment (git 2.31+
+ * reads GIT_CONFIG_COUNT); a caller's own GIT_CONFIG_* set is left alone. */
+static bool git_longpaths_env_init(void) {
+    if (!getenv("GIT_CONFIG_COUNT")) {
+        _putenv_s("GIT_CONFIG_COUNT", "1");
+        _putenv_s("GIT_CONFIG_KEY_0", "core.longpaths");
+        _putenv_s("GIT_CONFIG_VALUE_0", "true");
+    }
+    return true;
+}
+static const bool g_git_longpaths_env = git_longpaths_env_init();
+#endif
+
 enum {
     GIT_CMD_MAX = 1024,
     GIT_OUTPUT_MAX = 4096,

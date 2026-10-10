@@ -25,6 +25,34 @@ static inline wchar_t *cbm_utf8_to_wide(const char *utf8) {
     return w;
 }
 
+/* A path for the wide file APIs. Past MAX_PATH an absolute drive path is
+ * rewritten to the extended-length form (\\?\C:\...) the APIs accept
+ * without the 260-character limit; git itself writes refs that long (a
+ * branch name is unbounded). Shorter paths come back as cbm_utf8_to_wide
+ * gives them, so this changes nothing for the ordinary case. */
+static inline wchar_t *cbm_utf8_to_wide_path(const char *utf8) {
+    wchar_t *w = cbm_utf8_to_wide(utf8);
+    if (!w) {
+        return nullptr;
+    }
+    size_t len = wcslen(w);
+    bool is_drive = len >= 3 && ((w[0] >= L'A' && w[0] <= L'Z') || (w[0] >= L'a' && w[0] <= L'z')) &&
+                    w[1] == L':' && (w[2] == L'\\' || w[2] == L'/');
+    if (len < MAX_PATH || !is_drive) {
+        return w;
+    }
+    wchar_t *ext = (wchar_t *)malloc((len + 5) * sizeof(wchar_t));
+    if (!ext) {
+        return w; /* the plain path: it fails as it would have */
+    }
+    wmemcpy(ext, L"\\\\?\\", 4);
+    for (size_t i = 0; i <= len; i++) {
+        ext[4 + i] = w[i] == L'/' ? L'\\' : w[i];
+    }
+    free(w);
+    return ext;
+}
+
 static inline char *cbm_wide_to_utf8(const wchar_t *wide) {
     if (!wide) {
         return nullptr;

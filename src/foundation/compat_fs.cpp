@@ -454,7 +454,7 @@ int cbm_pclose(FILE *f) {
 }
 
 FILE *cbm_fopen(const char *path, const char *mode) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return NULL;
     }
@@ -470,7 +470,7 @@ FILE *cbm_fopen(const char *path, const char *mode) {
 }
 
 bool cbm_is_regular_file(const char *path) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return false;
     }

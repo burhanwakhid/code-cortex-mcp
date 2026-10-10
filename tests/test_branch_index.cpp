@@ -657,6 +657,10 @@ static int bi_status_matches(cbm_mcp_server_t *srv) {
 
 /* What session start compares: the checkout's HEAD files against the
  * identity recorded in the current database. */
+static const char *nz_s(const char *s) {
+    return s ? s : "(null)";
+}
+
 static bool bi_head_matches_index(const char *repo) {
     cbm_branch_id_t current;
     cbm_branch_id_t indexed = {};
@@ -669,6 +673,12 @@ static bool bi_head_matches_index(const char *repo) {
     bool known = s && cbm_branch_id_indexed(s, g_bi_project, &indexed);
     cbm_store_close(s);
     bool same = !known || cbm_branch_id_same(&indexed, &current);
+    if (!same) {
+        fprintf(stderr, "    head/index mismatch: index branch=%.60s... sha=%s detached=%d | "
+                        "head branch=%.60s... sha=%s detached=%d\n",
+                nz_s(indexed.branch), indexed.head_sha, indexed.is_detached,
+                nz_s(current.branch), current.head_sha, current.is_detached);
+    }
     cbm_branch_id_free(&indexed);
     cbm_branch_id_free(&current);
     return same;
