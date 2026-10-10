@@ -172,6 +172,14 @@ bool cbm_branch_slot_decompress(const char *slot, const char *out_path);
 /* Callback run when a restore starts, before it takes the live database's
  * write lock: a write made here must survive the restore. NULL clears. */
 void cbm_branch_slots_test_before_restore(void (*callback)(void *), void *data);
+/* Callback told of each durability step of a park or restore, in order:
+ * "fsync" (a file's data synced; detail = its path), "fsync_dir" (a
+ * directory synced), "rename" (detail = the destination), "restore_commit"
+ * (detail = the restore connection's PRAGMA synchronous level, decimal) and
+ * "unlink_incoming" (the restored slot removed). NULL clears. */
+void cbm_branch_slots_test_on_event(void (*callback)(const char *event, const char *detail,
+                                                     void *data),
+                                    void *data);
 #endif
 
 /* Sorted slot stems (cbm_branch_slot_name) of root's parked databases; with

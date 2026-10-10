@@ -5,6 +5,7 @@
 #include "pipeline/branch_slots.h"
 
 #include "store/store.h"
+#include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
@@ -20,6 +21,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#endif
 
 #define SLEN(s) (sizeof(s) - 1)
 
@@ -46,6 +50,29 @@ static const char BS_BRANCH_MARK[] = ".__branch__.";
 static const char BS_ZST_EXT[] = ".db.zst";
 static const char BS_DB_EXT_S[] = ".db";
 static const char BS_UNZ_EXT[] = ".db.unz";
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void (*on_event_cb)(const char *, const char *, void *) = nullptr;
+static void *on_event_data = nullptr;
+
+void cbm_branch_slots_test_on_event(void (*callback)(const char *, const char *, void *),
+                                    void *data) {
+    on_event_cb = callback;
+    on_event_data = data;
+}
+#endif
+
+/* Tell the test seam of a durability step (cbm_branch_slots_test_on_event). */
+static void bs_event(const char *event, const char *detail) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (on_event_cb) {
+        on_event_cb(event, detail, on_event_data);
+    }
+#else
+    (void)event;
+    (void)detail;
+#endif
+}
 
 const char *cbm_branch_switch_str(cbm_branch_switch_t action) {
     switch (action) {
@@ -467,8 +494,64 @@ static void unlink_scratch(const char *path) {
     (void)cbm_unlink(tmp);
 }
 
+/* Write f's data through to stable storage: its stdio buffer, then fsync
+ * (_commit on Windows). path names f for the test seam. */
+static bool sync_stream(FILE *f, const char *path) {
+    if (fflush(f) != 0) {
+        return false;
+    }
+#ifdef _WIN32
+    bool ok = _commit(cbm_fileno(f)) == 0;
+#else
+    bool ok = fsync(cbm_fileno(f)) == 0;
+#endif
+    if (ok) {
+        bs_event("fsync", path);
+    }
+    return ok;
+}
+
+/* Sync the file at path (an installed database). */
+static bool sync_file(const char *path) {
+    FILE *f = cbm_fopen(path, "r+b");
+    if (!f) {
+        return false;
+    }
+    bool ok = sync_stream(f, path);
+    return fclose(f) == 0 && ok;
+}
+
+/* Sync the directory holding path, so a rename into it survives a power
+ * loss. On POSIX an fsync of the directory; best effort, since a filesystem
+ * that cannot sync a directory has nothing more to offer and the rename
+ * cannot be taken back. Windows has nothing to do: NTFS journals its
+ * metadata and cbm_rename_replace renames with write-through. */
+static void sync_parent_dir(const char *path) {
+#ifndef _WIN32
+    char dir[BS_PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (!slash) {
+        return;
+    }
+    *slash = '\0';
+    int fd = open(dir[0] ? dir : "/", O_RDONLY);
+    if (fd < 0) {
+        return;
+    }
+    if (fsync(fd) == 0) {
+        bs_event("fsync_dir", dir);
+    }
+    (void)close(fd);
+#else
+    bs_event("fsync_dir", path);
+#endif
+}
+
 /* Compress the file at src into dst (one zstd frame with a checksum),
- * through dst.tmp and a rename, so dst is complete or absent. */
+ * through dst.tmp and a rename, so dst is complete or absent. dst is on
+ * stable storage when this returns true: a restore overwrites the outgoing
+ * graph right after, and this slot is then its only copy. */
 static bool compress_file(const char *src, const char *dst) {
     char tmp[BS_PATH_MAX];
     snprintf(tmp, sizeof(tmp), "%s.tmp", dst);
@@ -477,7 +560,7 @@ static bool compress_file(const char *src, const char *dst) {
     int64_t n = out ? cbm_zstd_compress_stream(in, out, file_size(src), BS_ZSTD_LEVEL,
                                                BS_ZSTD_WORKERS)
                     : -1;
-    bool ok = n > 0;
+    bool ok = n > 0 && sync_stream(out, tmp);
     if (out && fclose(out) != 0) {
         ok = false;
     }
@@ -489,11 +572,16 @@ static bool compress_file(const char *src, const char *dst) {
     }
     if (!ok) {
         (void)cbm_unlink(tmp);
+    } else {
+        bs_event("rename", dst);
+        sync_parent_dir(dst);
     }
     return ok;
 }
 
-bool cbm_branch_slot_decompress(const char *slot, const char *out_path) {
+/* cbm_branch_slot_decompress; durable: out_path is on stable storage when
+ * this returns true (a database about to replace the slot it came from). */
+static bool decompress_file(const char *slot, const char *out_path, bool durable) {
     if (!slot || !out_path) {
         return false;
     }
@@ -502,7 +590,7 @@ bool cbm_branch_slot_decompress(const char *slot, const char *out_path) {
     FILE *in = cbm_fopen(slot, "rb");
     FILE *out = in ? cbm_fopen(tmp, "wb") : NULL;
     int64_t n = out ? cbm_zstd_decompress_stream(in, out, BS_MAX_UNPACKED_BYTES) : -1;
-    bool ok = n > 0;
+    bool ok = n > 0 && (!durable || sync_stream(out, tmp));
     if (out && fclose(out) != 0) {
         ok = false;
     }
@@ -514,11 +602,18 @@ bool cbm_branch_slot_decompress(const char *slot, const char *out_path) {
          * onto this one (#897). */
         cbm_remove_db_sidecars(out_path);
         ok = cbm_rename_replace(tmp, out_path) == 0;
+        if (ok) {
+            bs_event("rename", out_path);
+        }
     }
     if (!ok) {
         (void)cbm_unlink(tmp);
     }
     return ok;
+}
+
+bool cbm_branch_slot_decompress(const char *slot, const char *out_path) {
+    return decompress_file(slot, out_path, false);
 }
 
 /* Park the live database at db_path as dir/<slot of slug>.db.zst: a
@@ -810,6 +905,13 @@ static bool restore_into(const char *slot, const char *db_path, const char *proj
     sqlite3 *sdb = cbm_store_get_db(src);
     sqlite3 *ddb = cbm_store_get_db(dst);
     bool ok = false;
+    /* The caller unlinks the incoming slot once this returns: the commit must
+     * be on stable storage by then. A write connection runs at synchronous =
+     * NORMAL, under which a WAL commit is durable only at the next
+     * checkpoint; FULL syncs the WAL at the commit. */
+    if (ddb && sqlite3_exec(ddb, "PRAGMA synchronous = FULL;", NULL, NULL, NULL) != SQLITE_OK) {
+        ddb = NULL;
+    }
     sqlite3_backup *bk = sdb && ddb ? sqlite3_backup_init(ddb, "main", sdb, "main") : NULL;
     if (bk) {
         int rc = sqlite3_backup_step(bk, 1);
@@ -828,6 +930,18 @@ static bool restore_into(const char *slot, const char *db_path, const char *proj
         /* Before SQLITE_DONE, finish rolls the destination back. */
         ok = sqlite3_backup_finish(bk) == SQLITE_OK && ok;
     }
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (ok && on_event_cb) {
+        sqlite3_stmt *st = NULL;
+        char level[16] = "-1";
+        if (sqlite3_prepare_v2(ddb, "PRAGMA synchronous;", -1, &st, NULL) == SQLITE_OK &&
+            sqlite3_step(st) == SQLITE_ROW) {
+            snprintf(level, sizeof(level), "%d", sqlite3_column_int(st, 0));
+        }
+        sqlite3_finalize(st);
+        bs_event("restore_commit", level);
+    }
+#endif
     if (ok) {
         shrink_wal(ddb);
     }
@@ -909,9 +1023,11 @@ static bool find_slot(const char *dir, const char *slug, char *buf, size_t bufsz
 
 /* The uncompressed database to install from `incoming`: the slot itself when
  * it is a legacy <slot>.db, else a decompressed scratch copy written to
- * `scratch` (the caller removes it with unlink_scratch). */
+ * `scratch` (the caller removes it with unlink_scratch). durable: the copy is
+ * synced to stable storage, for a caller that renames it into place. */
 static const char *open_incoming(const char *incoming, const char *dir, const char *slug,
-                                 char *scratch, size_t scratch_sz, int64_t *unpack_ms) {
+                                 char *scratch, size_t scratch_sz, bool durable,
+                                 int64_t *unpack_ms) {
     if (!ends_with(incoming, BS_ZST_EXT)) {
         return incoming;
     }
@@ -920,7 +1036,7 @@ static const char *open_incoming(const char *incoming, const char *dir, const ch
         return NULL;
     }
     unlink_scratch(scratch);
-    if (!cbm_branch_slot_decompress(incoming, scratch)) {
+    if (!decompress_file(incoming, scratch, durable)) {
         cbm_log_warn("branch.slot_unreadable", "slot", incoming);
         unlink_scratch(scratch);
         return NULL;
@@ -953,24 +1069,37 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
      * parked. With no main file there is no reader to protect, so it is
      * installed the way a fresh database is (stale sidecars removed, then one
      * rename): a compressed slot is decompressed beside it and renamed in, a
-     * legacy one copied. */
+     * legacy one copied. The slot is removed only once the installed file and
+     * its directory entry are on stable storage: a power loss in between
+     * must not leave neither. */
     if (!cbm_file_exists(db_path)) {
         if (!have_incoming) {
             return CBM_BRANCH_SWITCH_NONE;
         }
         char scratch[BS_PATH_MAX];
         int64_t unpack_ms = 0;
-        const char *src = open_incoming(incoming, dir, slug, scratch, sizeof(scratch), &unpack_ms);
+        const char *src =
+            open_incoming(incoming, dir, slug, scratch, sizeof(scratch), true, &unpack_ms);
         bool ok = false;
+        bool durable = false;
         if (src == incoming) {
             ok = copy_db(incoming, db_path);
+            durable = ok && sync_file(db_path);
         } else if (src) {
             cbm_remove_db_sidecars(db_path);
             ok = cbm_rename_replace(src, db_path) == 0;
+            if (ok) {
+                bs_event("rename", db_path);
+            }
+            durable = ok;
             unlink_scratch(scratch);
         }
         if (ok) {
-            unlink_slot(incoming);
+            sync_parent_dir(db_path);
+            if (durable) {
+                bs_event("unlink_incoming", incoming);
+                unlink_slot(incoming);
+            }
             cbm_log_info("branch.switch", "action", "restored", "to", slug, "from", "");
             return CBM_BRANCH_SWITCH_RESTORED;
         }
@@ -1029,17 +1158,26 @@ static cbm_branch_switch_t switch_from(const char *db_path, const char *project,
 
     /* Restore by content (restore_into). A failure at any step leaves the
      * outgoing database in place, already parked: it becomes the seed, as if
-     * nothing had been parked for this branch. */
+     * nothing had been parked for this branch.
+     *
+     * Ordered for a power loss at any point: the park is on stable storage
+     * (compress_file syncs the slot and its directory) before the restore
+     * overwrites the outgoing graph, the restore's commit is synced before
+     * restore_into returns (synchronous = FULL), and only then is the
+     * incoming slot removed. Each branch's graph is always in the live
+     * database or in its slot. */
     cbm_branch_switch_t action = CBM_BRANCH_SWITCH_SEEDED;
     if (incoming) {
         t0 = cbm_now_ms();
         char scratch[BS_PATH_MAX];
         int64_t unpack_ms = 0;
-        const char *src = open_incoming(incoming, dir, slug, scratch, sizeof(scratch), &unpack_ms);
+        const char *src =
+            open_incoming(incoming, dir, slug, scratch, sizeof(scratch), false, &unpack_ms);
         if (src && restore_into(src, db_path, project)) {
             action = CBM_BRANCH_SWITCH_RESTORED;
             log_kv("branch.restore", "elapsed_ms", (int64_t)(cbm_now_ms() - t0), "unpack_ms",
                    unpack_ms, "wal_bytes", wal_size(db_path));
+            bs_event("unlink_incoming", incoming);
             unlink_slot(incoming);
         } else {
             cbm_log_warn("branch.restore_failed", "to", slug, "action", "seeded");

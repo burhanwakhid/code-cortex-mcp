@@ -3020,6 +3020,91 @@ TEST(branch_incoming_slot_same_file_as_outgoing) {
     PASS();
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef struct {
+    char log[8192];
+} bi_events_t;
+
+/* Append "<event>:<basename of detail>;" to the log. */
+static void bi_on_event(const char *event, const char *detail, void *data) {
+    bi_events_t *ev = (bi_events_t *)data;
+    const char *base = strrchr(detail, '/');
+    base = base ? base + 1 : detail;
+    size_t len = strlen(ev->log);
+    snprintf(ev->log + len, sizeof(ev->log) - len, "%s:%s;", event, base);
+}
+
+/* Index of `needle` in log at or after `from`; -1 when absent. */
+static int bi_event_at(const char *log, const char *needle, int from) {
+    const char *hit = from >= 0 ? strstr(log + from, needle) : NULL;
+    return hit ? (int)(hit - log) : -1;
+}
+#endif
+
+/* A switch is crash-safe in order: the parked slot is on stable storage
+ * (file and directory entry) before the restore overwrites the outgoing
+ * graph, the restore commit is durable when it returns (synchronous FULL,
+ * not NORMAL, whose WAL commits wait for a checkpoint), and only then is the
+ * incoming slot removed. Restoring into a missing live database syncs the
+ * installed file before the slot goes. */
+TEST(branch_switch_syncs_before_unlink) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    char *repo = bi_make_repo("cbm_bi_sync");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    bi_events_t ev;
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* main parked */
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    ev.log[0] = '\0';
+    cbm_branch_slots_test_on_event(bi_on_event, &ev);
+    bi_run_t r = bi_index(repo, -1);
+    cbm_branch_slots_test_on_event(NULL, NULL);
+    ASSERT_STR_EQ(r.action, "restored");
+    int at = bi_event_at(ev.log, "fsync:feature.db.zst.tmp;", 0);
+    ASSERT_GTE(at, 0);
+    at = bi_event_at(ev.log, "rename:feature.db.zst;", at);
+    ASSERT_GTE(at, 0);
+    at = bi_event_at(ev.log, "fsync_dir:", at);
+    ASSERT_GTE(at, 0);
+    at = bi_event_at(ev.log, "restore_commit:", at);
+    ASSERT_GTE(at, 0);
+    int level = atoi(ev.log + at + strlen("restore_commit:"));
+    ASSERT_GTE(level, 2); /* FULL or EXTRA */
+    ASSERT_GTE(bi_event_at(ev.log, "unlink_incoming:main.db.zst;", at), 0);
+
+    /* No live database: the slot is decompressed and renamed into place. */
+    char db[1024];
+    bi_db_path(db, sizeof(db));
+    ASSERT_EQ(cbm_unlink(db), 0);
+    cbm_remove_db_sidecars(db);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ev.log[0] = '\0';
+    cbm_branch_slots_test_on_event(bi_on_event, &ev);
+    r = bi_index(repo, -1);
+    cbm_branch_slots_test_on_event(NULL, NULL);
+    ASSERT_STR_EQ(r.action, "restored");
+    char want[1200];
+    const char *dbname = strrchr(db, '/') + 1;
+    snprintf(want, sizeof(want), "fsync:%s;", "feature.db.unz.tmp");
+    at = bi_event_at(ev.log, want, 0);
+    ASSERT_GTE(at, 0);
+    snprintf(want, sizeof(want), "rename:%s;", dbname);
+    at = bi_event_at(ev.log, want, at);
+    ASSERT_GTE(at, 0);
+    at = bi_event_at(ev.log, "fsync_dir:", at);
+    ASSERT_GTE(at, 0);
+    ASSERT_GTE(bi_event_at(ev.log, "unlink_incoming:feature.db.zst;", at), 0);
+
+    bi_cleanup(repo);
+#endif
+    PASS();
+}
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -3093,4 +3178,5 @@ SUITE(branch_index) {
     RUN_TEST(branch_switch_sweeps_scratch);
     RUN_TEST(branch_restore_shrinks_wal_under_open_reader);
     RUN_TEST(branch_incoming_slot_same_file_as_outgoing);
+    RUN_TEST(branch_switch_syncs_before_unlink);
 }

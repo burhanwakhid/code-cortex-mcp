@@ -149,6 +149,22 @@ With no live database (first index, an interrupted rebuild, a manual delete) the
 to protect. The slot is installed like a fresh database: stale sidecars removed, then one
 rename.
 
+### Durability order
+
+A switch survives a power loss at any step. Each branch's graph is always in the live database or
+in its slot:
+
+1. The park syncs `<slot>.db.zst.tmp` to disk, renames it into place and syncs the slot
+   directory (`compress_file`). Only then does the restore overwrite the outgoing graph.
+2. The restore runs its connection at `synchronous = FULL`, so the WAL is synced at the commit.
+   Write connections otherwise run at `NORMAL`, under which a WAL commit is durable only at the
+   next checkpoint.
+3. Only after the commit is the incoming slot removed.
+
+With no live database, the decompressed copy is synced before it is renamed to `db_path`, and
+the cache directory after. A legacy `.db` slot copied in is synced the same way. The slot is
+removed after that.
+
 ### Slot layout
 
 ```text
