@@ -66,6 +66,7 @@ enum {
 #include <atomic>
 #include <cctype>
 #include <condition_variable>
+#include <exception>
 #include <mutex>
 #include <new>
 #include <string>
@@ -13290,16 +13291,26 @@ struct sweep_job {
 static void *sweep_thread(void *arg) {
     sweep_job *job = (sweep_job *)arg;
     cbm_mcp_server_t *srv = job->srv;
-    SWEEP_TEST_HOOK(0);
-    cbm_cache_expiry_cfg_t cfg;
-    cbm_cache_expiry_cfg_load(&cfg, NULL);
-    cbm_cache_sweep_opts_t opts = {};
-    opts.keep_project = job->keep_project[0] ? job->keep_project : NULL;
-    opts.keep = sweep_keep_watched;
-    opts.keep_ud = srv;
-    cbm_cache_sweep_result_t res;
-    (void)cbm_cache_expiry_sweep(&cfg, &opts, &res);
-    SWEEP_TEST_HOOK(1);
+    /* An exception leaving a thread function terminates the server: the
+     * sweep is housekeeping, so a failure in it (bad_alloc in the scan) is
+     * logged and dropped. Either way the flag is cleared and the job freed,
+     * so a later sweep can start. */
+    try {
+        SWEEP_TEST_HOOK(0);
+        cbm_cache_expiry_cfg_t cfg;
+        cbm_cache_expiry_cfg_load(&cfg, NULL);
+        cbm_cache_sweep_opts_t opts = {};
+        opts.keep_project = job->keep_project[0] ? job->keep_project : NULL;
+        opts.keep = sweep_keep_watched;
+        opts.keep_ud = srv;
+        cbm_cache_sweep_result_t res;
+        (void)cbm_cache_expiry_sweep(&cfg, &opts, &res);
+        SWEEP_TEST_HOOK(1);
+    } catch (const std::exception &e) {
+        cbm_log_warn("cache.expire.error", "msg", e.what());
+    } catch (...) {
+        cbm_log_warn("cache.expire.error", "msg", "unknown exception");
+    }
     srv->sweep_running.store(false);
     free(job);
     return NULL;

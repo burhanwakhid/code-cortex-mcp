@@ -21,6 +21,7 @@
 
 #include "sqlite3.h"
 #include <atomic>
+#include <new>
 #include <string>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1671,6 +1672,44 @@ static void ce_sweep_probe(int stage, void *data) {
     }
 }
 
+static void ce_sweep_throws_once(int stage, void *data) {
+    std::atomic<int> *calls = (std::atomic<int> *)data;
+    if (stage == 0 && calls->fetch_add(1) == 0) {
+        throw std::bad_alloc();
+    }
+}
+
+/* A sweep that throws (bad_alloc in the scan) must not take the server down:
+ * the thread logs it, clears its running flag and frees its job, so the next
+ * initialize starts a sweep again. */
+TEST(cache_server_sweep_survives_exception) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_srvx"));
+    ce_srv_env_t env;
+    ce_srv_env_enter(&env);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    std::atomic<int> calls{0};
+    cbm_mcp_test_sweep_hook(ce_sweep_throws_once, &calls);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv, CE_INITIALIZE);
+    free(resp);
+    cbm_mcp_server_join_threads(srv);
+    ASSERT_EQ(calls.load(), 1);
+    ASSERT_TRUE(cbm_cache_expiry_due(&cfg, (int64_t)time(NULL))); /* that sweep recorded nothing */
+    resp = cbm_mcp_server_handle(srv, CE_INITIALIZE);
+    free(resp);
+    cbm_mcp_server_join_threads(srv);
+    cbm_mcp_test_sweep_hook(NULL, NULL);
+    ASSERT_EQ(calls.load(), 2); /* a second sweep started */
+    ASSERT_FALSE(cbm_cache_expiry_due(&cfg, (int64_t)time(NULL)));
+    cbm_mcp_server_free(srv);
+    ce_srv_env_leave(&env);
+    ce_teardown(&e);
+    PASS();
+}
+
 /* The sweep reads the externally owned watcher. Dropping the watcher must
  * wait for a running sweep, so the caller can free the watcher right after
  * (main's shutdown order); the sweep still saw the watcher and kept its
@@ -1755,5 +1794,6 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_server_initialize_runs_sweep);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(cache_server_sweep_joined_before_watcher_drop);
+    RUN_TEST(cache_server_sweep_survives_exception);
 #endif
 }
