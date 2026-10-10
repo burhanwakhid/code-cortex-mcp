@@ -362,11 +362,22 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
                  * (verify_content), that holds only for the same bytes: this
                  * mode will not re-extract the file, so a changed one is
                  * purged rather than kept with the other checkout's symbols
-                 * (the next run that discovers it extracts it afresh). */
+                 * (the next run that discovers it extracts it afresh). A file
+                 * that stats but cannot be read has unknown bytes, not other
+                 * ones: kept, as a failed stat keeps it below, since this
+                 * mode would never re-extract it once purged. */
                 char digest[CBM_SHA256_HEX_LEN + 1];
-                preserve = !verify_content || empty_both(&stored[i], &st) ||
-                           (stored_sha_valid(&stored[i]) && file_sha256_hex(abs_path, digest) &&
-                            strcmp(digest, stored[i].sha256) == 0);
+                preserve = !verify_content || empty_both(&stored[i], &st);
+                if (!preserve && stored_sha_valid(&stored[i])) {
+                    errno = 0;
+                    if (!file_sha256_hex(abs_path, digest)) {
+                        cbm_log_warn("incremental.stat_uncertain", "rel_path", stored[i].rel_path,
+                                     "errno", itoa_buf(errno));
+                        preserve = true;
+                    } else {
+                        preserve = strcmp(digest, stored[i].sha256) == 0;
+                    }
+                }
             } else if (errno != ENOENT && errno != ENOTDIR) {
                 /* Transient or permission error — fail safe by preserving.
                  * EACCES, EIO, ELOOP, ENAMETOOLONG, etc. */

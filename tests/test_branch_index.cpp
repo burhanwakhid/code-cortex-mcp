@@ -3163,6 +3163,42 @@ TEST(branch_git_head_read_trailing_slash_root) {
     PASS();
 }
 
+/* After a switch, a stored file the current mode does not discover that
+ * exists but cannot be read is kept, as a file whose stat fails is: its
+ * bytes are unknown, not different, and this mode would never re-extract
+ * it once purged. */
+TEST(branch_switch_keeps_unreadable_mode_skipped_file) {
+#ifndef _WIN32
+    if (geteuid() == 0) {
+        PASS(); /* root reads a mode-000 file */
+    }
+    char *repo = bi_make_repo("cbm_bi_modeskip_unread");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    th_write_file(TH_PATH(repo, "docs/x.py"), "def doc_main():\n    return 1\n");
+    ASSERT_EQ(bi_git(repo, "add ."), 0);
+    ASSERT_EQ(bi_git(repo, "commit -q -m docs"), 0);
+
+    ASSERT_EQ(bi_index_mode(repo, CBM_MODE_FULL).rc, 0);
+    ASSERT_EQ(bi_count("doc_main"), 1);
+    ASSERT_EQ(bi_git(repo, "checkout -q -b same-tree"), 0);
+    char doc[700];
+    snprintf(doc, sizeof(doc), "%s/docs/x.py", repo);
+    ASSERT_EQ(chmod(doc, 0), 0);
+    bi_run_t r = bi_index_mode(repo, CBM_MODE_FAST);
+    (void)chmod(doc, 0644);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "seeded");
+    ASSERT_EQ(bi_count("doc_main"), 1);
+    ASSERT_EQ(bi_count("only_main"), 1);
+
+    bi_cleanup(repo);
+#endif
+    PASS();
+}
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -3239,4 +3275,5 @@ SUITE(branch_index) {
     RUN_TEST(branch_switch_syncs_before_unlink);
     RUN_TEST(branch_slot_named_like_scratch_survives_sweep);
     RUN_TEST(branch_git_head_read_trailing_slash_root);
+    RUN_TEST(branch_switch_keeps_unreadable_mode_skipped_file);
 }
