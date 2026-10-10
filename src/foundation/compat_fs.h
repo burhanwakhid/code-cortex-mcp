@@ -116,6 +116,13 @@ FILE *cbm_fopen(const char *path, const char *mode);
 /* Return true when a UTF-8 path names a regular file. */
 bool cbm_is_regular_file(const char *path);
 
+/* Return true when the path itself (not what it points to) is a link: a
+ * symlink on POSIX (lstat), any reparse point on Windows -- a directory
+ * junction, a directory or file symlink, a mount point. cbm_readdir and
+ * cbm_is_dir report a link to a directory as a directory on Windows, so a
+ * walker that deletes must ask this before it descends. */
+bool cbm_is_link(const char *path);
+
 /* stat() by UTF-8 path; st_size and st_mtime (Unix seconds) as stat gives
  * them. Windows goes through _wstat64, so non-ASCII paths and paths past
  * MAX_PATH work there; POSIX is plain stat(). */

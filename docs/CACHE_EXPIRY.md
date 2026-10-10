@@ -213,6 +213,12 @@ that still exists (the project's graph) or of nothing.
 
 `trash/` is a subdirectory, so scans of top-level `*.db` files never see trashed databases.
 
+Sizing and deleting a trash entry never follows a link. A symlink (POSIX), or any reparse point
+on Windows (a directory junction, a directory or file symlink), is removed itself, and the walk
+does not descend into it: on Windows the directory listing reports a junction as a directory,
+and following one would delete files outside the cache, or loop on a cyclic junction. `cache
+trash` and `cache restore` do not list an entry that is itself a link.
+
 ### Never removed
 
 - The project of the server's own session, and every project its watcher watches.

@@ -586,6 +586,63 @@ TEST(cache_trash_restore_and_purge) {
 }
 
 #ifndef _WIN32
+/* Purging a trash entry removes a link inside it and never follows it: a
+ * link to a directory outside the cache keeps that directory's files, a
+ * cyclic link ends the walk, and the size counts none of it. A trash entry
+ * that is itself a link is never listed or followed. On Windows the same
+ * walk meets a directory junction, which cbm_readdir calls a directory. */
+TEST(cache_trash_purge_never_follows_links) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_trlink"));
+    int64_t now = (int64_t)time(NULL);
+    char outside[700];
+    char keep[800];
+    snprintf(outside, sizeof(outside), "%s/outside", e.base);
+    ASSERT_TRUE(cbm_mkdir_p(outside, 0755));
+    snprintf(keep, sizeof(keep), "%s/keep.txt", outside);
+    std::string big(1 << 20, 'x');
+    ASSERT_EQ(th_write_file(keep, big.c_str()), 0);
+
+    char entry[800];
+    snprintf(entry, sizeof(entry), "%s/trash/%lld-lp", e.cache, (long long)(now - 10 * CE_DAY));
+    char sub[900];
+    snprintf(sub, sizeof(sub), "%s/branches", entry);
+    ASSERT_TRUE(cbm_mkdir_p(sub, 0755));
+    char f[1000];
+    snprintf(f, sizeof(f), "%s/lp.db", entry);
+    ASSERT_EQ(th_write_file(f, "db"), 0);
+    char lnk[1000];
+    snprintf(lnk, sizeof(lnk), "%s/outside", sub);
+    ASSERT_EQ(symlink(outside, lnk), 0);
+    char loop[1000];
+    snprintf(loop, sizeof(loop), "%s/loop", sub);
+    ASSERT_EQ(symlink(entry, loop), 0);
+    ASSERT_TRUE(cbm_is_link(lnk));
+    ASSERT_TRUE(cbm_is_dir(lnk)); /* what the walk must not trust */
+    ASSERT_FALSE(cbm_is_link(sub));
+    ASSERT_FALSE(cbm_is_link(f));
+
+    /* An entry that is a link itself, to the outside directory. */
+    char lentry[800];
+    snprintf(lentry, sizeof(lentry), "%s/trash/%lld-ln", e.cache, (long long)(now - 10 * CE_DAY));
+    ASSERT_EQ(symlink(outside, lentry), 0);
+    char msg[512];
+    ASSERT_NEQ(cbm_cache_trash_restore("ln", msg, sizeof(msg)), 0);
+
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.purged, 1);
+    ASSERT_LT(r.bytes, (int64_t)big.size());
+    ASSERT_FALSE(cbm_file_exists(entry));
+    ASSERT_TRUE(cbm_file_exists(keep));
+    ASSERT_TRUE(cbm_is_link(lentry));
+    (void)cbm_unlink(lentry);
+    ce_teardown(&e);
+    PASS();
+}
+
 /* A parked slot older than the slot age goes (database or not); a newer one
  * stays; old scratch of an interrupted park goes. */
 TEST(cache_old_slots_expire) {
@@ -1305,6 +1362,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_renamed_db_kept_by_project);
     RUN_TEST(cache_renamed_db_expires_as_project);
 #ifndef _WIN32
+    RUN_TEST(cache_trash_purge_never_follows_links);
     RUN_TEST(cache_old_slots_expire);
     RUN_TEST(cache_orphan_sidecars);
 #endif

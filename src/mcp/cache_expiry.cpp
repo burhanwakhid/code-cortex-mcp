@@ -70,8 +70,26 @@ static std::string fmt_time(int64_t t) {
     return b;
 }
 
-/* Every file under dir, recursively, without following symlinks. */
+/* How a walker that sizes or deletes treats one path. A link is never
+ * followed: on Windows cbm_readdir and cbm_is_dir call a junction or a
+ * directory symlink a directory, and descending into one would size, or
+ * delete, whatever it points at -- outside the cache, or round a cycle.
+ * Asked of the path, not the dirent, so a filesystem that reports no entry
+ * type (DT_UNKNOWN) still has its directories walked. */
+typedef enum { WALK_FILE, WALK_DIR, WALK_LINK } walk_kind_t;
+
+static walk_kind_t walk_kind(const char *path) {
+    if (cbm_is_link(path)) {
+        return WALK_LINK;
+    }
+    return cbm_is_dir(path) ? WALK_DIR : WALK_FILE;
+}
+
+/* Every file under dir, recursively, without following links. */
 static int64_t tree_bytes(const char *dir) {
+    if (walk_kind(dir) != WALK_DIR) {
+        return 0;
+    }
     cbm_dir_t *d = cbm_opendir(dir);
     if (!d) {
         return 0;
@@ -84,9 +102,10 @@ static int64_t tree_bytes(const char *dir) {
             continue;
         }
         std::string p = std::string(dir) + "/" + ent->name;
-        if (ent->is_dir) {
+        walk_kind_t k = walk_kind(p.c_str());
+        if (k == WALK_DIR) {
             subdirs.push_back(p);
-        } else {
+        } else if (k == WALK_FILE) {
             total += path_size(p.c_str());
         }
     }
@@ -97,25 +116,38 @@ static int64_t tree_bytes(const char *dir) {
     return total;
 }
 
-/* Delete dir and everything under it. cbm_readdir reports a symlink as a
- * file, so a link is unlinked, never followed. */
+/* Remove a link itself: a directory junction or directory symlink on
+ * Windows goes with rmdir (RemoveDirectoryW), anything else with unlink. */
+static void remove_link(const char *path) {
+    if (cbm_rmdir(path) != 0) {
+        (void)cbm_unlink(path);
+    }
+}
+
+/* Delete dir and everything under it. A link, dir itself included, is
+ * removed and never followed. */
 static void remove_tree(const char *dir) {
+    walk_kind_t self = walk_kind(dir);
+    if (self != WALK_DIR) {
+        if (self == WALK_LINK) {
+            remove_link(dir);
+        } else {
+            (void)cbm_unlink(dir);
+        }
+        return;
+    }
     cbm_dir_t *d = cbm_opendir(dir);
     if (d) {
-        std::vector<std::pair<std::string, bool>> items;
+        std::vector<std::string> items;
         cbm_dirent_t *ent;
         while ((ent = cbm_readdir(d)) != NULL) {
             if (strcmp(ent->name, ".") != 0 && strcmp(ent->name, "..") != 0) {
-                items.emplace_back(std::string(dir) + "/" + ent->name, ent->is_dir);
+                items.emplace_back(std::string(dir) + "/" + ent->name);
             }
         }
         cbm_closedir(d);
         for (const auto &it : items) {
-            if (it.second) {
-                remove_tree(it.first.c_str());
-            } else {
-                (void)cbm_unlink(it.first.c_str());
-            }
+            remove_tree(it.c_str());
         }
     }
     (void)cbm_rmdir(dir);
@@ -1144,7 +1176,8 @@ static std::vector<std::pair<long long, std::string>> trash_entries(const char *
     while ((ent = cbm_readdir(d)) != NULL) {
         char *end = NULL;
         long long t = strtoll(ent->name, &end, 10);
-        if (ent->is_dir && end && *end == '-' && t > 0) {
+        if (ent->is_dir && end && *end == '-' && t > 0 &&
+            !cbm_is_link((tdir + "/" + ent->name).c_str())) {
             out.emplace_back(t, ent->name);
         }
     }

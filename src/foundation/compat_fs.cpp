@@ -480,6 +480,17 @@ bool cbm_is_regular_file(const char *path) {
     return ret == 0 && (wst.st_mode & _S_IFMT) == _S_IFREG;
 }
 
+bool cbm_is_link(const char *path) {
+    wchar_t *wpath = path ? cbm_utf8_to_wide_path(path) : NULL;
+    if (!wpath) {
+        return false;
+    }
+    /* GetFileAttributesW reports the reparse point itself, never its target. */
+    DWORD attr = GetFileAttributesW(wpath);
+    free(wpath);
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT);
+}
+
 int cbm_stat(const char *path, cbm_stat_t *st) {
     wchar_t *wpath = path ? cbm_utf8_to_wide_path(path) : NULL;
     if (!wpath) {
@@ -919,6 +930,11 @@ FILE *cbm_fopen(const char *path, const char *mode) {
 bool cbm_is_regular_file(const char *path) {
     struct stat st;
     return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+bool cbm_is_link(const char *path) {
+    struct stat st;
+    return path && lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
 }
 
 bool cbm_mkdir_p(const char *path, int mode) {
