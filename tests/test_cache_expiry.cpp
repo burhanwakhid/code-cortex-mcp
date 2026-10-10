@@ -942,6 +942,37 @@ TEST(cache_pipeline_on_indexed_holds_lease) {
     PASS();
 }
 
+/* A run whose requested artifact export fails after the database was
+ * committed still fails, but it did build the database: it records the use,
+ * or the sweep the request handler starts next could trash the fresh
+ * database by its old last_used. */
+TEST(cache_pipeline_on_indexed_after_failed_export) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_onidx_exp"));
+    char repo[700];
+    snprintf(repo, sizeof(repo), "%s/repo", e.base);
+    char f[800];
+    snprintf(f, sizeof(f), "%s/a.py", repo);
+    ASSERT_EQ(th_write_file(f, "def a():\n    return 1\n"), 0);
+    /* A file where the artifact directory goes: the export cannot create it. */
+    snprintf(f, sizeof(f), "%s/.code-cortex", repo);
+    ASSERT_EQ(th_write_file(f, "not a directory\n"), 0);
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    ce_indexed_probe_t probe = {&e, 0, 0};
+    cbm_pipeline_set_on_indexed(p, ce_on_indexed, &probe);
+    ASSERT_NEQ(cbm_pipeline_run(p), 0);
+    char db[800];
+    snprintf(db, sizeof(db), "%s/%s.db", e.cache, cbm_pipeline_project_name(p));
+    ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_EQ(probe.calls, 1);
+    ASSERT_EQ(probe.lease_rc, CBM_INDEX_BUSY);
+    cbm_pipeline_free(p);
+    ce_teardown(&e);
+    PASS();
+}
+
 #ifdef CBM_ENABLE_TEST_SEAMS
 typedef struct {
     int projects;
@@ -1510,6 +1541,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_used_since_scan_is_kept);
     RUN_TEST(cache_index_and_query_record_use);
     RUN_TEST(cache_pipeline_on_indexed_holds_lease);
+    RUN_TEST(cache_pipeline_on_indexed_after_failed_export);
     RUN_TEST(cache_index_use_recorded_before_lease_release);
     RUN_TEST(cache_query_on_renamed_db_records_use);
     RUN_TEST(cache_open_reader_keeps_database);

@@ -163,6 +163,10 @@ struct cbm_pipeline {
      * the run (or with none): a restore, a dump, a stamp. Read at the end of
      * cbm_pipeline_run, which exports iff it is set. */
     bool artifact_stale;
+    /* The full rebuild's dump committed the database. A requested artifact
+     * export after it can still fail the run, but the run did build the
+     * database, so the on-indexed callback still runs. */
+    bool db_committed;
     /* The database under this project's name was indexed from another
      * directory (a derived-name collision): this checkout has no index, so
      * the run rebuilds in full and carries nothing over from it. */
@@ -1777,6 +1781,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         cbm_log_error("pipeline.err", "phase", "dump");
         return rc;
     }
+    p->db_committed = true;
     cbm_log_info("pass.timing", "pass", "dump", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
     /* Persist-tail spans (phase "persist"): attribute the ~60s that lands here
      * AFTER cbm_gbuf_dump_to_sqlite returns. Active only under CBM_PROFILE. */
@@ -2314,6 +2319,10 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     }
     pipeline_decide_content_check(p);
     int rc = pipeline_run_claimed(p);
+    /* The run built or kept a database: a requested export that fails after
+     * the commit (here or in the full rebuild) fails the run, but the
+     * database is in place and its use must still be recorded. */
+    bool indexed = rc == 0 || p->db_committed;
     if (rc == 0 && !check_cancel(p)) {
         char *db_path = resolve_db_path(p);
         if (cbm_pipeline_stamp_branch(p, db_path)) {
@@ -2354,7 +2363,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         pipeline_note_checkout_moved(p);
     }
     /* Still under the lease (lease_scope releases it on return). */
-    if (rc == 0 && p->on_indexed) {
+    if (indexed && p->on_indexed) {
         p->on_indexed(p, p->on_indexed_ud);
     }
     return rc;

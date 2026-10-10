@@ -36,7 +36,7 @@ The rules, in order of confidence:
 | `root_gone` | The recorded checkout root is missing on at least 3 sweeps, the first of them at least the grace period ago, and nothing used the database in the grace period. | 7 days |
 | `unused` | No tool call, hook or index run used the database for the threshold. | 90 days |
 | `slot` | A parked slot was parked longer ago than the threshold. | 30 days |
-| `sidecar` | A `-wal`, `-shm`, `-journal`, `.db.tmp` or `.db.import_tmp` file whose database is gone, or a scratch file (`.db.unz*`, `.db.zst.tmp`) beside the slots. | older than 1 hour |
+| `sidecar` | A `-wal`, `-shm`, `-journal`, `.db.tmp` or `.db.import_tmp` file whose database is gone, or a scratch file (`.db.unz*`, `.db.zst.tmp`) beside the slots | older than 1 hour |
 
 ### Root gone
 
@@ -88,7 +88,9 @@ on this machine. It expires like a deleted checkout, unless it is used within th
 - every index run (`index_repository`, the watcher's in-process run), which also records the
   root and clears a missing streak. The run records it before it releases the index lease
   (`cbm_pipeline_set_on_indexed`), so a sweep that judged the database stale before the run and
-  takes the lease right after it re-reads the row, finds the run's use, and keeps the database;
+  takes the lease right after it re-reads the row, finds the run's use, and keeps the database.
+  A run whose requested artifact export (`persistence`) fails after the database was committed
+  returns an error but still records the use, because the database it built is in place;
 - `code-cortex-mcp cache restore`.
 
 The write is throttled twice. A process remembers, per database, when it last recorded use and
