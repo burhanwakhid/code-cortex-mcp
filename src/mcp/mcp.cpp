@@ -1553,8 +1553,12 @@ static const char *cwd_project_name(void) {
             return g_cwd_project;
         }
         /* An unindexed git checkout root (a linked worktree, a nested repo)
-         * ends the walk: the enclosing checkout's index is other code. */
-        if (cbm_git_checkout_root_kind(dir) != CBM_GIT_CHECKOUT_NONE) {
+         * ends the walk: the enclosing checkout's index is other code. A
+         * submodule's gitlink does not: discovery indexes its files into the
+         * enclosing checkout's graph. */
+        cbm_git_checkout_kind_t kind = cbm_git_checkout_root_kind(dir);
+        if (kind == CBM_GIT_CHECKOUT_MAIN ||
+            (kind == CBM_GIT_CHECKOUT_GITLINK && cbm_git_is_linked_worktree(dir))) {
             break;
         }
         char *slash = strrchr(dir, '/');

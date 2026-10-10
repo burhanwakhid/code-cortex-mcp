@@ -11,7 +11,7 @@ in `src/mcp/mcp.cpp` and the hooks.
 Code Cortex stores one SQLite graph per project at `<cache>/<project>.db`. The project name
 comes from the checkout path. Before this design, three things went wrong with that rule:
 
-- A git worktree, nested repository or submodule inside an indexed checkout had no index of
+- A git worktree or nested repository inside an indexed checkout had no index of
   its own. Project resolution climbed the parent directories and answered from the parent's
   graph, which describes other code and often another branch. Nothing warned the agent.
 - A linked worktree added inside the checkout (`git worktree add ./wt`) was indexed into the
@@ -33,9 +33,12 @@ gets its own project and its own database, with no extra mechanism.
 
 Project resolution walks up from the working directory and takes the first level that has an
 index. The walk now stops at a git checkout boundary. When a level does not resolve and holds a
-`.git` directory or `.git` file, the walk ends there (`cbm_git_checkout_root_kind`, one `stat`,
-no git subprocess). SessionStart then names that directory as the `repo_path` to index, and for
-a linked worktree it says that the main checkout's index is not used.
+`.git` directory or a linked worktree's `.git` file, the walk ends there
+(`cbm_git_checkout_root_kind` and `cbm_git_is_linked_worktree`: one `stat` and one small file
+read, no git subprocess). SessionStart then names that directory as the `repo_path` to index,
+and for a linked worktree it says that the main checkout's index is not used. A submodule's
+`.git` file does not end the walk: discovery indexes the submodule's files into the enclosing
+checkout's graph, so the enclosing checkout answers for them.
 
 Derived names collide, because separators fold to `-`: `/x/a-b/repo` and `/x/a/b-repo` both
 become `x-a-b-repo`. A derived-name hit is therefore accepted only from a database whose

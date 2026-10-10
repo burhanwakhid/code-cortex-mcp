@@ -780,7 +780,7 @@ TEST(hook_prompt_caller_evidence_keeps_lexical_and_binding_uncertainty) {
  * <repo> (.git directory) holding a plain subdirectory, a linked worktree
  * (.git file naming .git/worktrees/wt), a nested repo (.git directory) and a
  * submodule (.git file naming .git/modules/sub) — none of the last three
- * indexed. Returns the realpath'd repo root (caller frees) or NULL. POSIX
+ * indexed of their own (the submodule's files are in the parent's graph). Returns the realpath'd repo root (caller frees) or NULL. POSIX
  * only (realpath, chdir); the helper itself is a plain stat. */
 #ifndef _WIN32
 static bool hf_write_file(const char *path, const char *text) {
@@ -902,15 +902,25 @@ TEST(hook_walkup_stops_at_unindexed_checkout_root) {
     ASSERT_NOT_NULL(strstr(text, "linked git worktree"));
     free(text);
 
-    /* Nested repo (.git directory) and submodule: same stop, no worktree hint. */
-    const char *others[] = {"nested", "sub"};
+    /* Nested repo (.git directory): same stop, no worktree hint. */
+    snprintf(p, sizeof(p), "%s/nested", repo);
+    text = cbm_session_start_text_for_testing(p);
+    ASSERT_NOT_NULL(text);
+    snprintf(want, sizeof(want), "repo_path = %s)", p);
+    ASSERT_NOT_NULL(strstr(text, want));
+    ASSERT_NULL(strstr(text, "linked git worktree"));
+    free(text);
+
+    /* Submodules (also one at worktrees/<name>): discovery indexes their
+     * files into the superproject's graph, so the walk passes their gitlink
+     * and answers from the superproject. */
+    const char *subs[] = {"sub", "worktrees/sm"};
     for (size_t i = 0; i < 2; i++) {
-        snprintf(p, sizeof(p), "%s/%s", repo, others[i]);
+        snprintf(p, sizeof(p), "%s/%s", repo, subs[i]);
         text = cbm_session_start_text_for_testing(p);
         ASSERT_NOT_NULL(text);
-        snprintf(want, sizeof(want), "repo_path = %s)", p);
+        snprintf(want, sizeof(want), "indexed as \"%s\"", parent);
         ASSERT_NOT_NULL(strstr(text, want));
-        ASSERT_NULL(strstr(text, "linked git worktree"));
         free(text);
     }
 
@@ -982,7 +992,8 @@ TEST(hook_coverage_walk_stops_at_unindexed_checkout_root) {
 }
 
 /* The MCP server's cwd resolver (project argument omitted) obeys the same
- * boundary as the hooks. */
+ * boundary as the hooks: a linked worktree or nested repo ends the walk, a
+ * submodule does not. */
 TEST(mcp_cwd_project_stops_at_unindexed_checkout_root) {
 #ifdef _WIN32
     PASS(); /* chdir/realpath-driven, like tool_project_resolves_from_cwd */
@@ -1005,12 +1016,22 @@ TEST(mcp_cwd_project_stops_at_unindexed_checkout_root) {
     ASSERT_NOT_NULL(cbm_mcp_cwd_project());
     ASSERT_STR_EQ(cbm_mcp_cwd_project(), parent);
 
-    const char *stops[] = {"/.worktrees/wt/src", "/nested/src", "/sub"};
-    for (size_t i = 0; i < 3; i++) {
+    const char *stops[] = {"/.worktrees/wt/src", "/nested/src"};
+    for (size_t i = 0; i < 2; i++) {
         snprintf(p, sizeof(p), "%s%s", repo, stops[i]);
         ASSERT_EQ(chdir(p), 0);
         cbm_mcp_reset_cwd_project_cache();
         ASSERT_NULL(cbm_mcp_cwd_project());
+    }
+    /* A submodule's files are in the superproject's graph (discovery walks
+     * it): its gitlink does not end the walk. */
+    const char *passes[] = {"/sub", "/worktrees/sm"};
+    for (size_t i = 0; i < 2; i++) {
+        snprintf(p, sizeof(p), "%s%s", repo, passes[i]);
+        ASSERT_EQ(chdir(p), 0);
+        cbm_mcp_reset_cwd_project_cache();
+        ASSERT_NOT_NULL(cbm_mcp_cwd_project());
+        ASSERT_STR_EQ(cbm_mcp_cwd_project(), parent);
     }
 
     snprintf(p, sizeof(p), "%s/.worktrees/wt", repo);
