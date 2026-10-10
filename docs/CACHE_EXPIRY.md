@@ -97,9 +97,9 @@ The write is throttled twice. A process remembers, per database, when it last re
 skips the next hour of calls with one map lookup. The first call of a process (each hook is its
 own process) reads the row from `_config.db` and writes only when the row is an hour old. A read
 never takes `_config.db`'s write lock, so a hook pays one SQLite open and one indexed read, once
-per database it opens. The in-process throttle starts only after the row is current: when the
-write fails because `_config.db` is busy (a sweep holds its transaction), the next call tries
-again.
+per database it opens. The write waits up to 2.5 seconds for a busy `_config.db`. The
+in-process throttle starts only after the row is current: when the write still fails, the next
+call tries again.
 
 A database seen for the first time starts its clock at that sweep. Its file mtime is not used:
 the mtime is the last index run, and a database queried daily but indexed long ago would then
@@ -141,10 +141,14 @@ takes), so a second server skips its sweep.
 The tool workers and hook processes never sweep. The CLI command `code-cortex-mcp cache expire`
 runs a sweep on demand, whatever the interval.
 
-A sweep is one scan of the cache directory, one usage-table read per database (in one
-transaction) and a `stat` of each recorded root. It opens a project database only to learn its
-project name or a root the usage table does not have yet (first from the `store_meta` memo, else
-one read of its `projects` row) and to quiesce a database it is about to remove.
+A sweep is one scan of the cache directory, one usage-table read per database and a `stat` of
+each recorded root. It opens a project database only to learn its project name or a root the
+usage table does not have yet (first from the `store_meta` memo, else one read of its `projects`
+row) and to quiesce a database it is about to remove. The scan holds no transaction on
+`_config.db`: a learned root or a `stat` of a network mount can take seconds, and a use recorded
+in that time must not wait for the sweep. The sweep then writes the rows that changed in one short
+transaction. A row that changed after the scan read it recorded a use meanwhile: the sweep keeps
+that write and does not judge the database on this sweep.
 
 A file is judged as the project it holds, not as its filename. A renamed or legacy file
 `<cache>/<other>.db` that holds project `X` is served as `X` by the fallback scan, so the

@@ -915,6 +915,49 @@ TEST(cache_used_since_scan_is_kept) {
     PASS();
 }
 
+/* A use recorded while the sweep scans (learning roots, statting them) lands
+ * and keeps the database: the scan holds no write lock on _config.db, and
+ * the rows it writes afterwards never overwrite a use recorded meanwhile.
+ * Two databases, so the scan has rows to write: a fresh one and an idle one
+ * whose root is not yet recorded. */
+static void ce_touch_during_scan(void *ud) {
+    cbm_cache_usage_touch((const char *)ud, NULL);
+}
+
+TEST(cache_touch_during_scan_lands) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_scantouch"));
+    char root[700];
+    char db[800];
+    char fresh[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "scantouched", root, db, sizeof(db));
+    ce_make_db(&e, "scanfresh", root, fresh, sizeof(fresh));
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 200 * CE_DAY, NULL));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_expiry_test_scan_hook(ce_touch_during_scan, db);
+    cbm_cache_sweep_result_t r;
+    int rc = ce_sweep(&cfg, now, false, &r);
+    cbm_cache_expiry_test_scan_hook(NULL, NULL);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.projects, 0);
+    ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_EQ(ce_trash_count(&e), 0);
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "scantouched", &lu, &checks);
+    ASSERT_GTE(lu, now);
+    ce_usage(&e, "scanfresh", &lu, &checks);
+    ASSERT_EQ(lu, now); /* the fresh database's row was still written */
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
 /* End to end through the server: an index run and a tool call record use;
  * delete_project removes the usage row with the database. */
 TEST(cache_index_and_query_record_use) {
@@ -1631,6 +1674,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_usage_touch_is_throttled);
     RUN_TEST(cache_usage_touch_retries_after_busy);
     RUN_TEST(cache_used_since_scan_is_kept);
+    RUN_TEST(cache_touch_during_scan_lands);
     RUN_TEST(cache_index_and_query_record_use);
     RUN_TEST(cache_pipeline_on_indexed_holds_lease);
     RUN_TEST(cache_pipeline_on_indexed_after_failed_export);

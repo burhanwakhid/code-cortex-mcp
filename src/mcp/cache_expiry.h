@@ -150,6 +150,12 @@ int cbm_cache_trash_restore(const char *which, char *msg, size_t msg_sz);
 /* Trash entries, newest first, printed one per line to `out` (a FILE *). */
 int cbm_cache_trash_list(void *out);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Callback run once by a sweep after it has read and judged every usage row
+ * and before it writes any. NULL clears. */
+void cbm_cache_expiry_test_scan_hook(void (*callback)(void *data), void *data);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

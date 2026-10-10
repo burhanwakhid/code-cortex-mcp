@@ -26,7 +26,11 @@
 #include <unordered_map>
 #include <vector>
 
-enum { CE_PATH_MAX = 4096, CE_BUSY_MS = 200 };
+/* CE_BUSY_MS bounds a wait in the sweep's own reads and probes. A use
+ * recorded by a tool call or hook, and the sweep's one short write, wait
+ * longer (CE_WRITE_BUSY_MS): a use lost to a busy _config.db lets a sweep
+ * trash a database that was just used. */
+enum { CE_PATH_MAX = 4096, CE_BUSY_MS = 200, CE_WRITE_BUSY_MS = 2500 };
 
 /* SQLite sidecars of <x>.db, and the temp files a dump (<x>.db.tmp) or an
  * artifact import (<x>.db.import_tmp) write before renaming into place. */
@@ -317,6 +321,7 @@ bool cbm_cache_usage_set(const char *db_path, int64_t last_used, const char *roo
     if (!db) {
         return false;
     }
+    sqlite3_busy_timeout(db, CE_WRITE_BUSY_MS);
     usage_row_t r = usage_get(db, key);
     if (last_used > 0) {
         r.last_used = last_used;
@@ -352,6 +357,7 @@ void cbm_cache_usage_touch(const char *db_path, const char *root_path) {
     if (!db) {
         return;
     }
+    sqlite3_busy_timeout(db, CE_WRITE_BUSY_MS);
     usage_row_t r = usage_get(db, key);
     bool fresh = r.found && now - r.last_used < CBM_CACHE_USAGE_RESOLUTION_S;
     bool root_known = !root_path || (r.root == root_path && r.missing_checks == 0);
@@ -524,6 +530,16 @@ static std::string learn_project(const char *path, const std::string &stem) {
     return rows == 1 && cbm_validate_project_name(name.c_str()) ? name : stem;
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void (*g_scan_test_cb)(void *) = nullptr;
+static void *g_scan_test_data = nullptr;
+
+void cbm_cache_expiry_test_scan_hook(void (*callback)(void *data), void *data) {
+    g_scan_test_cb = callback;
+    g_scan_test_data = data;
+}
+#endif
+
 /* ── Removal ────────────────────────────────────────────────────── */
 
 int cbm_cache_remove_project(const char *db_path, const char *project, const char *trash_entry,
@@ -680,6 +696,8 @@ typedef struct {
     std::string path;
     usage_row_t row;
     root_state_t state;
+    usage_row_t seen; /* the row as the scan read it */
+    bool moved;       /* the row changed after the scan, or could not be written */
 } db_entry_t;
 
 static bool refuse(cbm_cache_sweep_result_t *res, const char *why) {
@@ -969,7 +987,7 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
                 std::string path = std::string(cdir) + "/" + ent->name;
                 std::string name = learn_project(path.c_str(), stem);
                 if (cbm_validate_project_name(name.c_str())) {
-                    dbs.push_back({name, stem, path, {}, ROOT_UNCERTAIN});
+                    dbs.push_back({name, stem, path, {}, ROOT_UNCERTAIN, {}, false});
                 }
             } else if (is_sidecar_name(ent->name, &base) && base != "_config.db") {
                 sidecars.emplace_back(ent->name, base);
@@ -998,31 +1016,32 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
 
     /* Usage rows; a database seen for the first time starts its clock now,
      * so nothing expires as unused before it has had the full period to be
-     * used under this build. Roots are learned once. */
+     * used under this build. Roots are learned once. Learning a root opens
+     * the database and judging it stats the disk (a network mount can take
+     * seconds), so the scan holds no transaction: a tool call or hook
+     * recording a use meanwhile must not lose its write to a busy
+     * _config.db. Rows are written afterwards, in one short transaction. */
     int known = 0;
     int missing = 0;
-    if (!opts->dry_run) {
-        sqlite3_exec(db, "BEGIN;", NULL, NULL, NULL);
-    }
     for (auto &e : dbs) {
         const char *key = cbm_store_meta_key(e.path.c_str());
         e.row = usage_get(db, key);
-        bool dirty = false;
+        e.seen = e.row;
         if (!e.row.found) {
             e.row.last_used = now;
-            dirty = true;
         }
         if (e.row.root.empty()) {
             e.row.root = learn_root(e.path.c_str(), e.name.c_str());
-            dirty = dirty || !e.row.root.empty();
         }
         e.state = e.row.root.empty() ? ROOT_UNCERTAIN : root_state(e.row.root);
         known += e.state != ROOT_UNCERTAIN;
         missing += e.state == ROOT_MISSING;
-        if (dirty && !opts->dry_run) {
-            (void)usage_put(db, key, e.row);
-        }
     }
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_scan_test_cb) {
+        g_scan_test_cb(g_scan_test_data);
+    }
+#endif
     /* Every judged root missing at once is a moved home or a copied cache,
      * not a cleanup: count nothing. */
     bool mass_missing = known >= 5 && missing == known;
@@ -1031,12 +1050,7 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
     }
     bool count_roots = !env_changed && !mass_missing;
 
-    std::vector<std::pair<size_t, cbm_cache_expiry_kind_t>> due;
-    std::vector<std::string> reasons;
-    for (size_t i = 0; i < dbs.size(); i++) {
-        db_entry_t &e = dbs[i];
-        const char *key = cbm_store_meta_key(e.path.c_str());
-        usage_row_t before = e.row;
+    for (auto &e : dbs) {
         if (e.state == ROOT_PRESENT || env_changed) {
             e.row.missing_since = 0;
             e.row.missing_checks = 0;
@@ -1046,38 +1060,86 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
             }
             e.row.missing_checks++;
         }
-        if (!opts->dry_run && (before.missing_checks != e.row.missing_checks ||
-                               before.missing_since != e.row.missing_since)) {
-            (void)usage_put(db, key, e.row);
+    }
+    /* Write the rows that changed. A row that moved since the scan read it
+     * recorded a use (or a new root) meanwhile: it keeps that write and is
+     * not judged on this sweep. */
+    if (!opts->dry_run) {
+        sqlite3_busy_timeout(db, CE_WRITE_BUSY_MS);
+        bool ok = sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) == SQLITE_OK;
+        for (auto &e : dbs) {
+            if (!ok) {
+                e.moved = true; /* nothing recorded: judge nothing */
+                continue;
+            }
+            const usage_row_t &a = e.seen;
+            const usage_row_t &b = e.row;
+            bool changed = !a.found || a.last_used != b.last_used || a.root != b.root ||
+                           a.missing_since != b.missing_since ||
+                           a.missing_checks != b.missing_checks;
+            if (!changed) {
+                continue;
+            }
+            usage_row_t cur = usage_get(db, cbm_store_meta_key(e.path.c_str()));
+            if (cur.found != a.found || cur.last_used != a.last_used || cur.root != a.root ||
+                cur.missing_since != a.missing_since || cur.missing_checks != a.missing_checks) {
+                e.moved = true;
+                continue;
+            }
+            ok = usage_put(db, cbm_store_meta_key(e.path.c_str()), e.row);
+            e.moved = !ok;
         }
+        if (ok) {
+            ok = sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK;
+        }
+        if (!ok) {
+            sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+            for (auto &e : dbs) {
+                e.moved = true;
+            }
+        }
+    }
+    sqlite3_close(db);
+    db = NULL;
+
+    std::vector<std::pair<size_t, cbm_cache_expiry_kind_t>> due;
+    std::vector<std::string> reasons;
+    for (size_t i = 0; i < dbs.size(); i++) {
+        db_entry_t &e = dbs[i];
         int64_t idle = now - e.row.last_used;
         bool root_gone = cfg->root_grace_s > 0 && e.state == ROOT_MISSING && count_roots &&
                          e.row.missing_checks >= cfg->root_checks &&
                          now - e.row.missing_since >= cfg->root_grace_s &&
                          idle >= cfg->root_grace_s;
+        cbm_cache_expiry_kind_t kind = CBM_EXPIRE_PENDING;
+        std::string reason;
         if (root_gone) {
-            due.emplace_back(i, CBM_EXPIRE_ROOT_GONE);
-            reasons.push_back("root " + e.row.root + " missing since " +
-                              fmt_time(e.row.missing_since) + " (" +
-                              std::to_string(e.row.missing_checks) + " sweeps), unused for " +
-                              fmt_days(idle) + " days");
+            kind = CBM_EXPIRE_ROOT_GONE;
+            reason = "root " + e.row.root + " missing since " + fmt_time(e.row.missing_since) +
+                     " (" + std::to_string(e.row.missing_checks) + " sweeps), unused for " +
+                     fmt_days(idle) + " days";
         } else if (cfg->unused_s > 0 && idle >= cfg->unused_s) {
-            due.emplace_back(i, CBM_EXPIRE_UNUSED);
-            reasons.push_back("unused for " + fmt_days(idle) + " days (last used " +
-                              fmt_time(e.row.last_used) + ")");
+            kind = CBM_EXPIRE_UNUSED;
+            reason = "unused for " + fmt_days(idle) + " days (last used " +
+                     fmt_time(e.row.last_used) + ")";
         } else if (e.state == ROOT_MISSING && e.row.missing_checks > 0) {
             report(&c, CBM_EXPIRE_PENDING, label(e), e.path, 0,
                    "root " + e.row.root + " missing since " + fmt_time(e.row.missing_since) +
                        " (" + std::to_string(e.row.missing_checks) + " of " +
                        std::to_string(cfg->root_checks) + " sweeps)",
                    false, NULL);
+            continue;
+        } else {
+            continue;
         }
+        if (e.moved) {
+            report(&c, kind, label(e), e.path, 0, reason, false, "used since the scan");
+            res->skipped++;
+            continue;
+        }
+        due.emplace_back(i, kind);
+        reasons.push_back(reason);
     }
-    if (!opts->dry_run) {
-        sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
-    }
-    sqlite3_close(db);
-    db = NULL;
 
     for (size_t k = 0; k < due.size(); k++) {
         expire_project(cdir, dbs[due[k].first], due[k].second, reasons[k], now, &c);
