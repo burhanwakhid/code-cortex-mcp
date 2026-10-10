@@ -1289,6 +1289,52 @@ static std::vector<std::pair<long long, std::string>> trash_entries(const char *
     return out;
 }
 
+int cbm_cache_trash_remove_all(void) {
+    const char *cdir = cbm_resolve_cache_dir();
+    if (!cdir || !cdir[0]) {
+        return 0;
+    }
+    std::string tdir = std::string(cdir) + "/trash";
+    walk_kind_t self = walk_kind(tdir.c_str());
+    if (self != WALK_DIR) {
+        if (self == WALK_LINK) {
+            remove_link(tdir.c_str()); /* never what it points at */
+        }
+        return 0;
+    }
+    std::vector<std::string> names;
+    cbm_dir_t *d = cbm_opendir(tdir.c_str());
+    if (d) {
+        cbm_dirent_t *ent;
+        while ((ent = cbm_readdir(d)) != NULL) {
+            if (strcmp(ent->name, ".") != 0 && strcmp(ent->name, "..") != 0) {
+                names.emplace_back(ent->name);
+            }
+        }
+        cbm_closedir(d);
+    }
+    int removed = 0;
+    for (const auto &n : names) {
+        std::string p = tdir + "/" + n;
+        /* An entry is restored under its project's lease, as the sweep
+         * purges it: one being restored right now stays. */
+        cbm_db_lease_t *lease = NULL;
+        size_t dash = n.find('-');
+        bool entry = dash != std::string::npos && walk_kind(p.c_str()) == WALK_DIR;
+        if (entry) {
+            std::string dbp = std::string(cdir) + "/" + n.substr(dash + 1) + ".db";
+            if (cbm_db_lease_try_acquire(dbp.c_str(), &lease) != 0) {
+                continue;
+            }
+        }
+        remove_tree(p.c_str());
+        cbm_db_lease_release(lease);
+        removed += entry;
+    }
+    (void)cbm_rmdir(tdir.c_str()); /* only when empty */
+    return removed;
+}
+
 int cbm_cache_trash_list(void *out) {
     FILE *f = out ? (FILE *)out : stdout;
     const char *cdir = cbm_resolve_cache_dir();

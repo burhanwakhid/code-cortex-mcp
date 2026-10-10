@@ -3421,6 +3421,12 @@ static int remove_indexes_in_dir(const char *cache_dir) {
     if (!cache_dir) {
         return 0;
     }
+    /* This cache's trash holds its expired databases; a legacy cache
+     * directory (migration) has none. The usage and memo rows need no
+     * forgetting here: they live in _config.db, which this scan removes
+     * with the other *.db files. */
+    const char *current = cbm_resolve_cache_dir();
+    bool own_cache = current && strcmp(cache_dir, current) == 0;
 
     cbm_dir_t *d = cbm_opendir(cache_dir);
     if (!d) {
@@ -3474,6 +3480,9 @@ static int remove_indexes_in_dir(const char *cache_dir) {
     /* Parked databases whose <project>.db was already gone. Every parked
      * database removed counts, as the prompts that led here counted them. */
     count += remove_orphan_branch_slots(cache_dir);
+    if (own_cache) {
+        (void)cbm_cache_trash_remove_all();
+    }
     return count;
 }
 

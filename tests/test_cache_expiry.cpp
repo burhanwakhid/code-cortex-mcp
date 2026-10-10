@@ -14,6 +14,7 @@
 #include <foundation/platform.h>
 #include <mcp/cache_expiry.h>
 #include <mcp/mcp.h>
+#include <mcp/store_meta.h>
 #include <pipeline/branch_slots.h>
 #include <pipeline/pipeline.h>
 #include <store/store.h>
@@ -252,6 +253,66 @@ TEST(cache_cli_now_needs_dry_run) {
     ASSERT_EQ(cbm_cmd_cache(4, preview), 0);
     ASSERT_TRUE(cbm_file_exists(db));
     ce_teardown(&e);
+    PASS();
+}
+
+/* Uninstall's index removal takes the trash with it, never following a
+ * link out of it. No usage or memo row survives either: they live in
+ * _config.db, which goes with the other *.db files. */
+TEST(cache_uninstall_removes_trash_and_rows) {
+#ifndef _WIN32
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_uninst"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    ce_make_db(&e, "uninst", root, db, sizeof(db));
+    ASSERT_TRUE(cbm_cache_usage_set(db, (int64_t)time(NULL), root));
+    cbm_file_gen_t gen;
+    ASSERT_TRUE(cbm_file_generation(db, &gen));
+    cbm_store_meta_row_t row;
+    cbm_store_meta_row_init(&row, db, &gen);
+    snprintf(row.project, sizeof(row.project), "uninst");
+    snprintf(row.root_path, sizeof(row.root_path), "%s", root);
+    cbm_store_meta_db_t *meta = cbm_store_meta_open();
+    ASSERT_TRUE(cbm_store_meta_put(meta, &row));
+    cbm_store_meta_close(meta);
+    /* A trash entry holding a database, a link to a directory outside the
+     * cache, and a link to a file outside it. */
+    char outside[800];
+    snprintf(outside, sizeof(outside), "%s/outside", e.base);
+    cbm_mkdir_p(outside, 0755);
+    char keep[900];
+    snprintf(keep, sizeof(keep), "%s/precious.txt", outside);
+    ASSERT_EQ(th_write_file(keep, "keep"), 0);
+    char entry[900];
+    snprintf(entry, sizeof(entry), "%s/trash/1700000000-old", e.cache);
+    ASSERT_TRUE(cbm_mkdir_p(entry, 0755));
+    char p[1000];
+    snprintf(p, sizeof(p), "%s/old.db", entry);
+    ASSERT_EQ(th_write_file(p, "old graph"), 0);
+    snprintf(p, sizeof(p), "%s/dirlink", entry);
+    ASSERT_EQ(symlink(outside, p), 0);
+    snprintf(p, sizeof(p), "%s/filelink", entry);
+    ASSERT_EQ(symlink(keep, p), 0);
+
+    ASSERT_GTE(cbm_remove_indexes(e.base), 1);
+    ASSERT_FALSE(cbm_file_exists(db));
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "uninst", &lu, &checks);
+    ASSERT_EQ(lu, -1);
+    meta = cbm_store_meta_open();
+    cbm_store_meta_row_t found;
+    bool memo = cbm_store_meta_find_project(meta, "uninst", &found);
+    cbm_store_meta_close(meta);
+    ASSERT_FALSE(memo);
+    snprintf(p, sizeof(p), "%s/trash", e.cache);
+    ASSERT_FALSE(cbm_is_dir(p));
+    ASSERT_TRUE(cbm_file_exists(keep));
+    ce_teardown(&e);
+#endif
     PASS();
 }
 
@@ -1824,6 +1885,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_root_gone_but_used_is_kept);
     RUN_TEST(cache_root_back_before_move_is_kept);
     RUN_TEST(cache_cli_now_needs_dry_run);
+    RUN_TEST(cache_uninstall_removes_trash_and_rows);
     RUN_TEST(cache_root_back_resets_streak);
     RUN_TEST(cache_root_uncertain_never_counts);
     RUN_TEST(cache_root_unicode_and_long_is_present);

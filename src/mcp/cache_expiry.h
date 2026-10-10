@@ -153,6 +153,11 @@ int cbm_cache_remove_project(const char *db_path, const char *project, const cha
  * project has a database again. msg receives a one-line outcome. */
 int cbm_cache_trash_restore(const char *which, char *msg, size_t msg_sz);
 
+/* Delete the whole trash directory, never following a link (uninstall).
+ * An entry whose project is being restored or indexed (its lease busy) is
+ * kept. Returns the trash entries removed. */
+int cbm_cache_trash_remove_all(void);
+
 /* Trash entries, newest first, printed one per line to `out` (a FILE *). */
 int cbm_cache_trash_list(void *out);
 

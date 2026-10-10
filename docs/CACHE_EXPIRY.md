@@ -214,10 +214,11 @@ remounted or a checkout restored since the scan.
 
 The removal is `cbm_cache_remove_project`, which `delete_project` also uses: the database, its
 WAL and SHM, its parked slots of every root, its `store_meta` row and its usage row go together.
-The one difference is the destination. Every other path that removes a database (the watcher's
-prune of a missing root, the quarantine of a corrupt file, `uninstall`) also forgets both rows
+The one difference is the destination. The other paths that remove a database (the watcher's
+prune of a missing root, the quarantine of a corrupt file) also forget both rows
 (`cbm_cache_usage_forget`), so a database later built at that path does not inherit a stale root
-or missing-root streak.
+or missing-root streak. `uninstall` removes `_config.db` with the other `*.db` files, rows
+included, and deletes the trash directory without following links in it.
 
 ### Trash
 
