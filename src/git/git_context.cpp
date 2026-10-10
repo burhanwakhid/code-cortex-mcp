@@ -598,6 +598,15 @@ int cbm_git_head_read(const char *root, cbm_git_head_t *out) {
     snprintf(top, sizeof(top), "%s", root);
     cbm_stat_t st; /* cbm_stat: non-ASCII and long checkout paths on Windows */
     for (;;) {
+        /* Drop trailing separators ("/repo/sub/", or what a cut below
+         * leaves of "/repo//sub"): the cut would otherwise land on one and
+         * end the walk before /repo/.git is probed. A filesystem root ("/",
+         * "C:\") keeps its separator: "C:" alone is a relative path. */
+        size_t len = strlen(top);
+        while (len > 1 && !(len == 3 && top[1] == ':') &&
+               (top[len - 1] == '/' || top[len - 1] == '\\')) {
+            top[--len] = '\0';
+        }
         int n = snprintf(path, sizeof(path), "%s/.git", top);
         if (n > 0 && (size_t)n < sizeof(path) && cbm_stat(path, &st) == 0) {
             break;

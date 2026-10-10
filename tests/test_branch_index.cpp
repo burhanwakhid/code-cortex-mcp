@@ -3141,6 +3141,28 @@ TEST(branch_slot_named_like_scratch_survives_sweep) {
     PASS();
 }
 
+/* An index root given with a trailing separator still walks up to the
+ * checkout's .git: "repo/src/" reads the same HEAD as "repo/src". */
+TEST(branch_git_head_read_trailing_slash_root) {
+    char *repo = bi_make_repo("cbm_bi_headslash");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char slug[256];
+    char p[600];
+
+    snprintf(p, sizeof(p), "%s/", repo);
+    ASSERT_STR_EQ(bi_head_slug(p, slug, sizeof(slug)), "main");
+    snprintf(p, sizeof(p), "%s/src/", repo);
+    ASSERT_STR_EQ(bi_head_slug(p, slug, sizeof(slug)), "main");
+    snprintf(p, sizeof(p), "%s/src//", repo);
+    ASSERT_STR_EQ(bi_head_slug(p, slug, sizeof(slug)), "main");
+
+    th_rmtree(repo);
+    PASS();
+}
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -3216,4 +3238,5 @@ SUITE(branch_index) {
     RUN_TEST(branch_incoming_slot_same_file_as_outgoing);
     RUN_TEST(branch_switch_syncs_before_unlink);
     RUN_TEST(branch_slot_named_like_scratch_survives_sweep);
+    RUN_TEST(branch_git_head_read_trailing_slash_root);
 }
