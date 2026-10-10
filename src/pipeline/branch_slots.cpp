@@ -504,9 +504,13 @@ static void log_kv(const char *msg, const char *k1, int64_t v1, const char *k2, 
     cbm_log_info(msg, k1, b1, k2, b2, k3, b3);
 }
 
-static void unlink_slot(const char *path) {
-    (void)cbm_unlink(path);
+/* True when the slot file is gone afterwards: an unlink refused (a read-only
+ * cache, a Windows sharing violation) leaves it, and the caller must not
+ * report it removed. */
+static bool unlink_slot(const char *path) {
+    int rc = cbm_unlink(path);
     cbm_remove_db_sidecars(path);
+    return rc == 0 || !cbm_file_exists(path);
 }
 
 /* Remove a scratch database and everything SQLite or the dump put beside it. */
@@ -1526,18 +1530,25 @@ static int expire_dir(const char *dir, int64_t slot_before, int64_t scratch_befo
             continue;
         }
         int64_t bytes = file_size(path);
-        if (cb) {
-            cb(path, bytes, !is_slot, ud);
-        }
+        /* Reported and counted only once the file is gone: a refused unlink
+         * (a read-only cache, a Windows sharing violation) would otherwise
+         * claim space the file still holds. */
+        bool gone = dry_run;
         if (!dry_run) {
-            if (is_slot) {
-                unlink_slot(path);
+            gone = is_slot ? unlink_slot(path) : (cbm_unlink(path) == 0 || !cbm_file_exists(path));
+            if (gone && is_slot) {
                 cbm_log_info("cache.expire", "kind", "slot", "path", path);
-            } else {
-                (void)cbm_unlink(path);
+            } else if (!gone) {
+                cbm_log_warn("cache.expire.skipped", "kind", is_slot ? "slot" : "scratch", "path",
+                             path, "reason", "unlink_failed");
             }
         }
-        removed += is_slot ? 1 : 0;
+        if (gone) {
+            if (cb) {
+                cb(path, bytes, !is_slot, ud);
+            }
+            removed += is_slot ? 1 : 0;
+        }
         free(names[i]);
     }
     free(names);

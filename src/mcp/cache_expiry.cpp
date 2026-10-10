@@ -457,6 +457,17 @@ static root_state_t root_state(const std::string &root) {
         return ROOT_UNCERTAIN;
     }
     std::string dir = root;
+#ifdef _WIN32
+    /* A stored Windows root is written with backslashes; the walk up splits
+     * on '/' and the Windows file calls take either, so fold them first.
+     * Without this a deleted `C:\Users\me\repo` found no separator, was
+     * classed uncertain, and never started its missing streak. */
+    for (char &c : dir) {
+        if (c == '\\') {
+            c = '/';
+        }
+    }
+#endif
     while (dir.size() > 1 && dir.back() == '/') {
         dir.pop_back();
     }
@@ -466,14 +477,19 @@ static root_state_t root_state(const std::string &root) {
             return ROOT_UNCERTAIN;
         }
         dir = slash == 0 ? "/" : dir.substr(0, slash);
+#ifdef _WIN32
+        if (dir.size() == 2 && dir[1] == ':') {
+            dir += '/'; /* the drive root itself, not the drive's current dir */
+        }
+#endif
         if (cbm_stat(dir.c_str(), &st) == 0) {
             return is_mount_parent(dir) ? ROOT_UNCERTAIN : ROOT_MISSING;
         }
         if (errno != ENOENT && errno != ENOTDIR) {
             return ROOT_UNCERTAIN;
         }
-        if (dir == "/") {
-            return ROOT_UNCERTAIN;
+        if (dir == "/" || (dir.size() == 3 && dir[1] == ':')) {
+            return ROOT_UNCERTAIN; /* the root itself is unreachable */
         }
     }
 }

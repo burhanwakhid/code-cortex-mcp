@@ -561,6 +561,83 @@ TEST(cache_keeps_session_and_watched) {
     PASS();
 }
 
+/* A Windows root is stored with backslashes: once the checkout is gone, the
+ * walk up to its nearest existing ancestor must split on them, or the root is
+ * classed uncertain and its missing streak never starts. */
+TEST(cache_root_gone_windows_separators) {
+#ifdef _WIN32
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_bs"));
+    char root[700];
+    snprintf(root, sizeof(root), "%s\\gone\\repo", e.base);
+    for (char *c = root; *c; c++) {
+        if (*c == '/') {
+            *c = '\\';
+        }
+    }
+    char db[800];
+    ce_make_db(&e, "bs", root, db, sizeof(db));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    int64_t t0 = (int64_t)time(NULL);
+    ASSERT_EQ(ce_sweep(&cfg, t0, false, &r), 0);
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "bs", &lu, &checks);
+    ASSERT_EQ(checks, 1); /* missing, not uncertain */
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
+static void ce_count_slot(const char *path, int64_t bytes, bool scratch, void *ud) {
+    (void)path;
+    (void)bytes;
+    (void)scratch;
+    (*(int *)ud)++;
+}
+
+/* A slot whose unlink is refused (a read-only slot directory) is neither
+ * reported nor counted as removed. */
+TEST(cache_slot_unlink_refused_not_counted) {
+#ifndef _WIN32
+    if (geteuid() == 0) {
+        PASS(); /* root ignores directory permissions */
+    }
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_ro"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "ro", root, db, sizeof(db));
+    char sdir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(db, "ro", root, sdir, sizeof(sdir)));
+    char slot[1300];
+    snprintf(slot, sizeof(slot), "%s/old.db.zst", sdir);
+    th_write_file(slot, "a");
+    ce_age(slot, now - 31 * CE_DAY);
+    ASSERT_EQ(chmod(sdir, 0555), 0);
+    int reported = 0;
+    int removed = cbm_branch_slots_expire(db, "ro", now - 30 * CE_DAY, now - 3600, false,
+                                          ce_count_slot, &reported);
+    chmod(sdir, 0755);
+    ASSERT_EQ(removed, 0);
+    ASSERT_EQ(reported, 0);
+    ASSERT_TRUE(cbm_file_exists(slot));
+    /* Writable again: reported and counted once it is gone. */
+    removed = cbm_branch_slots_expire(db, "ro", now - 30 * CE_DAY, now - 3600, false,
+                                      ce_count_slot, &reported);
+    ASSERT_EQ(removed, 1);
+    ASSERT_EQ(reported, 1);
+    ASSERT_FALSE(cbm_file_exists(slot));
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
 /* A project being indexed (its lease held) is skipped, and expired by a
  * later sweep once the lease is free. */
 TEST(cache_skips_leased_project) {
@@ -1784,6 +1861,57 @@ TEST(cache_server_initialize_runs_sweep) {
     PASS();
 }
 
+/* A server started below the repository root exempts the index the cwd
+ * walk-up resolves to (the ancestor's), not the name derived from cwd: an
+ * unused-for-long ancestor index must survive its own session's first sweep. */
+TEST(cache_server_sweep_keeps_ancestor_index) {
+#ifndef _WIN32
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_sub"));
+    char repo[700];
+    char sub[800];
+    snprintf(repo, sizeof(repo), "%s/repo", e.base);
+    snprintf(sub, sizeof(sub), "%s/src", repo);
+    cbm_mkdir_p(sub, 0755);
+    char *real = realpath(repo, NULL);
+    ASSERT_NOT_NULL(real);
+    char *name = cbm_project_name_from_path(real);
+    ASSERT_NOT_NULL(name);
+    char db[900];
+    ce_make_db(&e, name, real, db, sizeof(db));
+    int64_t now = (int64_t)time(NULL);
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 200 * CE_DAY, NULL));
+    char old_cwd[1024];
+    ASSERT_NOT_NULL(getcwd(old_cwd, sizeof(old_cwd)));
+    char real_sub[900];
+    snprintf(real_sub, sizeof(real_sub), "%s/src", real);
+    ASSERT_EQ(chdir(real_sub), 0);
+    cbm_mcp_reset_cwd_project_cache();
+    ce_srv_env_t env;
+    ce_srv_env_enter(&env);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    ASSERT_TRUE(cbm_cache_expiry_due(&cfg, now));
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(srv, CE_INITIALIZE);
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    cbm_mcp_server_join_threads(srv);
+    cbm_mcp_server_free(srv);
+    ce_srv_env_leave(&env);
+    (void)chdir(old_cwd);
+    cbm_mcp_reset_cwd_project_cache();
+    ASSERT_FALSE(cbm_cache_expiry_due(&cfg, now)); /* the sweep ran */
+    ASSERT_TRUE(cbm_file_exists(db));              /* and kept the session's index */
+    ASSERT_EQ(ce_trash_count(&e), 0);
+    free(name);
+    free(real);
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
 #ifdef CBM_ENABLE_TEST_SEAMS
 typedef struct {
     std::atomic<int> started;
@@ -1893,6 +2021,8 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_refuses_unknown_cache_dir);
     RUN_TEST(cache_unused_expires);
     RUN_TEST(cache_keeps_session_and_watched);
+    RUN_TEST(cache_root_gone_windows_separators);
+    RUN_TEST(cache_slot_unlink_refused_not_counted);
     RUN_TEST(cache_skips_leased_project);
     RUN_TEST(cache_skips_database_with_open_reader);
     RUN_TEST(cache_dry_run_changes_nothing);
@@ -1923,6 +2053,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_busy_reader_gate_refuses_open);
     RUN_TEST(cache_reader_gate_refuses_replaced_file);
     RUN_TEST(cache_server_initialize_runs_sweep);
+    RUN_TEST(cache_server_sweep_keeps_ancestor_index);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(cache_server_sweep_joined_before_watcher_drop);
     RUN_TEST(cache_server_sweep_survives_exception);

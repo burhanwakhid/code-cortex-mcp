@@ -13334,7 +13334,14 @@ static void maybe_sweep_cache(cbm_mcp_server_t *srv) {
         return;
     }
     job->srv = srv;
-    snprintf(job->keep_project, sizeof(job->keep_project), "%s", srv->session_project);
+    /* The project to exempt is the one the session's tool calls resolve to:
+     * the indexed ancestor the cwd walk-up finds (a server started in a
+     * subdirectory, or on a custom-named index), not the name derived from
+     * cwd itself, which names no database and would exempt nothing while the
+     * live index went to trash. */
+    const char *keep = cwd_project_name();
+    snprintf(job->keep_project, sizeof(job->keep_project), "%s",
+             keep && keep[0] ? keep : srv->session_project);
     srv->sweep_running.store(true);
     if (cbm_thread_create(&srv->sweep_tid, 0, sweep_thread, job) == 0) {
         srv->sweep_active = true;

@@ -252,7 +252,9 @@ entry that is itself a link.
 
 ### Never removed
 
-- The project of the server's own session, and every project its watcher watches.
+- The project of the server's own session (the one its cwd walk-up resolves to: the indexed
+  ancestor when the server starts in a subdirectory, a custom-named index when the memo records
+  one), and every project its watcher watches.
 - A project whose index lease is held (being indexed or deleted elsewhere), also when the
   database is a renamed file and the lease is that of the project's own `<project>.db`.
 - A database that a reader holds open (its reader gate), or with a reader holding a WAL
@@ -325,4 +327,6 @@ Each removal logs one `cache.expire` line (kind, name, path, reason), each skip 
   project). A sweep from another process can expire it as unused.
 - The watcher's own prune of a watched root that stays missing for 10 minutes (`watcher.cpp`)
   still deletes directly, not through the trash.
-- Windows is not verified. Root classification treats a drive root as a mount parent.
+- Root classification treats a drive root as a mount parent; a stored Windows root is walked up
+  on either separator. A slot whose unlink is refused (a read-only cache, a sharing violation)
+  is logged `cache.expire.skipped` and neither reported nor counted as reclaimed.
