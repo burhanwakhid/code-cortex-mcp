@@ -46,7 +46,7 @@ cbm_dir_t *cbm_opendir(const char *path) {
     if (!path) {
         return NULL;
     }
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return NULL;
     }
@@ -480,9 +480,20 @@ bool cbm_is_regular_file(const char *path) {
     return ret == 0 && (wst.st_mode & _S_IFMT) == _S_IFREG;
 }
 
+int cbm_stat(const char *path, cbm_stat_t *st) {
+    wchar_t *wpath = path ? cbm_utf8_to_wide_path(path) : NULL;
+    if (!wpath) {
+        errno = ENOENT;
+        return CBM_NOT_FOUND;
+    }
+    int ret = _wstat64(wpath, st);
+    free(wpath);
+    return ret;
+}
+
 bool cbm_mkdir_p(const char *path, int mode) {
     (void)mode;
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return false;
     }
@@ -498,7 +509,21 @@ bool cbm_mkdir_p(const char *path, int mode) {
         return false;
     }
     wmemcpy(tmp, wpath, wlen + 1);
-    for (wchar_t *p = tmp + SKIP_ONE; *p; p++) {
+    /* An extended-length path walks from its root: \\?\C:\ or the share of
+     * \\?\UNC\server\share\. Its prefix components are not directories. */
+    wchar_t *start = tmp + SKIP_ONE;
+    if (cbm_wide_has_long_prefix(tmp)) {
+        start = tmp + 4; /* past \\?\ */
+        if (wcsncmp(start, L"UNC\\", 4) == 0) {
+            start += 4;
+            for (int seps = 0; *start && seps < 2; start++) {
+                seps += *start == L'\\';
+            }
+        } else if (start[0] && start[1] == L':' && start[2] == L'\\') {
+            start += 3;
+        }
+    }
+    for (wchar_t *p = start; *p; p++) {
         if (*p == L'/' || *p == L'\\') {
             *p = L'\0';
             _wmkdir(tmp);
@@ -512,7 +537,7 @@ bool cbm_mkdir_p(const char *path, int mode) {
 }
 
 int cbm_unlink(const char *path) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return CBM_NOT_FOUND;
     }
@@ -522,7 +547,7 @@ int cbm_unlink(const char *path) {
 }
 
 int cbm_rmdir(const char *path) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return CBM_NOT_FOUND;
     }
@@ -1017,8 +1042,8 @@ bool cbm_find_git(char *out, size_t out_sz) {
  * (wide paths — raw MoveFileExA would re-mangle non-ASCII cache paths). */
 int cbm_rename_replace(const char *src, const char *dst) {
 #ifdef _WIN32
-    wchar_t *wsrc = cbm_utf8_to_wide(src);
-    wchar_t *wdst = cbm_utf8_to_wide(dst);
+    wchar_t *wsrc = cbm_utf8_to_wide_path(src);
+    wchar_t *wdst = cbm_utf8_to_wide_path(dst);
     int ret = CBM_NOT_FOUND;
     if (wsrc && wdst) {
         if (MoveFileExW(wsrc, wdst,
@@ -1141,7 +1166,7 @@ static bool db_lease_windows_components_safe(const Char *path, bool allow_naviga
 static char *db_lease_real_path(const char *path, bool *missing) {
     *missing = false;
 #ifdef _WIN32
-    wchar_t *wide = cbm_utf8_to_wide(path);
+    wchar_t *wide = cbm_utf8_to_wide_path(path);
     if (!wide) {
         return NULL;
     }
@@ -1296,7 +1321,7 @@ int cbm_db_lease_try_acquire(const char *db_path, cbm_db_lease_t **out) {
     }
     lease->target = target;
 #ifdef _WIN32
-    wchar_t *wide = cbm_utf8_to_wide(lock_path);
+    wchar_t *wide = cbm_utf8_to_wide_path(lock_path);
     lease->handle =
         wide ? CreateFileW(wide, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                            NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)

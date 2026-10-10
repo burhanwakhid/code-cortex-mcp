@@ -7,6 +7,9 @@
 #include "../src/foundation/platform.h"
 #include "../src/foundation/dump_verify.h"
 #include "../src/foundation/system_info_internal.h"
+#include "../src/foundation/compat_fs.h"
+#include "../src/store/store.h"
+#include "test_helpers.h"
 #include <stdlib.h>
 #include <unistd.h>
 #if !defined(_WIN32)
@@ -715,6 +718,79 @@ TEST(regex_estimate_counts_brackets_and_escapes_literally) {
     PASS();
 }
 
+/* A path past MAX_PATH (260) works through every file helper and through
+ * SQLite. A branch slot named after a long branch is that long (about 340
+ * characters under the cache), and on Windows the wide APIs refuse such a
+ * path unless it is given in the extended-length form. Elsewhere the same
+ * steps run as an ordinary check: each component stays under NAME_MAX. */
+TEST(platform_file_helpers_long_path) {
+    char *made = th_mktempdir("cbm_longpath");
+    ASSERT_NOT_NULL(made);
+    char root[256];
+    snprintf(root, sizeof(root), "%s", made);
+    char d1[1024];
+    char d2[1024];
+    snprintf(d1, sizeof(d1), "%s/%0120d", root, 0);
+    snprintf(d2, sizeof(d2), "%s/%0120d", d1, 1);
+    ASSERT_GT(strlen(d2), 260);
+    ASSERT_TRUE(cbm_mkdir_p(d2, 0755));
+    ASSERT_TRUE(cbm_is_dir(d2));
+
+    char file[1024];
+    char moved[1024];
+    snprintf(file, sizeof(file), "%s/%060d.bin", d2, 2);
+    snprintf(moved, sizeof(moved), "%s/%060d.bin", d2, 3);
+    FILE *f = cbm_fopen(file, "wb");
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(fwrite("hello", 1, 5, f), 5);
+    ASSERT_EQ(fclose(f), 0);
+    ASSERT_TRUE(cbm_file_exists(file));
+    ASSERT_TRUE(cbm_is_regular_file(file));
+    ASSERT_EQ(cbm_file_size(file), 5);
+    cbm_stat_t st;
+    ASSERT_EQ(cbm_stat(file, &st), 0);
+    ASSERT_EQ((long long)st.st_size, 5);
+    ASSERT_GT((long long)st.st_mtime, 0);
+    ASSERT_EQ(cbm_rename_replace(file, moved), 0);
+    ASSERT_FALSE(cbm_file_exists(file));
+    ASSERT_TRUE(cbm_file_exists(moved));
+
+    int seen = 0;
+    cbm_dir_t *dir = cbm_opendir(d2);
+    ASSERT_NOT_NULL(dir);
+    for (cbm_dirent_t *e = cbm_readdir(dir); e; e = cbm_readdir(dir)) {
+        seen += strstr(moved, e->name) != NULL;
+    }
+    cbm_closedir(dir);
+    ASSERT_EQ(seen, 1);
+
+    /* SQLite: open (create), dump through its .tmp and rename, reopen. */
+    char db[1024];
+    char dump[1024];
+    snprintf(db, sizeof(db), "%s/%060d.db", d2, 4);
+    snprintf(dump, sizeof(dump), "%s/%060d.db", d2, 5);
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "longpath", "/x"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_dump_to_file(s, dump), CBM_STORE_OK);
+    cbm_store_close(s);
+    s = cbm_store_open_path_query(dump);
+    ASSERT_NOT_NULL(s);
+    cbm_store_close(s);
+
+    const char *files[] = {moved, db, dump};
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        (void)cbm_unlink(files[i]);
+        cbm_remove_db_sidecars(files[i]);
+        ASSERT_FALSE(cbm_file_exists(files[i]));
+    }
+    ASSERT_EQ(cbm_rmdir(d2), 0);
+    ASSERT_FALSE(cbm_is_dir(d2));
+    ASSERT_EQ(cbm_rmdir(d1), 0);
+    ASSERT_EQ(cbm_rmdir(root), 0);
+    PASS();
+}
+
 SUITE(platform) {
     RUN_TEST(regex_compile_refuses_oversized_expansion);
     RUN_TEST(regex_compile_accepts_expansion_under_budget);
@@ -732,6 +808,7 @@ SUITE(platform) {
     RUN_TEST(platform_file_size);
     RUN_TEST(platform_mmap);
     RUN_TEST(platform_mmap_nonexistent);
+    RUN_TEST(platform_file_helpers_long_path);
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);
     RUN_TEST(platform_default_workers_env_unset);

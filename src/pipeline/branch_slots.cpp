@@ -405,16 +405,16 @@ static bool copy_db(const char *src, const char *dest) {
 }
 
 static int64_t file_mtime(const char *path) {
-    struct stat st;
-    if (stat(path, &st) != 0) {
+    cbm_stat_t st;
+    if (cbm_stat(path, &st) != 0) {
         return -1;
     }
     return (int64_t)st.st_mtime;
 }
 
 static int64_t file_size(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0 ? (int64_t)st.st_size : -1;
+    cbm_stat_t st;
+    return cbm_stat(path, &st) == 0 ? (int64_t)st.st_size : -1;
 }
 
 static int64_t wal_size(const char *db_path) {

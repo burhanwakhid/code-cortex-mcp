@@ -90,6 +90,9 @@ enum {
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include "foundation/win_utf8.h"
+#endif
 
 /* ── SQLite bind helpers ───────────────────────────────────────── */
 
@@ -852,6 +855,21 @@ static void sqlite_cosine_i8(sqlite3_context *ctx, int argc, sqlite3_value **arg
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
+/* sqlite3_open_v2 for a file path. SQLite's win32 VFS opens a path through
+ * the wide APIs as it is given: past MAX_PATH that needs the extended-length
+ * form (\\?\C:\...), which the VFS accepts but never adds. A branch slot
+ * named after a long branch is that long. Elsewhere the path goes as is. */
+static int store_sqlite_open(const char *path, sqlite3 **db, int flags) {
+#ifdef _WIN32
+    char *long_path = path ? cbm_utf8_long_path(path) : NULL;
+    int rc = sqlite3_open_v2(long_path ? long_path : path, db, flags, NULL);
+    free(long_path);
+    return rc;
+#else
+    return sqlite3_open_v2(path, db, flags, NULL);
+#endif
+}
+
 /* SQLite authorizer: deny dangerous operations that could be exploited via
  * SQL injection through the Cypher→SQL translation layer. */
 static int store_authorizer(void *user_data, int action, const char *p3, const char *p4,
@@ -881,7 +899,7 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
         flags |= SQLITE_OPEN_MEMORY;
     }
 
-    int rc = sqlite3_open_v2(path, &s->db, flags, NULL);
+    int rc = store_sqlite_open(path, &s->db, flags);
     if (rc != SQLITE_OK) {
         free(s);
         return NULL;
@@ -1016,7 +1034,7 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
      *
      * No SQLITE_OPEN_CREATE on either path — a missing DB must return NULL
      * (no ghost .db for unknown/unindexed projects). */
-    int rc = sqlite3_open_v2(db_path, &s->db, SQLITE_OPEN_READONLY, NULL);
+    int rc = store_sqlite_open(db_path, &s->db, SQLITE_OPEN_READONLY);
     if (rc == SQLITE_OK) {
         /* Force first DB access so a read-only-FS WAL failure surfaces now. */
         if (sqlite3_exec(s->db, "SELECT 1 FROM sqlite_master LIMIT 1;", NULL, NULL, NULL) !=
@@ -1474,16 +1492,20 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
     char *sl = strrchr(dir, '/');
     if (sl) {
         *sl = '\0';
+#ifdef _WIN32
+        (void)cbm_mkdir_p(dir, 0755); /* wide, and past MAX_PATH */
+#else
         (void)cbm_mkdir(dir);
+#endif
     }
 
     /* Write to temp file for atomic swap */
     char tmp_path[CBM_SZ_1K];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", dest_path);
-    (void)unlink(tmp_path);
+    (void)cbm_unlink(tmp_path);
 
     sqlite3 *dest_db = NULL;
-    int rc = sqlite3_open(tmp_path, &dest_db);
+    int rc = store_sqlite_open(tmp_path, &dest_db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
     if (rc != SQLITE_OK) {
         store_set_error(s, "dump: cannot open temp file");
         return CBM_STORE_ERR;
@@ -1493,7 +1515,7 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
     if (!bk) {
         store_set_error(s, "dump: backup init failed");
         sqlite3_close(dest_db);
-        (void)unlink(tmp_path);
+        (void)cbm_unlink(tmp_path);
         return CBM_STORE_ERR;
     }
 
@@ -1503,7 +1525,7 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
     if (rc != SQLITE_DONE) {
         store_set_error(s, "dump: backup step failed");
         sqlite3_close(dest_db);
-        (void)unlink(tmp_path);
+        (void)cbm_unlink(tmp_path);
         return CBM_STORE_ERR;
     }
 
@@ -1522,7 +1544,7 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
      * dump_install_ignores_stale_wal_sidecar on the Windows runner). */
     if (cbm_rename_replace(tmp_path, dest_path) != 0) {
         store_set_error(s, "dump: rename failed");
-        (void)unlink(tmp_path);
+        (void)cbm_unlink(tmp_path);
         return CBM_STORE_ERR;
     }
 

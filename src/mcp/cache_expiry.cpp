@@ -41,13 +41,13 @@ static bool ends_with(const char *s, const char *suffix) {
 }
 
 static int64_t path_mtime(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0 ? (int64_t)st.st_mtime : -1;
+    cbm_stat_t st;
+    return cbm_stat(path, &st) == 0 ? (int64_t)st.st_mtime : -1;
 }
 
 static int64_t path_size(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0 ? (int64_t)st.st_size : 0;
+    cbm_stat_t st;
+    return cbm_stat(path, &st) == 0 ? (int64_t)st.st_size : 0;
 }
 
 static std::string fmt_days(int64_t s) {

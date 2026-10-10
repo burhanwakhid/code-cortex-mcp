@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <sys/stat.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -103,6 +104,19 @@ FILE *cbm_fopen(const char *path, const char *mode);
 
 /* Return true when a UTF-8 path names a regular file. */
 bool cbm_is_regular_file(const char *path);
+
+/* stat() by UTF-8 path; st_size and st_mtime (Unix seconds) as stat gives
+ * them. Windows goes through _wstat64, so non-ASCII paths and paths past
+ * MAX_PATH work there; POSIX is plain stat(). */
+#ifdef _WIN32
+typedef struct _stat64 cbm_stat_t;
+int cbm_stat(const char *path, cbm_stat_t *st);
+#else
+typedef struct stat cbm_stat_t;
+static inline int cbm_stat(const char *path, cbm_stat_t *st) {
+    return stat(path, st);
+}
+#endif
 
 /* Execute a command without shell interpretation.
  * argv is a NULL-terminated array: {"cmd", "arg1", "arg2", NULL}.
