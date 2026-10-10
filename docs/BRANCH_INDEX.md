@@ -176,14 +176,17 @@ The carry has three states:
 ### Artifact freshness
 
 The `.code-cortex/graph.db.zst` artifact (team sharing) must follow the live graph. Its metadata
-records the graph's `Branch` node and a content fingerprint: the SHA-256 over the `file_hashes`
-paths and digests (`cbm_store_content_fingerprint`). A run ends by comparing them with the live
-database and exports when they differ. A failed export is therefore repaired by any later run,
-and a count-preserving edit is not missed. An imported artifact records the importing checkout
-as its root, so the first run treats it as this checkout's graph and compares the exporter's
-identity with the checkout.
-The artifact directory is never indexed, and a `.cbmignore` negation cannot change that: an
-indexed `artifact.json` would change on every export and start another.
+records the graph's `Branch` node, a content fingerprint (the SHA-256 over the `file_hashes`
+paths and digests, `cbm_store_content_fingerprint`) and the graph's generation: the index
+format (`PRAGMA user_version`) and the `indexed_at` of the dump that wrote it. A run ends by
+comparing them with the live database and exports when they differ. A failed export is
+therefore repaired by any later run, a count-preserving edit is not missed, and neither is a
+rebuild from unchanged sources after a format or extractor upgrade. Metadata without these
+fields is never current, so one export brings an older artifact up to date. An imported
+artifact records the importing checkout as its root, so the first run treats it as this
+checkout's graph and compares the exporter's identity with the checkout. The artifact directory
+is never indexed, and a `.cbmignore` negation cannot change that: an indexed `artifact.json`
+would change on every export and start another.
 
 ### Content verification after an identity change
 

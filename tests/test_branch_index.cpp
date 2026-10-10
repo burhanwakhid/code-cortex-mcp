@@ -2222,6 +2222,62 @@ TEST(branch_artifact_behind_after_count_preserving_edit) {
     PASS();
 }
 
+/* Run one SQL statement on the project's live database. */
+static bool bi_db_exec(const char *sql) {
+    char db[1024];
+    sqlite3 *h = NULL;
+    bool ok = sqlite3_open(bi_db_path(db, sizeof(db)), &h) == SQLITE_OK &&
+              sqlite3_exec(h, sql, NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(h);
+    return ok;
+}
+
+/* A rebuild from unchanged sources (an index format upgrade) whose export
+ * fails leaves the Branch node and the content fingerprint as the artifact
+ * recorded them; the graph generation still tells a later no-op run that the
+ * artifact is behind. */
+TEST(branch_artifact_behind_after_format_rebuild) {
+    if (geteuid() == 0) {
+        PASS();
+    }
+    char *repo = bi_make_repo("cbm_bi_artfmt");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char art[512];
+    snprintf(art, sizeof(art), "%s/.code-cortex", repo);
+    char db[1024];
+    ASSERT_EQ(bi_index_persist(repo), 0);
+    bi_db_path(db, sizeof(db));
+    ASSERT_TRUE(cbm_artifact_is_current(db, repo, g_bi_project));
+
+    /* The graph and its artifact as an older build wrote them. */
+    ASSERT_TRUE(bi_db_exec("PRAGMA user_version = 3;"));
+    ASSERT_EQ(cbm_artifact_export(db, repo, g_bi_project, CBM_ARTIFACT_FAST), 0);
+    ASSERT_TRUE(cbm_artifact_is_current(db, repo, g_bi_project));
+
+    ASSERT_EQ(chmod(art, 0500), 0);
+    bi_run_t r = bi_index(repo, -1); /* format rebuild; its export fails */
+    (void)chmod(art, 0755);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_FALSE(cbm_artifact_is_current(db, repo, g_bi_project));
+
+    int64_t before = bi_artifact_mtime(repo);
+    r = bi_index(repo, -1); /* nothing to do, but the artifact is behind */
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_EQ(r.reparsed, 0);
+    ASSERT_NEQ(bi_artifact_mtime(repo), before);
+    ASSERT_TRUE(cbm_artifact_is_current(db, repo, g_bi_project));
+
+    /* Another dump of the same sources moves the generation. */
+    ASSERT_TRUE(bi_db_exec("UPDATE projects SET indexed_at = '2000-01-01T00:00:00Z';"));
+    ASSERT_FALSE(cbm_artifact_is_current(db, repo, g_bi_project));
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 /* delete_project and the index reset keep a project's parked branches when
  * its live database could not be removed. */
 TEST(branch_slots_kept_when_live_db_undeletable) {
@@ -2915,6 +2971,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_foreign_live_db_same_identity_rebuilds);
 #ifndef _WIN32
     RUN_TEST(branch_artifact_behind_after_count_preserving_edit);
+    RUN_TEST(branch_artifact_behind_after_format_rebuild);
     RUN_TEST(branch_slots_kept_when_live_db_undeletable);
     RUN_TEST(branch_artifact_bootstrap_adopted_by_importer);
 #endif
