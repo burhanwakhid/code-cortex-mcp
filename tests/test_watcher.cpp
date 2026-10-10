@@ -1982,7 +1982,10 @@ TEST(watcher_null_watch_count) {
  * ══════════════════════════════════════════════════════════════════ */
 
 #include <foundation/constants.h>
+#include <mcp/cache_expiry.h>
+#include "sqlite3.h"
 #include <string>
+#include <time.h>
 
 struct prune_lease_env {
     const char *name;
@@ -1993,6 +1996,24 @@ struct prune_lease_env {
         else { cbm_unsetenv(name); }
     }
 };
+/* Rows cache_usage holds for <cache>/<key>. */
+static int prune_usage_rows(const char *cache, const char *key) {
+    std::string cp = std::string(cache) + "/_config.db";
+    sqlite3 *db = NULL;
+    int n = -1;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_open(cp.c_str(), &db) == SQLITE_OK &&
+        sqlite3_prepare_v2(db, "SELECT count(*) FROM cache_usage WHERE db_name = ?1;", -1, &st,
+                           NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, key, -1, SQLITE_STATIC);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            n = sqlite3_column_int(st, 0);
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return n;
+}
 static bool prune_bytes_equal(const std::string& path, const char *expected) {
     FILE *f = cbm_fopen(path.c_str(), "rb");
     if (!f) { return false; }
@@ -2012,6 +2033,8 @@ TEST(watcher_prune_lease_preserves_grace_and_retry) {
     const char *suffixes[] = {"", "-wal", "-shm"};
     const char *values[] = {"keep db", "keep wal", "keep shm"};
     for (int i = 0; i < 3; ++i) { ASSERT_EQ(th_write_file((db + suffixes[i]).c_str(), values[i]), 0); }
+    ASSERT(cbm_cache_usage_set(db.c_str(), (int64_t)time(NULL), absent.c_str()));
+    ASSERT_EQ(prune_usage_rows(root, "missing-target.db"), 1);
     cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
     cbm_watcher_watch(w, "missing-target", absent.c_str());
     for (int i = 0; i < 4; ++i) { ASSERT_EQ(cbm_watcher_poll_once(w), 0); }
@@ -2027,6 +2050,8 @@ TEST(watcher_prune_lease_preserves_grace_and_retry) {
     ASSERT_EQ(cbm_watcher_watch_count(w), 0); // Retained absence state retries when free.
     for (const char *suffix : suffixes) { ASSERT(!cbm_is_regular_file((db + suffix).c_str())); }
     ASSERT(cbm_is_regular_file((db + ".index.lock").c_str()));
+    // A database rebuilt at this path must not inherit the pruned one's row.
+    ASSERT_EQ(prune_usage_rows(root, "missing-target.db"), 0);
     cbm_watcher_free(w);
     th_rmtree(root);
     PASS();

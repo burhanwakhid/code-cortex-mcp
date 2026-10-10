@@ -1942,11 +1942,7 @@ static cbm_store_t *resolve_store_by_name(cbm_mcp_server_t *srv, const char *pro
             snprintf(shm_path, sizeof(shm_path), "%s-shm", path);
             cbm_unlink(wal_path);
             cbm_unlink(shm_path);
-            {
-                cbm_store_meta_db_t *meta = cbm_store_meta_open();
-                cbm_store_meta_forget(meta, path);
-                cbm_store_meta_close(meta);
-            }
+            cbm_cache_usage_forget(path);
             cbm_db_lease_release(lease);
             srv->store_resolution_state = CBM_INTEGRITY_CORRUPT;
             return NULL;
@@ -7741,17 +7737,30 @@ static void touch_indexed(const cbm_pipeline_t *p, void *ud) {
     }
 }
 
-int cbm_mcp_index_in_process(const char *root_path) {
+/* A full in-process index of root_path that records its use and root
+ * (touch_indexed). srv supplies the branch-index config (NULL: defaults);
+ * serialize holds the process-wide pipeline lock around the run. */
+static int index_in_process(const cbm_mcp_server_t *srv, const char *root_path, bool serialize) {
     cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
     if (!p) {
         return CBM_NOT_FOUND;
     }
-    apply_branch_index_config(NULL, p);
+    apply_branch_index_config(srv, p);
     cbm_pipeline_set_on_indexed(p, touch_indexed, NULL);
+    if (serialize) {
+        cbm_pipeline_lock();
+    }
     int rc = cbm_pipeline_run(p);
+    if (serialize) {
+        cbm_pipeline_unlock();
+    }
     INDEX_TEST_HOOK(p);
     cbm_pipeline_free(p);
     return rc;
+}
+
+int cbm_mcp_index_in_process(const char *root_path) {
+    return index_in_process(NULL, root_path, false);
 }
 
 /* index_repository's "branch" block: which branch this run indexed, which one
@@ -13024,19 +13033,9 @@ static void *autoindex_thread(void *arg) {
         return NULL;
     }
 
-    cbm_pipeline_t *p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);
-    if (!p) {
-        cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
-        return NULL;
-    }
-    apply_branch_index_config(srv, p);
-
-    /* Block until any concurrent pipeline finishes */
-    cbm_pipeline_lock();
-    int rc = cbm_pipeline_run(p);
-    cbm_pipeline_unlock();
-
-    cbm_pipeline_free(p);
+    /* Block until any concurrent pipeline finishes. The run records its use
+     * and root for cache expiry, as every other index path does. */
+    int rc = index_in_process(srv, srv->session_root, true);
     /* Extraction builds a THREAD-LOCAL node-type bitset cache (cbm_kind_in_set).
      * Parallel workers free theirs in pass_parallel.cpp; the in-process auto-index
      * runs extraction on THIS short-lived thread, so it must free its own cache

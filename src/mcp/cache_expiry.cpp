@@ -336,14 +336,36 @@ bool cbm_cache_usage_set(const char *db_path, int64_t last_used, const char *roo
     return ok;
 }
 
+/* Per database, when this process last recorded its use. */
+static std::mutex g_touch_mu;
+static std::unordered_map<std::string, int64_t> g_touch_seen;
+
+void cbm_cache_usage_forget(const char *db_path) {
+    const char *key = cbm_store_meta_key(db_path);
+    if (!key[0]) {
+        return;
+    }
+    cbm_store_meta_db_t *meta = cbm_store_meta_open();
+    cbm_store_meta_forget(meta, db_path);
+    cbm_store_meta_close(meta);
+    sqlite3 *db = state_open(false);
+    if (db) {
+        sqlite3_busy_timeout(db, CE_WRITE_BUSY_MS);
+    }
+    usage_forget(db, key);
+    sqlite3_close(db);
+    std::lock_guard<std::mutex> g(g_touch_mu);
+    g_touch_seen.erase(key);
+}
+
 void cbm_cache_usage_touch(const char *db_path, const char *root_path) {
     const char *key = cbm_store_meta_key(db_path);
     if (!key[0]) {
         return;
     }
     int64_t now = (int64_t)time(NULL);
-    static std::mutex mu;
-    static std::unordered_map<std::string, int64_t> seen;
+    std::mutex &mu = g_touch_mu;
+    std::unordered_map<std::string, int64_t> &seen = g_touch_seen;
     {
         std::lock_guard<std::mutex> g(mu);
         auto it = seen.find(key);
@@ -575,12 +597,7 @@ int cbm_cache_remove_project(const char *db_path, const char *project, const cha
     if (rc == -1) {
         return rc; /* the project still exists, and its parked branches with it */
     }
-    cbm_store_meta_db_t *meta = cbm_store_meta_open();
-    cbm_store_meta_forget(meta, db_path);
-    cbm_store_meta_close(meta);
-    sqlite3 *db = state_open(false);
-    usage_forget(db, cbm_store_meta_key(db_path));
-    sqlite3_close(db);
+    cbm_cache_usage_forget(db_path);
     char **slots = NULL;
     int n = cbm_branch_slots_list(db_path, project, NULL, &slots);
     cbm_branch_slots_free_list(slots, n);

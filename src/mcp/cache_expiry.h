@@ -75,6 +75,12 @@ void cbm_cache_expiry_cfg_load(cbm_cache_expiry_cfg_t *out, struct cbm_config *c
  * per CBM_CACHE_USAGE_RESOLUTION_S per database. Best-effort, never fails. */
 void cbm_cache_usage_touch(const char *db_path, const char *root_path);
 
+/* Forget the database at db_path: its cache_usage and store_meta rows, and
+ * this process's throttle entry. Called wherever a database is removed, so
+ * a database later built at that path starts clean instead of inheriting a
+ * stale root or missing-root streak. */
+void cbm_cache_usage_forget(const char *db_path);
+
 /* Set a database's usage row outright (tests, `cache restore`). last_used 0
  * leaves it; root_path NULL leaves it. Resets the missing-root streak. */
 bool cbm_cache_usage_set(const char *db_path, int64_t last_used, const char *root_path);

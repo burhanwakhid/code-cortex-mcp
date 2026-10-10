@@ -993,6 +993,71 @@ TEST(cache_index_and_query_record_use) {
     PASS();
 }
 
+/* The session auto-index outside a supervisor host (and with the supervisor
+ * switched off) runs the pipeline in process: that run is a use too, and it
+ * records the checkout root, like every other index path. */
+TEST(cache_autoindex_in_process_records_use) {
+#ifndef _WIN32
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_auto"));
+    char repo[700];
+    snprintf(repo, sizeof(repo), "%s/repo", e.base);
+    char f[800];
+    snprintf(f, sizeof(f), "%s/a.py", repo);
+    ASSERT_EQ(th_write_file(f, "def a():\n    return 1\n"), 0);
+    char *real = realpath(repo, NULL);
+    ASSERT_NOT_NULL(real);
+    char old_cwd[1024];
+    ASSERT_NOT_NULL(getcwd(old_cwd, sizeof(old_cwd)));
+    char old_expiry[64];
+    char old_update[64];
+    bool had_expiry = cbm_safe_getenv("CBM_CACHE_EXPIRY", old_expiry, sizeof(old_expiry), NULL);
+    bool had_update = cbm_safe_getenv("CBM_UPDATE_CHECK", old_update, sizeof(old_update), NULL);
+    cbm_setenv("CBM_CACHE_EXPIRY", "0", 1); /* no sweep: it would record the row itself */
+    cbm_setenv("CBM_UPDATE_CHECK", "0", 1);
+    cbm_config_t *cfgs = cbm_config_open(e.cache);
+    ASSERT_NOT_NULL(cfgs);
+    cbm_config_set(cfgs, CBM_CONFIG_AUTO_INDEX, "true");
+    ASSERT_EQ(chdir(real), 0);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfgs);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{"
+             "\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},"
+             "\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}");
+    free(resp);
+    cbm_mcp_server_join_threads(srv);
+    cbm_mcp_server_free(srv);
+    (void)chdir(old_cwd);
+    cbm_config_close(cfgs);
+    if (had_expiry) {
+        cbm_setenv("CBM_CACHE_EXPIRY", old_expiry, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_EXPIRY");
+    }
+    if (had_update) {
+        cbm_setenv("CBM_UPDATE_CHECK", old_update, 1);
+    } else {
+        cbm_unsetenv("CBM_UPDATE_CHECK");
+    }
+    char *name = cbm_project_name_from_path(real);
+    ASSERT_NOT_NULL(name);
+    char db[900];
+    snprintf(db, sizeof(db), "%s/%s.db", e.cache, name);
+    ASSERT_TRUE(cbm_file_exists(db)); /* the auto-index ran */
+    int64_t lu;
+    int checks;
+    ce_usage(&e, name, &lu, &checks);
+    ASSERT_GT(lu, 0);
+    ASSERT_EQ(checks, 0);
+    free(name);
+    free(real);
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
 typedef struct {
     const ce_env_t *e;
     int calls;
@@ -1676,6 +1741,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_used_since_scan_is_kept);
     RUN_TEST(cache_touch_during_scan_lands);
     RUN_TEST(cache_index_and_query_record_use);
+    RUN_TEST(cache_autoindex_in_process_records_use);
     RUN_TEST(cache_pipeline_on_indexed_holds_lease);
     RUN_TEST(cache_pipeline_on_indexed_after_failed_export);
     RUN_TEST(cache_index_use_recorded_before_lease_release);

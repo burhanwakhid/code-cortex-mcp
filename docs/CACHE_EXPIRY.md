@@ -85,7 +85,8 @@ on this machine. It expires like a deleted checkout, unless it is used within th
 - `resolve_store`, which every tool call and every hook (SessionStart, the prompt and read hooks)
   goes through to open a project's database. It records use on the file it opened, which for a
   renamed or legacy database that the fallback scan finds is not `<project>.db`;
-- every index run (`index_repository`, the watcher's in-process run), which also records the
+- every index run (`index_repository`, the watcher's in-process run, the session auto-index
+  with or without the supervisor), which also records the
   root and clears a missing streak. The run records it before it releases the index lease
   (`cbm_pipeline_set_on_indexed`), so a sweep that judged the database stale before the run and
   takes the lease right after it re-reads the row, finds the run's use, and keeps the database.
@@ -211,7 +212,10 @@ skips the database: the next sweep decides again.
 
 The removal is `cbm_cache_remove_project`, which `delete_project` also uses: the database, its
 WAL and SHM, its parked slots of every root, its `store_meta` row and its usage row go together.
-The one difference is the destination.
+The one difference is the destination. Every other path that removes a database (the watcher's
+prune of a missing root, the quarantine of a corrupt file, `uninstall`) also forgets both rows
+(`cbm_cache_usage_forget`), so a database later built at that path does not inherit a stale root
+or missing-root streak.
 
 ### Trash
 
@@ -315,6 +319,5 @@ Each removal logs one `cache.expire` line (kind, name, path, reason), each skip 
   re-indexed, is excluded only from that server's own sweep (as its session or watched
   project). A sweep from another process can expire it as unused.
 - The watcher's own prune of a watched root that stays missing for 10 minutes (`watcher.cpp`)
-  still deletes directly, not through the trash, and leaves the database's usage row behind (a
-  few bytes in `_config.db`).
+  still deletes directly, not through the trash.
 - Windows is not verified. Root classification treats a drive root as a mount parent.

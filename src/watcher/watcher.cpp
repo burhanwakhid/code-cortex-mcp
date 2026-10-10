@@ -28,6 +28,8 @@
 #include "pipeline/artifact.h" /* CBM_ARTIFACT_DIR: the indexer's own output directory */
 /* Parked per-branch databases of a pruned project. */
 #include "pipeline/branch_slots.h"
+/* A pruned database's usage and memo rows. */
+#include "mcp/cache_expiry.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -458,6 +460,7 @@ static int delete_cached_project_db(const char *project_name) {
         return CBM_NOT_FOUND;
     }
     cbm_remove_db_sidecars(path);
+    cbm_cache_usage_forget(path);
     (void)cbm_branch_slots_delete_all(path, project_name);
     cbm_db_lease_release(lease);
     return 0;
