@@ -107,7 +107,8 @@ int cbm_store_set_format_version(cbm_store_t *s, int version);
  * qualified name and display name (either buffer may be NULL) and returns
  * CBM_STORE_NOT_FOUND when the graph has no Branch node. set rewrites that
  * node in place — same id, so HAS_BRANCH keeps pointing at it — with the
- * edge's properties and the node's full-text entry, in one transaction; an
+ * edge's properties (recreating the edge from the Project node when it is
+ * missing) and the node's full-text entry, in one transaction; an
  * incremental run reuses the stored structure and would otherwise keep the
  * branch of whichever run last rebuilt it. set WRITES. */
 int cbm_store_get_branch(cbm_store_t *s, const char *project, char *qn_buf, size_t qn_sz,
@@ -124,7 +125,8 @@ bool cbm_store_content_fingerprint(cbm_store_t *s, const char *project, char out
 int cbm_store_get_branch_dup(cbm_store_t *s, const char *project, char **qn, char **name,
                              char **props);
 /* True when the project has a Branch node and it, and every HAS_BRANCH edge,
- * already carry exactly these values (set would change nothing). */
+ * already carry exactly these values, and the node has its HAS_BRANCH edge
+ * whenever a Project node exists (set would change nothing). */
 bool cbm_store_branch_is(cbm_store_t *s, const char *project, const char *qn, const char *name,
                          const char *props_json);
 /* get, plus the node's properties: the git identity it was built from

@@ -69,7 +69,9 @@ layout](#slot-layout)).
 Each run writes the checkout it indexed on the graph's `Branch` node: the qualified name
 `<project>.__branch__.<slug>` and properties with `branch`, `is_detached`, `head_sha` and
 `is_git` (`cbm_pipeline_stamp_branch_store`). The node, its `HAS_BRANCH` edge and its full-text
-entry are written in one transaction, and only when one of them differs.
+entry are written in one transaction, and only when one of them differs. A `Branch` node that
+has lost its `HAS_BRANCH` edge (a legacy or torn database) also counts as different: the stamp
+recreates the edge from the `Project` node.
 
 Two comparisons use that identity (`cbm_branch_id_same` and `cbm_branch_id_same_strict`):
 

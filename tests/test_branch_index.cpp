@@ -1387,6 +1387,70 @@ TEST(branch_stamp_repairs_torn_edge) {
     PASS();
 }
 
+/* HAS_BRANCH edges from the Project node to the Branch node carrying the
+ * node's properties, -1 on error. */
+static int bi_branch_edges_in_step(void) {
+    char db[1024];
+    cbm_store_t *s = cbm_store_open_path_query(bi_db_path(db, sizeof(db)));
+    sqlite3 *h = cbm_store_get_db(s);
+    sqlite3_stmt *st = NULL;
+    int n = -1;
+    if (h && sqlite3_prepare_v2(h,
+                                "SELECT count(*) FROM edges e JOIN nodes b ON b.id = e.target_id "
+                                "JOIN nodes pn ON pn.id = e.source_id WHERE e.project = ?1 AND "
+                                "e.type = 'HAS_BRANCH' AND b.label = 'Branch' AND "
+                                "pn.label = 'Project' AND e.properties = b.properties",
+                                -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, g_bi_project, -1, SQLITE_TRANSIENT);
+        n = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : -1;
+    }
+    sqlite3_finalize(st);
+    cbm_store_close(s);
+    return n;
+}
+
+/* A Branch node that lost its HAS_BRANCH edge (a legacy or torn database)
+ * is not current although the node names the checkout: the next run puts
+ * the edge back, and the stamp itself recreates it. */
+TEST(branch_stamp_recreates_missing_edge) {
+    char *repo = bi_make_repo("cbm_bi_noedge");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_branch_edges_in_step(), 1);
+
+    char db[1024];
+    char sql[1400];
+    snprintf(sql, sizeof(sql), "DELETE FROM edges WHERE project = '%s' AND type = 'HAS_BRANCH';",
+             g_bi_project);
+    cbm_store_t *s = cbm_store_open_path(bi_db_path(db, sizeof(db)));
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_exec(s, sql), CBM_STORE_OK);
+    cbm_store_close(s);
+    ASSERT_EQ(bi_branch_edges_in_step(), 0);
+
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_EQ(r.reparsed, 0);
+    ASSERT_EQ(bi_branch_edges_in_step(), 1);
+
+    /* set itself: rewriting the node in place also restores the edge. */
+    s = cbm_store_open_path(bi_db_path(db, sizeof(db)));
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_exec(s, sql), CBM_STORE_OK);
+    char qn[1024];
+    ASSERT_EQ(cbm_store_get_branch(s, g_bi_project, qn, sizeof(qn), NULL, 0), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_set_branch(s, g_bi_project, qn, "main", "{}"), CBM_STORE_OK);
+    ASSERT_TRUE(cbm_store_branch_is(s, g_bi_project, qn, "main", "{}"));
+    cbm_store_close(s);
+    ASSERT_EQ(bi_branch_edges_in_step(), 1);
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 /* An outgoing database whose ADR cannot be read may hold the only copy of
  * the newest ADR: the switch must keep it in place as the seed rather than
  * restore a parked database over it. */
@@ -2950,6 +3014,7 @@ SUITE(branch_index) {
 #endif
     RUN_TEST(branch_stamp_keeps_fts_in_step);
     RUN_TEST(branch_stamp_repairs_torn_edge);
+    RUN_TEST(branch_stamp_recreates_missing_edge);
     RUN_TEST(branch_unreadable_adr_blocks_restore);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(branch_switch_recomputes_session_brief);

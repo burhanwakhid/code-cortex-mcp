@@ -3620,6 +3620,17 @@ int cbm_store_set_branch(cbm_store_t *s, const char *project, const char *qn, co
                            "UPDATE edges SET properties = ?2 "
                            "WHERE project = ?1 AND type = 'HAS_BRANCH';",
                            project, props, NULL, NULL) != SQLITE_DONE ||
+               /* A legacy or torn database may have lost the edge: put it
+                * back from the Project node, or traversals from the project
+                * never reach the branch. */
+               branch_exec(s,
+                           "INSERT INTO edges (project, source_id, target_id, type, properties) "
+                           "SELECT ?1, pn.id, b.id, 'HAS_BRANCH', ?2 FROM nodes pn, nodes b "
+                           "WHERE pn.project = ?1 AND pn.label = 'Project' AND "
+                           "pn.qualified_name = ?1 AND b.project = ?1 AND b.label = 'Branch' "
+                           "AND NOT EXISTS (SELECT 1 FROM edges WHERE project = ?1 AND "
+                           "type = 'HAS_BRANCH' AND target_id = b.id) LIMIT 1;",
+                           project, props, NULL, NULL) != SQLITE_DONE ||
                (fts && !fts_branch_row(s, project, false))) {
         store_set_error_sqlite(s, "set_branch_edge");
     } else {
@@ -3643,13 +3654,20 @@ bool cbm_store_branch_is(cbm_store_t *s, const char *project, const char *qn, co
     }
     const char *props = props_json && props_json[0] ? props_json : "{}";
     /* Any Branch row or HAS_BRANCH edge that differs -- including the edge of
-     * a stamp torn before stamps were transactional. */
+     * a stamp torn before stamps were transactional -- or a Branch node with
+     * no HAS_BRANCH edge while a Project node exists to carry one (set
+     * recreates it). */
     int rc = branch_exec(s,
                          "SELECT 1 WHERE EXISTS (SELECT 1 FROM nodes WHERE project = ?1 AND "
                          "label = 'Branch') AND NOT EXISTS (SELECT 1 FROM nodes WHERE project = "
                          "?1 AND label = 'Branch' AND (qualified_name IS NOT ?2 OR name IS NOT "
                          "?3 OR properties IS NOT ?4)) AND NOT EXISTS (SELECT 1 FROM edges WHERE "
-                         "project = ?1 AND type = 'HAS_BRANCH' AND properties IS NOT ?4);",
+                         "project = ?1 AND type = 'HAS_BRANCH' AND properties IS NOT ?4) AND "
+                         "NOT EXISTS (SELECT 1 FROM nodes b WHERE b.project = ?1 AND "
+                         "b.label = 'Branch' AND EXISTS (SELECT 1 FROM nodes pn WHERE "
+                         "pn.project = ?1 AND pn.label = 'Project' AND pn.qualified_name = ?1) "
+                         "AND NOT EXISTS (SELECT 1 FROM edges WHERE project = ?1 AND "
+                         "type = 'HAS_BRANCH' AND target_id = b.id));",
                          project, qn, name, props);
     return rc == SQLITE_ROW;
 }
