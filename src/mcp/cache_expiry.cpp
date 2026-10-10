@@ -914,11 +914,16 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
             }
             std::string base;
             if (ends_with(ent->name, ".db") && strcmp(ent->name, "_config.db") != 0) {
-                std::string name(ent->name, strlen(ent->name) - 3);
+                /* The project is what the file holds, not its filename: a
+                 * legacy or renamed file ("old project.db") is served under
+                 * its internal name, so it is judged under that name. Only
+                 * the name used as a path component (trash entry, slot
+                 * directory) has to be a safe one. */
+                std::string stem(ent->name, strlen(ent->name) - 3);
+                std::string path = std::string(cdir) + "/" + ent->name;
+                std::string name = learn_project(path.c_str(), stem);
                 if (cbm_validate_project_name(name.c_str())) {
-                    std::string path = std::string(cdir) + "/" + ent->name;
-                    dbs.push_back({learn_project(path.c_str(), name), name, path, {},
-                                   ROOT_UNCERTAIN});
+                    dbs.push_back({name, stem, path, {}, ROOT_UNCERTAIN});
                 }
             } else if (is_sidecar_name(ent->name, &base) && base != "_config.db") {
                 sidecars.emplace_back(ent->name, base);
@@ -937,6 +942,13 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
             e.name = e.stem;
         }
     }
+    /* A stem that is no safe path component cannot stand in: such a copy is
+     * not judged. */
+    dbs.erase(std::remove_if(dbs.begin(), dbs.end(),
+                             [](const db_entry_t &e) {
+                                 return !cbm_validate_project_name(e.name.c_str());
+                             }),
+              dbs.end());
 
     /* Usage rows; a database seen for the first time starts its clock now,
      * so nothing expires as unused before it has had the full period to be

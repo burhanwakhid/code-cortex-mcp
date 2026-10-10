@@ -141,7 +141,10 @@ one read of its `projects` row) and to quiesce a database it is about to remove.
 A file is judged as the project it holds, not as its filename. A renamed or legacy file
 `<cache>/<other>.db` that holds project `X` is served as `X` by the fallback scan, so the
 session, watch and slot checks use `X`, and its slots are those under `branches/X/`. Reports
-name it `X (<other>.db)`. When two files hold the same project, both keep their filenames.
+name it `X (<other>.db)`. The filename does not have to be a valid project name (`old
+project.db` is judged as the `X` it holds); the project name does, because it names the trash
+entry and the slot directory. When two files hold the same project, both keep their filenames,
+and a file whose filename is not a valid project name is then not judged.
 
 ## Removal
 

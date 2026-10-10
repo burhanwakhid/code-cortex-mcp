@@ -1069,6 +1069,52 @@ TEST(cache_renamed_db_waits_for_project_lease) {
     PASS();
 }
 
+/* A legacy or renamed file whose filename is no valid project name ("old
+ * project.db") is served by the fallback scan under its internal name; the
+ * sweep tracks and expires it under that name too. A copy whose own name
+ * would have to stand in (a second file claims the project) and is no safe
+ * path component is not judged. */
+TEST(cache_renamed_db_with_unsafe_stem_expires) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_rnstem"));
+    char root[700];
+    char db[800];
+    char dup[800];
+    char twin[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db_as(&e, "old project", "oldproj", root, db, sizeof(db));
+    ce_make_db_as(&e, "dup copy", "dupproj", root, dup, sizeof(dup));
+    ce_make_db(&e, "dupproj", root, twin, sizeof(twin));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0); /* first seen: clocks start */
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "old project", &lu, &checks);
+    ASSERT_EQ(lu, now);
+    ce_usage(&e, "dup copy", &lu, &checks);
+    ASSERT_EQ(lu, -1);
+
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 100 * CE_DAY, NULL));
+    ASSERT_TRUE(cbm_cache_usage_set(dup, now - 100 * CE_DAY, NULL));
+    ASSERT_TRUE(cbm_cache_usage_set(twin, now - 1 * CE_DAY, NULL));
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.projects, 1);
+    ASSERT_FALSE(cbm_file_exists(db));
+    ASSERT_TRUE(cbm_file_exists(dup));
+    ASSERT_TRUE(cbm_file_exists(twin));
+    char msg[512];
+    ASSERT_EQ(cbm_cache_trash_restore("oldproj", msg, sizeof(msg)), 0);
+    char back[800];
+    snprintf(back, sizeof(back), "%s/oldproj.db", e.cache);
+    ASSERT_TRUE(cbm_file_exists(back));
+    ce_teardown(&e);
+    PASS();
+}
+
 /* ── The server's background sweep ─────────────────────────────── */
 
 /* Enable automatic sweeps (test_main turns them off for the whole run) and
@@ -1214,6 +1260,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_open_reader_keeps_database);
     RUN_TEST(cache_open_reader_keeps_renamed_database);
     RUN_TEST(cache_renamed_db_waits_for_project_lease);
+    RUN_TEST(cache_renamed_db_with_unsafe_stem_expires);
     RUN_TEST(cache_server_initialize_runs_sweep);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(cache_server_sweep_joined_before_watcher_drop);
