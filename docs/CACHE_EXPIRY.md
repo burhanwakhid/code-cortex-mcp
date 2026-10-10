@@ -86,7 +86,9 @@ on this machine. It expires like a deleted checkout, unless it is used within th
   goes through to open a project's database. It records use on the file it opened, which for a
   renamed or legacy database that the fallback scan finds is not `<project>.db`;
 - every index run (`index_repository`, the watcher's in-process run), which also records the
-  root and clears a missing streak;
+  root and clears a missing streak. The run records it before it releases the index lease
+  (`cbm_pipeline_set_on_indexed`), so a sweep that judged the database stale before the run and
+  takes the lease right after it re-reads the row, finds the run's use, and keeps the database;
 - `code-cortex-mcp cache restore`.
 
 The write is throttled twice. A process remembers, per database, when it last recorded use and

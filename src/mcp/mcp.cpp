@@ -7679,8 +7679,30 @@ static void apply_branch_index_config(const cbm_mcp_server_t *srv, cbm_pipeline_
     }
 }
 
-/* An index run is a use, and it knows the checkout root exactly. */
-static void touch_indexed(const cbm_pipeline_t *p) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void (*index_test_cb)(const char *, void *) = nullptr;
+static void *index_test_data = nullptr;
+
+void cbm_mcp_test_index_hook(void (*callback)(const char *project, void *data), void *data) {
+    index_test_cb = callback;
+    index_test_data = data;
+}
+#define INDEX_TEST_HOOK(p)                                                                         \
+    do {                                                                                           \
+        if (index_test_cb) {                                                                       \
+            index_test_cb(cbm_pipeline_project_name(p), index_test_data);                          \
+        }                                                                                          \
+    } while (0)
+#else
+#define INDEX_TEST_HOOK(p) ((void)0)
+#endif
+
+/* An index run is a use, and it knows the checkout root exactly. The
+ * pipeline calls this before it releases the index lease: a sweep in another
+ * process that judged the database stale before the run takes the lease
+ * only after this write, re-reads the row, and keeps the database. */
+static void touch_indexed(const cbm_pipeline_t *p, void *ud) {
+    (void)ud;
     const char *name = cbm_pipeline_project_name(p);
     char path[CBM_SZ_1K];
     project_db_path(name, path, sizeof(path));
@@ -7695,10 +7717,9 @@ int cbm_mcp_index_in_process(const char *root_path) {
         return CBM_NOT_FOUND;
     }
     apply_branch_index_config(NULL, p);
+    cbm_pipeline_set_on_indexed(p, touch_indexed, NULL);
     int rc = cbm_pipeline_run(p);
-    if (rc == 0) {
-        touch_indexed(p);
-    }
+    INDEX_TEST_HOOK(p);
     cbm_pipeline_free(p);
     return rc;
 }
@@ -7836,9 +7857,11 @@ static char *index_repository_in_process(cbm_mcp_server_t *srv, const char *args
      * can cancel it mid-run. */
     cbm_pipeline_lock();
     srv->active_pipeline = p;
+    cbm_pipeline_set_on_indexed(p, touch_indexed, NULL);
     int rc = cbm_pipeline_run(p);
     srv->active_pipeline = NULL;
     cbm_pipeline_unlock();
+    INDEX_TEST_HOOK(p);
 
     /* Capture the excluded-subtree list (#411) while the pipeline (which owns
      * the strings) is still alive — the response builder copies them into the
@@ -7884,7 +7907,6 @@ static char *index_repository_in_process(cbm_mcp_server_t *srv, const char *args
             yyjson_mut_obj_add_bool(doc, root, "format_migration", true);
         }
         add_branch_switch_json(doc, root, p);
-        touch_indexed(p);
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         /* #1665: a post-publish artifact export failure (read-only repo, etc.)

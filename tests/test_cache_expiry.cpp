@@ -10,6 +10,7 @@
 #include "test_helpers.h"
 #include <cli/cli.h>
 #include <foundation/compat_fs.h>
+#include <foundation/constants.h>
 #include <foundation/platform.h>
 #include <mcp/cache_expiry.h>
 #include <mcp/mcp.h>
@@ -902,6 +903,108 @@ TEST(cache_index_and_query_record_use) {
     PASS();
 }
 
+typedef struct {
+    const ce_env_t *e;
+    int calls;
+    int lease_rc;
+} ce_indexed_probe_t;
+
+static void ce_on_indexed(const cbm_pipeline_t *p, void *ud) {
+    ce_indexed_probe_t *probe = (ce_indexed_probe_t *)ud;
+    probe->calls++;
+    char db[800];
+    snprintf(db, sizeof(db), "%s/%s.db", probe->e->cache, cbm_pipeline_project_name(p));
+    cbm_db_lease_t *lease = NULL;
+    probe->lease_rc = cbm_db_lease_try_acquire(db, &lease);
+    cbm_db_lease_release(lease);
+}
+
+/* The pipeline's on-indexed callback runs once per successful run, while
+ * the run still holds the database's index lease: what it records, a sweep
+ * in another process can only judge after it. */
+TEST(cache_pipeline_on_indexed_holds_lease) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_onidx"));
+    char repo[700];
+    snprintf(repo, sizeof(repo), "%s/repo", e.base);
+    char f[800];
+    snprintf(f, sizeof(f), "%s/a.py", repo);
+    ASSERT_EQ(th_write_file(f, "def a():\n    return 1\n"), 0);
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ce_indexed_probe_t probe = {&e, 0, 0};
+    cbm_pipeline_set_on_indexed(p, ce_on_indexed, &probe);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_EQ(probe.calls, 1);
+    ASSERT_EQ(probe.lease_rc, CBM_INDEX_BUSY);
+    cbm_pipeline_free(p);
+    ce_teardown(&e);
+    PASS();
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef struct {
+    int projects;
+    int runs;
+} ce_gap_sweep_t;
+
+/* A sweep in the moment after the index run released its lease. */
+static void ce_sweep_in_gap(const char *project, void *data) {
+    (void)project;
+    ce_gap_sweep_t *g = (ce_gap_sweep_t *)data;
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    if (ce_sweep(&cfg, (int64_t)time(NULL), false, &r) == 0) {
+        g->projects += r.projects;
+        g->runs++;
+    }
+}
+#endif
+
+/* An index run records its use before it releases the index lease. A sweep
+ * that takes the lease the moment the run lets go of it (one in another
+ * process that judged the database stale before the run) re-reads the usage
+ * row and finds the run's use there, so it keeps the database it just built. */
+TEST(cache_index_use_recorded_before_lease_release) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_idxgap"));
+    char repo[700];
+    snprintf(repo, sizeof(repo), "%s/repo", e.base);
+    char f[800];
+    snprintf(f, sizeof(f), "%s/a.py", repo);
+    ASSERT_EQ(th_write_file(f, "def a():\n    return 1\n"), 0);
+    ASSERT_EQ(cbm_mcp_index_in_process(repo), 0);
+    char *name = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(name);
+    char db[800];
+    snprintf(db, sizeof(db), "%s/%s.db", e.cache, name);
+    ASSERT_TRUE(cbm_file_exists(db));
+    int64_t now = (int64_t)time(NULL);
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 100 * CE_DAY, NULL));
+
+    ce_gap_sweep_t g = {0, 0};
+    cbm_mcp_test_index_hook(ce_sweep_in_gap, &g);
+    int rc = cbm_mcp_index_in_process(repo);
+    cbm_mcp_test_index_hook(NULL, NULL);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(g.runs, 1);
+    ASSERT_EQ(g.projects, 0);
+    ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_EQ(ce_trash_count(&e), 0);
+    int64_t lu;
+    int checks;
+    ce_usage(&e, name, &lu, &checks);
+    ASSERT_GTE(lu, now);
+    free(name);
+    ce_teardown(&e);
+    PASS();
+#else
+    SKIP("requires CBM_TEST_SEAMS");
+#endif
+}
+
 /* A file named otherwise than the project it holds (renamed, or a legacy
  * name the fallback scan still serves) is judged as that project: the
  * session's and the watched one are kept by their project names. */
@@ -1406,6 +1509,8 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_usage_touch_retries_after_busy);
     RUN_TEST(cache_used_since_scan_is_kept);
     RUN_TEST(cache_index_and_query_record_use);
+    RUN_TEST(cache_pipeline_on_indexed_holds_lease);
+    RUN_TEST(cache_index_use_recorded_before_lease_release);
     RUN_TEST(cache_query_on_renamed_db_records_use);
     RUN_TEST(cache_open_reader_keeps_database);
     RUN_TEST(cache_open_reader_keeps_renamed_database);

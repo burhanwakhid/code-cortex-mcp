@@ -131,6 +131,10 @@ void cbm_mcp_server_join_threads(cbm_mcp_server_t *srv);
 /* Callback run on the cache sweep thread: stage 0 before the sweep, stage 1
  * after it. NULL clears. */
 void cbm_mcp_test_sweep_hook(void (*callback)(int stage, void *data), void *data);
+/* Callback run right after an index run's cbm_pipeline_run returns (its
+ * lease released), in index_repository and cbm_mcp_index_in_process. NULL
+ * clears. */
+void cbm_mcp_test_index_hook(void (*callback)(const char *project, void *data), void *data);
 #endif
 
 /* Set external config store reference (for auto_index setting). Not owned. */

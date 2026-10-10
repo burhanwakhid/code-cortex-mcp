@@ -70,6 +70,13 @@ int cbm_pipeline_claim_index(cbm_pipeline_t *p);
  * Discovers files, extracts, resolves, and dumps to SQLite. */
 int cbm_pipeline_run(cbm_pipeline_t *p);
 
+/* Callback run() calls once a run succeeds, before it releases the index
+ * lease: what must happen before another process can take the database
+ * (the cache sweep judges it under that lease) goes here, not after run()
+ * returns. Runs on run()'s thread; NULL clears. Set before run. */
+typedef void (*cbm_pipeline_indexed_fn)(const cbm_pipeline_t *p, void *ud);
+void cbm_pipeline_set_on_indexed(cbm_pipeline_t *p, cbm_pipeline_indexed_fn fn, void *ud);
+
 /* Request cancellation of a running pipeline (thread-safe). */
 void cbm_pipeline_cancel(cbm_pipeline_t *p);
 

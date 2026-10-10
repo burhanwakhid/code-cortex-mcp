@@ -150,6 +150,8 @@ struct cbm_pipeline {
      * parking; the outcome of this run's switch is reported back. */
     int branch_keep;
     int64_t branch_budget; /* bytes of parked slots per checkout; <= 0 no size cap */
+    cbm_pipeline_indexed_fn on_indexed; /* run under the lease after success */
+    void *on_indexed_ud;
     cbm_branch_switch_t branch_action;
     char *branch_from;            /* slug the database was built for; NULL unknown */
     int files_reparsed;           /* source files extracted this run; -1 unknown */
@@ -604,6 +606,13 @@ void cbm_pipeline_set_branch_keep(cbm_pipeline_t *p, int keep) {
 void cbm_pipeline_set_branch_budget(cbm_pipeline_t *p, int64_t budget) {
     if (p) {
         p->branch_budget = budget;
+    }
+}
+
+void cbm_pipeline_set_on_indexed(cbm_pipeline_t *p, cbm_pipeline_indexed_fn fn, void *ud) {
+    if (p) {
+        p->on_indexed = fn;
+        p->on_indexed_ud = ud;
     }
 }
 
@@ -2343,6 +2352,10 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         }
         free(db_path);
         pipeline_note_checkout_moved(p);
+    }
+    /* Still under the lease (lease_scope releases it on return). */
+    if (rc == 0 && p->on_indexed) {
+        p->on_indexed(p, p->on_indexed_ud);
     }
     return rc;
 }
