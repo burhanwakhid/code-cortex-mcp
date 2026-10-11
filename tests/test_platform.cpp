@@ -10,6 +10,7 @@
 #include "../src/foundation/compat_fs.h"
 #include "../src/store/store.h"
 #include "test_helpers.h"
+#include <pipeline/branch_slots.h> /* cbm_branch_root_key */
 #include <stdlib.h>
 #include <unistd.h>
 #if !defined(_WIN32)

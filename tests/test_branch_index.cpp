@@ -2254,6 +2254,16 @@ TEST(branch_foreign_live_db_same_identity_rebuilds) {
     PASS();
 }
 
+/* Run one SQL statement on the project's live database. */
+static bool bi_db_exec(const char *sql) {
+    char db[1024];
+    sqlite3 *h = NULL;
+    bool ok = sqlite3_open(bi_db_path(db, sizeof(db)), &h) == SQLITE_OK &&
+              sqlite3_exec(h, sql, NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(h);
+    return ok;
+}
+
 #ifndef _WIN32
 /* A rename that keeps node and edge counts, made while the export fails, is
  * still caught by a later no-op run: the artifact is compared by content. */
@@ -2284,16 +2294,6 @@ TEST(branch_artifact_behind_after_count_preserving_edit) {
 
     bi_cleanup(repo);
     PASS();
-}
-
-/* Run one SQL statement on the project's live database. */
-static bool bi_db_exec(const char *sql) {
-    char db[1024];
-    sqlite3 *h = NULL;
-    bool ok = sqlite3_open(bi_db_path(db, sizeof(db)), &h) == SQLITE_OK &&
-              sqlite3_exec(h, sql, NULL, NULL, NULL) == SQLITE_OK;
-    sqlite3_close(h);
-    return ok;
 }
 
 /* A rebuild from unchanged sources (an index format upgrade) whose export
