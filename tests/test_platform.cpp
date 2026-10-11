@@ -902,6 +902,24 @@ TEST(platform_root_matches_windows_unicode_case_and_junction) {
     PASS();
 }
 
+/* A relative root keeps every unresolved "..": "../../repo" is not "repo"
+ * (and not another checkout's identity), while a resolvable one still pops
+ * and an absolute path's leading ".." still folds to the root. */
+TEST(platform_root_normalize_keeps_unresolved_dotdot) {
+    char out[256];
+    ASSERT_TRUE(cbm_root_normalize("../../repo", false, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "../../repo");
+    ASSERT_TRUE(cbm_root_normalize("a/../../repo", false, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "../repo");
+    ASSERT_TRUE(cbm_root_normalize("../a/../repo", false, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "../repo");
+    ASSERT_TRUE(cbm_root_normalize("/../../repo", false, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "/repo");
+    ASSERT_TRUE(cbm_root_normalize("/a/b/../../c", false, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "/c");
+    PASS();
+}
+
 SUITE(platform) {
     RUN_TEST(regex_compile_refuses_oversized_expansion);
     RUN_TEST(regex_compile_accepts_expansion_under_budget);
@@ -921,6 +939,7 @@ SUITE(platform) {
     RUN_TEST(platform_mmap_nonexistent);
     RUN_TEST(platform_readdir_reports_links_as_not_dirs);
     RUN_TEST(platform_root_matches_windows_unicode_case_and_junction);
+    RUN_TEST(platform_root_normalize_keeps_unresolved_dotdot);
     RUN_TEST(platform_file_helpers_long_path);
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);

@@ -395,6 +395,43 @@ TEST(cache_root_uncertain_never_counts) {
     PASS();
 }
 
+/* A memo root that fills its column may be truncated: the sweep reads the
+ * database's own projects table instead of starting a missing streak
+ * against a live checkout. */
+TEST(cache_truncated_memo_root_is_not_trusted) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_memolong"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    ce_make_db(&e, "ml", root, db, sizeof(db));
+    cbm_file_gen_t gen;
+    ASSERT_TRUE(cbm_file_generation(db, &gen));
+    cbm_store_meta_db_t *meta = cbm_store_meta_open();
+    ASSERT_NOT_NULL(meta);
+    cbm_store_meta_row_t row;
+    cbm_store_meta_row_init(&row, db, &gen);
+    snprintf(row.project, sizeof(row.project), "ml");
+    memset(row.root_path, 'x', sizeof(row.root_path) - 1);
+    row.root_path[0] = '/';
+    row.root_path[sizeof(row.root_path) - 1] = '\0'; /* a root cut at the column */
+    ASSERT_TRUE(cbm_store_meta_put(meta, &row));
+    cbm_store_meta_close(meta);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, (int64_t)time(NULL), false, &r), 0);
+    ASSERT_EQ(r.projects, 0);
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "ml", &lu, &checks);
+    ASSERT_EQ(checks, 0); /* the real root exists: no streak */
+    ASSERT_TRUE(cbm_file_exists(db));
+    ce_teardown(&e);
+    PASS();
+}
+
 /* A root named with non-ASCII characters, and one past the Windows MAX_PATH,
  * is present: the probe must not read either as "no such file" (the narrow
  * Windows stat does) and start a missing streak on a live checkout. */
@@ -2192,6 +2229,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_uninstall_removes_trash_and_rows);
     RUN_TEST(cache_root_back_resets_streak);
     RUN_TEST(cache_root_uncertain_never_counts);
+    RUN_TEST(cache_truncated_memo_root_is_not_trusted);
     RUN_TEST(cache_root_unicode_and_long_is_present);
     RUN_TEST(cache_mass_missing_and_env_change_count_nothing);
     RUN_TEST(cache_refuses_unknown_cache_dir);

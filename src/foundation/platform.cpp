@@ -726,7 +726,19 @@ bool cbm_root_normalize(const char *in, bool fold_case, char *out, size_t out_sz
         if (dotdot && o == base && absolute) {
             continue; /* "/.." is "/" */
         }
+        /* ".." pops the previous segment -- unless that segment is itself an
+         * unresolved ".." of a relative path ("../../repo"): popping it would
+         * make "../../repo" into "repo", one checkout's identity for
+         * another's. Such a ".." is kept and this one appended after it. */
+        bool prev_is_dotdot = false;
         if (dotdot && o > base) {
+            size_t start = o;
+            while (start > base && out[start - 1] != '/') {
+                start--;
+            }
+            prev_is_dotdot = o - start == 2 && out[start] == '.' && out[start + 1] == '.';
+        }
+        if (dotdot && o > base && !prev_is_dotdot) {
             while (o > base && out[o - 1] != '/') {
                 o--;
             }

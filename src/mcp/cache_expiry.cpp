@@ -545,7 +545,12 @@ static std::string learn_root(const char *path, const char *project) {
     if (cbm_file_generation(path, &gen)) {
         cbm_store_meta_db_t *meta = cbm_store_meta_open();
         cbm_store_meta_row_t row;
-        bool hit = cbm_store_meta_get(meta, path, &gen, &row) && row.root_path[0];
+        /* A memo root that fills its column may be truncated (the memo keeps
+         * CBM_STORE_META_PATH_MAX bytes): such a root would read as missing
+         * and start a streak against a live checkout, so the database's own
+         * projects table is read instead. */
+        bool hit = cbm_store_meta_get(meta, path, &gen, &row) && row.root_path[0] &&
+                   strlen(row.root_path) < CBM_STORE_META_PATH_MAX - 1;
         cbm_store_meta_close(meta);
         if (hit) {
             return row.root_path;

@@ -1475,7 +1475,8 @@ static bool project_db_owned_by(const char *project, const char *dir, cbm_store_
         return true;
     }
     cbm_store_meta_row_t row;
-    if (meta && cbm_store_meta_get(meta, path, &gen, &row) && strcmp(row.project, project) == 0) {
+    if (meta && cbm_store_meta_get(meta, path, &gen, &row) && strcmp(row.project, project) == 0 &&
+        strlen(row.root_path) < CBM_STORE_META_PATH_MAX - 1) { /* else maybe truncated */
         return cbm_root_matches(row.root_path, dir);
     }
     cbm_store_t *s = cbm_store_open_path_query(path);
