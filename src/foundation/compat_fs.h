@@ -96,6 +96,15 @@ void cbm_db_lease_release(cbm_db_lease_t *lease);
  * descriptor of the file would drop them. Release with cbm_db_lease_release. */
 int cbm_db_read_gate_acquire(const char *db_path, bool exclusive, cbm_db_lease_t **out);
 
+/* Non-mutating probes of the two locks, for previews: whether the index
+ * lease of db_path is held (0 free, CBM_INDEX_BUSY held), and whether any
+ * reader holds its gate (0 none, CBM_INDEX_BUSY some). Neither creates a
+ * directory or a lock file: a lock file that does not exist is free, and
+ * an existing one is tried exclusively and let go at once. -1: cannot
+ * tell (the database path cannot be resolved). */
+int cbm_db_lease_probe(const char *db_path);
+int cbm_db_read_gate_probe(const char *db_path);
+
 /* Delete a file. Returns 0 on success. */
 int cbm_unlink(const char *path);
 /* Remove <db_path>-wal/-shm. Any path installing a fresh DB generation must

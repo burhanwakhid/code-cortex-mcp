@@ -1386,6 +1386,73 @@ int cbm_db_lease_try_acquire(const char *db_path, cbm_db_lease_t **out) {
     return 0;
 }
 
+/* Shared body of the probes: the lock file <real db path><suffix>, opened
+ * only if it exists, tried exclusively and released. */
+static int db_lock_probe(const char *db_path, const char *suffix) {
+    bool missing = false;
+    char *target = db_path && db_path[0] && strlen(db_path) < DB_LEASE_PATH_MAX - 32
+                       ? db_lease_real_path(db_path, &missing)
+                       : NULL;
+    if (!target) {
+        return missing ? 0 : -1; /* no database: nothing holds its locks */
+    }
+    char lock_path[DB_LEASE_PATH_MAX];
+    int n = snprintf(lock_path, sizeof(lock_path), "%s%s", target, suffix);
+    free(target);
+    if (n <= 0 || (size_t)n >= sizeof(lock_path)) {
+        return -1;
+    }
+#ifdef _WIN32
+    wchar_t *wide = cbm_utf8_to_wide_path(lock_path);
+    HANDLE h = wide ? CreateFileW(wide, GENERIC_READ | GENERIC_WRITE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL, NULL)
+                    : INVALID_HANDLE_VALUE;
+    if (h == INVALID_HANDLE_VALUE && wide) {
+        h = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+    free(wide);
+    if (h == INVALID_HANDLE_VALUE) {
+        return GetLastError() == ERROR_FILE_NOT_FOUND ? 0 : -1;
+    }
+    OVERLAPPED overlap = {};
+    int rc = 0;
+    if (LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &overlap)) {
+        OVERLAPPED unlock = {};
+        UnlockFileEx(h, 0, 1, 0, &unlock);
+    } else {
+        rc = GetLastError() == ERROR_LOCK_VIOLATION ? CBM_INDEX_BUSY : -1;
+    }
+    CloseHandle(h);
+    return rc;
+#else
+    int fd = open(lock_path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        fd = open(lock_path, O_RDONLY | O_CLOEXEC);
+    }
+    if (fd < 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    int rc = 0;
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        (void)flock(fd, LOCK_UN);
+    } else {
+        rc = errno == EWOULDBLOCK || errno == EAGAIN ? CBM_INDEX_BUSY : -1;
+    }
+    close(fd);
+    return rc;
+#endif
+}
+
+int cbm_db_lease_probe(const char *db_path) {
+    return db_lock_probe(db_path, ".index.lock");
+}
+
+int cbm_db_read_gate_probe(const char *db_path) {
+    return db_lock_probe(db_path, ".read.lock");
+}
+
 const char *cbm_db_lease_target(const cbm_db_lease_t *lease) {
     return lease ? lease->target : NULL;
 }

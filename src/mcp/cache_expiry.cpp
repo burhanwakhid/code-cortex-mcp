@@ -923,15 +923,15 @@ static void purge_trash(const char *cdir, const cbm_cache_expiry_cfg_t *cfg, int
          * busy one (a restore, or an index run of the project) keeps the
          * entry for the next sweep. */
         cbm_db_lease_t *lease = NULL;
+        std::string dbp = std::string(cdir) + "/" + e.substr(e.find('-') + 1) + ".db";
+        if ((c->opts->dry_run ? cbm_db_lease_probe(dbp.c_str())
+                              : cbm_db_lease_try_acquire(dbp.c_str(), &lease)) != 0) {
+            report(c, CBM_EXPIRE_TRASH_PURGE, e, p, bytes, "in the trash since the previous sweep",
+                   false, "its project being restored or indexed");
+            c->res->skipped++;
+            continue;
+        }
         if (!c->opts->dry_run) {
-            std::string dbp = std::string(cdir) + "/" + e.substr(e.find('-') + 1) + ".db";
-            if (cbm_db_lease_try_acquire(dbp.c_str(), &lease) != 0) {
-                report(c, CBM_EXPIRE_TRASH_PURGE, e, p, bytes,
-                       "in the trash since the previous sweep", false,
-                       "its project being restored or indexed");
-                c->res->skipped++;
-                continue;
-            }
             bool gone = remove_tree(p.c_str());
             cbm_db_lease_release(lease);
             if (!gone) {
@@ -1014,8 +1014,12 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
     /* A preview runs every check below as the sweep would -- the lease,
      * the reader gate, quiescence, a use since the scan, the root -- and
      * only then says "would be removed" instead of moving the file. */
+    /* A preview probes the locks (nothing created, nothing held) and skips
+     * the quiescence check, which is a checkpoint: it writes. */
+    const bool dry = c->opts->dry_run;
     cbm_db_lease_t *lease = NULL;
-    if (cbm_db_lease_try_acquire(e.path.c_str(), &lease) != 0) {
+    if ((dry ? cbm_db_lease_probe(e.path.c_str())
+             : cbm_db_lease_try_acquire(e.path.c_str(), &lease)) != 0) {
         report(c, kind, label(e), e.path, bytes, reason, false, "being indexed");
         c->res->skipped++;
         return;
@@ -1029,7 +1033,8 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
     if (e.name != e.stem) {
         std::string cpath = std::string(cdir) + "/" + e.name + ".db";
         const char *why = NULL;
-        if (cbm_db_lease_try_acquire(cpath.c_str(), &canon) != 0) {
+        if ((dry ? cbm_db_lease_probe(cpath.c_str())
+                 : cbm_db_lease_try_acquire(cpath.c_str(), &canon)) != 0) {
             why = "its project being indexed";
         } else if (cbm_file_exists(cpath.c_str())) {
             why = "its project's own database appeared";
@@ -1049,7 +1054,8 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
      * has it open, and a reader that comes now waits until the move is done,
      * then finds the file gone. */
     cbm_db_lease_t *gate = NULL;
-    int grc = cbm_db_read_gate_acquire(e.path.c_str(), true, &gate);
+    int grc = dry ? cbm_db_read_gate_probe(e.path.c_str())
+                  : cbm_db_read_gate_acquire(e.path.c_str(), true, &gate);
     if (grc != 0) {
         cbm_db_lease_release(canon);
         cbm_db_lease_release(lease);
@@ -1058,7 +1064,7 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
         c->res->skipped++;
         return;
     }
-    if (!quiesced(e.path.c_str())) {
+    if (!dry && !quiesced(e.path.c_str())) {
         cbm_db_lease_release(gate);
         cbm_db_lease_release(canon);
         cbm_db_lease_release(lease);
@@ -1410,7 +1416,8 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
             continue;
         }
         cbm_db_lease_t *lease = NULL;
-        if (!opts->dry_run && cbm_db_lease_try_acquire(dbp.c_str(), &lease) != 0) {
+        if ((opts->dry_run ? cbm_db_lease_probe(dbp.c_str())
+                           : cbm_db_lease_try_acquire(dbp.c_str(), &lease)) != 0) {
             continue; /* being indexed: its own switch manages its slots */
         }
         (void)cbm_branch_slots_expire(dbp.c_str(), p.c_str(), slot_before, scratch_before,
@@ -1431,6 +1438,9 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
             continue;
         }
         int64_t bytes = path_size(sp.c_str());
+        if (opts->dry_run && cbm_db_lease_probe(dbp.c_str()) != 0) {
+            continue; /* an index run creating the database holds its lease */
+        }
         if (!opts->dry_run) {
             cbm_db_lease_t *lease = NULL;
             if (cbm_db_lease_try_acquire(dbp.c_str(), &lease) != 0) {

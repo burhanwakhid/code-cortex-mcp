@@ -1117,10 +1117,29 @@ TEST(cache_dry_run_applies_safety_checks_and_creates_nothing) {
     ASSERT_EQ(ce_sweep(&cfg, now, true, &r), 0);
     ASSERT_EQ(r.projects, 0);
     ASSERT_EQ(r.skipped, 1); /* "being indexed", as the real sweep would say */
-    cbm_db_lease_release(lease);
+    /* An aged slot of the leased project is not previewed as removable. */
+    char sdir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(db, "busy", root, sdir, sizeof(sdir)));
+    char slot[1300];
+    snprintf(slot, sizeof(slot), "%s/old.db.zst", sdir);
+    th_write_file(slot, "s");
+#ifndef _WIN32
+    ce_age(slot, now - 40 * CE_DAY);
     ASSERT_EQ(ce_sweep(&cfg, now, true, &r), 0);
-    ASSERT_EQ(r.projects, 1); /* free: would be removed */
+    ASSERT_EQ(r.slots, 0);
+#endif
+    cbm_db_lease_release(lease);
+    /* A second, free database: the preview judges it without creating its
+     * lock files (the lease's or the reader gate's). */
+    char db2[800];
+    ce_make_db(&e, "fresh", root, db2, sizeof(db2));
+    ASSERT_TRUE(cbm_cache_usage_set(db2, now - 100 * CE_DAY, NULL));
+    ASSERT_EQ(ce_sweep(&cfg, now, true, &r), 0);
+    ASSERT_EQ(r.projects, 2); /* both free now: would be removed */
     ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_TRUE(cbm_file_exists(db2));
+    ASSERT_FALSE(cbm_file_exists((std::string(db2) + ".index.lock").c_str()));
+    ASSERT_FALSE(cbm_file_exists((std::string(db2) + ".read.lock").c_str()));
     /* No cache directory: the settings load does not create one. */
     char nocache[700];
     snprintf(nocache, sizeof(nocache), "%s/never-made", e.base);

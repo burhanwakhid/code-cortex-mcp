@@ -316,7 +316,8 @@ code-cortex-mcp cache restore <project>  # put the newest trashed database of <p
 missing streaks, no sweep time — not even a cache directory, `_config.db` or its tables when
 they do not exist yet. A project the real sweep would skip (its index lease held, a reader on
 its gate, a read transaction open, used since the scan, root present again) is shown kept with
-that reason, not as removable. It also lists the roots that are missing but still in their
+that reason, not as removable. A preview probes the index lease and the reader gate without creating or
+holding their lock files, and does not run the quiescence check (a checkpoint, which writes). It also lists the roots that are missing but still in their
 grace period (`watch`). `--now EPOCH` previews a sweep as of another time and is accepted only
 with `--dry-run`: a real sweep dates its trash entries and usage rows with its clock, so a past
 time would let the next sweep purge the trash at once and a future time would trash everything.
