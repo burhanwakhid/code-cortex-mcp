@@ -657,8 +657,19 @@ int cbm_cache_remove_project(const char *db_path, const char *project, const cha
         if (linked || !cbm_mkdir_p(trash_entry, 0755) || cbm_rename_replace(db_path, dst) != 0) {
             rc = -1;
         } else if (cbm_file_exists(wal)) {
-            snprintf(dst, sizeof(dst), "%s/%s.db-wal", trash_entry, project);
-            (void)cbm_rename_replace(wal, dst);
+            /* The sweep only moves a quiesced database (every frame in the
+             * main file), so a WAL that will not move is deleted instead;
+             * one that will not go either is not left beside a missing
+             * database (a recreated one would read its stale frames): the
+             * main file goes back and the removal fails. */
+            char wdst[CE_PATH_MAX];
+            snprintf(wdst, sizeof(wdst), "%s/%s.db-wal", trash_entry, project);
+            if (cbm_rename_replace(wal, wdst) != 0 && cbm_unlink(wal) != 0 &&
+                cbm_file_exists(wal)) {
+                cbm_log_warn("cache.remove.wal_stuck", "path", wal);
+                (void)cbm_rename_replace(dst, db_path); /* roll the main file back */
+                rc = -1;
+            }
         }
         (void)cbm_unlink(shm);
     } else if (exists) {

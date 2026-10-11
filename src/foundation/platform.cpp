@@ -835,13 +835,20 @@ bool cbm_root_canonical(const char *root, char *out, size_t out_sz) {
     free(final_utf8);
     return ok;
 #else
-    /* Lexical form first, so "x/./gone/.." still resolves through x. */
+    /* Lexical form first, so "x/./gone/.." still resolves through x. A
+     * relative root that folds to nothing (".", "sub/..") is the current
+     * directory: resolved as ".", never hashed as "" -- every checkout
+     * opened as "." would share one slot key otherwise. */
     char lex[CBM_ROOT_MAX];
     char real[PATH_MAX];
     if (!cbm_root_normalize(root, false, lex, sizeof(lex))) {
         return false;
     }
-    return cbm_root_normalize(realpath(lex, real) ? real : lex, false, out, out_sz);
+    const char *probe = lex[0] ? lex : ".";
+    if (realpath(probe, real)) {
+        return cbm_root_normalize(real, false, out, out_sz);
+    }
+    return lex[0] && cbm_root_normalize(lex, false, out, out_sz);
 #endif
 }
 

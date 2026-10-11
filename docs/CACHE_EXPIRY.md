@@ -341,3 +341,6 @@ Each removal logs one `cache.expire` line (kind, name, path, reason), each skip 
   to go, that is said rather than hidden: the sweep reports "some parked branches could not be
   removed", `delete_project` returns `status: deleted` with a `warning`, and the log has
   `cache.remove.slots_left`; the slot expiry of a later sweep retries them.
+  A WAL that will not follow its (quiesced) main file into the trash is deleted instead; one
+  that will not go either rolls the main file back and the project is reported "could not be
+  moved" (`cache.remove.wal_stuck`), never left beside a missing database.

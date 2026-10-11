@@ -920,6 +920,27 @@ TEST(platform_root_normalize_keeps_unresolved_dotdot) {
     PASS();
 }
 
+/* A relative root that folds to nothing is the current directory, with a
+ * real identity -- never the empty string every such checkout would share. */
+TEST(platform_root_canonical_dot_is_cwd) {
+    char out[CBM_ROOT_MAX];
+    char cwd_out[CBM_ROOT_MAX];
+    char cwd[CBM_ROOT_MAX];
+    ASSERT_NOT_NULL(getcwd(cwd, sizeof(cwd)));
+    ASSERT_TRUE(cbm_root_canonical(cwd, cwd_out, sizeof(cwd_out)));
+    ASSERT_TRUE(cwd_out[0] != '\0');
+    ASSERT_TRUE(cbm_root_canonical(".", out, sizeof(out)));
+    ASSERT_STR_EQ(out, cwd_out);
+    ASSERT_TRUE(cbm_root_canonical("sub/..", out, sizeof(out)));
+    ASSERT_STR_EQ(out, cwd_out);
+    char ka[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    char kb[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    ASSERT_TRUE(cbm_branch_root_key(".", ka, sizeof(ka)));
+    ASSERT_TRUE(cbm_branch_root_key(cwd, kb, sizeof(kb)));
+    ASSERT_STR_EQ(ka, kb);
+    PASS();
+}
+
 SUITE(platform) {
     RUN_TEST(regex_compile_refuses_oversized_expansion);
     RUN_TEST(regex_compile_accepts_expansion_under_budget);
@@ -940,6 +961,7 @@ SUITE(platform) {
     RUN_TEST(platform_readdir_reports_links_as_not_dirs);
     RUN_TEST(platform_root_matches_windows_unicode_case_and_junction);
     RUN_TEST(platform_root_normalize_keeps_unresolved_dotdot);
+    RUN_TEST(platform_root_canonical_dot_is_cwd);
     RUN_TEST(platform_file_helpers_long_path);
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);
