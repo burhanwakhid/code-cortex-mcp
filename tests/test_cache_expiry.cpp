@@ -1096,6 +1096,42 @@ TEST(cache_remove_project_reports_slots_left) {
     PASS();
 }
 
+/* A preview decides with the sweep's own checks: a project being indexed
+ * (its lease held) is reported kept, not "would be removed". And loading
+ * the expiry settings for a cache that does not exist creates nothing. */
+TEST(cache_dry_run_applies_safety_checks_and_creates_nothing) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_dryck"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "busy", root, db, sizeof(db));
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 100 * CE_DAY, NULL));
+    cbm_db_lease_t *lease = NULL;
+    ASSERT_EQ(cbm_db_lease_try_acquire(db, &lease), 0);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, true, &r), 0);
+    ASSERT_EQ(r.projects, 0);
+    ASSERT_EQ(r.skipped, 1); /* "being indexed", as the real sweep would say */
+    cbm_db_lease_release(lease);
+    ASSERT_EQ(ce_sweep(&cfg, now, true, &r), 0);
+    ASSERT_EQ(r.projects, 1); /* free: would be removed */
+    ASSERT_TRUE(cbm_file_exists(db));
+    /* No cache directory: the settings load does not create one. */
+    char nocache[700];
+    snprintf(nocache, sizeof(nocache), "%s/never-made", e.base);
+    cbm_setenv("CBM_CACHE_DIR", nocache, 1);
+    cbm_cache_expiry_cfg_load(&cfg, NULL);
+    ASSERT_FALSE(cbm_is_dir(nocache));
+    cbm_setenv("CBM_CACHE_DIR", e.cache, 1);
+    ce_teardown(&e);
+    PASS();
+}
+
 /* A trash entry with a file that refuses to go (a read-only directory) is
  * skipped, not reported purged, and purged by a later sweep once it can be. */
 TEST(cache_trash_purge_refused_is_skipped) {
@@ -2278,6 +2314,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_skips_leased_project);
     RUN_TEST(cache_skips_database_with_open_reader);
     RUN_TEST(cache_dry_run_changes_nothing);
+    RUN_TEST(cache_dry_run_applies_safety_checks_and_creates_nothing);
     RUN_TEST(cache_trash_restore_and_purge);
     RUN_TEST(cache_trash_purge_skips_leased_project);
     RUN_TEST(cache_renamed_db_kept_by_project);

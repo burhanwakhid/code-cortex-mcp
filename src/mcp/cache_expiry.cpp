@@ -301,8 +301,12 @@ void cbm_cache_expiry_cfg_load(cbm_cache_expiry_cfg_t *out, struct cbm_config *c
     out->interval_s = CBM_CACHE_EXPIRY_INTERVAL_S;
     cbm_config_t *owned = NULL;
     if (!cfg) {
+        /* Opened only when it exists: cbm_config_open would create the
+         * cache directory and _config.db, and a preview (`cache expire
+         * --dry-run` before anything was indexed) must write nothing. */
         const char *dir = cbm_resolve_cache_dir();
-        owned = dir ? cbm_config_open(dir) : NULL;
+        std::string cfgdb = dir ? std::string(dir) + "/_config.db" : "";
+        owned = dir && cbm_file_exists(cfgdb.c_str()) ? cbm_config_open(dir) : NULL;
         cfg = owned;
     }
     if (cfg) {
@@ -1007,12 +1011,9 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
         c->res->skipped++;
         return;
     }
-    if (c->opts->dry_run) {
-        report(c, kind, label(e), e.path, bytes, reason, false, NULL);
-        c->res->projects++;
-        c->res->bytes += bytes;
-        return;
-    }
+    /* A preview runs every check below as the sweep would -- the lease,
+     * the reader gate, quiescence, a use since the scan, the root -- and
+     * only then says "would be removed" instead of moving the file. */
     cbm_db_lease_t *lease = NULL;
     if (cbm_db_lease_try_acquire(e.path.c_str(), &lease) != 0) {
         report(c, kind, label(e), e.path, bytes, reason, false, "being indexed");
@@ -1083,6 +1084,15 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
         cbm_db_lease_release(lease);
         report(c, kind, label(e), e.path, bytes, reason, false, "root present again");
         c->res->skipped++;
+        return;
+    }
+    if (c->opts->dry_run) {
+        cbm_db_lease_release(gate);
+        cbm_db_lease_release(canon);
+        cbm_db_lease_release(lease);
+        report(c, kind, label(e), e.path, bytes, reason, false, NULL);
+        c->res->projects++;
+        c->res->bytes += bytes;
         return;
     }
     int parked = 0;
@@ -1171,7 +1181,9 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
         refuse(res, "another sweep is running");
         return -1;
     }
-    sqlite3 *db = state_open(true);
+    /* A preview creates no state tables either: rows it cannot read are
+     * "never seen", which is what a real sweep would record first. */
+    sqlite3 *db = state_open(!opts->dry_run);
     if (!db) {
         cbm_db_lease_release(sweep_lease);
         refuse(res, "cannot open _config.db");

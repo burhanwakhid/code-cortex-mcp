@@ -3685,6 +3685,11 @@ int cbm_cmd_cache(int argc, char **argv) {
             (void)fprintf(stderr, "--now needs --dry-run\n");
             return CLI_TRUE;
         }
+        const char *cdir0 = cbm_resolve_cache_dir();
+        if (dry && (!cdir0 || !cbm_is_dir(cdir0))) {
+            printf("Cache expiry preview: no cache directory yet, nothing to sweep\n");
+            return 0; /* a preview creates nothing, the cache included */
+        }
         cbm_cache_expiry_cfg_t cfg;
         cbm_cache_expiry_cfg_load(&cfg, NULL);
         cbm_cache_sweep_opts_t opts = {};
