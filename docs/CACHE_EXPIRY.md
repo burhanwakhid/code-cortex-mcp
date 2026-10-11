@@ -250,7 +250,9 @@ filesystem that reports no entry type (NFS, FUSE) has its entries classified by 
 parked slots on such a mount are still found. `<cache>/trash` and `<cache>/branches` (or a
 project's directory under it) standing as a link are refused outright: nothing is scanned,
 parked, moved or deleted through them (`cache.expire.refused`, `branch.slots_dir_link`), and a project
-whose database cannot be moved into the trash stays. `cache trash` and `cache restore` do not list an
+whose database cannot be moved into the trash stays. A `<name>.db` in the cache that is itself a link is not a project of the cache
+(`cache.expire.skipped … is_link`): never opened, judged or moved; a slot file that is a link is
+never restored (`branch.slot_link`). `cache trash` and `cache restore` do not list an
 entry that is itself a link.
 
 ### Never removed

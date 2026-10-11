@@ -1151,6 +1151,60 @@ TEST(cache_dry_run_applies_safety_checks_and_creates_nothing) {
     PASS();
 }
 
+/* A <name>.db that is a symlink to a database outside the cache is not a
+ * project of this cache: the sweep neither opens nor expires it, and the
+ * file it points at is untouched. A slot file that is a symlink is never
+ * restored. */
+TEST(cache_linked_db_and_slot_are_ignored) {
+#ifndef _WIN32
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_lndb"));
+    char root[700];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    /* The "outside" database: a real one, made in the cache then moved out. */
+    char ext[800];
+    ce_make_db(&e, "ext", root, ext, sizeof(ext));
+    char outside[800];
+    snprintf(outside, sizeof(outside), "%s/outside.db", e.base);
+    ASSERT_EQ(cbm_rename_replace(ext, outside), 0);
+    cbm_remove_db_sidecars(ext);
+    int64_t size_before = (int64_t)cbm_file_size(outside);
+    char link[800];
+    snprintf(link, sizeof(link), "%s/linked.db", e.cache);
+    ASSERT_EQ(symlink(outside, link), 0);
+    ASSERT_TRUE(cbm_cache_usage_set(link, now - 200 * CE_DAY, NULL));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.projects, 0);
+    ASSERT_TRUE(cbm_is_link(link));
+    ASSERT_TRUE(cbm_file_exists(outside));
+    ASSERT_EQ((int64_t)cbm_file_size(outside), size_before);
+    ASSERT_EQ(ce_trash_count(&e), 0);
+    /* A slot that is a link to that database is not an incoming slot. */
+    char db[800];
+    ce_make_db(&e, "p", root, db, sizeof(db));
+    char sdir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(db, "p", root, sdir, sizeof(sdir)));
+    ASSERT_TRUE(cbm_mkdir_p(sdir, 0755));
+    char slot[1300];
+    snprintf(slot, sizeof(slot), "%s/feature.db", sdir);
+    ASSERT_EQ(symlink(outside, slot), 0);
+    char *from = NULL;
+    ASSERT_EQ(cbm_branch_slots_switch(db, "p", "feature", root, 8, 0, &from),
+              CBM_BRANCH_SWITCH_NONE);
+    ASSERT_NULL(from);
+    ASSERT_EQ((int64_t)cbm_file_size(outside), size_before);
+    (void)cbm_unlink(slot);
+    (void)cbm_unlink(link);
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
 /* A trash entry with a file that refuses to go (a read-only directory) is
  * skipped, not reported purged, and purged by a later sweep once it can be. */
 TEST(cache_trash_purge_refused_is_skipped) {
@@ -2344,6 +2398,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_trash_purge_refused_is_skipped);
     RUN_TEST(cache_trash_root_link_is_refused);
     RUN_TEST(cache_slots_dir_link_is_refused);
+    RUN_TEST(cache_linked_db_and_slot_are_ignored);
     RUN_TEST(cache_old_slots_expire);
     RUN_TEST(cache_orphan_slot_sidecars_expire);
     RUN_TEST(cache_orphan_sidecars);

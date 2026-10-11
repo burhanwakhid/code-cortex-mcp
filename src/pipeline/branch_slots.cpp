@@ -1065,11 +1065,25 @@ static bool adopt_legacy_slot(const char *db_path, const char *project, const ch
 
 /* The incoming slot for slug in dir: <slot>.db.zst, else an uncompressed
  * <slot>.db an earlier build parked. False when neither exists. */
+/* An existing slot file that is not a link: a symlink or reparse point in
+ * a slot's place would be read, decompressed and copied into the live
+ * database from wherever it points. Logged, and treated as no slot. */
+static bool slot_present(const char *path) {
+    if (!cbm_file_exists(path)) {
+        return false;
+    }
+    if (cbm_is_link(path)) {
+        cbm_log_warn("branch.slot_link", "path", path);
+        return false;
+    }
+    return true;
+}
+
 static bool find_slot(const char *dir, const char *slug, char *buf, size_t bufsz) {
-    if (slot_file(dir, slug, BS_ZST_EXT, buf, bufsz) && cbm_file_exists(buf)) {
+    if (slot_file(dir, slug, BS_ZST_EXT, buf, bufsz) && slot_present(buf)) {
         return true;
     }
-    return slot_file(dir, slug, BS_DB_EXT_S, buf, bufsz) && cbm_file_exists(buf);
+    return slot_file(dir, slug, BS_DB_EXT_S, buf, bufsz) && slot_present(buf);
 }
 
 /* The uncompressed database to install from `incoming`: the slot itself when

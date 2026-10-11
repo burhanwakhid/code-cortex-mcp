@@ -1226,6 +1226,14 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
                  * directory) has to be a safe one. */
                 std::string stem(ent->name, strlen(ent->name) - 3);
                 std::string path = std::string(cdir) + "/" + ent->name;
+                /* A <name>.db that is a link (a symlink, a reparse point)
+                 * points outside the cache: never opened, judged or moved
+                 * -- the sweep's no-follow boundary holds for files too. */
+                if (cbm_is_link(path.c_str())) {
+                    cbm_log_warn("cache.expire.skipped", "kind", "database", "path",
+                                 path.c_str(), "reason", "is_link");
+                    continue;
+                }
                 std::string name = learn_project(path.c_str(), stem);
                 if (cbm_validate_project_name(name.c_str())) {
                     dbs.push_back({name, stem, path, {}, ROOT_UNCERTAIN, {}, false});
