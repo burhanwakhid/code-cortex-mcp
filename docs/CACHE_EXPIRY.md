@@ -334,4 +334,8 @@ Each removal logs one `cache.expire` line (kind, name, path, reason), each skip 
   the shared `<project>.db` goes regardless of which checkout it was indexed from.
 - Root classification treats a drive root as a mount parent; a stored Windows root is walked up
   on either separator. A slot whose unlink is refused (a read-only cache, a sharing violation)
-  is logged `cache.expire.skipped` and neither reported nor counted as reclaimed.
+  is logged `cache.expire.skipped` and neither reported nor counted as reclaimed. When a
+  project's database is removed (expiry, `delete_project`) but one of its parked slots refuses
+  to go, that is said rather than hidden: the sweep reports "some parked branches could not be
+  removed", `delete_project` returns `status: deleted` with a `warning`, and the log has
+  `cache.remove.slots_left`; the slot expiry of a later sweep retries them.

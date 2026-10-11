@@ -687,6 +687,18 @@ int cbm_cache_remove_project(const char *db_path, const char *project, const cha
     if (parked) {
         *parked = removed;
     }
+    /* A slot that refused to go (a read-only directory, a sharing violation)
+     * would restore graph data the caller was told is gone: reported, not
+     * hidden behind the main file's success. */
+    slots = NULL;
+    int left = cbm_branch_slots_list(db_path, project, NULL, &slots);
+    cbm_branch_slots_free_list(slots, left);
+    if (left > 0) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d", left);
+        cbm_log_warn("cache.remove.slots_left", "project", project, "slots", buf);
+        return 2;
+    }
     return rc;
 }
 
@@ -1019,6 +1031,13 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
             fclose(f);
         }
         report(c, kind, label(e), entry, bytes, reason, true, NULL);
+        c->res->projects++;
+        c->res->bytes += bytes;
+    } else if (rc == 2) {
+        /* The database went; some parked slot could not be removed and
+         * waits for the slot expiry of a later sweep. */
+        report(c, kind, label(e), entry, bytes, reason, true,
+               "some parked branches could not be removed");
         c->res->projects++;
         c->res->bytes += bytes;
     } else if (rc < 0) {

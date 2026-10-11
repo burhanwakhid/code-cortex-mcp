@@ -144,7 +144,9 @@ bool cbm_cache_expiry_due(const cbm_cache_expiry_cfg_t *cfg, int64_t now);
  * deletes; otherwise the database (and WAL) and the slot directory are moved
  * into that directory. The caller holds the index lease. Returns 0 when the
  * database was removed, 1 when it did not exist, -1 when it could not be
- * removed (its slots are then kept). *parked receives the slot count. */
+ * removed (its slots are then kept), 2 when it was removed but some parked
+ * slot could not be (cache.remove.slots_left; the slot expiry retries).
+ * *parked receives the slot count removed or moved. */
 int cbm_cache_remove_project(const char *db_path, const char *project, const char *trash_entry,
                              int *parked);
 

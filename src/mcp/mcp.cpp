@@ -4226,7 +4226,8 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     bool is_error = false;
     int parked_deleted = 0;
     int removed = cbm_cache_remove_project(path, name, NULL, &parked_deleted);
-    if (removed == 0) {
+    bool slots_left = removed == 2;
+    if (removed == 0 || slots_left) {
         status = "deleted";
     } else if (removed < 0) {
         status = "delete_failed";
@@ -4254,6 +4255,11 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_str(doc, root, "status", status);
     if (parked_deleted > 0) {
         yyjson_mut_obj_add_int(doc, root, "parked_branches_deleted", parked_deleted);
+    }
+    if (slots_left) {
+        yyjson_mut_obj_add_str(doc, root, "warning",
+                               "some parked branches could not be removed; the cache sweep "
+                               "retries (cache.remove.slots_left in the log)");
     }
     if (error_detail) {
         yyjson_mut_obj_add_str(doc, root, "error", error_detail);

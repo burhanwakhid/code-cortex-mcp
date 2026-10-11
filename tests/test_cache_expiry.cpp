@@ -989,6 +989,39 @@ TEST(cache_slots_dir_link_is_refused) {
     PASS();
 }
 
+/* A removal whose parked slot refuses to go (a read-only slot directory)
+ * reports that (rc 2) rather than success: a kept slot could later restore
+ * graph data the caller was told is gone. */
+TEST(cache_remove_project_reports_slots_left) {
+#ifndef _WIN32
+    if (geteuid() == 0) {
+        PASS(); /* root ignores directory permissions */
+    }
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_rmleft"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    ce_make_db(&e, "rl", root, db, sizeof(db));
+    char sdir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(db, "rl", root, sdir, sizeof(sdir)));
+    char slot[1300];
+    snprintf(slot, sizeof(slot), "%s/main.db.zst", sdir);
+    th_write_file(slot, "a");
+    ASSERT_EQ(chmod(sdir, 0555), 0);
+    int parked = -1;
+    int rc = cbm_cache_remove_project(db, "rl", NULL, &parked);
+    chmod(sdir, 0755);
+    ASSERT_EQ(rc, 2);
+    ASSERT_EQ(parked, 0);
+    ASSERT_FALSE(cbm_file_exists(db));
+    ASSERT_TRUE(cbm_file_exists(slot));
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
 /* A trash entry with a file that refuses to go (a read-only directory) is
  * skipped, not reported purged, and purged by a later sweep once it can be. */
 TEST(cache_trash_purge_refused_is_skipped) {
@@ -2166,6 +2199,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_keeps_session_and_watched);
     RUN_TEST(cache_root_gone_windows_separators);
     RUN_TEST(cache_slot_unlink_refused_not_counted);
+    RUN_TEST(cache_remove_project_reports_slots_left);
     RUN_TEST(cache_skips_leased_project);
     RUN_TEST(cache_skips_database_with_open_reader);
     RUN_TEST(cache_dry_run_changes_nothing);
