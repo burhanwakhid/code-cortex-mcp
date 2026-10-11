@@ -870,6 +870,19 @@ bool cbm_root_matches(const char *recorded, const char *dir) {
 #else
     const bool fold = false;
 #endif
+#ifdef _WIN32
+    /* The fold assumes the volume ignores case. A directory can opt into
+     * case sensitivity (per-directory on NTFS), where "Repo" and "repo"
+     * are two directories: when both paths exist, their file identities
+     * decide -- a folded match between two different directories is no
+     * match. Identity unknown for either (one is gone): the fold stands. */
+    DWORD sa, ha, la, sb, hb, lb;
+    bool ida = win_dir_identity(recorded, &sa, &ha, &la);
+    bool idb = win_dir_identity(dir, &sb, &hb, &lb);
+    if (ida && idb) {
+        return sa == sb && ha == hb && la == lb;
+    }
+#endif
     if (cbm_root_normalize(recorded, fold, a, sizeof(a)) &&
         cbm_root_normalize(dir, fold, b, sizeof(b)) && strcmp(a, b) == 0) {
         return true; /* lexically equal: no filesystem access needed */
@@ -879,12 +892,7 @@ bool cbm_root_matches(const char *recorded, const char *dir) {
         return true;
     }
 #ifdef _WIN32
-    /* Both exist but spell differently (a junction the final path could
-     * not resolve, a case the fold missed): one directory on the volume
-     * has one file index. */
-    DWORD sa, ha, la, sb, hb, lb;
-    return win_dir_identity(recorded, &sa, &ha, &la) && win_dir_identity(dir, &sb, &hb, &lb) &&
-           sa == sb && ha == hb && la == lb;
+    return false; /* one of them is gone and they spell differently */
 #else
     /* A case-insensitive volume: two spellings of one directory realpath to
      * different strings, but are one inode. */

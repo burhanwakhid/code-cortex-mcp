@@ -5273,7 +5273,7 @@ static bool uninstall_decide_index_deletion(const char *home, bool requested, bo
         return false;
     }
     if (dry_run) {
-        printf("(dry-run — indexes would be deleted)\n");
+        printf("(dry-run — indexes, parked branches and the cache trash would be deleted)\n");
         return false;
     }
     return true;

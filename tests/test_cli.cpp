@@ -15,6 +15,9 @@
 #include "test_helpers.h"
 #include <cli/cli.h>
 #include <foundation/sha256.h>
+#include <pipeline/branch_slots.h>
+#include <foundation/compat_fs.h>
+#include <foundation/platform.h> /* cbm_file_exists */
 #include <foundation/yaml.h>
 #include <yyjson/yyjson.h>
 #include <string>
@@ -1562,6 +1565,49 @@ TEST(cli_uninstall_dry_run) {
         ASSERT_EQ(stat(path, &st), 0);
     }
 
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* `uninstall --dry-run` modifies nothing: a cache holding only parked
+ * branch databases (counted as indexes) keeps them, and the cache trash. */
+TEST(cli_uninstall_dry_run_keeps_parked_slots) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-dryslot-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char cache[512];
+    snprintf(cache, sizeof(cache), "%s/cache", tmpdir);
+    ASSERT_TRUE(cbm_mkdir_p(cache, 0755));
+    char old_cache[1024];
+    char old_home[1024];
+    bool had_cache = cbm_safe_getenv("CBM_CACHE_DIR", old_cache, sizeof(old_cache), NULL);
+    bool had_home = cbm_safe_getenv("HOME", old_home, sizeof(old_home), NULL);
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("HOME", tmpdir, 1);
+    char db[600];
+    snprintf(db, sizeof(db), "%s/parked.db", cache); /* never created: slots only */
+    char sdir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(db, "parked", tmpdir, sdir, sizeof(sdir)));
+    ASSERT_TRUE(cbm_mkdir_p(sdir, 0755));
+    char slot[1300];
+    snprintf(slot, sizeof(slot), "%s/main.db.zst", sdir);
+    ASSERT_EQ(th_write_file(slot, "slot"), 0);
+    char trash[700];
+    snprintf(trash, sizeof(trash), "%s/trash/1700000000-old", cache);
+    ASSERT_TRUE(cbm_mkdir_p(trash, 0755));
+    char trashed[900];
+    snprintf(trashed, sizeof(trashed), "%s/old.db", trash);
+    ASSERT_EQ(th_write_file(trashed, "db"), 0);
+
+    const char *argv[] = {"uninstall", "--dry-run"};
+    int rc = cbm_cmd_uninstall(2, (char **)argv);
+
+    if (had_cache) cbm_setenv("CBM_CACHE_DIR", old_cache, 1); else cbm_unsetenv("CBM_CACHE_DIR");
+    if (had_home) cbm_setenv("HOME", old_home, 1); else cbm_unsetenv("HOME");
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(cbm_file_exists(slot));
+    ASSERT_TRUE(cbm_file_exists(trashed));
     test_rmdir_r(tmpdir);
     PASS();
 }
@@ -4848,6 +4894,7 @@ SUITE(cli) {
     /* Dry-run lifecycle (2 tests) */
     RUN_TEST(cli_install_dry_run);
     RUN_TEST(cli_uninstall_dry_run);
+    RUN_TEST(cli_uninstall_dry_run_keeps_parked_slots);
 
     /* Full lifecycle (1 test — cli_test.go) */
     RUN_TEST(cli_install_and_uninstall);

@@ -175,8 +175,10 @@ removed after that.
   checkouts with the same derived name never share slots, and every spelling of one directory
   gets the same key: separators, `.`/`..` and trailing separators are folded, symlinks resolved
   (`realpath`); on Windows the directory's final path (a junction or symlink resolved, the
-  volume's own case) with Unicode case folding, and `cbm_root_matches` falls back to the
-  volume serial + file index when two spellings still differ. A slot from the earlier flat layout (`branches/<project>/<slot>.db`) is
+  volume's own case) with Unicode case folding; when both directories exist, `cbm_root_matches`
+  lets the volume serial + file index decide outright (a directory opted into per-directory case
+  sensitivity makes `Repo` and `repo` two checkouts), and only a vanished one is compared by
+  its folded spelling. A slot from the earlier flat layout (`branches/<project>/<slot>.db`) is
   moved into the root's directory when it records that root.
 - `<slot>` is the slug when it fits in 200 bytes. A longer slug becomes a prefix plus `-` and
   16 hex digits of the SHA-256 of the whole slug. The file name thus stays one path component
