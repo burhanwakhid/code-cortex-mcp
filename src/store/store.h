@@ -338,6 +338,11 @@ void cbm_store_end_reads(cbm_store_t *s);
 /* Get the underlying sqlite3 handle (for testing only). */
 struct sqlite3 *cbm_store_get_db(cbm_store_t *s);
 
+/* sqlite3_open_v2 for a file path: on Windows a path past MAX_PATH goes in
+ * its extended-length form (\\?\...), which SQLite's VFS accepts but never
+ * adds. Every open of a cache database goes through this. */
+int cbm_store_sqlite_open(const char *path, struct sqlite3 **db, int flags);
+
 /* Get the last error message (static string, valid until next call). */
 const char *cbm_store_error(cbm_store_t *s);
 

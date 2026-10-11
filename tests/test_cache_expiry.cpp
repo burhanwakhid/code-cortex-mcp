@@ -885,6 +885,104 @@ TEST(cache_trash_purge_never_follows_links) {
     PASS();
 }
 
+/* <cache>/trash standing as a link to a directory outside the cache is never
+ * followed: nothing in there is purged, and nothing is moved through it. */
+TEST(cache_trash_root_link_is_refused) {
+#ifndef _WIN32
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_trroot"));
+    int64_t now = (int64_t)time(NULL);
+    char outside[700];
+    snprintf(outside, sizeof(outside), "%s/outside", e.base);
+    char victim_dir[800];
+    snprintf(victim_dir, sizeof(victim_dir), "%s/%lld-x", outside, (long long)(now - 10 * CE_DAY));
+    ASSERT_TRUE(cbm_mkdir_p(victim_dir, 0755));
+    char victim[900];
+    snprintf(victim, sizeof(victim), "%s/x.db", victim_dir);
+    ASSERT_EQ(th_write_file(victim, "keep"), 0);
+    char tdir[700];
+    snprintf(tdir, sizeof(tdir), "%s/trash", e.cache);
+    ASSERT_EQ(symlink(outside, tdir), 0);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.purged, 0);
+    ASSERT_TRUE(cbm_file_exists(victim));
+    ASSERT_TRUE(cbm_is_link(tdir));
+    /* A removal that would move a database through the link is refused. */
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    ce_make_db(&e, "mv", root, db, sizeof(db));
+    char entry[900];
+    snprintf(entry, sizeof(entry), "%s/%lld-mv", tdir, (long long)now);
+    int parked = 0;
+    ASSERT_EQ(cbm_cache_remove_project(db, "mv", entry, &parked), -1);
+    ASSERT_TRUE(cbm_file_exists(db));
+    char moved[1000];
+    snprintf(moved, sizeof(moved), "%s/%lld-mv/mv.db", outside, (long long)now);
+    ASSERT_FALSE(cbm_file_exists(moved));
+    (void)cbm_unlink(tdir);
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
+/* <cache>/branches (or a project's directory under it) standing as a link
+ * is never scanned for deletion: old slots behind it stay. */
+TEST(cache_slots_dir_link_is_refused) {
+#ifndef _WIN32
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_sllink"));
+    int64_t now = (int64_t)time(NULL);
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    ce_make_db(&e, "ln", root, db, sizeof(db));
+    char outside[700];
+    snprintf(outside, sizeof(outside), "%s/outside/ln", e.base);
+    ASSERT_TRUE(cbm_mkdir_p(outside, 0755));
+    char victim[900];
+    snprintf(victim, sizeof(victim), "%s/old.db.zst", outside);
+    ASSERT_EQ(th_write_file(victim, "slot"), 0);
+    ce_age(victim, now - 60 * CE_DAY);
+    char bdir[700];
+    snprintf(bdir, sizeof(bdir), "%s/branches", e.cache);
+    char parent[700];
+    snprintf(parent, sizeof(parent), "%s/outside", e.base);
+    ASSERT_EQ(symlink(parent, bdir), 0);
+    int reported = 0;
+    ASSERT_EQ(cbm_branch_slots_expire(db, "ln", now - 30 * CE_DAY, now - 3600, false,
+                                      ce_count_slot, &reported),
+              0);
+    ASSERT_EQ(reported, 0);
+    ASSERT_EQ(cbm_branch_slots_delete_all(db, "ln"), 0);
+    ASSERT_TRUE(cbm_file_exists(victim));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.slots, 0);
+    ASSERT_TRUE(cbm_file_exists(victim));
+    (void)cbm_unlink(bdir);
+    /* The project directory itself as a link, under a real branches dir. */
+    ASSERT_TRUE(cbm_mkdir_p(bdir, 0755));
+    char pdir[800];
+    snprintf(pdir, sizeof(pdir), "%s/ln", bdir);
+    ASSERT_EQ(symlink(outside, pdir), 0);
+    ASSERT_EQ(cbm_branch_slots_delete_all(db, "ln"), 0);
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.slots, 0);
+    ASSERT_TRUE(cbm_file_exists(victim));
+    (void)cbm_unlink(pdir);
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
 /* A trash entry with a file that refuses to go (a read-only directory) is
  * skipped, not reported purged, and purged by a later sweep once it can be. */
 TEST(cache_trash_purge_refused_is_skipped) {
@@ -1036,7 +1134,8 @@ TEST(cache_orphan_sidecars) {
     cbm_mkdir_p(root, 0755);
     int64_t now = (int64_t)time(NULL);
     ce_make_db(&e, "live", root, db, sizeof(db));
-    const char *gone[] = {"gone.db-wal", "gone.db-shm", "gone.db.tmp", "gone.db.import_tmp"};
+    const char *gone[] = {"gone.db-wal",     "gone.db-shm",        "gone.db.tmp",
+                          "gone.db.tmp-wal", "gone.db.import_tmp", "gone.db.import_tmp-shm"};
     const char *stay[] = {"live.db-wal", "gone.db.index.lock", "fresh.db-wal", "notes.txt"};
     char p[900];
     for (const char *n : gone) {
@@ -1053,7 +1152,7 @@ TEST(cache_orphan_sidecars) {
     ce_cfg(&cfg);
     cbm_cache_sweep_result_t r;
     ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
-    ASSERT_EQ(r.sidecars, 4);
+    ASSERT_EQ(r.sidecars, 6);
     for (const char *n : gone) {
         snprintf(p, sizeof(p), "%s/%s", e.cache, n);
         ASSERT_FALSE(cbm_file_exists(p));
@@ -2071,6 +2170,8 @@ SUITE(cache_expiry) {
 #ifndef _WIN32
     RUN_TEST(cache_trash_purge_never_follows_links);
     RUN_TEST(cache_trash_purge_refused_is_skipped);
+    RUN_TEST(cache_trash_root_link_is_refused);
+    RUN_TEST(cache_slots_dir_link_is_refused);
     RUN_TEST(cache_old_slots_expire);
     RUN_TEST(cache_orphan_slot_sidecars_expire);
     RUN_TEST(cache_orphan_sidecars);

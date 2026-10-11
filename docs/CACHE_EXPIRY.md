@@ -36,7 +36,7 @@ The rules, in order of confidence:
 | `root_gone` | The recorded checkout root is missing on at least 3 sweeps, the first of them at least the grace period ago, and nothing used the database in the grace period. | 7 days |
 | `unused` | No tool call, hook or index run used the database for the threshold. | 90 days |
 | `slot` | A parked slot was parked longer ago than the threshold. | 30 days |
-| `sidecar` | A `-wal`, `-shm`, `-journal`, `.db.tmp` or `.db.import_tmp` file whose database is gone, or a scratch file (`.db.unz*`, `.db.zst.tmp`) beside the slots, or the `-wal`, `-shm` or `-journal` file of a legacy `.db` slot that is gone. | older than 1 hour |
+| `sidecar` | A `-wal`, `-shm`, `-journal`, `.db.tmp` or `.db.import_tmp` file (or a `-wal`/`-shm`/`-journal` of those temp files) whose database is gone, or a scratch file (`.db.unz*`, `.db.zst.tmp`) beside the slots, or the `-wal`, `-shm` or `-journal` file of a legacy `.db` slot that is gone. | older than 1 hour |
 
 ### Root gone
 
@@ -247,7 +247,10 @@ does not descend into it: following one would delete files outside the cache, or
 cyclic junction. The same holds for every other cache walk (branch-slot cleanup and expiry,
 the project and trash scans): a directory listing never reports a link as a directory, and a
 filesystem that reports no entry type (NFS, FUSE) has its entries classified by `lstat`, so
-parked slots on such a mount are still found. `cache trash` and `cache restore` do not list an
+parked slots on such a mount are still found. `<cache>/trash` and `<cache>/branches` (or a
+project's directory under it) standing as a link are refused outright: nothing is scanned,
+moved or deleted through them (`cache.expire.refused`, `branch.slots_dir_link`), and a project
+whose database cannot be moved into the trash stays. `cache trash` and `cache restore` do not list an
 entry that is itself a link.
 
 ### Never removed

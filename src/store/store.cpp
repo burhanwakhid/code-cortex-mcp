@@ -872,7 +872,7 @@ static void sqlite_cosine_i8(sqlite3_context *ctx, int argc, sqlite3_value **arg
  * the wide APIs as it is given: past MAX_PATH that needs the extended-length
  * form (\\?\C:\...), which the VFS accepts but never adds. A branch slot
  * named after a long branch is that long. Elsewhere the path goes as is. */
-static int store_sqlite_open(const char *path, sqlite3 **db, int flags) {
+int cbm_store_sqlite_open(const char *path, sqlite3 **db, int flags) {
 #ifdef _WIN32
     char *long_path = path ? cbm_utf8_long_path(path) : NULL;
     int rc = sqlite3_open_v2(long_path ? long_path : path, db, flags, NULL);
@@ -912,7 +912,7 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
         flags |= SQLITE_OPEN_MEMORY;
     }
 
-    int rc = store_sqlite_open(path, &s->db, flags);
+    int rc = cbm_store_sqlite_open(path, &s->db, flags);
     if (rc != SQLITE_OK) {
         free(s);
         return NULL;
@@ -1063,7 +1063,7 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
      *
      * No SQLITE_OPEN_CREATE on either path — a missing DB must return NULL
      * (no ghost .db for unknown/unindexed projects). */
-    int rc = store_sqlite_open(db_path, &s->db, SQLITE_OPEN_READONLY);
+    int rc = cbm_store_sqlite_open(db_path, &s->db, SQLITE_OPEN_READONLY);
     if (rc == SQLITE_OK) {
         /* Force first DB access so a read-only-FS WAL failure surfaces now. */
         if (sqlite3_exec(s->db, "SELECT 1 FROM sqlite_master LIMIT 1;", NULL, NULL, NULL) !=
@@ -1603,7 +1603,7 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
     (void)cbm_unlink(tmp_path);
 
     sqlite3 *dest_db = NULL;
-    int rc = store_sqlite_open(tmp_path, &dest_db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+    int rc = cbm_store_sqlite_open(tmp_path, &dest_db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
     if (rc != SQLITE_OK) {
         store_set_error(s, "dump: cannot open temp file");
         return CBM_STORE_ERR;

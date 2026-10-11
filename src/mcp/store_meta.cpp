@@ -65,7 +65,7 @@ cbm_store_meta_db_t *cbm_store_meta_open(void) {
      * creation here — a missing cache dir means nothing has been indexed, and
      * creating it from a lookup would be a side effect the caller never asked
      * for. */
-    int rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+    int rc = cbm_store_sqlite_open(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
     if (rc != SQLITE_OK) {
         sqlite3_close(db);
         return NULL;

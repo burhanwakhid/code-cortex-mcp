@@ -10,6 +10,7 @@
 #include "foundation/str_util.h"
 #include "mcp/store_meta.h"
 #include "pipeline/branch_slots.h"
+#include "store/store.h" /* cbm_store_sqlite_open */
 
 #include <sqlite3.h>
 
@@ -32,10 +33,13 @@
  * trash a database that was just used. */
 enum { CE_PATH_MAX = 4096, CE_BUSY_MS = 200, CE_WRITE_BUSY_MS = 2500 };
 
-/* SQLite sidecars of <x>.db, and the temp files a dump (<x>.db.tmp) or an
- * artifact import (<x>.db.import_tmp) write before renaming into place. */
-static const char *const CE_SIDECAR_SUFFIXES[] = {".db-wal", ".db-shm", ".db-journal",
-                                                  ".db.tmp", ".db.import_tmp"};
+/* SQLite sidecars of <x>.db, the temp files a dump (<x>.db.tmp) or an
+ * artifact import (<x>.db.import_tmp) write before renaming into place, and
+ * the sidecars SQLite leaves beside those temp files when the writer dies. */
+static const char *const CE_SIDECAR_SUFFIXES[] = {
+    ".db-wal",        ".db-shm",        ".db-journal",       ".db.tmp",
+    ".db.tmp-wal",    ".db.tmp-shm",    ".db.tmp-journal",   ".db.import_tmp",
+    ".db.import_tmp-wal", ".db.import_tmp-shm", ".db.import_tmp-journal"};
 
 /* ── Small helpers ──────────────────────────────────────────────── */
 
@@ -174,7 +178,7 @@ static sqlite3 *state_open(bool create_tables) {
     char path[CE_PATH_MAX];
     snprintf(path, sizeof(path), "%s/_config.db", cdir);
     sqlite3 *db = NULL;
-    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) !=
+    if (cbm_store_sqlite_open(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) !=
         SQLITE_OK) {
         sqlite3_close(db);
         return NULL;
@@ -526,7 +530,7 @@ static std::string learn_root(const char *path, const char *project) {
     }
     std::string root;
     sqlite3 *db = NULL;
-    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+    if (cbm_store_sqlite_open(path, &db, SQLITE_OPEN_READONLY) == SQLITE_OK) {
         sqlite3_busy_timeout(db, CE_BUSY_MS);
         const char *sqls[] = {"SELECT root_path FROM projects WHERE name = ?1;",
                               "SELECT root_path FROM projects LIMIT 1;"};
@@ -568,7 +572,7 @@ static std::string learn_project(const char *path, const std::string &stem) {
     std::string name;
     int rows = 0;
     sqlite3 *db = NULL;
-    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+    if (cbm_store_sqlite_open(path, &db, SQLITE_OPEN_READONLY) == SQLITE_OK) {
         sqlite3_busy_timeout(db, CE_BUSY_MS);
         sqlite3_stmt *st = NULL;
         if (sqlite3_prepare_v2(db, "SELECT name FROM projects WHERE instr(name, '::') = 0 LIMIT 2;",
@@ -597,6 +601,8 @@ void cbm_cache_expiry_test_scan_hook(void (*callback)(void *data), void *data) {
 
 /* ── Removal ────────────────────────────────────────────────────── */
 
+static bool trash_dir_usable(const std::string &tdir);
+
 int cbm_cache_remove_project(const char *db_path, const char *project, const char *trash_entry,
                              int *parked) {
     if (parked) {
@@ -608,10 +614,19 @@ int cbm_cache_remove_project(const char *db_path, const char *project, const cha
     snprintf(shm, sizeof(shm), "%s-shm", db_path);
     bool exists = cbm_file_exists(db_path);
     int rc = exists ? 0 : 1;
+    /* Nothing is moved through a link standing in for the trash directory
+     * or the entry: the file would land outside the cache. */
+    bool linked = false;
+    if (trash_entry) {
+        std::string tdir(trash_entry);
+        size_t cut = tdir.find_last_of("/\\");
+        linked = cbm_is_link(trash_entry) ||
+                 (cut != std::string::npos && cut > 0 && !trash_dir_usable(tdir.substr(0, cut)));
+    }
     if (exists && trash_entry) {
         char dst[CE_PATH_MAX];
         snprintf(dst, sizeof(dst), "%s/%s.db", trash_entry, project);
-        if (!cbm_mkdir_p(trash_entry, 0755) || cbm_rename_replace(db_path, dst) != 0) {
+        if (linked || !cbm_mkdir_p(trash_entry, 0755) || cbm_rename_replace(db_path, dst) != 0) {
             rc = -1;
         } else if (cbm_file_exists(wal)) {
             snprintf(dst, sizeof(dst), "%s/%s.db-wal", trash_entry, project);
@@ -638,7 +653,7 @@ int cbm_cache_remove_project(const char *db_path, const char *project, const cha
     if (trash_entry && n > 0 && cbm_branch_slots_dir(db_path, project, NULL, sdir, sizeof(sdir))) {
         char dst[CE_PATH_MAX];
         snprintf(dst, sizeof(dst), "%s/branches", trash_entry);
-        if (cbm_mkdir_p(trash_entry, 0755) && cbm_rename_replace(sdir, dst) == 0) {
+        if (!linked && cbm_mkdir_p(trash_entry, 0755) && cbm_rename_replace(sdir, dst) == 0) {
             if (parked) {
                 *parked = n;
             }
@@ -659,7 +674,7 @@ int cbm_cache_remove_project(const char *db_path, const char *project, const cha
 static bool quiesced(const char *path) {
     sqlite3 *db = NULL;
     bool ok = false;
-    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK) {
+    if (cbm_store_sqlite_open(path, &db, SQLITE_OPEN_READWRITE) == SQLITE_OK) {
         sqlite3_busy_timeout(db, CE_BUSY_MS);
         /* A fresh connection has not read the header yet, and a checkpoint
          * on it reports "not WAL" (-1 frames): read the mode first. */
@@ -757,10 +772,25 @@ static bool refuse(cbm_cache_sweep_result_t *res, const char *why) {
     return false;
 }
 
+/* Whether <cache>/trash is a real directory, or absent. A link in its place
+ * (a symlink, a junction) is never followed: entries found through it would
+ * be outside the cache, and removed from there. */
+static bool trash_dir_usable(const std::string &tdir) {
+    if (walk_kind(tdir.c_str()) != WALK_LINK) {
+        return true;
+    }
+    cbm_log_warn("cache.expire.refused", "reason", "trash directory is a link", "path",
+                 tdir.c_str());
+    return false;
+}
+
 /* Purge trash entries ("<epoch>-<project>") older than cfg->trash_s. */
 static void purge_trash(const char *cdir, const cbm_cache_expiry_cfg_t *cfg, int64_t now,
                         sweep_ctx_t *c) {
     std::string tdir = std::string(cdir) + "/trash";
+    if (!trash_dir_usable(tdir)) {
+        return;
+    }
     cbm_dir_t *d = cbm_opendir(tdir.c_str());
     if (!d) {
         return;
@@ -1220,7 +1250,15 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
     /* Parked slots and slot scratch, per project directory under branches/
      * (also of projects whose database is gone), under that project's lease. */
     std::string bdir = std::string(cdir) + "/branches";
-    cbm_dir_t *bd = cbm_opendir(bdir.c_str());
+    /* A link in place of branches/ is not followed (the slot cleanup refuses
+     * it too): what it points at is outside the cache. */
+    cbm_dir_t *bd = NULL;
+    if (cbm_is_link(bdir.c_str())) {
+        cbm_log_warn("cache.expire.refused", "reason", "branches directory is a link", "path",
+                     bdir.c_str());
+    } else {
+        bd = cbm_opendir(bdir.c_str());
+    }
     std::vector<std::string> pdirs;
     if (bd) {
         cbm_dirent_t *ent;
@@ -1317,6 +1355,9 @@ bool cbm_cache_expiry_due(const cbm_cache_expiry_cfg_t *cfg, int64_t now) {
 static std::vector<std::pair<long long, std::string>> trash_entries(const char *cdir) {
     std::vector<std::pair<long long, std::string>> out;
     std::string tdir = std::string(cdir) + "/trash";
+    if (!trash_dir_usable(tdir)) {
+        return out;
+    }
     cbm_dir_t *d = cbm_opendir(tdir.c_str());
     if (!d) {
         return out;
