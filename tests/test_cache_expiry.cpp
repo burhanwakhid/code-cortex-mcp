@@ -432,6 +432,43 @@ TEST(cache_truncated_memo_root_is_not_trusted) {
     PASS();
 }
 
+/* A root whose nearest existing ancestor is an empty directory (a mount
+ * point with nothing mounted) is unavailable, not deleted: no streak. One
+ * whose ancestor has other entries (a removed checkout beside others) is
+ * missing. */
+TEST(cache_root_under_empty_ancestor_is_uncertain) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_mnt"));
+    char mnt[700];
+    char busy[700];
+    snprintf(mnt, sizeof(mnt), "%s/mnt-data", e.base);
+    snprintf(busy, sizeof(busy), "%s/work", e.base);
+    ASSERT_TRUE(cbm_mkdir_p(mnt, 0755));
+    ASSERT_TRUE(cbm_mkdir_p(busy, 0755));
+    char sibling[800];
+    snprintf(sibling, sizeof(sibling), "%s/other-repo", busy);
+    ASSERT_TRUE(cbm_mkdir_p(sibling, 0755));
+    char r1[800];
+    char r2[800];
+    snprintf(r1, sizeof(r1), "%s/repo", mnt);
+    snprintf(r2, sizeof(r2), "%s/repo", busy);
+    char db[800];
+    ce_make_db(&e, "unmounted", r1, db, sizeof(db));
+    ce_make_db(&e, "deleted", r2, db, sizeof(db));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, (int64_t)time(NULL), false, &r), 0);
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "unmounted", &lu, &checks);
+    ASSERT_EQ(checks, 0);
+    ce_usage(&e, "deleted", &lu, &checks);
+    ASSERT_EQ(checks, 1);
+    ce_teardown(&e);
+    PASS();
+}
+
 /* A root named with non-ASCII characters, and one past the Windows MAX_PATH,
  * is present: the probe must not read either as "no such file" (the narrow
  * Windows stat does) and start a missing streak on a live checkout. */
@@ -2230,6 +2267,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_root_back_resets_streak);
     RUN_TEST(cache_root_uncertain_never_counts);
     RUN_TEST(cache_truncated_memo_root_is_not_trusted);
+    RUN_TEST(cache_root_under_empty_ancestor_is_uncertain);
     RUN_TEST(cache_root_unicode_and_long_is_present);
     RUN_TEST(cache_mass_missing_and_env_change_count_nothing);
     RUN_TEST(cache_refuses_unknown_cache_dir);
@@ -2237,7 +2275,6 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_keeps_session_and_watched);
     RUN_TEST(cache_root_gone_windows_separators);
     RUN_TEST(cache_slot_unlink_refused_not_counted);
-    RUN_TEST(cache_remove_project_reports_slots_left);
     RUN_TEST(cache_skips_leased_project);
     RUN_TEST(cache_skips_database_with_open_reader);
     RUN_TEST(cache_dry_run_changes_nothing);
@@ -2246,6 +2283,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_renamed_db_kept_by_project);
     RUN_TEST(cache_renamed_db_expires_as_project);
 #ifndef _WIN32
+    RUN_TEST(cache_remove_project_reports_slots_left);
     RUN_TEST(cache_trash_purge_never_follows_links);
     RUN_TEST(cache_trash_purge_refused_is_skipped);
     RUN_TEST(cache_trash_root_link_is_refused);

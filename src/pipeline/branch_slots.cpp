@@ -31,6 +31,7 @@
 
 enum {
     BS_PATH_MAX = CBM_PATH_MAX,
+    BS_SUFFIX_RESERVE = 16, /* longest scratch suffix appended to a slot path */
     /* zstd level of a parked slot. Measured on two index databases (zstd
      * 1.5.7, one thread): level 3 gave 9.0x (redis, 216 MB) and 5.9x (opencv,
      * 462 MB) at about 600 MB/s; level 9 gave 10.0x and 6.7x at a fifth of
@@ -367,7 +368,11 @@ static bool slot_file(const char *dir, const char *slug, const char *ext, char *
         return false;
     }
     int n = snprintf(buf, bufsz, "%s/%s%s", dir, name, ext);
-    return n > 0 && (size_t)n < bufsz;
+    /* Room for every scratch suffix this module appends (".tmp", ".unz",
+     * "-journal"): a slot path that fills the buffer would make its
+     * scratch path truncate to the slot path itself, and the compressor
+     * write straight over the final file. */
+    return n > 0 && (size_t)n + BS_SUFFIX_RESERVE < bufsz;
 }
 
 static bool ends_with(const char *name, const char *suffix) {
@@ -517,10 +522,14 @@ static bool unlink_slot(const char *path) {
 static void unlink_scratch(const char *path) {
     char tmp[BS_PATH_MAX];
     unlink_slot(path);
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    unlink_slot(tmp);
-    snprintf(tmp, sizeof(tmp), "%s-journal", path);
-    (void)cbm_unlink(tmp);
+    int tn = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (tn > 0 && (size_t)tn < sizeof(tmp)) {
+        unlink_slot(tmp);
+    }
+    tn = snprintf(tmp, sizeof(tmp), "%s-journal", path);
+    if (tn > 0 && (size_t)tn < sizeof(tmp)) {
+        (void)cbm_unlink(tmp);
+    }
 }
 
 /* Write f's data through to stable storage: its stdio buffer, then fsync
@@ -583,7 +592,10 @@ static void sync_parent_dir(const char *path) {
  * graph right after, and this slot is then its only copy. */
 static bool compress_file(const char *src, const char *dst) {
     char tmp[BS_PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", dst);
+    int tn = snprintf(tmp, sizeof(tmp), "%s.tmp", dst);
+    if (tn <= 0 || (size_t)tn >= sizeof(tmp)) {
+        return false; /* a truncated scratch name would be dst itself */
+    }
     FILE *in = cbm_fopen(src, "rb");
     FILE *out = in ? cbm_fopen(tmp, "wb") : NULL;
     int64_t n = out ? cbm_zstd_compress_stream(in, out, file_size(src), BS_ZSTD_LEVEL,
@@ -615,7 +627,10 @@ static bool decompress_file(const char *slot, const char *out_path, bool durable
         return false;
     }
     char tmp[BS_PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", out_path);
+    int tn = snprintf(tmp, sizeof(tmp), "%s.tmp", out_path);
+    if (tn <= 0 || (size_t)tn >= sizeof(tmp)) {
+        return false; /* a truncated scratch name would be out_path itself */
+    }
     FILE *in = cbm_fopen(slot, "rb");
     FILE *out = in ? cbm_fopen(tmp, "wb") : NULL;
     int64_t n = out ? cbm_zstd_decompress_stream(in, out, BS_MAX_UNPACKED_BYTES) : -1;

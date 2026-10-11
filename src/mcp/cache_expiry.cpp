@@ -479,6 +479,53 @@ static bool is_mount_parent(const std::string &dir) {
  * nearest existing ancestor is "/" or a mount parent (/Volumes, /mnt, ...)
  * may be an unmounted volume, and any error other than "no such file" (a
  * permission error, a network mount timing out) proves nothing: UNCERTAIN. */
+/* Whether an existing directory looks like a mount point whose volume is
+ * not mounted right now: it is empty (a mount point directory is), or it
+ * is named as a mount point in /etc/fstab or the mount table. A checkout
+ * below it is unavailable, not deleted. */
+static bool looks_like_mount_point(const std::string &dir) {
+    cbm_dir_t *d = cbm_opendir(dir.c_str());
+    if (d) {
+        bool empty = true;
+        cbm_dirent_t *ent;
+        while ((ent = cbm_readdir(d)) != NULL) {
+            if (strcmp(ent->name, ".") != 0 && strcmp(ent->name, "..") != 0) {
+                empty = false;
+                break;
+            }
+        }
+        cbm_closedir(d);
+        if (empty) {
+            return true;
+        }
+    }
+#ifndef _WIN32
+    for (const char *table : {"/etc/fstab", "/proc/self/mounts"}) {
+        FILE *f = fopen(table, "r");
+        if (!f) {
+            continue;
+        }
+        char line[CE_PATH_MAX];
+        bool found = false;
+        while (!found && fgets(line, sizeof(line), f)) {
+            if (line[0] == '#') {
+                continue;
+            }
+            /* "<device> <mount point> <type> ..." in both files */
+            char *save = NULL;
+            char *dev = strtok_r(line, " \t\n", &save);
+            char *mnt = dev ? strtok_r(NULL, " \t\n", &save) : NULL;
+            found = mnt && dir == mnt;
+        }
+        fclose(f);
+        if (found) {
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
 static root_state_t root_state(const std::string &root) {
     bool absolute = !root.empty() && root[0] == '/';
 #ifdef _WIN32
@@ -527,7 +574,11 @@ static root_state_t root_state(const std::string &root) {
         }
 #endif
         if (cbm_stat(dir.c_str(), &st) == 0) {
-            return is_mount_parent(dir) ? ROOT_UNCERTAIN : ROOT_MISSING;
+            /* The nearest existing ancestor: a mount parent, or itself a
+             * mount point with nothing mounted (/mnt/data of an unmounted
+             * /mnt/data/repo), means unavailable, not deleted. */
+            return is_mount_parent(dir) || looks_like_mount_point(dir) ? ROOT_UNCERTAIN
+                                                                        : ROOT_MISSING;
         }
         if (errno != ENOENT && errno != ENOTDIR) {
             return ROOT_UNCERTAIN;
