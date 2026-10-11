@@ -334,16 +334,26 @@ bool cbm_cache_usage_set(const char *db_path, int64_t last_used, const char *roo
         return false;
     }
     sqlite3_busy_timeout(db, CE_WRITE_BUSY_MS);
-    usage_row_t r = usage_get(db, key);
-    if (last_used > 0) {
-        r.last_used = last_used;
+    /* Read-modify-write under the write lock: a query touch (no root) in
+     * another process reading the row before this and writing after it
+     * would put the old root and missing streak back. */
+    bool ok = sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) == SQLITE_OK;
+    if (ok) {
+        usage_row_t r = usage_get(db, key);
+        if (last_used > 0) {
+            r.last_used = last_used;
+        }
+        if (root_path) {
+            r.root = root_path;
+        }
+        r.missing_since = 0;
+        r.missing_checks = 0;
+        ok = usage_put(db, key, r) &&
+             sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK;
+        if (!ok) {
+            (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        }
     }
-    if (root_path) {
-        r.root = root_path;
-    }
-    r.missing_since = 0;
-    r.missing_checks = 0;
-    bool ok = usage_put(db, key, r);
     sqlite3_close(db);
     return ok;
 }
@@ -397,13 +407,26 @@ void cbm_cache_usage_touch(const char *db_path, const char *root_path) {
     bool root_known = !root_path || (r.root == root_path && r.missing_checks == 0);
     bool ok = true;
     if (!fresh || !root_known) {
-        r.last_used = now;
-        if (root_path) {
-            r.root = root_path;
-            r.missing_since = 0;
-            r.missing_checks = 0;
+        /* The write re-reads the row under the write lock: between the read
+         * above and this write an index run may have recorded a new root and
+         * cleared the missing streak, and a stale copy written over it would
+         * undo that -- after the grace period the sweep would trash an index
+         * a live checkout owns. */
+        ok = sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) == SQLITE_OK;
+        if (ok) {
+            r = usage_get(db, key);
+            r.last_used = now;
+            if (root_path) {
+                r.root = root_path;
+                r.missing_since = 0;
+                r.missing_checks = 0;
+            }
+            ok = usage_put(db, key, r) &&
+                 sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK;
+            if (!ok) {
+                (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+            }
         }
-        ok = usage_put(db, key, r);
     }
     sqlite3_close(db);
     /* Throttle only what reached _config.db: a write lost to a busy database

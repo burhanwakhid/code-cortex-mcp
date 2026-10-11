@@ -368,7 +368,15 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
                  * mode would never re-extract it once purged. */
                 char digest[CBM_SHA256_HEX_LEN + 1];
                 preserve = !verify_content || empty_both(&stored[i], &st);
-                if (!preserve && stored_sha_valid(&stored[i])) {
+                if (!preserve && !stored_sha_valid(&stored[i])) {
+                    /* No digest to compare against (a row from before
+                     * digests were stored, or a malformed one): the bytes
+                     * are unknown, not known to differ. Kept, like an
+                     * unreadable file; purged, this mode could never
+                     * re-extract it. */
+                    cbm_log_warn("incremental.digest_unknown", "rel_path", stored[i].rel_path);
+                    preserve = true;
+                } else if (!preserve) {
                     errno = 0;
                     if (!file_sha256_hex(abs_path, digest)) {
                         cbm_log_warn("incremental.stat_uncertain", "rel_path", stored[i].rel_path,

@@ -3199,6 +3199,34 @@ TEST(branch_switch_keeps_unreadable_mode_skipped_file) {
     PASS();
 }
 
+/* A stored file the current mode does not discover whose stored digest is
+ * missing or malformed (a row from before digests were stored) is kept on
+ * a verifying switch: the bytes are unknown, not known to differ. */
+TEST(branch_switch_keeps_mode_skipped_file_without_digest) {
+    char *repo = bi_make_repo("cbm_bi_modeskip_nodigest");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    th_write_file(TH_PATH(repo, "docs/x.py"), "def doc_main():\n    return 1\n");
+    ASSERT_EQ(bi_git(repo, "add ."), 0);
+    ASSERT_EQ(bi_git(repo, "commit -q -m docs"), 0);
+
+    ASSERT_EQ(bi_index_mode(repo, CBM_MODE_FULL).rc, 0);
+    ASSERT_EQ(bi_count("doc_main"), 1);
+    ASSERT_TRUE(bi_db_exec("UPDATE file_hashes SET sha256 = 'not-a-digest' "
+                           "WHERE rel_path = 'docs/x.py';"));
+    ASSERT_EQ(bi_git(repo, "checkout -q -b same-tree"), 0);
+    bi_run_t r = bi_index_mode(repo, CBM_MODE_FAST);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_EQ(r.action, "seeded");
+    ASSERT_EQ(bi_count("doc_main"), 1);
+    ASSERT_EQ(bi_count("only_main"), 1);
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -3276,4 +3304,5 @@ SUITE(branch_index) {
     RUN_TEST(branch_slot_named_like_scratch_survives_sweep);
     RUN_TEST(branch_git_head_read_trailing_slash_root);
     RUN_TEST(branch_switch_keeps_unreadable_mode_skipped_file);
+    RUN_TEST(branch_switch_keeps_mode_skipped_file_without_digest);
 }
