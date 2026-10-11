@@ -1081,6 +1081,32 @@ static const char *open_incoming(const char *incoming, const char *dir, const ch
     return scratch;
 }
 
+/* Whether a slot directory may be scanned, written or deleted: neither it,
+ * the project directory, nor the shared <cache>/branches above it is a link
+ * (a symlink, a junction). A link in any of them would be followed to files
+ * outside the cache -- old slots removed from there, a park written there.
+ * Walks up until the "branches" component has been checked. */
+static bool slots_dir_safe(const char *dir) {
+    char path[BS_PATH_MAX];
+    snprintf(path, sizeof(path), "%s", dir);
+    for (int level = 0; level < 4; level++) {
+        if (cbm_is_link(path)) {
+            cbm_log_warn("branch.slots_dir_link", "path", path);
+            return false;
+        }
+        char *slash = strrchr(path, '/');
+        if (!slash || slash == path) {
+            break;
+        }
+        bool was_branches = strcmp(slash + 1, "branches") == 0;
+        *slash = '\0';
+        if (was_branches) {
+            break;
+        }
+    }
+    return true;
+}
+
 cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *project,
                                             const char *slug, const char *root, int keep,
                                             int64_t budget, char **from) {
@@ -1090,7 +1116,7 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
     char dir[BS_PATH_MAX];
     char incoming[BS_PATH_MAX];
     if (keep < 1 || !slug_is_safe(slug) ||
-        !cbm_branch_slots_dir(db_path, project, root, dir, sizeof(dir))) {
+        !cbm_branch_slots_dir(db_path, project, root, dir, sizeof(dir)) || !slots_dir_safe(dir)) {
         return CBM_BRANCH_SWITCH_NONE;
     }
     sweep_scratch(dir);
@@ -1449,33 +1475,10 @@ static int delete_dir_slots(const char *dir) {
     return removed;
 }
 
-/* Whether a slot directory may be scanned for deletion: neither it nor the
- * shared <cache>/branches above it is a link (a symlink, a junction). A link
- * in either place would be followed to files outside the cache, and old
- * slots removed from there. Root-key subdirectories come from cbm_readdir,
- * which never reports a link as a directory. */
-static bool slots_dir_deletable(const char *dir) {
-    if (cbm_is_link(dir)) {
-        cbm_log_warn("branch.slots_dir_link", "path", dir);
-        return false;
-    }
-    char parent[BS_PATH_MAX];
-    snprintf(parent, sizeof(parent), "%s", dir);
-    char *slash = strrchr(parent, '/');
-    if (slash && slash != parent) {
-        *slash = '\0';
-        if (cbm_is_link(parent)) {
-            cbm_log_warn("branch.slots_dir_link", "path", parent);
-            return false;
-        }
-    }
-    return true;
-}
-
 int cbm_branch_slots_delete_all(const char *db_path, const char *project) {
     char dir[BS_PATH_MAX];
     if (!cbm_branch_slots_dir(db_path, project, NULL, dir, sizeof(dir)) ||
-        !slots_dir_deletable(dir)) {
+        !slots_dir_safe(dir)) {
         return 0;
     }
     /* Every root's slots (a derived name can be several directories'), and
@@ -1590,7 +1593,7 @@ int cbm_branch_slots_expire(const char *db_path, const char *project, int64_t sl
                             void *ud) {
     char dir[BS_PATH_MAX];
     if (!cbm_branch_slots_dir(db_path, project, NULL, dir, sizeof(dir)) ||
-        !slots_dir_deletable(dir)) {
+        !slots_dir_safe(dir)) {
         return 0;
     }
     int removed = expire_dir(dir, slot_before, scratch_before, dry_run, cb, ud);

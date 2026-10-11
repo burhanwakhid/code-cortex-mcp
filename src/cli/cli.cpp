@@ -3496,7 +3496,6 @@ int cbm_remove_indexes(const char *home_dir) {
 
 struct cbm_config {
     sqlite3 *db;
-    char get_buf[CLI_BUF_4K]; /* static buffer for cbm_config_get return values */
 };
 
 cbm_config_t *cbm_config_open(const char *cache_dir) {
@@ -3558,12 +3557,18 @@ const char *cbm_config_get(cbm_config_t *cfg, const char *key, const char *defau
     }
     sqlite3_bind_text(stmt, SQL_PARAM_1, key, SQL_NUL_TERM, cbm_sqlite_transient);
 
+    /* The value is returned from a per-thread buffer, not one in the handle:
+     * the server's auto-index and sweep threads read settings through the
+     * same handle as the main thread, and a shared buffer let one read's
+     * value replace another's before it was parsed. (SQLite serializes the
+     * connection itself.) */
+    static thread_local char get_buf[CLI_BUF_4K];
     const char *result = default_val;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         const char *val = (const char *)sqlite3_column_text(stmt, 0);
         if (val) {
-            snprintf(cfg->get_buf, sizeof(cfg->get_buf), "%s", val);
-            result = cfg->get_buf;
+            snprintf(get_buf, sizeof(get_buf), "%s", val);
+            result = get_buf;
         }
     }
     sqlite3_finalize(stmt);

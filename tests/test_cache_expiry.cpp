@@ -961,6 +961,12 @@ TEST(cache_slots_dir_link_is_refused) {
     ASSERT_EQ(reported, 0);
     ASSERT_EQ(cbm_branch_slots_delete_all(db, "ln"), 0);
     ASSERT_TRUE(cbm_file_exists(victim));
+    /* A switch neither parks into nor restores from the linked directory. */
+    char *from = NULL;
+    ASSERT_EQ(cbm_branch_slots_switch(db, "ln", "feature", root, 8, 0, &from),
+              CBM_BRANCH_SWITCH_NONE);
+    ASSERT_NULL(from);
+    ASSERT_TRUE(cbm_file_exists(victim));
     cbm_cache_expiry_cfg_t cfg;
     ce_cfg(&cfg);
     cbm_cache_sweep_result_t r;

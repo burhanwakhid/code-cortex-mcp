@@ -1470,13 +1470,21 @@ int cbm_cache_trash_restore(const char *which, char *msg, size_t msg_sz) {
     } else {
         std::string src = edir + "/" + project + ".db";
         cbm_remove_db_sidecars(dbp.c_str());
-        if (cbm_rename_replace(src.c_str(), dbp.c_str()) != 0) {
-            snprintf(msg, msg_sz, "could not move %s back", src.c_str());
-        } else {
-            std::string wal = src + "-wal";
-            if (cbm_file_exists(wal.c_str())) {
-                (void)cbm_rename_replace(wal.c_str(), (dbp + "-wal").c_str());
+        /* The saved WAL goes back first, the main file last: the database
+         * is published by the main file's rename, and a writer opening it
+         * in between (an ADR write from another server) would have its own
+         * fresh WAL replaced by the saved one. With the WAL in place before
+         * the main file, an opener finds both. */
+        std::string wal = src + "-wal";
+        std::string live_wal = dbp + "-wal";
+        bool wal_back = !cbm_file_exists(wal.c_str()) ||
+                        cbm_rename_replace(wal.c_str(), live_wal.c_str()) == 0;
+        if (!wal_back || cbm_rename_replace(src.c_str(), dbp.c_str()) != 0) {
+            snprintf(msg, msg_sz, "could not move %s back", wal_back ? src.c_str() : wal.c_str());
+            if (wal_back && cbm_file_exists(live_wal.c_str())) {
+                (void)cbm_rename_replace(live_wal.c_str(), wal.c_str()); /* undo */
             }
+        } else {
             char sdir[CE_PATH_MAX];
             std::string tb = edir + "/branches";
             bool slots_back = true;
