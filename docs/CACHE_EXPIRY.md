@@ -338,8 +338,8 @@ Each removal logs one `cache.expire` line (kind, name, path, reason), each skip 
   `projects` row is read instead. A slot whose unlink is refused (a read-only cache, a sharing violation)
   is logged `cache.expire.skipped` and neither reported nor counted as reclaimed. When a
   project's database is removed (expiry, `delete_project`) but one of its parked slots refuses
-  to go, that is said rather than hidden: the sweep reports "some parked branches could not be
-  removed", `delete_project` returns `status: deleted` with a `warning`, and the log has
+  to go, that is said rather than hidden: the sweep reports the project removed with "some parked
+  branches could not be removed" in its reason and counts only the bytes that went, `delete_project` returns `status: deleted` with a `warning`, and the log has
   `cache.remove.slots_left`; the slot expiry of a later sweep retries them.
   A WAL that will not follow its (quiesced) main file into the trash is deleted instead; one
   that will not go either rolls the main file back and the project is reported "could not be

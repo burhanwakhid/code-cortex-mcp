@@ -1051,11 +1051,23 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
         c->res->bytes += bytes;
     } else if (rc == 2) {
         /* The database went; some parked slot could not be removed and
-         * waits for the slot expiry of a later sweep. */
-        report(c, kind, label(e), entry, bytes, reason, true,
-               "some parked branches could not be removed");
+         * waits for the slot expiry of a later sweep. Reported as removed
+         * (it is), the slots' refusal carried in the reason, and only what
+         * actually went counted: the slots still on disk are measured
+         * again and left out of the reclaimed bytes. */
+        int64_t left = 0;
+        info = NULL;
+        ni = cbm_branch_slots_info(e.path.c_str(), e.name.c_str(), NULL, &info);
+        for (int i = 0; i < ni; i++) {
+            left += info[i].bytes > 0 ? info[i].bytes : 0;
+        }
+        cbm_branch_slots_free_info(info, ni);
+        int64_t gone = bytes > left ? bytes - left : 0;
+        report(c, kind, label(e), entry, gone,
+               reason + "; some parked branches could not be removed and stay for a later sweep",
+               true, NULL);
         c->res->projects++;
-        c->res->bytes += bytes;
+        c->res->bytes += gone;
     } else if (rc < 0) {
         report(c, kind, label(e), e.path, bytes, reason, false, "could not be moved");
         c->res->skipped++;
