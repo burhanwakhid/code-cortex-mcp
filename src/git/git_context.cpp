@@ -607,19 +607,32 @@ int cbm_git_head_read(const char *root, cbm_git_head_t *out) {
                (top[len - 1] == '/' || top[len - 1] == '\\')) {
             top[--len] = '\0';
         }
-        int n = snprintf(path, sizeof(path), "%s/.git", top);
+        bool at_root = (len == 1 && top[0] == '/') || (len == 3 && top[1] == ':');
+        int n = snprintf(path, sizeof(path), "%s%s.git", top, at_root ? "" : "/");
         if (n > 0 && (size_t)n < sizeof(path) && cbm_stat(path, &st) == 0) {
             break;
+        }
+        if (at_root) {
+            return CBM_NOT_FOUND; /* the filesystem root was probed too */
         }
         char *slash = strrchr(top, '/');
         char *bslash = strrchr(top, '\\');
         if (bslash && (!slash || bslash > slash)) {
             slash = bslash;
         }
-        if (!slash || slash == top || slash[1] == '\0') {
-            return CBM_NOT_FOUND; /* reached the filesystem root */
+        if (!slash) {
+            return CBM_NOT_FOUND; /* a relative path with nothing above */
         }
-        *slash = '\0';
+        /* A repository rooted at the filesystem root ("/", "C:\\") is probed
+         * once more: "/sub" becomes "/" and "C:\\sub" becomes "C:\\" -- with
+         * its separator, "C:" alone being a drive-relative path. */
+        if (slash == top) {
+            top[1] = '\0';
+        } else if (slash == top + 2 && top[1] == ':') {
+            top[3] = '\0';
+        } else {
+            *slash = '\0';
+        }
     }
     if (S_ISDIR(st.st_mode)) {
         snprintf(gitdir, sizeof(gitdir), "%s", path);
