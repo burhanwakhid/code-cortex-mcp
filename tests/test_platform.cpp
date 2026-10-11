@@ -841,6 +841,58 @@ TEST(platform_file_helpers_long_path) {
     PASS();
 }
 
+/* Windows: two spellings of one directory that differ in a non-ASCII
+ * letter's case are one checkout (the volume folds case by Unicode rules),
+ * and a junction to it is the same checkout too (the final path resolves
+ * it; the file identity backs that up). Same root, same slot key. */
+TEST(platform_root_matches_windows_unicode_case_and_junction) {
+#ifdef _WIN32
+    char *base = th_mktempdir("cbm_plat_root");
+    ASSERT_NOT_NULL(base);
+    char upper[600];
+    char lower[600];
+    snprintf(upper, sizeof(upper), "%s/\xc3\x84-repo", base); /* Ä-repo */
+    snprintf(lower, sizeof(lower), "%s/\xc3\xa4-repo", base); /* ä-repo */
+    ASSERT_TRUE(cbm_mkdir_p(upper, 0755));
+    ASSERT_TRUE(cbm_is_dir(lower)); /* the volume is case-insensitive */
+    ASSERT_TRUE(cbm_root_matches(upper, lower));
+    ASSERT_TRUE(cbm_root_matches(lower, upper));
+    char ka[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    char kb[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    ASSERT_TRUE(cbm_branch_root_key(upper, ka, sizeof(ka)));
+    ASSERT_TRUE(cbm_branch_root_key(lower, kb, sizeof(kb)));
+    ASSERT_STR_EQ(ka, kb);
+    /* A junction (no privilege needed, unlike a symlink). */
+    char link[600];
+    snprintf(link, sizeof(link), "%s/via-junction", base);
+    char cmd[2048];
+    char wl[600];
+    char wu[600];
+    snprintf(wl, sizeof(wl), "%s", link);
+    snprintf(wu, sizeof(wu), "%s", upper);
+    for (char *c = wl; *c; c++) {
+        if (*c == '/') {
+            *c = '\\';
+        }
+    }
+    for (char *c = wu; *c; c++) {
+        if (*c == '/') {
+            *c = '\\';
+        }
+    }
+    snprintf(cmd, sizeof(cmd), "cmd /c mklink /J \"%s\" \"%s\" >nul 2>&1", wl, wu);
+    if (system(cmd) == 0 && cbm_is_link(link)) {
+        ASSERT_TRUE(cbm_root_matches(upper, link));
+        ASSERT_TRUE(cbm_root_matches(link, lower));
+        ASSERT_TRUE(cbm_branch_root_key(link, kb, sizeof(kb)));
+        ASSERT_STR_EQ(ka, kb);
+        (void)cbm_rmdir(link);
+    }
+    th_rmtree(base);
+#endif
+    PASS();
+}
+
 SUITE(platform) {
     RUN_TEST(regex_compile_refuses_oversized_expansion);
     RUN_TEST(regex_compile_accepts_expansion_under_budget);
@@ -859,6 +911,7 @@ SUITE(platform) {
     RUN_TEST(platform_mmap);
     RUN_TEST(platform_mmap_nonexistent);
     RUN_TEST(platform_readdir_reports_links_as_not_dirs);
+    RUN_TEST(platform_root_matches_windows_unicode_case_and_junction);
     RUN_TEST(platform_file_helpers_long_path);
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);

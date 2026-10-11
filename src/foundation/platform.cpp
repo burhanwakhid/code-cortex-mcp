@@ -649,15 +649,39 @@ bool cbm_root_normalize(const char *in, bool fold_case, char *out, size_t out_sz
     if (!in || !out || out_sz < 2) {
         return false;
     }
+#ifdef _WIN32
+    /* The volume folds case by Unicode rules, not ASCII ones: "C:\\Ä\\repo"
+     * and "c:\\ä\\repo" are one directory. Fold the whole string the way
+     * the filesystem does (CharLowerW), then the byte pass below is a no-op
+     * for the non-ASCII characters. */
+    char *folded = NULL;
+    if (fold_case) {
+        wchar_t *w = cbm_utf8_to_wide(in);
+        if (w) {
+            CharLowerW(w);
+            folded = cbm_wide_to_utf8(w);
+            free(w);
+        }
+    }
+    if (folded) {
+        in = folded;
+    }
+#endif
     size_t n = strlen(in);
     char *work = (char *)malloc(n + 1);
     if (!work) {
+#ifdef _WIN32
+        free(folded);
+#endif
         return false;
     }
     for (size_t i = 0; i <= n; i++) {
         char c = in[i] == '\\' ? '/' : in[i];
         work[i] = fold_case ? (char)tolower((unsigned char)c) : c;
     }
+#ifdef _WIN32
+    free(folded);
+#endif
     /* Prefix: a drive ("c:"), a UNC share ("//"), or a POSIX root ("/");
      * none for a relative path. The drive letter's case never matters. */
     size_t o = 0;
@@ -728,14 +752,76 @@ bool cbm_root_normalize(const char *in, bool fold_case, char *out, size_t out_sz
     return true;
 }
 
+#ifdef _WIN32
+/* The final path of an existing directory, as the volume spells it (a
+ * junction or directory symlink resolved), in UTF-8 with the \\?\ prefix
+ * stripped; NULL when it cannot be opened. Caller frees. */
+static char *win_dir_final_path(const char *path) {
+    wchar_t *wide = cbm_utf8_to_wide_path(path);
+    if (!wide) {
+        return NULL;
+    }
+    HANDLE h = CreateFileW(wide, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                           OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(wide);
+    if (h == INVALID_HANDLE_VALUE) {
+        return NULL;
+    }
+    wchar_t final_path[CBM_ROOT_MAX];
+    DWORD n = GetFinalPathNameByHandleW(h, final_path, CBM_ROOT_MAX, FILE_NAME_NORMALIZED);
+    CloseHandle(h);
+    if (n == 0 || n >= CBM_ROOT_MAX) {
+        return NULL;
+    }
+    const wchar_t *plain = final_path;
+    if (wcsncmp(plain, L"\\\\?\\UNC\\", 8) == 0) {
+        final_path[6] = L'\\';
+        plain = final_path + 6;
+    } else if (wcsncmp(plain, L"\\\\?\\", 4) == 0) {
+        plain += 4;
+    }
+    return cbm_wide_to_utf8(plain);
+}
+
+/* The volume serial and file index of a directory: its identity on the
+ * volume, the same through every spelling, junction and symlink. */
+static bool win_dir_identity(const char *path, DWORD *serial, DWORD *hi, DWORD *lo) {
+    wchar_t *wide = cbm_utf8_to_wide_path(path);
+    if (!wide) {
+        return false;
+    }
+    HANDLE h = CreateFileW(wide, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                           OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(wide);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    bool ok = GetFileInformationByHandle(h, &info) != 0;
+    CloseHandle(h);
+    if (ok) {
+        *serial = info.dwVolumeSerialNumber;
+        *hi = info.nFileIndexHigh;
+        *lo = info.nFileIndexLow;
+    }
+    return ok;
+}
+#endif
+
 bool cbm_root_canonical(const char *root, char *out, size_t out_sz) {
     if (!root || !root[0]) {
         return false;
     }
 #ifdef _WIN32
+    /* The directory's final path where it exists (a junction or symlink
+     * resolved, 8.3 names expanded, the volume's own spelling of the case),
+     * else _fullpath: absolute, "." and ".." folded, lexically. */
+    char *final_utf8 = win_dir_final_path(root);
     char full[_MAX_PATH];
-    const char *src = _fullpath(full, root, sizeof(full)) ? full : root;
-    return cbm_root_normalize(src, true, out, out_sz);
+    const char *src = final_utf8 ? final_utf8 : (_fullpath(full, root, sizeof(full)) ? full : root);
+    bool ok = cbm_root_normalize(src, true, out, out_sz);
+    free(final_utf8);
+    return ok;
 #else
     /* Lexical form first, so "x/./gone/.." still resolves through x. */
     char lex[CBM_ROOT_MAX];
@@ -774,7 +860,12 @@ bool cbm_root_matches(const char *recorded, const char *dir) {
         return true;
     }
 #ifdef _WIN32
-    return false;
+    /* Both exist but spell differently (a junction the final path could
+     * not resolve, a case the fold missed): one directory on the volume
+     * has one file index. */
+    DWORD sa, ha, la, sb, hb, lb;
+    return win_dir_identity(recorded, &sa, &ha, &la) && win_dir_identity(dir, &sb, &hb, &lb) &&
+           sa == sb && ha == hb && la == lb;
 #else
     /* A case-insensitive volume: two spellings of one directory realpath to
      * different strings, but are one inode. */
