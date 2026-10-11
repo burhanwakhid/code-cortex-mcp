@@ -863,14 +863,20 @@ TEST(platform_root_matches_windows_unicode_case_and_junction) {
     ASSERT_TRUE(cbm_branch_root_key(upper, ka, sizeof(ka)));
     ASSERT_TRUE(cbm_branch_root_key(lower, kb, sizeof(kb)));
     ASSERT_STR_EQ(ka, kb);
-    /* A junction (no privilege needed, unlike a symlink). */
+    /* A junction (no privilege needed, unlike a symlink) to an ASCII-named
+     * directory: the mklink command line goes through system() in the ANSI
+     * code page, which would garble a non-ASCII target. */
+    char plain[600];
+    snprintf(plain, sizeof(plain), "%s/plain-repo", base);
+    ASSERT_TRUE(cbm_mkdir_p(plain, 0755));
+    ASSERT_TRUE(cbm_branch_root_key(plain, ka, sizeof(ka)));
     char link[600];
     snprintf(link, sizeof(link), "%s/via-junction", base);
     char cmd[2048];
     char wl[600];
     char wu[600];
     snprintf(wl, sizeof(wl), "%s", link);
-    snprintf(wu, sizeof(wu), "%s", upper);
+    snprintf(wu, sizeof(wu), "%s", plain);
     for (char *c = wl; *c; c++) {
         if (*c == '/') {
             *c = '\\';
@@ -883,8 +889,10 @@ TEST(platform_root_matches_windows_unicode_case_and_junction) {
     }
     snprintf(cmd, sizeof(cmd), "cmd /c mklink /J \"%s\" \"%s\" >nul 2>&1", wl, wu);
     if (system(cmd) == 0 && cbm_is_link(link)) {
-        ASSERT_TRUE(cbm_root_matches(upper, link));
-        ASSERT_TRUE(cbm_root_matches(link, lower));
+        ASSERT_TRUE(cbm_is_dir(link)); /* the target exists through it */
+        ASSERT_TRUE(cbm_root_matches(plain, link));
+        ASSERT_TRUE(cbm_root_matches(link, plain));
+        ASSERT_FALSE(cbm_root_matches(upper, link));
         ASSERT_TRUE(cbm_branch_root_key(link, kb, sizeof(kb)));
         ASSERT_STR_EQ(ka, kb);
         (void)cbm_rmdir(link);
