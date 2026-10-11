@@ -434,7 +434,10 @@ static const char *itoa_buf(int v) {
     return buf;
 }
 
-static int delete_cached_project_db(const char *project_name) {
+/* Remove the project's database and the parked slots of the checkout at
+ * root_path. Only that checkout's: a second checkout deriving the same
+ * project name keeps its own slots (separated by root key). */
+static int delete_cached_project_db(const char *project_name, const char *root_path) {
     if (!cbm_validate_project_name(project_name)) {
         return CBM_NOT_FOUND;
     }
@@ -461,7 +464,11 @@ static int delete_cached_project_db(const char *project_name) {
     }
     cbm_remove_db_sidecars(path);
     cbm_cache_usage_forget(path);
-    (void)cbm_branch_slots_delete_all(path, project_name);
+    if (root_path && root_path[0]) {
+        (void)cbm_branch_slots_delete_root(path, project_name, root_path);
+    } else {
+        (void)cbm_branch_slots_delete_all(path, project_name);
+    }
     cbm_db_lease_release(lease);
     return 0;
 }
@@ -701,7 +708,7 @@ static void prune_missing_project(cbm_watcher_t *w, project_state_t *s) {
      * is referenced by the poll_once snapshot iterating us. On OOM the
      * watch stays registered and pruning retries on the next cycle. */
     if (current == s && defer_state_free(w, s)) {
-        int rc = delete_cached_project_db(project_name);
+        int rc = delete_cached_project_db(project_name, s->root_path);
         if (rc == 0) {
             cbm_ht_delete(w->projects, project_name);
             removed = true;

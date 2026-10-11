@@ -210,6 +210,12 @@ void cbm_branch_slots_free_info(cbm_branch_slot_info_t *info, int count);
  * the number of databases removed. */
 int cbm_branch_slots_delete_all(const char *db_path, const char *project);
 
+/* Delete only the parked databases of project that belong to the checkout
+ * at root (its root-key directory), then the directories left empty. Two
+ * checkouts that derive the same project name keep separate slots; a prune
+ * of one must not take the other's. Returns the number removed. */
+int cbm_branch_slots_delete_root(const char *db_path, const char *project, const char *root);
+
 /* Called by cbm_branch_slots_expire for each file it removes (or, in a dry
  * run, would remove): `path` the file, `bytes` its size, `scratch` true for a
  * scratch or temp file of an interrupted park or restore, false for a slot. */

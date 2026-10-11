@@ -1504,6 +1504,25 @@ int cbm_branch_slots_delete_all(const char *db_path, const char *project) {
     return removed;
 }
 
+int cbm_branch_slots_delete_root(const char *db_path, const char *project, const char *root) {
+    char dir[BS_PATH_MAX];
+    if (!root || !root[0] || !cbm_branch_slots_dir(db_path, project, root, dir, sizeof(dir)) ||
+        !slots_dir_safe(dir)) {
+        return 0;
+    }
+    int removed = delete_dir_slots(dir);
+    (void)cbm_rmdir(dir); /* only when empty: the root key's directory */
+    for (int up = 0; up < 2; up++) {
+        char *slash = strrchr(dir, '/');
+        if (!slash || slash == dir) {
+            break;
+        }
+        *slash = '\0';
+        (void)cbm_rmdir(dir); /* the project directory, then branches/ */
+    }
+    return removed;
+}
+
 /* Expire the files of one slot directory (cbm_branch_slots_expire). */
 static int expire_dir(const char *dir, int64_t slot_before, int64_t scratch_before, bool dry_run,
                       cbm_branch_slot_expire_cb cb, void *ud) {

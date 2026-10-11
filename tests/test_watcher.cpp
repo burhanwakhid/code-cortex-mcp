@@ -1983,6 +1983,7 @@ TEST(watcher_null_watch_count) {
 
 #include <foundation/constants.h>
 #include <mcp/cache_expiry.h>
+#include <pipeline/branch_slots.h>
 #include "sqlite3.h"
 #include <string>
 #include <time.h>
@@ -2057,6 +2058,44 @@ TEST(watcher_prune_lease_preserves_grace_and_retry) {
     PASS();
 }
 
+/* Two checkouts deriving the same project name keep separate slot
+ * directories (root key). Pruning the one that vanished takes its own slots
+ * only; the other checkout's parked branches stay. */
+TEST(watcher_prune_keeps_colliding_roots_slots) {
+    char root[256] = "/tmp/cbm_prune_coll_XXXXXX";
+    ASSERT(cbm_mkdtemp(root));
+    prune_lease_env cache("CBM_CACHE_DIR", root);
+    prune_lease_env grace("CBM_WATCHER_PRUNE_GRACE_S", "0");
+    std::string db = std::string(root) + "/coll.db";
+    std::string absent = std::string(root) + "/absent-root";
+    std::string other = std::string(root) + "/other-root";
+    ASSERT(cbm_mkdir_p(other.c_str(), 0755));
+    ASSERT_EQ(th_write_file(db.c_str(), "db"), 0);
+    char adir[1024];
+    char bdir[1024];
+    ASSERT(cbm_branch_slots_dir(db.c_str(), "coll", absent.c_str(), adir, sizeof(adir)));
+    ASSERT(cbm_branch_slots_dir(db.c_str(), "coll", other.c_str(), bdir, sizeof(bdir)));
+    ASSERT(strcmp(adir, bdir) != 0);
+    ASSERT(cbm_mkdir_p(adir, 0755));
+    ASSERT(cbm_mkdir_p(bdir, 0755));
+    std::string a_slot = std::string(adir) + "/main.db.zst";
+    std::string b_slot = std::string(bdir) + "/main.db.zst";
+    ASSERT_EQ(th_write_file(a_slot.c_str(), "a"), 0);
+    ASSERT_EQ(th_write_file(b_slot.c_str(), "b"), 0);
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    cbm_watcher_watch(w, "coll", absent.c_str());
+    for (int i = 0; i < 4 && cbm_watcher_watch_count(w) == 1; ++i) {
+        ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    }
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+    ASSERT(!cbm_is_regular_file(db.c_str()));
+    ASSERT(!cbm_is_regular_file(a_slot.c_str()));
+    ASSERT(cbm_is_regular_file(b_slot.c_str())); /* the other checkout's slot stays */
+    cbm_watcher_free(w);
+    th_rmtree(root);
+    PASS();
+}
+
 struct pending_lease_calls { int calls = 0; };
 static int pending_lease_callback(const char *, const char *, void *ud) {
     auto *state = static_cast<pending_lease_calls *>(ud);
@@ -2123,6 +2162,7 @@ TEST(watcher_pending_mark_during_callback_survives_success) {
 SUITE(watcher) {
     RUN_TEST(watcher_pending_mark_during_callback_survives_success);
     RUN_TEST(watcher_prune_lease_preserves_grace_and_retry);
+    RUN_TEST(watcher_prune_keeps_colliding_roots_slots);
     RUN_TEST(watcher_pending_initial_index_retries_clean_baseline);
 
     /* Adaptive interval */

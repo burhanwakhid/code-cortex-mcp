@@ -329,7 +329,9 @@ Each removal logs one `cache.expire` line (kind, name, path, reason), each skip 
   re-indexed, is excluded only from that server's own sweep (as its session or watched
   project). A sweep from another process can expire it as unused.
 - The watcher's own prune of a watched root that stays missing for 10 minutes (`watcher.cpp`)
-  still deletes directly, not through the trash.
+  still deletes directly, not through the trash. It removes the parked slots of that checkout
+  only (its root key); a second checkout deriving the same project name keeps its slots, but
+  the shared `<project>.db` goes regardless of which checkout it was indexed from.
 - Root classification treats a drive root as a mount parent; a stored Windows root is walked up
   on either separator. A slot whose unlink is refused (a read-only cache, a sharing violation)
   is logged `cache.expire.skipped` and neither reported nor counted as reclaimed.

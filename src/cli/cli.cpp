@@ -3693,8 +3693,9 @@ int cbm_cmd_cache(int argc, char **argv) {
         opts.report = cache_report;
         opts.report_ud = &dry;
         cbm_cache_sweep_result_t res;
+        const char *cdir = cbm_resolve_cache_dir();
         printf("%s %s\n", dry ? "Cache expiry preview for" : "Cache expiry in",
-               cbm_resolve_cache_dir());
+               cdir ? cdir : "(no cache directory)");
         if (cbm_cache_expiry_sweep(&cfg, &opts, &res) != 0) {
             (void)fprintf(stderr, "not swept: %s\n", res.refused_reason);
             return CLI_TRUE;
