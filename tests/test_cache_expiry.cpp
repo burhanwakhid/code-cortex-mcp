@@ -712,6 +712,115 @@ TEST(cache_slot_unlink_refused_not_counted) {
     PASS();
 }
 
+/* A preview decides with the sweep's own checks: a project being indexed
+ * (its lease held) is reported kept, not "would be removed". And loading
+ * the expiry settings for a cache that does not exist creates nothing. */
+TEST(cache_dry_run_applies_safety_checks_and_creates_nothing) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_dryck"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "busy", root, db, sizeof(db));
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 100 * CE_DAY, NULL));
+    cbm_db_lease_t *lease = NULL;
+    ASSERT_EQ(cbm_db_lease_try_acquire(db, &lease), 0);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, true, &r), 0);
+    ASSERT_EQ(r.projects, 0);
+    ASSERT_EQ(r.skipped, 1); /* "being indexed", as the real sweep would say */
+    /* An aged slot of the leased project is not previewed as removable. */
+    char sdir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(db, "busy", root, sdir, sizeof(sdir)));
+    char slot[1300];
+    snprintf(slot, sizeof(slot), "%s/old.db.zst", sdir);
+    th_write_file(slot, "s");
+#ifndef _WIN32
+    ce_age(slot, now - 40 * CE_DAY);
+    ASSERT_EQ(ce_sweep(&cfg, now, true, &r), 0);
+    ASSERT_EQ(r.slots, 0);
+#endif
+    cbm_db_lease_release(lease);
+    /* A second, free database: the preview judges it without creating its
+     * lock files (the lease's or the reader gate's). */
+    char db2[800];
+    ce_make_db(&e, "fresh", root, db2, sizeof(db2));
+    ASSERT_TRUE(cbm_cache_usage_set(db2, now - 100 * CE_DAY, NULL));
+    ASSERT_EQ(ce_sweep(&cfg, now, true, &r), 0);
+    ASSERT_EQ(r.projects, 2); /* both free now: would be removed */
+    ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_TRUE(cbm_file_exists(db2));
+    ASSERT_FALSE(cbm_file_exists((std::string(db2) + ".index.lock").c_str()));
+    ASSERT_FALSE(cbm_file_exists((std::string(db2) + ".read.lock").c_str()));
+    /* No cache directory: the settings load does not create one. */
+    char nocache[700];
+    snprintf(nocache, sizeof(nocache), "%s/never-made", e.base);
+    cbm_setenv("CBM_CACHE_DIR", nocache, 1);
+    cbm_cache_expiry_cfg_load(&cfg, NULL);
+    ASSERT_FALSE(cbm_is_dir(nocache));
+    cbm_setenv("CBM_CACHE_DIR", e.cache, 1);
+    ce_teardown(&e);
+    PASS();
+}
+
+/* A <name>.db that is a symlink to a database outside the cache is not a
+ * project of this cache: the sweep neither opens nor expires it, and the
+ * file it points at is untouched. A slot file that is a symlink is never
+ * restored. */
+TEST(cache_linked_db_and_slot_are_ignored) {
+#ifndef _WIN32
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_lndb"));
+    char root[700];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    /* The "outside" database: a real one, made in the cache then moved out. */
+    char ext[800];
+    ce_make_db(&e, "ext", root, ext, sizeof(ext));
+    char outside[800];
+    snprintf(outside, sizeof(outside), "%s/outside.db", e.base);
+    ASSERT_EQ(cbm_rename_replace(ext, outside), 0);
+    cbm_remove_db_sidecars(ext);
+    int64_t size_before = (int64_t)cbm_file_size(outside);
+    char link[800];
+    snprintf(link, sizeof(link), "%s/linked.db", e.cache);
+    ASSERT_EQ(symlink(outside, link), 0);
+    ASSERT_TRUE(cbm_cache_usage_set(link, now - 200 * CE_DAY, NULL));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.projects, 0);
+    ASSERT_TRUE(cbm_is_link(link));
+    ASSERT_TRUE(cbm_file_exists(outside));
+    ASSERT_EQ((int64_t)cbm_file_size(outside), size_before);
+    ASSERT_EQ(ce_trash_count(&e), 0);
+    /* A slot that is a link to that database is not an incoming slot. */
+    char db[800];
+    ce_make_db(&e, "p", root, db, sizeof(db));
+    char sdir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(db, "p", root, sdir, sizeof(sdir)));
+    ASSERT_TRUE(cbm_mkdir_p(sdir, 0755));
+    char slot[1300];
+    snprintf(slot, sizeof(slot), "%s/feature.db", sdir);
+    ASSERT_EQ(symlink(outside, slot), 0);
+    char *from = NULL;
+    ASSERT_EQ(cbm_branch_slots_switch(db, "p", "feature", root, 8, 0, &from),
+              CBM_BRANCH_SWITCH_NONE);
+    ASSERT_NULL(from);
+    ASSERT_EQ((int64_t)cbm_file_size(outside), size_before);
+    (void)cbm_unlink(slot);
+    (void)cbm_unlink(link);
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
 /* A project being indexed (its lease held) is skipped, and expired by a
  * later sweep once the lease is free. */
 TEST(cache_skips_leased_project) {
@@ -1091,115 +1200,6 @@ TEST(cache_remove_project_reports_slots_left) {
     ASSERT_EQ(parked, 0);
     ASSERT_FALSE(cbm_file_exists(db));
     ASSERT_TRUE(cbm_file_exists(slot));
-    ce_teardown(&e);
-#endif
-    PASS();
-}
-
-/* A preview decides with the sweep's own checks: a project being indexed
- * (its lease held) is reported kept, not "would be removed". And loading
- * the expiry settings for a cache that does not exist creates nothing. */
-TEST(cache_dry_run_applies_safety_checks_and_creates_nothing) {
-    ce_env_t e;
-    ASSERT_TRUE(ce_setup(&e, "cbm_ce_dryck"));
-    char root[700];
-    char db[800];
-    snprintf(root, sizeof(root), "%s/repo", e.base);
-    cbm_mkdir_p(root, 0755);
-    int64_t now = (int64_t)time(NULL);
-    ce_make_db(&e, "busy", root, db, sizeof(db));
-    ASSERT_TRUE(cbm_cache_usage_set(db, now - 100 * CE_DAY, NULL));
-    cbm_db_lease_t *lease = NULL;
-    ASSERT_EQ(cbm_db_lease_try_acquire(db, &lease), 0);
-    cbm_cache_expiry_cfg_t cfg;
-    ce_cfg(&cfg);
-    cbm_cache_sweep_result_t r;
-    ASSERT_EQ(ce_sweep(&cfg, now, true, &r), 0);
-    ASSERT_EQ(r.projects, 0);
-    ASSERT_EQ(r.skipped, 1); /* "being indexed", as the real sweep would say */
-    /* An aged slot of the leased project is not previewed as removable. */
-    char sdir[1100];
-    ASSERT_TRUE(cbm_branch_slots_dir(db, "busy", root, sdir, sizeof(sdir)));
-    char slot[1300];
-    snprintf(slot, sizeof(slot), "%s/old.db.zst", sdir);
-    th_write_file(slot, "s");
-#ifndef _WIN32
-    ce_age(slot, now - 40 * CE_DAY);
-    ASSERT_EQ(ce_sweep(&cfg, now, true, &r), 0);
-    ASSERT_EQ(r.slots, 0);
-#endif
-    cbm_db_lease_release(lease);
-    /* A second, free database: the preview judges it without creating its
-     * lock files (the lease's or the reader gate's). */
-    char db2[800];
-    ce_make_db(&e, "fresh", root, db2, sizeof(db2));
-    ASSERT_TRUE(cbm_cache_usage_set(db2, now - 100 * CE_DAY, NULL));
-    ASSERT_EQ(ce_sweep(&cfg, now, true, &r), 0);
-    ASSERT_EQ(r.projects, 2); /* both free now: would be removed */
-    ASSERT_TRUE(cbm_file_exists(db));
-    ASSERT_TRUE(cbm_file_exists(db2));
-    ASSERT_FALSE(cbm_file_exists((std::string(db2) + ".index.lock").c_str()));
-    ASSERT_FALSE(cbm_file_exists((std::string(db2) + ".read.lock").c_str()));
-    /* No cache directory: the settings load does not create one. */
-    char nocache[700];
-    snprintf(nocache, sizeof(nocache), "%s/never-made", e.base);
-    cbm_setenv("CBM_CACHE_DIR", nocache, 1);
-    cbm_cache_expiry_cfg_load(&cfg, NULL);
-    ASSERT_FALSE(cbm_is_dir(nocache));
-    cbm_setenv("CBM_CACHE_DIR", e.cache, 1);
-    ce_teardown(&e);
-    PASS();
-}
-
-/* A <name>.db that is a symlink to a database outside the cache is not a
- * project of this cache: the sweep neither opens nor expires it, and the
- * file it points at is untouched. A slot file that is a symlink is never
- * restored. */
-TEST(cache_linked_db_and_slot_are_ignored) {
-#ifndef _WIN32
-    ce_env_t e;
-    ASSERT_TRUE(ce_setup(&e, "cbm_ce_lndb"));
-    char root[700];
-    snprintf(root, sizeof(root), "%s/repo", e.base);
-    cbm_mkdir_p(root, 0755);
-    int64_t now = (int64_t)time(NULL);
-    /* The "outside" database: a real one, made in the cache then moved out. */
-    char ext[800];
-    ce_make_db(&e, "ext", root, ext, sizeof(ext));
-    char outside[800];
-    snprintf(outside, sizeof(outside), "%s/outside.db", e.base);
-    ASSERT_EQ(cbm_rename_replace(ext, outside), 0);
-    cbm_remove_db_sidecars(ext);
-    int64_t size_before = (int64_t)cbm_file_size(outside);
-    char link[800];
-    snprintf(link, sizeof(link), "%s/linked.db", e.cache);
-    ASSERT_EQ(symlink(outside, link), 0);
-    ASSERT_TRUE(cbm_cache_usage_set(link, now - 200 * CE_DAY, NULL));
-    cbm_cache_expiry_cfg_t cfg;
-    ce_cfg(&cfg);
-    cbm_cache_sweep_result_t r;
-    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
-    ASSERT_EQ(r.projects, 0);
-    ASSERT_TRUE(cbm_is_link(link));
-    ASSERT_TRUE(cbm_file_exists(outside));
-    ASSERT_EQ((int64_t)cbm_file_size(outside), size_before);
-    ASSERT_EQ(ce_trash_count(&e), 0);
-    /* A slot that is a link to that database is not an incoming slot. */
-    char db[800];
-    ce_make_db(&e, "p", root, db, sizeof(db));
-    char sdir[1100];
-    ASSERT_TRUE(cbm_branch_slots_dir(db, "p", root, sdir, sizeof(sdir)));
-    ASSERT_TRUE(cbm_mkdir_p(sdir, 0755));
-    char slot[1300];
-    snprintf(slot, sizeof(slot), "%s/feature.db", sdir);
-    ASSERT_EQ(symlink(outside, slot), 0);
-    char *from = NULL;
-    ASSERT_EQ(cbm_branch_slots_switch(db, "p", "feature", root, 8, 0, &from),
-              CBM_BRANCH_SWITCH_NONE);
-    ASSERT_NULL(from);
-    ASSERT_EQ((int64_t)cbm_file_size(outside), size_before);
-    (void)cbm_unlink(slot);
-    (void)cbm_unlink(link);
     ce_teardown(&e);
 #endif
     PASS();
