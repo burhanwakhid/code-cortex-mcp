@@ -492,8 +492,22 @@ void cbm_cache_usage_touch(const char *db_path, const char *root_path) {
 
 typedef enum { ROOT_PRESENT, ROOT_MISSING, ROOT_UNCERTAIN } root_state_t;
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static std::string g_test_mount_parent;
+
+void cbm_cache_expiry_test_mount_parent(const char *dir) {
+    g_test_mount_parent = dir ? dir : "";
+    std::replace(g_test_mount_parent.begin(), g_test_mount_parent.end(), '\\', '/');
+}
+#endif
+
 /* Directories under which a missing path may only be an unmounted volume. */
 static bool is_mount_parent(const std::string &dir) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (!g_test_mount_parent.empty() && dir == g_test_mount_parent) {
+        return true;
+    }
+#endif
     static const char *const roots[] = {"/",        "/Volumes",       "/mnt",
                                         "/media",   "/run/media",     "/net",
                                         "/Network", "/System/Volumes", "/private/var/automount",
@@ -531,11 +545,21 @@ static bool is_mount_parent(const std::string &dir) {
  * may be an unmounted volume, and any error other than "no such file" (a
  * permission error, a network mount timing out) proves nothing: UNCERTAIN. */
 /* Whether an existing directory looks like a mount point whose volume is
- * not mounted right now: it is empty (a mount point directory is), or it
- * is named as a mount point in /etc/fstab or the mount table. A checkout
- * below it is unavailable, not deleted. */
+ * not mounted right now: it is named as a mount point in /etc/fstab or the
+ * mount table, or it is empty (a mount point directory is) AND sits directly
+ * in a mount parent (/mnt/data, /media/me/usb, /data under "/"). A checkout
+ * below it is unavailable, not deleted. An empty directory anywhere else is
+ * what a removal leaves behind: `git worktree remove` of repo/.worktrees/x
+ * leaves repo/.worktrees empty, and that worktree is deleted. */
 static bool looks_like_mount_point(const std::string &dir) {
-    cbm_dir_t *d = cbm_opendir(dir.c_str());
+    size_t cut = dir.find_last_of('/');
+    std::string parent = cut == std::string::npos ? "" : cut == 0 ? "/" : dir.substr(0, cut);
+#ifdef _WIN32
+    if (parent.size() == 2 && parent[1] == ':') {
+        parent += '/'; /* C:/data: its parent is the drive root */
+    }
+#endif
+    cbm_dir_t *d = !parent.empty() && is_mount_parent(parent) ? cbm_opendir(dir.c_str()) : NULL;
     if (d) {
         bool empty = true;
         cbm_dirent_t *ent;

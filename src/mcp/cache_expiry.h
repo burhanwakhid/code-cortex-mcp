@@ -175,6 +175,10 @@ int cbm_cache_trash_list(void *out);
 /* Callback run once by a sweep after it has read and judged every usage row
  * and before it writes any. NULL clears. */
 void cbm_cache_expiry_test_scan_hook(void (*callback)(void *data), void *data);
+/* One more directory the root classifier treats as a mount parent (like
+ * /mnt), so a test can lay out an unmounted mount point it can create.
+ * NULL clears. */
+void cbm_cache_expiry_test_mount_parent(const char *dir);
 #endif
 
 #ifdef __cplusplus

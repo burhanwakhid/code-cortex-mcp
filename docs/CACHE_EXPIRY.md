@@ -373,9 +373,12 @@ Each removal logs one `cache.expire` line (kind, name, path, reason), each skip 
   (`cbm_cache_remove_project_root`). Expiry still moves the slots of every root with an
   expired database.
 - Root classification treats a drive root as a mount parent; a stored Windows root is walked up
-  on either separator. The nearest existing ancestor of a missing root that is an empty
-  directory, or is named as a mount point in `/etc/fstab` or the mount table, is taken for an
-  unmounted volume (`/mnt/data` of `/mnt/data/repo`): uncertain, never a missing streak. So is
+  on either separator. The nearest existing ancestor of a missing root that is named as a
+  mount point in `/etc/fstab` or the mount table, or that is an empty directory directly in a
+  mount parent, is taken for an unmounted volume (`/mnt/data` of `/mnt/data/repo`): uncertain,
+  never a missing streak. An empty directory elsewhere is what a removal leaves: after
+  `git worktree remove` of `repo/.worktrees/x` the empty `repo/.worktrees` remains, and that
+  worktree is missing. So is
   a root that is, or lies under, a dangling link (a symlink or junction to a volume that is not
   mounted): the link says nothing about whether the checkout behind it exists. A root the memo (`_config.db`) recorded is used only when it is shorter
   than the memo column (1024 bytes): one that fills it may be truncated, and the database's own

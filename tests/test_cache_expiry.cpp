@@ -439,13 +439,16 @@ TEST(cache_truncated_memo_root_is_not_trusted) {
     PASS();
 }
 
-/* A root whose nearest existing ancestor is an empty directory (a mount
- * point with nothing mounted) is unavailable, not deleted: no streak. One
- * whose ancestor has other entries (a removed checkout beside others) is
- * missing. */
+/* A root whose nearest existing ancestor is an empty directory directly in
+ * a mount parent (a mount point with nothing mounted, /mnt/data) is
+ * unavailable, not deleted: no streak. One whose ancestor has other entries
+ * (a removed checkout beside others) is missing. The test makes its base a
+ * mount parent (like /mnt), which it could not create. */
 TEST(cache_root_under_empty_ancestor_is_uncertain) {
+#ifdef CBM_ENABLE_TEST_SEAMS
     ce_env_t e;
     ASSERT_TRUE(ce_setup(&e, "cbm_ce_mnt"));
+    cbm_cache_expiry_test_mount_parent(e.base);
     char mnt[700];
     char busy[700];
     snprintf(mnt, sizeof(mnt), "%s/mnt-data", e.base);
@@ -468,9 +471,36 @@ TEST(cache_root_under_empty_ancestor_is_uncertain) {
     ASSERT_EQ(ce_sweep(&cfg, (int64_t)time(NULL), false, &r), 0);
     int64_t lu;
     int checks;
+    cbm_cache_expiry_test_mount_parent(NULL);
     ce_usage(&e, "unmounted", &lu, &checks);
     ASSERT_EQ(checks, 0);
     ce_usage(&e, "deleted", &lu, &checks);
+    ASSERT_EQ(checks, 1);
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
+/* `git worktree remove` of repo/.worktrees/x leaves repo/.worktrees empty.
+ * An empty directory that is not directly in a mount parent is no unmounted
+ * mount point: the worktree is missing, and expires by root_gone. */
+TEST(cache_removed_worktree_under_empty_dir_is_missing) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_wtgone"));
+    char wts[700];
+    snprintf(wts, sizeof(wts), "%s/repo/.worktrees", e.base);
+    ASSERT_TRUE(cbm_mkdir_p(wts, 0755)); /* left empty */
+    char wt[800];
+    snprintf(wt, sizeof(wt), "%s/x", wts);
+    char db[800];
+    ce_make_db(&e, "wtx", wt, db, sizeof(db));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, (int64_t)time(NULL), false, &r), 0);
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "wtx", &lu, &checks);
     ASSERT_EQ(checks, 1);
     ce_teardown(&e);
     PASS();
@@ -3271,6 +3301,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_root_uncertain_never_counts);
     RUN_TEST(cache_truncated_memo_root_is_not_trusted);
     RUN_TEST(cache_root_under_empty_ancestor_is_uncertain);
+    RUN_TEST(cache_removed_worktree_under_empty_dir_is_missing);
     RUN_TEST(cache_root_behind_dangling_link_is_uncertain);
     RUN_TEST(cache_root_unicode_and_long_is_present);
     RUN_TEST(cache_mass_missing_and_env_change_count_nothing);
