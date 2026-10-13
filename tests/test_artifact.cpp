@@ -206,6 +206,33 @@ TEST(artifact_export_fails_closed_without_publish_lock) {
     PASS();
 }
 
+/* The import refuses a payload artifact.json does not describe (an export
+ * caught between publishing the payload and the metadata). */
+TEST(artifact_import_refuses_payload_metadata_mismatch) {
+    setup_artifact_test();
+    char repo[1024];
+    char db[1024];
+    snprintf(repo, sizeof(repo), "%s/pfp-repo", g_tmpdir);
+    snprintf(db, sizeof(db), "%s/pfp.db", g_tmpdir);
+    cbm_mkdir_p(repo, 0755);
+    create_test_db(db);
+    ASSERT_EQ(cbm_artifact_export(db, repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/pfp-imported.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repo, import_db), 0); /* the pair as published */
+    char zst[1100];
+    snprintf(zst, sizeof(zst), "%s/.code-cortex/graph.db.zst", repo);
+    FILE *f = fopen(zst, "ab");
+    ASSERT_NOT_NULL(f);
+    fputs("another payload", f);
+    fclose(f);
+    char import_db2[1024];
+    snprintf(import_db2, sizeof(import_db2), "%s/pfp-imported2.db", g_tmpdir);
+    ASSERT_NEQ(cbm_artifact_import(repo, import_db2), 0);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
 /* An export removes the snapshot files (cbm_artifact_<pid>_<n>.db and its
  * sidecars) that a process which died mid-export left in the temp
  * directory; this process's own and a live process's stay. */
@@ -599,6 +626,7 @@ SUITE(artifact) {
     RUN_TEST(artifact_concurrent_exports_do_not_collide);
     RUN_TEST(artifact_concurrent_exports_one_repo_publish_one_pair);
     RUN_TEST(artifact_export_fails_closed_without_publish_lock);
+    RUN_TEST(artifact_import_refuses_payload_metadata_mismatch);
     RUN_TEST(artifact_export_removes_orphaned_snapshots);
     RUN_TEST(artifact_export_fast_roundtrip);
     RUN_TEST(artifact_export_best_roundtrip);

@@ -309,6 +309,20 @@ static int read_metadata_version(const char *repo_path) {
 }
 
 /* Read original_size from artifact.json. Returns 0 on error. */
+/* A string field of artifact.json; "" when absent. */
+static std::string read_metadata_string(const char *repo_path, const char *key) {
+    char meta_path[CBM_SZ_4K];
+    artifact_path(meta_path, sizeof(meta_path), repo_path, CBM_ARTIFACT_META);
+    size_t len = 0;
+    char *json = read_file_alloc(meta_path, &len);
+    yyjson_doc *doc = json ? yyjson_read(json, len, 0) : NULL;
+    free(json);
+    const char *v = doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), key)) : NULL;
+    std::string out = v ? v : "";
+    yyjson_doc_free(doc);
+    return out;
+}
+
 static size_t read_metadata_original_size(const char *repo_path) {
     char meta_path[CBM_SZ_4K];
     artifact_path(meta_path, sizeof(meta_path), repo_path, CBM_ARTIFACT_META);
@@ -369,6 +383,17 @@ static void graph_generation(cbm_store_t *s, const char *project, int *format, c
  * does not record: not current, exported again. */
 enum { ART_FP_EDGE = 64 * 1024 };
 
+/* The fingerprint of a payload held in memory (the import reads it whole). */
+static void payload_fingerprint_bytes(const char *data, size_t size,
+                                      char out[CBM_SHA256_HEX_LEN + 1]) {
+    size_t head = size < (size_t)ART_FP_EDGE ? size : (size_t)ART_FP_EDGE;
+    size_t tail = size - head < (size_t)ART_FP_EDGE ? size - head : (size_t)ART_FP_EDGE;
+    std::string buf = std::to_string((long long)size) + ":";
+    buf.append(data, head);
+    buf.append(data + size - tail, tail);
+    cbm_sha256_hex(buf.data(), buf.size(), out);
+}
+
 static bool payload_fingerprint(const char *path, char out[CBM_SHA256_HEX_LEN + 1]) {
     out[0] = '\0';
     FILE *f = cbm_fopen(path, "rb");
@@ -384,10 +409,11 @@ static bool payload_fingerprint(const char *path, char out[CBM_SHA256_HEX_LEN + 
         fclose(f);
         return false;
     }
-    std::string buf = std::to_string(size) + ":";
     size_t head = size < ART_FP_EDGE ? (size_t)size : (size_t)ART_FP_EDGE;
     size_t tail = size - (long long)head < ART_FP_EDGE ? (size_t)(size - (long long)head)
                                                        : (size_t)ART_FP_EDGE;
+    /* The same bytes payload_fingerprint_bytes hashes: the head, then the
+     * tail, laid out as if the file were read whole. */
     std::string chunk(head + tail, '\0');
     bool ok = fseek(f, 0, SEEK_SET) == 0 && fread(&chunk[0], 1, head, f) == head;
     if (ok && tail > 0) {
@@ -398,6 +424,7 @@ static bool payload_fingerprint(const char *path, char out[CBM_SHA256_HEX_LEN + 
     if (!ok) {
         return false;
     }
+    std::string buf = std::to_string(size) + ":";
     buf += chunk;
     cbm_sha256_hex(buf.data(), buf.size(), out);
     return true;
@@ -920,6 +947,21 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
     if (!compressed) {
         cbm_log_error("artifact.import", "err", "read_artifact");
         return CBM_NOT_FOUND;
+    }
+
+    /* The payload must be the one artifact.json describes: an import that
+     * met an export between publishing the payload and the metadata would
+     * otherwise take old compatibility metadata for a newer payload.
+     * Metadata from before the fingerprint has none and is not checked. */
+    std::string want_fp = read_metadata_string(repo_path, "payload_fp");
+    if (!want_fp.empty()) {
+        char got_fp[CBM_SHA256_HEX_LEN + 1];
+        payload_fingerprint_bytes(compressed, clen, got_fp);
+        if (want_fp != got_fp) {
+            free(compressed);
+            cbm_log_error("artifact.import", "err", "payload_metadata_mismatch");
+            return CBM_NOT_FOUND;
+        }
     }
 
     /* Decompress */
