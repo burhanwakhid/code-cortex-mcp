@@ -653,7 +653,9 @@ bool cbm_file_gen_equal(const cbm_file_gen_t *a, const cbm_file_gen_t *b) {
 }
 
 bool cbm_root_normalize(const char *in, bool fold_case, char *out, size_t out_sz) {
-    if (!in || !out || out_sz < 2) {
+    /* Room for the longest prefix and its terminator: "c:/" or "//" + NUL.
+     * Below that, a UNC prefix wrote its terminator past the buffer. */
+    if (!in || !out || out_sz < 4) {
         return false;
     }
 #ifdef _WIN32

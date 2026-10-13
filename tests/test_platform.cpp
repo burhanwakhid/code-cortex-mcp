@@ -956,6 +956,13 @@ TEST(platform_root_matches_windows_case_sensitive_dirs_differ) {
  * and an absolute path's leading ".." still folds to the root. */
 TEST(platform_root_normalize_keeps_unresolved_dotdot) {
     char out[256];
+    /* Too small for a prefix and its terminator: refused, nothing written
+     * past the buffer (a UNC prefix used to write its NUL at out[2]). */
+    char tiny[4] = {'x', 'x', 'x', 'x'};
+    ASSERT_FALSE(cbm_root_normalize("//server/share", false, tiny, 2));
+    ASSERT_FALSE(cbm_root_normalize("//server/share", false, tiny, 3));
+    ASSERT_EQ(tiny[2], 'x');
+    ASSERT_EQ(tiny[3], 'x');
     ASSERT_TRUE(cbm_root_normalize("../../repo", false, out, sizeof(out)));
     ASSERT_STR_EQ(out, "../../repo");
     ASSERT_TRUE(cbm_root_normalize("a/../../repo", false, out, sizeof(out)));
