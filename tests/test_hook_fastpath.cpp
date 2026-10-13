@@ -812,7 +812,9 @@ static char *hf_make_checkouts(void) {
                           "/repo/nested/src",
                           "/repo/sub",
                           "/repo/sepdir/src",
-                          "/elsewhere/sepdir.git"};
+                          "/elsewhere/sepdir.git",
+                          "/repo/sepmod/src",
+                          "/elsewhere/modules/sepmod.git"};
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
         snprintf(p, sizeof(p), "%s%s", base, dirs[i]);
         ok = ok && cbm_mkdir_p(p, 0755);
@@ -828,6 +830,10 @@ static char *hf_make_checkouts(void) {
      * outside any superproject's "modules". A checkout of its own. */
     snprintf(p, sizeof(p), "%s/repo/sepdir/.git", base);
     snprintf(text, sizeof(text), "gitdir: %s/elsewhere/sepdir.git\n", base);
+    ok = ok && hf_write_file(p, text);
+    /* The same, its git dir under an unrelated directory named "modules". */
+    snprintf(p, sizeof(p), "%s/repo/sepmod/.git", base);
+    snprintf(text, sizeof(text), "gitdir: %s/elsewhere/modules/sepmod.git\n", base);
     ok = ok && hf_write_file(p, text);
     /* A submodule at worktrees/sm: its gitdir's parent is named "worktrees". */
     snprintf(p, sizeof(p), "%s/repo/worktrees/sm/.git", base);
@@ -897,6 +903,8 @@ TEST(hook_walkup_stops_at_unindexed_checkout_root) {
     ASSERT_EQ(cbm_git_checkout_root_kind(p), CBM_GIT_CHECKOUT_GITLINK);
     ASSERT_FALSE(cbm_git_is_linked_worktree(p));
     ASSERT_FALSE(cbm_git_gitlink_is_submodule(p));
+    snprintf(p, sizeof(p), "%s/sepmod", repo);
+    ASSERT_FALSE(cbm_git_gitlink_is_submodule(p)); /* "modules" elsewhere is no superproject's */
     snprintf(p, sizeof(p), "%s/src/deep", repo);
     ASSERT_EQ(cbm_git_checkout_root_kind(p), CBM_GIT_CHECKOUT_NONE);
 
@@ -1040,8 +1048,8 @@ TEST(mcp_cwd_project_stops_at_unindexed_checkout_root) {
     ASSERT_NOT_NULL(cbm_mcp_cwd_project());
     ASSERT_STR_EQ(cbm_mcp_cwd_project(), parent);
 
-    const char *stops[] = {"/.worktrees/wt/src", "/nested/src", "/sepdir/src"};
-    for (size_t i = 0; i < 3; i++) {
+    const char *stops[] = {"/.worktrees/wt/src", "/nested/src", "/sepdir/src", "/sepmod/src"};
+    for (size_t i = 0; i < 4; i++) {
         snprintf(p, sizeof(p), "%s%s", repo, stops[i]);
         ASSERT_EQ(chdir(p), 0);
         cbm_mcp_reset_cwd_project_cache();

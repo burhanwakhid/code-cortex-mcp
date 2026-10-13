@@ -956,13 +956,13 @@ bool cbm_git_is_linked_worktree(const char *dir) {
     return parent && strcmp(parent + 1, "worktrees") == 0;
 }
 
-bool cbm_git_gitlink_is_submodule(const char *dir) {
-    if (cbm_git_checkout_root_kind(dir) != CBM_GIT_CHECKOUT_GITLINK ||
-        cbm_git_is_linked_worktree(dir)) {
+/* The git dir a gitlink at <dir>/.git names, resolved against dir and
+ * canonical (cbm_root_canonical); false when dir has no readable gitlink. */
+static bool gitlink_target(const char *dir, char *out, size_t out_sz) {
+    char path[CBM_SZ_4K];
+    if (snprintf(path, sizeof(path), "%s/.git", dir) >= (int)sizeof(path)) {
         return false;
     }
-    char path[CBM_SZ_4K];
-    snprintf(path, sizeof(path), "%s/.git", dir);
     FILE *f = cbm_fopen(path, "r");
     if (!f) {
         return false;
@@ -973,24 +973,67 @@ bool cbm_git_gitlink_is_submodule(const char *dir) {
     if (!got || strncmp(line, "gitdir:", 7) != 0) {
         return false;
     }
-    /* A submodule's admin directory lives in its superproject's git dir, at
-     * <git dir>/modules/<path> (nested: .../modules/a/modules/b). A gitlink
-     * whose target has no "modules" component is a repository of its own
-     * whose git dir was put elsewhere (git init --separate-git-dir): a
-     * checkout boundary, like a nested clone. */
-    for (char *c = line; *c; c++) {
-        if (*c == '\\') {
-            *c = '/';
-        }
+    char *v = line + 7;
+    while (*v == ' ') {
+        v++;
     }
-    const char *v = line + 7;
-    for (const char *m = strstr(v, "modules"); m; m = strstr(m + 1, "modules")) {
-        bool starts = m == v || m[-1] == '/' || m[-1] == ' ';
-        bool ends = m[7] == '/' || m[7] == '\0' || m[7] == '\n' || m[7] == '\r';
-        if (starts && ends) {
-            return true;
-        }
+    size_t n = strlen(v);
+    while (n > 0 && (v[n - 1] == '\n' || v[n - 1] == '\r' || v[n - 1] == ' ')) {
+        v[--n] = '\0';
     }
-    return false;
+    if (!v[0]) {
+        return false;
+    }
+    bool absolute = v[0] == '/' || v[0] == '\\' || (v[0] && v[1] == ':');
+    char joined[CBM_SZ_4K];
+    int jn = absolute ? snprintf(joined, sizeof(joined), "%s", v)
+                      : snprintf(joined, sizeof(joined), "%s/%s", dir, v);
+    return jn > 0 && jn < (int)sizeof(joined) && cbm_root_canonical(joined, out, out_sz);
+}
+
+bool cbm_git_gitlink_is_submodule(const char *dir) {
+    if (cbm_git_checkout_root_kind(dir) != CBM_GIT_CHECKOUT_GITLINK ||
+        cbm_git_is_linked_worktree(dir)) {
+        return false;
+    }
+    char target[CBM_SZ_4K];
+    if (!gitlink_target(dir, target, sizeof(target))) {
+        return false;
+    }
+    /* A submodule's git dir lives in its superproject's git dir, under
+     * "modules": <super>/.git/modules/<path>, or, for a submodule of a
+     * submodule, <the parent submodule's git dir>/modules/<path>. The
+     * superproject is the nearest enclosing directory with a .git of its
+     * own. Anything else -- a git dir put elsewhere with --separate-git-dir,
+     * wherever it sits, even under a directory named "modules" -- is a
+     * repository of its own: a checkout boundary. */
+    char up[CBM_SZ_4K];
+    if (!cbm_root_canonical(dir, up, sizeof(up))) {
+        return false;
+    }
+    for (;;) {
+        char *slash = strrchr(up, '/');
+        if (!slash || slash == up || (slash == up + 2 && up[1] == ':')) {
+            return false; /* no enclosing repository */
+        }
+        *slash = '\0';
+        cbm_git_checkout_kind_t kind = cbm_git_checkout_root_kind(up);
+        if (kind == CBM_GIT_CHECKOUT_NONE) {
+            continue;
+        }
+        char super_git[CBM_SZ_4K];
+        if (kind == CBM_GIT_CHECKOUT_MAIN) {
+            char dot[CBM_SZ_4K];
+            snprintf(dot, sizeof(dot), "%s/.git", up);
+            if (!cbm_root_canonical(dot, super_git, sizeof(super_git))) {
+                return false;
+            }
+        } else if (!gitlink_target(up, super_git, sizeof(super_git))) {
+            return false;
+        }
+        char prefix[CBM_SZ_4K];
+        int pn = snprintf(prefix, sizeof(prefix), "%s/modules/", super_git);
+        return pn > 0 && pn < (int)sizeof(prefix) && strncmp(target, prefix, (size_t)pn) == 0;
+    }
 }
 
