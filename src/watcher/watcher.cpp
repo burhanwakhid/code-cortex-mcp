@@ -460,7 +460,11 @@ static int delete_cached_project_db(const char *project_name, const char *root_p
     // Preserve unlink's original symlink-entry semantics. The canonical target
     // is only the shared lease identity, never an expanded deletion scope.
     const char *path = requested;
-    if (root_path && root_path[0] && cbm_file_exists(path) &&
+    /* A link in the cache is removed as itself (unlink, below), never its
+     * referent: whose index it points at does not matter. A real file's
+     * owner must be root_path's -- another checkout's, or one that cannot be
+     * read, is kept. */
+    if (root_path && root_path[0] && !cbm_is_link(path) && cbm_file_exists(path) &&
         !cbm_branch_db_root_matches(path, project_name, root_path)) {
         cbm_log_info("watcher.prune.kept_foreign_db", "project", project_name, "root", root_path);
         (void)cbm_branch_slots_delete_root(path, project_name, root_path);

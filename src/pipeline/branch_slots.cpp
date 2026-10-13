@@ -1055,16 +1055,27 @@ bool cbm_branch_db_root_matches(const char *path, const char *project, const cha
     if (!root || !root[0]) {
         return true;
     }
+    /* No file: nothing to own (the caller's removal finds nothing). A file
+     * whose project row cannot be read -- unreadable, corrupt, another
+     * project's -- is NOT taken for root's: a prune deciding on it would
+     * unlink another checkout's index. Unknown answers no; the caller
+     * defers. */
+    if (!cbm_file_exists(path)) {
+        return true;
+    }
     cbm_store_t *s = cbm_store_open_path_query(path);
     cbm_project_t proj = {0};
-    bool ok = true;
+    bool ok = false;
+    bool known = false;
     if (s && cbm_store_get_project(s, project, &proj) == CBM_STORE_OK) {
-        ok = cbm_root_matches(proj.root_path, root);
+        known = true;
+        ok = !proj.root_path || !proj.root_path[0] || cbm_root_matches(proj.root_path, root);
         cbm_project_free_fields(&proj);
     }
     cbm_store_close(s);
     if (!ok) {
-        cbm_log_warn("branch.foreign_db", "path", path, "root", root);
+        cbm_log_warn("branch.foreign_db", "path", path, "root", root, "reason",
+                     known ? "other_root" : "owner_unreadable");
     }
     return ok;
 }

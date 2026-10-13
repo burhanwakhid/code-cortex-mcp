@@ -9,6 +9,8 @@
 #include "../src/foundation/sha256.h"
 #include "../src/foundation/str_util.h" /* CBM_CROSS_REPO_DB_FILENAME */
 #include "test_framework.h"
+#include <algorithm>
+#include <vector>
 #include "test_helpers.h" /* th_write_file / th_rmtree / th_mktempdir */
 #include <mcp/mcp.h>
 #include <mcp/mcp_internal.h> /* cbm_detect_node_in_hunks (#1363) */
@@ -3049,6 +3051,11 @@ TEST(tool_index_repository_cross_repo_rejects_non_string_targets) {
  * and under their reader gate: a missing target (moved to trash, never
  * indexed) is skipped, not created empty, and one whose gate is held
  * exclusive (a move in progress) is skipped untouched. */
+static std::vector<std::string> g_xr_used;
+static void xr_record_used(const char *db_path) {
+    g_xr_used.push_back(db_path);
+}
+
 TEST(cross_repo_never_creates_missing_target) {
     char cache[256];
     snprintf(cache, sizeof(cache), "%s", th_mktempdir("cbm_xrepo_gate"));
@@ -3078,8 +3085,22 @@ TEST(cross_repo_never_creates_missing_target) {
     int scanned_missing = r.projects_scanned;
 
     const char *present[] = {"xr-tgt"};
+    g_xr_used.clear();
+    cbm_cross_repo_set_usage_hook(xr_record_used);
     r = cbm_cross_repo_match("xr-src", present, 1);
+    cbm_cross_repo_set_usage_hook(NULL);
     int scanned_present = r.projects_scanned;
+    /* Both databases the pass opened are reported for usage recording. */
+    bool used_src = std::find(g_xr_used.begin(), g_xr_used.end(), src_db) != g_xr_used.end();
+    bool used_tgt = std::find(g_xr_used.begin(), g_xr_used.end(), tgt_db) != g_xr_used.end();
+
+    /* The source's reader gate held exclusive (a move in progress): no pass,
+     * so nothing is written into a file about to be trashed. */
+    cbm_db_lease_t *src_gate = NULL;
+    int sgrc = cbm_db_read_gate_acquire(src_db, true, &src_gate);
+    r = cbm_cross_repo_match("xr-src", present, 1);
+    int scanned_src_moving = r.projects_scanned;
+    cbm_db_lease_release(src_gate);
 
     cbm_db_lease_t *gate = NULL;
     int grc = cbm_db_read_gate_acquire(tgt_db, true, &gate);
@@ -3099,6 +3120,10 @@ TEST(cross_repo_never_creates_missing_target) {
     ASSERT_EQ(scanned_present, 1);
     ASSERT_EQ(grc, 0);
     ASSERT_EQ(scanned_moving, 0);
+    ASSERT_TRUE(used_src);
+    ASSERT_TRUE(used_tgt);
+    ASSERT_EQ(sgrc, 0);
+    ASSERT_EQ(scanned_src_moving, 0);
     PASS();
 }
 

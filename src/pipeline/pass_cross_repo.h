@@ -38,6 +38,11 @@ typedef struct {
 cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **target_projects,
                                              int target_count);
 
+/* Called with the path of every project database a cbm_cross_repo_match pass
+ * opened (the source and each target), so the caller can record their use
+ * for the cache expiry. NULL clears. Set once; not per call. */
+void cbm_cross_repo_set_usage_hook(void (*hook)(const char *db_path));
+
 #ifdef __cplusplus
 }
 #endif

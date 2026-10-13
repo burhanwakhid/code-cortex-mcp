@@ -950,6 +950,20 @@ static void free_project_list(char **projects, int count) {
 
 /* ── Entry point ─────────────────────────────────────────────────── */
 
+static void (*g_cr_usage_hook)(const char *db_path) = nullptr;
+
+void cbm_cross_repo_set_usage_hook(void (*hook)(const char *db_path)) {
+    g_cr_usage_hook = hook;
+}
+
+/* A database this pass read and wrote is in use: tell the usage recorder,
+ * or a sweep right after could expire it as unused. */
+static void cr_note_used(const char *db_path) {
+    if (g_cr_usage_hook) {
+        g_cr_usage_hook(db_path);
+    }
+}
+
 cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **target_projects,
                                              int target_count) {
     cbm_cross_repo_result_t result = {0};
@@ -1014,10 +1028,27 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
         result.no_targets = true;
     }
 
-    /* Open source project store (read-write) */
+    /* Open source project store (read-write), under its reader gate for the
+     * whole pass, as the targets are: the cache sweep moves a database only
+     * with the gate held exclusive, so it cannot trash the source mid-pass
+     * and leave the writes going to the renamed file. A move in progress
+     * fails the pass like a missing source. A gate that cannot be had at all
+     * leaves the open ungated. */
     char src_path[CR_PATH_BUF];
     cr_db_path(project, src_path, sizeof(src_path));
-    cbm_store_t *src_store = result.failed ? NULL : cbm_store_open_path(src_path);
+    cbm_db_lease_t *src_gate = NULL;
+    cbm_store_t *src_store = NULL;
+    if (!result.failed) {
+        if (cbm_db_read_gate_acquire(src_path, false, &src_gate) == CBM_INDEX_BUSY) {
+            cbm_log_info("cross_repo.skip", "project", project, "reason", "source_gate_busy");
+        } else {
+            src_store = cbm_store_open_path_existing(src_path);
+            if (!src_store) {
+                cbm_db_lease_release(src_gate);
+                src_gate = NULL;
+            }
+        }
+    }
     if (!src_store) {
         result.failed = true;
         if (own_list) {
@@ -1025,6 +1056,8 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
         }
         return result;
     }
+
+    cr_note_used(src_path);
 
     /* Clean existing CROSS_* edges for this project */
     delete_cross_edges(src_store, project);
@@ -1053,6 +1086,7 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
             cbm_db_lease_release(gate);
             continue;
         }
+        cr_note_used(tgt_path);
 
         result.http_edges += match_http_routes(src_store, project, tgt_store, tgt);
         /* Reverse direction: when this pass runs from the provider side, the
@@ -1080,6 +1114,7 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
     }
 
     cbm_store_close(src_store);
+    cbm_db_lease_release(src_gate);
 
     if (own_list) {
         free_project_list(resolved, resolved_count);

@@ -6656,6 +6656,10 @@ static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
 /* ── index_repository ─────────────────────────────────────────── */
 
 /* Handle mode="cross-repo-intelligence" — extract to reduce complexity. */
+static void cross_repo_note_used(const char *db_path) {
+    cbm_cache_usage_touch(db_path, NULL);
+}
+
 static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
     /* cbm_project_name_from_path already returns a heap copy we own; wrapping
      * it in heap_strdup leaked the original on every cross-repo call. */
@@ -6704,6 +6708,9 @@ static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
         targets[ti++] = yyjson_get_str(val);
     }
 
+    /* Record the use of every database the pass opens: the sweep that may
+     * follow must not judge them unused. */
+    cbm_cross_repo_set_usage_hook(cross_repo_note_used);
     cbm_cross_repo_result_t result = cbm_cross_repo_match(project, targets, tp_count);
     free(targets);
     yyjson_doc_free(jdoc);

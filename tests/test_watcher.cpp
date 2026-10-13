@@ -2024,6 +2024,36 @@ static bool prune_bytes_equal(const std::string& path, const char *expected) {
     return n == strlen(expected) && memcmp(bytes, expected, n) == 0;
 }
 
+/* A minimal project database at path for project, recording root. */
+static bool prune_make_db(const std::string &path, const char *project, const std::string &root) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) {
+        sqlite3_close(db);
+        return false;
+    }
+    std::string sql = "CREATE TABLE projects(name TEXT PRIMARY KEY, indexed_at TEXT, root_path "
+                      "TEXT); INSERT INTO projects VALUES('" +
+                      std::string(project) + "','2026-01-01T00:00:00Z','" + root + "');";
+    bool ok = sqlite3_exec(db, sql.c_str(), NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(db);
+    return ok;
+}
+
+static std::string prune_read_all(const std::string &path) {
+    std::string out;
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) {
+        return out;
+    }
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        out.append(buf, n);
+    }
+    fclose(f);
+    return out;
+}
+
 TEST(watcher_prune_lease_preserves_grace_and_retry) {
     char root[256] = "/tmp/cbm_prune_lease_XXXXXX";
     ASSERT(cbm_mkdtemp(root));
@@ -2032,8 +2062,11 @@ TEST(watcher_prune_lease_preserves_grace_and_retry) {
     std::string db = std::string(root) + "/missing-target.db";
     std::string absent = std::string(root) + "/absent-root";
     const char *suffixes[] = {"", "-wal", "-shm"};
-    const char *values[] = {"keep db", "keep wal", "keep shm"};
-    for (int i = 0; i < 3; ++i) { ASSERT_EQ(th_write_file((db + suffixes[i]).c_str(), values[i]), 0); }
+    /* The database records the vanished root: the prune may remove it. */
+    ASSERT(prune_make_db(db, "missing-target", absent));
+    std::string db_bytes = prune_read_all(db);
+    const char *values[] = {db_bytes.c_str(), "keep wal", "keep shm"};
+    for (int i = 1; i < 3; ++i) { ASSERT_EQ(th_write_file((db + suffixes[i]).c_str(), values[i]), 0); }
     ASSERT(cbm_cache_usage_set(db.c_str(), (int64_t)time(NULL), absent.c_str()));
     ASSERT_EQ(prune_usage_rows(root, "missing-target.db"), 1);
     cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
@@ -2045,7 +2078,8 @@ TEST(watcher_prune_lease_preserves_grace_and_retry) {
     cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", "0", 1);
     for (int i = 0; i < 4; ++i) { ASSERT_EQ(cbm_watcher_poll_once(w), 0); }
     ASSERT_EQ(cbm_watcher_watch_count(w), 1); // Busy state remains registered and alive.
-    for (int i = 0; i < 3; ++i) { ASSERT(prune_bytes_equal(db + suffixes[i], values[i])); }
+    ASSERT(prune_read_all(db) == db_bytes);
+    for (int i = 1; i < 3; ++i) { ASSERT(prune_bytes_equal(db + suffixes[i], values[i])); }
     cbm_db_lease_release(lease);
     ASSERT_EQ(cbm_watcher_poll_once(w), 0);
     ASSERT_EQ(cbm_watcher_watch_count(w), 0); // Retained absence state retries when free.
@@ -2070,7 +2104,7 @@ TEST(watcher_prune_keeps_colliding_roots_slots) {
     std::string absent = std::string(root) + "/absent-root";
     std::string other = std::string(root) + "/other-root";
     ASSERT(cbm_mkdir_p(other.c_str(), 0755));
-    ASSERT_EQ(th_write_file(db.c_str(), "db"), 0);
+    ASSERT(prune_make_db(db, "coll", absent)); /* last indexed from the vanished root */
     char adir[1024];
     char bdir[1024];
     ASSERT(cbm_branch_slots_dir(db.c_str(), "coll", absent.c_str(), adir, sizeof(adir)));
@@ -2148,6 +2182,28 @@ TEST(watcher_prune_keeps_colliding_roots_db) {
     PASS();
 }
 
+/* A vanished checkout's prune must not delete a database whose owner it
+ * cannot read (corrupt, unreadable): with a colliding derived name it may be
+ * another checkout's index. Unknown ownership defers the prune. */
+TEST(watcher_prune_defers_on_unreadable_owner) {
+    char root[256] = "/tmp/cbm_prune_unread_XXXXXX";
+    ASSERT(cbm_mkdtemp(root));
+    prune_lease_env cache("CBM_CACHE_DIR", root);
+    prune_lease_env grace("CBM_WATCHER_PRUNE_GRACE_S", "0");
+    std::string db = std::string(root) + "/unread.db";
+    std::string absent = std::string(root) + "/absent-root";
+    ASSERT_EQ(th_write_file(db.c_str(), "not a sqlite database, owner unknown"), 0);
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    cbm_watcher_watch(w, "unread", absent.c_str());
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    }
+    ASSERT(cbm_is_regular_file(db.c_str())); /* kept */
+    cbm_watcher_free(w);
+    th_rmtree(root);
+    PASS();
+}
+
 struct pending_lease_calls { int calls = 0; };
 static int pending_lease_callback(const char *, const char *, void *ud) {
     auto *state = static_cast<pending_lease_calls *>(ud);
@@ -2215,6 +2271,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_pending_mark_during_callback_survives_success);
     RUN_TEST(watcher_prune_lease_preserves_grace_and_retry);
     RUN_TEST(watcher_prune_keeps_colliding_roots_slots);
+    RUN_TEST(watcher_prune_defers_on_unreadable_owner);
     RUN_TEST(watcher_prune_keeps_colliding_roots_db);
     RUN_TEST(watcher_pending_initial_index_retries_clean_baseline);
 
