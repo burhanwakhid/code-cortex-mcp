@@ -1707,6 +1707,78 @@ TEST(branch_stamp_only_switch_reexports_artifact) {
     PASS();
 }
 
+/* Whole file into buf (NUL-terminated, truncated to n-1); false when absent. */
+static bool bi_read_text(const char *path, char *buf, size_t n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    size_t got = fread(buf, 1, n - 1, f);
+    buf[got] = '\0';
+    fclose(f);
+    return true;
+}
+
+/* The team artifact is committed. Committing it moves HEAD, which the Branch
+ * node records; the artifact's freshness must not depend on it, or the next
+ * run re-exports and leaves the tree dirty after every commit. artifact.json
+ * records neither the HEAD commit's place in the Branch properties nor this
+ * checkout's paths, so another clone's run does not see it as behind. */
+TEST(branch_committed_artifact_stays_current) {
+    char *repo = bi_make_repo("cbm_bi_artcommit");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    snprintf(g_bi_project, sizeof(g_bi_project), "%s", cbm_pipeline_project_name(p));
+    snprintf(g_bi_root, sizeof(g_bi_root), "%s", cbm_pipeline_repo_path(p));
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    ASSERT_TRUE(cbm_artifact_exists(repo));
+
+    char meta[1024];
+    snprintf(meta, sizeof(meta), "%s/.code-cortex/artifact.json", repo);
+    char text[16384];
+    ASSERT_TRUE(bi_read_text(meta, text, sizeof(text)));
+    ASSERT_NULL(strstr(text, "head_sha"));
+    ASSERT_NULL(strstr(text, "canonical_root"));
+    ASSERT_NULL(strstr(text, "worktree_root"));
+    ASSERT_NULL(strstr(text, "git_common_dir"));
+
+    ASSERT_EQ(bi_git(repo, "add -A"), 0);
+    ASSERT_EQ(bi_git(repo, "commit -q -m artifact"), 0);
+    char db[1024];
+    bi_db_path(db, sizeof(db));
+    ASSERT_TRUE(cbm_artifact_is_current(db, repo, g_bi_project));
+
+    int64_t before = bi_artifact_mtime(repo);
+    cbm_usleep(1100000);
+    bi_run_t r = bi_index(repo, -1); /* stamps the new HEAD commit */
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_EQ(r.reparsed, 0);
+    ASSERT_EQ(bi_artifact_mtime(repo), before);
+    ASSERT_TRUE(cbm_artifact_is_current(db, repo, g_bi_project));
+
+    /* The tree git sees is clean: no re-exported artifact, nothing new. */
+    char status[1024];
+    snprintf(status, sizeof(status), "%s_status.txt", repo);
+    char cmd[3072];
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" status --porcelain > \"%s\" 2>%s", repo, status,
+             bi_null_dev());
+    ASSERT_EQ(system(cmd), 0);
+    char out[4096];
+    ASSERT_TRUE(bi_read_text(status, out, sizeof(out)));
+    cbm_unlink(status);
+    ASSERT_STR_EQ(out, "");
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 extern "C" int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_run);
 extern "C" void cbm_set_auto_answer_for_test(int value);
 
@@ -3425,6 +3497,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_restore_keeps_concurrent_adr_write);
 #endif
     RUN_TEST(branch_stamp_only_switch_reexports_artifact);
+    RUN_TEST(branch_committed_artifact_stays_current);
     RUN_TEST(branch_restore_reexports_artifact);
     RUN_TEST(branch_index_prompt_counts_parked_only_cache);
     RUN_TEST(branch_long_slug_slot_names);

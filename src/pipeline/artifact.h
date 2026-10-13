@@ -55,14 +55,17 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path);
 bool cbm_artifact_exists(const char *repo_path);
 
 /* Whether the artifact's metadata matches the live database at db_path: the
- * same Branch node (qualified name and properties: branch, HEAD commit), the
+ * same branch (the Branch node's qualified name and branch name), the
  * same content fingerprint (cbm_store_content_fingerprint: the indexed
  * sources' digests, so any source edit moves it, count-preserving or not)
  * and the same graph generation (index format and the dump's indexed_at, so
  * a rebuild from unchanged sources after an upgrade moves it).
  * Reads artifact.json, one Branch query and one scan of file_hashes; never
  * decompresses the artifact. False when either side cannot be read or the
- * metadata predates these fields. */
+ * metadata predates these fields. The HEAD commit and the checkout's paths
+ * are not compared, and artifact.json does not record them: committing the
+ * artifact moves HEAD, and another developer's clone has other paths, and
+ * neither changes the graph. */
 bool cbm_artifact_is_current(const char *db_path, const char *repo_path, const char *project);
 
 /* Get the git commit hash from artifact metadata. Caller must free().

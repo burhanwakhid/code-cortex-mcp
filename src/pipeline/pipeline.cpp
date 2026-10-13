@@ -2325,9 +2325,13 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     bool indexed = rc == 0 || p->db_committed;
     if (rc == 0 && !check_cancel(p)) {
         char *db_path = resolve_db_path(p);
-        if (cbm_pipeline_stamp_branch(p, db_path)) {
-            p->artifact_stale = true;
-        }
+        /* A stamp alone does not make the artifact stale: when it renames
+         * the branch, cbm_artifact_is_current sees the new QN and name below;
+         * when it only records a new HEAD commit or checkout path (the commit
+         * that added the artifact, another clone), the graph the artifact
+         * holds is still this one, and re-exporting it would dirty the tree
+         * after every commit. */
+        (void)cbm_pipeline_stamp_branch(p, db_path);
         /* Export iff the artifact is behind the live database: a restore
          * with nothing re-extracted, a stamp-only switch, a full rebuild
          * without the persistence flag while an artifact exists, an earlier

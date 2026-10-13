@@ -349,7 +349,7 @@ static void graph_generation(cbm_store_t *s, const char *project, int *format, c
 
 /* Write artifact.json metadata. */
 static int write_metadata(const char *repo_path, const char *project_name, int nodes, int edges,
-                          const char *branch_qn, const char *branch_props, const char *content_fp,
+                          const char *branch_qn, const char *branch_name, const char *content_fp,
                           int index_format, const char *graph_gen, size_t original_size,
                           size_t compressed_size, int compression_level) {
     char commit[CBM_SZ_64] = "";
@@ -368,11 +368,16 @@ static int write_metadata(const char *repo_path, const char *project_name, int n
     yyjson_mut_obj_add_str(doc, root, "project", project_name);
     yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, root, "edges", edges);
-    /* The graph's Branch node, so a later run can tell, without opening the
+    /* The graph's branch, so a later run can tell, without opening the
      * artifact, whether the live database has moved on from it
-     * (cbm_artifact_is_current). */
+     * (cbm_artifact_is_current). Only the QN and the branch name: the Branch
+     * node's properties also hold this checkout's absolute paths and HEAD
+     * commit. Recorded here, committing the artifact moved HEAD and made it
+     * look behind (a re-export and a dirty tree after every commit), each
+     * developer's clone overwrote the others' artifact, and the file
+     * published local paths. */
     yyjson_mut_obj_add_str(doc, root, "branch_qn", branch_qn ? branch_qn : "");
-    yyjson_mut_obj_add_str(doc, root, "branch_props", branch_props ? branch_props : "");
+    yyjson_mut_obj_add_str(doc, root, "branch_name", branch_name ? branch_name : "");
     yyjson_mut_obj_add_str(doc, root, "content_fp", content_fp ? content_fp : "");
     yyjson_mut_obj_add_int(doc, root, "index_format", index_format);
     yyjson_mut_obj_add_str(doc, root, "graph_generation", graph_gen ? graph_gen : "");
@@ -614,7 +619,7 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     int nodes = 0;
     int edges = 0;
     char *branch_qn = NULL;
-    char *branch_props = NULL;
+    char *branch_name = NULL;
     char content_fp[CBM_SHA256_HEX_LEN + 1] = "";
     int index_format = 0;
     char graph_gen[CBM_SZ_64] = "";
@@ -622,7 +627,7 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     if (count_store) {
         nodes = cbm_store_count_nodes(count_store, project_name);
         edges = cbm_store_count_edges(count_store, project_name);
-        (void)cbm_store_get_branch_dup(count_store, project_name, &branch_qn, NULL, &branch_props);
+        (void)cbm_store_get_branch_dup(count_store, project_name, &branch_qn, &branch_name, NULL);
         (void)cbm_store_content_fingerprint(count_store, project_name, content_fp);
         graph_generation(count_store, project_name, &index_format, graph_gen, sizeof(graph_gen));
         cbm_store_close(count_store);
@@ -632,11 +637,11 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     }
 
     /* Write metadata */
-    int mrc = write_metadata(repo_path, project_name, nodes, edges, branch_qn, branch_props,
+    int mrc = write_metadata(repo_path, project_name, nodes, edges, branch_qn, branch_name,
                              content_fp, index_format, graph_gen, db_size, (size_t)clen,
                              compression_level);
     free(branch_qn);
-    free(branch_props);
+    free(branch_name);
     if (mrc != 0) {
         cbm_unlink(zst_path);
         return CBM_NOT_FOUND;
@@ -849,28 +854,28 @@ bool cbm_artifact_is_current(const char *db_path, const char *repo_path, const c
     free(json);
     yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
     const char *a_qn = yyjson_get_str(root ? yyjson_obj_get(root, "branch_qn") : NULL);
-    const char *a_props = yyjson_get_str(root ? yyjson_obj_get(root, "branch_props") : NULL);
+    const char *a_name = yyjson_get_str(root ? yyjson_obj_get(root, "branch_name") : NULL);
     const char *a_fp = yyjson_get_str(root ? yyjson_obj_get(root, "content_fp") : NULL);
     yyjson_val *a_format = root ? yyjson_obj_get(root, "index_format") : NULL;
     const char *a_gen = yyjson_get_str(root ? yyjson_obj_get(root, "graph_generation") : NULL);
     bool current = false;
     /* Metadata from a build that did not record these is never current: one
      * export brings it up to date. */
-    if (a_qn && a_props && a_fp && a_fp[0] && yyjson_is_int(a_format) && a_gen && a_gen[0]) {
+    if (a_qn && a_name && a_fp && a_fp[0] && yyjson_is_int(a_format) && a_gen && a_gen[0]) {
         cbm_store_t *s = cbm_store_open_path_query(db_path);
         char *qn = NULL;
-        char *props = NULL;
+        char *name = NULL;
         char fp[CBM_SHA256_HEX_LEN + 1];
         int format = 0;
         char gen[CBM_SZ_64];
-        if (s && cbm_store_get_branch_dup(s, project, &qn, NULL, &props) != CBM_STORE_ERR) {
+        if (s && cbm_store_get_branch_dup(s, project, &qn, &name, NULL) != CBM_STORE_ERR) {
             graph_generation(s, project, &format, gen, sizeof(gen));
-            current = strcmp(qn ? qn : "", a_qn) == 0 && strcmp(props ? props : "", a_props) == 0 &&
+            current = strcmp(qn ? qn : "", a_qn) == 0 && strcmp(name ? name : "", a_name) == 0 &&
                       format == (int)yyjson_get_int(a_format) && strcmp(gen, a_gen) == 0 &&
                       cbm_store_content_fingerprint(s, project, fp) && strcmp(fp, a_fp) == 0;
         }
         free(qn);
-        free(props);
+        free(name);
         cbm_store_close(s);
     }
     yyjson_doc_free(doc);
