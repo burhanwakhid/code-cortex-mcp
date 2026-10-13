@@ -2527,8 +2527,8 @@ TEST(cache_config_get_value_is_per_thread) {
             }
         }
     };
-    std::thread ta(reader, "ce_thread_a", std::cref(va));
-    std::thread tb(reader, "ce_thread_b", std::cref(vb));
+    std::thread ta([&] { reader("ce_thread_a", va); });
+    std::thread tb([&] { reader("ce_thread_b", vb); });
     go.store(true);
     ta.join();
     tb.join();
