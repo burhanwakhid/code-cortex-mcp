@@ -613,6 +613,16 @@ static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool str
 
 /* ── Export ───────────────────────────────────────────────────────── */
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void (*g_after_payload_cb)(void *) = nullptr;
+static void *g_after_payload_data = nullptr;
+
+void cbm_artifact_test_after_payload(void (*callback)(void *data), void *data) {
+    g_after_payload_cb = callback;
+    g_after_payload_data = data;
+}
+#endif
+
 int cbm_artifact_export(const char *db_path, const char *repo_path, const char *project_name,
                         int quality) {
     clear_export_error();
@@ -634,6 +644,21 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     }
     if (!cbm_is_dir(art_dir)) {
         return artifact_export_fail("prepare_artifact_dir", art_dir, "not_directory", 0);
+    }
+
+    /* The generation the snapshot is taken at: read before it, compared with
+     * the one read after. manage_adr writes without the index lease, so an
+     * ADR committed between the snapshot and the metadata read would put the
+     * new ADR's digest in artifact.json beside a payload holding the old ADR,
+     * and the pair would read as current indefinitely. */
+    char gen_before[CBM_SZ_64] = "";
+    {
+        int fmt = 0;
+        cbm_store_t *pre = cbm_store_open_path_query(db_path);
+        if (pre) {
+            graph_generation(pre, project_name, &fmt, gen_before, sizeof(gen_before));
+            cbm_store_close(pre);
+        }
     }
 
     size_t db_size = 0;
@@ -690,6 +715,12 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
         return artifact_export_fail("write_artifact", zst_path, ioerr.err, ioerr.err_no);
     }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_after_payload_cb) {
+        g_after_payload_cb(g_after_payload_data);
+    }
+#endif
+
     /* Get node/edge counts for metadata */
     int nodes = 0;
     int edges = 0;
@@ -709,6 +740,13 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
         /* A failed read is CBM_STORE_ERR; never record it as a count. */
         nodes = nodes < 0 ? 0 : nodes;
         edges = edges < 0 ? 0 : edges;
+    }
+    if (strcmp(gen_before, graph_gen) != 0) {
+        /* Moved during the export (an ADR written meanwhile): the payload's
+         * generation is not known for sure. Record none, so the artifact is
+         * never taken for current and the next run exports it again. */
+        cbm_log_info("artifact.export.generation_moved", "project", project_name);
+        graph_gen[0] = '\0';
     }
 
     /* Write metadata */

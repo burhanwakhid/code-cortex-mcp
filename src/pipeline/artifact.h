@@ -80,6 +80,12 @@ char *cbm_artifact_commit(const char *repo_path);
  * were the pre-existing bug). Exposed so the shell-safety contract is unit-tested. */
 bool cbm_artifact_repo_path_is_shell_safe(const char *repo_path);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Callback run by cbm_artifact_export after the payload is written and
+ * before the metadata is read from the live database. NULL clears. */
+void cbm_artifact_test_after_payload(void (*callback)(void *data), void *data);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

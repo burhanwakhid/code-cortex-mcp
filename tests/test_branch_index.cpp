@@ -1957,6 +1957,44 @@ TEST(branch_artifact_stale_after_adr_update) {
     PASS();
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void bi_write_adr_now(void *ud) {
+    cbm_store_t *s = cbm_store_open_path((const char *)ud);
+    if (s) {
+        (void)cbm_store_adr_store(s, g_bi_project, "## Decision\nwritten mid-export\n");
+        cbm_store_close(s);
+    }
+}
+#endif
+
+/* An ADR committed after the export's snapshot and before its metadata read
+ * leaves a payload with the old ADR: the metadata must not claim the new
+ * ADR's generation, or the stale payload would read as current for good. */
+TEST(branch_artifact_adr_during_export_is_not_current) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    char *repo = bi_make_repo("cbm_bi_artrace");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    snprintf(g_bi_project, sizeof(g_bi_project), "%s", cbm_pipeline_project_name(p));
+    snprintf(g_bi_root, sizeof(g_bi_root), "%s", cbm_pipeline_repo_path(p));
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    char db[1024];
+    bi_db_path(db, sizeof(db));
+    cbm_artifact_test_after_payload(bi_write_adr_now, db);
+    int rc = cbm_artifact_export(db, repo, g_bi_project, CBM_ARTIFACT_FAST);
+    cbm_artifact_test_after_payload(NULL, NULL);
+    ASSERT_EQ(rc, 0);
+    ASSERT_FALSE(cbm_artifact_is_current(db, repo, g_bi_project));
+    bi_cleanup(repo);
+#endif
+    PASS();
+}
+
 extern "C" int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_run);
 extern "C" void cbm_set_auto_answer_for_test(int value);
 
@@ -3983,6 +4021,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_stamp_only_switch_reexports_artifact);
     RUN_TEST(branch_committed_artifact_stays_current);
     RUN_TEST(branch_artifact_stale_after_adr_update);
+    RUN_TEST(branch_artifact_adr_during_export_is_not_current);
     RUN_TEST(branch_dump_generation_is_sub_second);
     RUN_TEST(branch_restore_reexports_artifact);
     RUN_TEST(branch_index_prompt_counts_parked_only_cache);
