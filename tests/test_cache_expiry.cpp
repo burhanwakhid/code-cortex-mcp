@@ -3100,7 +3100,10 @@ TEST(cache_usage_write_keeps_concurrent_root) {
 
 /* An orphan sidecar whose unlink is refused (a read-only cache directory)
  * is neither reported nor counted; once the directory is writable again it
- * is. */
+ * is. With _config.db in WAL mode a read-only directory may also make the
+ * whole sweep refuse (a WAL database cannot be opened for writing without
+ * its -shm): that is just as safe, so either outcome passes, as long as
+ * nothing is reported or removed. */
 TEST(cache_orphan_sidecar_unlink_refused_not_reported) {
 #ifndef _WIN32
     if (geteuid() == 0) {
@@ -3127,7 +3130,7 @@ TEST(cache_orphan_sidecar_unlink_refused_not_reported) {
     ASSERT_EQ(chmod(e.cache, 0555), 0);
     int rc = ce_sweep(&cfg, now, false, &r);
     chmod(e.cache, 0755);
-    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(rc == 0 || rc == -1);
     ASSERT_EQ(r.sidecars, 0);
     ASSERT_EQ(r.bytes, 0);
     ASSERT_TRUE(cbm_file_exists(side));
