@@ -326,6 +326,10 @@ int cbm_remove_indexes(const char *home_dir);
 
 typedef struct cbm_config cbm_config_t;
 
+/* How long a config read or write waits for another process's commit on
+ * _config.db before it gives up (a read then returns its default). */
+#define CBM_CONFIG_BUSY_MS 2500
+
 /* Open the config store in the given cache directory.
  * Creates _config.db if it doesn't exist. Returns NULL on error. */
 cbm_config_t *cbm_config_open(const char *cache_dir);

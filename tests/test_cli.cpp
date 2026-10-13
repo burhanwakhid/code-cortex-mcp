@@ -20,9 +20,12 @@
 #include <foundation/platform.h> /* cbm_file_exists */
 #include <foundation/yaml.h>
 #include <yyjson/yyjson.h>
+#include <sqlite3.h>
+#include <chrono>
 #include <string>
 #include <vector>
 #include <string.h>
+#include <thread>
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/stat.h>
@@ -4162,6 +4165,44 @@ TEST(cli_config_get_int) {
     PASS();
 }
 
+/* Another process commits to _config.db all the time (usage rows, the
+ * store_meta memo, the sweep). A setting read that meets such a commit must
+ * wait for it, not return the default: the multi-process stress test
+ * (scripts/branch-index-stress.py) saw index runs park with
+ * branch_index_keep 8 although 1 was configured. */
+TEST(cli_config_read_waits_for_writer) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_config_set(cfg, "branch_index_keep", "1");
+    cbm_config_set(cfg, "cache_expiry", "false");
+    cbm_config_close(cfg);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/_config.db", tmpdir);
+    sqlite3 *writer = NULL;
+    ASSERT_EQ(sqlite3_open(path, &writer), SQLITE_OK);
+    /* An exclusive lock is what a reader meets during a writer's commit. */
+    ASSERT_EQ(sqlite3_exec(writer, "BEGIN EXCLUSIVE;", NULL, NULL, NULL), SQLITE_OK);
+    std::thread release([writer] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        (void)sqlite3_exec(writer, "COMMIT;", NULL, NULL, NULL);
+    });
+    cfg = cbm_config_open(tmpdir);
+    int keep = cbm_config_get_int(cfg, "branch_index_keep", 8);
+    bool enabled = cbm_config_get_bool(cfg, "cache_expiry", true);
+    release.join();
+    sqlite3_close(writer);
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    ASSERT_EQ(keep, 1);
+    ASSERT_FALSE(enabled);
+    PASS();
+}
+
 TEST(cli_config_delete) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
@@ -5084,6 +5125,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_get_set);
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);
+    RUN_TEST(cli_config_read_waits_for_writer);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
 

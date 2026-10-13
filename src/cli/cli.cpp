@@ -3516,6 +3516,14 @@ cbm_config_t *cbm_config_open(const char *cache_dir) {
         }
         return NULL;
     }
+    /* _config.db is a rollback-journal database that other processes write
+     * all the time: usage rows (every hook and tool worker), the store_meta
+     * memo, the sweep's rows. A reader that meets one of those commits gets
+     * SQLITE_BUSY, and without a timeout a setting read then returned its
+     * default: an index run parked with branch_index_keep 8 instead of the
+     * configured 1, and a sweep could run with cache_expiry false or judge
+     * by the 90-day default a rule set to 0. Wait for the commit instead. */
+    sqlite3_busy_timeout(db, CBM_CONFIG_BUSY_MS);
 
     /* Create table if not exists */
     const char *sql = "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)";
