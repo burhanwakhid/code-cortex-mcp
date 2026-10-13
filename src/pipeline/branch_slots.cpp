@@ -3,6 +3,10 @@
  * See branch_slots.h for the layout and the contract.
  */
 #include "pipeline/branch_slots.h"
+#ifdef _WIN32
+#include <windows.h>
+#include "foundation/win_utf8.h"
+#endif
 
 #include "store/store.h"
 #include "foundation/compat.h"
@@ -509,20 +513,48 @@ static int64_t wal_size(const char *db_path) {
     return file_size(wal);
 }
 
-/* Whether paths a and b name one existing file. POSIX compares device and
- * inode, which also catches two names a case-insensitive filesystem folds
- * together (and a symlink). Windows reports no inode number through
- * _wstat64; its filesystems compare names without case, so the names are
- * compared that way there. */
+#ifdef _WIN32
+/* A file's identity on its volume: serial number and file index. */
+static bool win_file_identity(const char *path, DWORD *serial, DWORD *hi, DWORD *lo) {
+    wchar_t *wide = cbm_utf8_to_wide_path(path);
+    if (!wide) {
+        return false;
+    }
+    HANDLE h = CreateFileW(wide, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                           OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(wide);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    bool ok = GetFileInformationByHandle(h, &info) != 0;
+    CloseHandle(h);
+    if (ok) {
+        *serial = info.dwVolumeSerialNumber;
+        *hi = info.nFileIndexHigh;
+        *lo = info.nFileIndexLow;
+    }
+    return ok;
+}
+#endif
+
+/* Whether paths a and b name one existing file: the same file identity,
+ * which also catches two names a case-insensitive filesystem folds together
+ * (and a symlink) -- and tells apart two names that differ only in case in
+ * a case-sensitive directory (NTFS per-directory case sensitivity), where a
+ * case-folded name compare took "Feature" and "feature" for one slot. POSIX:
+ * device and inode; Windows: volume serial and file index. */
 static bool same_file(const char *a, const char *b) {
+#ifdef _WIN32
+    DWORD sa, ha, la, sb, hb, lb;
+    return win_file_identity(a, &sa, &ha, &la) && win_file_identity(b, &sb, &hb, &lb) &&
+           sa == sb && ha == hb && la == lb;
+#else
     cbm_stat_t sa;
     cbm_stat_t sb;
     if (cbm_stat(a, &sa) != 0 || cbm_stat(b, &sb) != 0) {
         return false;
     }
-#ifdef _WIN32
-    return _stricmp(a, b) == 0;
-#else
     return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
 #endif
 }
