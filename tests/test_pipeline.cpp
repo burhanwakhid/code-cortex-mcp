@@ -4570,12 +4570,16 @@ TEST(git_context_linked_worktree) {
     ASSERT_STR_EQ(main_ctx.canonical_root, wt_ctx.canonical_root);
     ASSERT_NOT_NULL(wt_ctx.branch);
     ASSERT_STR_EQ(wt_ctx.branch, "feature/git-context");
-    ASSERT_STR_EQ(wt_ctx.branch_slug, "feature-git-context");
+    /* The '/' was replaced: the slug carries a hash of the whole name. */
+    ASSERT_EQ(strncmp(wt_ctx.branch_slug, "feature-git-context-", 20), 0);
+    ASSERT_EQ((int)strlen(wt_ctx.branch_slug), 20 + 12);
     ASSERT_NOT_NULL(wt_ctx.head_sha);
 
     char *qn = cbm_git_context_branch_qn("proj", &wt_ctx);
     ASSERT_NOT_NULL(qn);
-    ASSERT_STR_EQ(qn, "proj.__branch__.feature-git-context");
+    char want_qn[128];
+    snprintf(want_qn, sizeof(want_qn), "proj.__branch__.%s", wt_ctx.branch_slug);
+    ASSERT_STR_EQ(qn, want_qn);
     free(qn);
 
     char json[2048];

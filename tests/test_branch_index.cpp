@@ -26,6 +26,7 @@
 #include <foundation/platform.h>
 #include <foundation/sha256.h>
 
+#include <ctype.h>
 #include <stdio.h>
 #include "sqlite3.h"
 #include <stdlib.h>
@@ -236,6 +237,67 @@ TEST(branch_git_config_env_append) {
     PASS();
 }
 
+/* Distinct branch names never share a slug: one the slugger changed ("a/b"
+ * against "a-b"), one with nothing it can keep (all non-ASCII), and the
+ * reserved "detached" and "working-tree" get a hash of the whole name. A
+ * name that is its own slug stays as it is. Every slug is one safe path
+ * component, and long ones still map to bounded slot names. */
+static bool bi_slug_safe(const char *s) {
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (!(isalnum(c) || c == '-' || c == '_' || c == '.')) {
+            return false;
+        }
+    }
+    return s[0] != '\0';
+}
+
+TEST(branch_slugs_never_collide) {
+    const char *names[] = {"a/b",          "a-b",      "a_b",          "-a-b",
+                           "\xc3\xa9\xc3\xa9", "\xc3\xa8\xc3\xa8", "\xe4\xb8\xad", "detached",
+                           "working-tree", "branch",   "feature/x/y",  "feature-x-y"};
+    enum { N = sizeof(names) / sizeof(names[0]) };
+    char *slugs[N + 2];
+    for (int i = 0; i < N; i++) {
+        slugs[i] = cbm_git_branch_slug(names[i], false);
+        ASSERT_NOT_NULL(slugs[i]);
+        ASSERT_TRUE(bi_slug_safe(slugs[i]));
+    }
+    slugs[N] = cbm_git_branch_slug(NULL, true);      /* every detached HEAD */
+    slugs[N + 1] = cbm_git_branch_slug(NULL, false); /* outside git */
+    ASSERT_STR_EQ(slugs[N], "detached");
+    ASSERT_STR_EQ(slugs[N + 1], "working-tree");
+    for (int i = 0; i < N + 2; i++) {
+        for (int k = i + 1; k < N + 2; k++) {
+            ASSERT_STR_NEQ(slugs[i], slugs[k]);
+        }
+    }
+    ASSERT_STR_EQ(slugs[1], "a-b"); /* its own slug: unchanged */
+    ASSERT_STR_EQ(slugs[9], "branch");
+    ASSERT_EQ(strncmp(slugs[0], "a-b-", 4), 0);
+    ASSERT_EQ((int)strlen(slugs[0]), 4 + 12);
+    ASSERT_EQ(strncmp(slugs[4], "branch-", 7), 0);
+    ASSERT_EQ(strncmp(slugs[7], "detached-", 9), 0);
+    char *again = cbm_git_branch_slug("a/b", false);
+    ASSERT_STR_EQ(again, slugs[0]); /* stable */
+    free(again);
+    for (int i = 0; i < N + 2; i++) {
+        free(slugs[i]);
+    }
+    /* A long name the slugger changed: still one bounded slot name. */
+    static char longname[600];
+    memset(longname, 'q', sizeof(longname) - 1);
+    longname[100] = '/';
+    longname[sizeof(longname) - 1] = '\0';
+    char *ls = cbm_git_branch_slug(longname, false);
+    ASSERT_NOT_NULL(ls);
+    char slot[CBM_BRANCH_SLOT_NAME_MAX + 1];
+    ASSERT_TRUE(cbm_branch_slot_name(ls, slot, sizeof(slot)));
+    ASSERT_EQ((int)strlen(slot), CBM_BRANCH_SLOT_NAME_MAX);
+    free(ls);
+    PASS();
+}
+
 TEST(branch_slug_from_qn) {
     ASSERT_STR_EQ(cbm_branch_slug_from_qn("proj.__branch__.main", "proj"), "main");
     /* A branch whose name contains the marker keeps all of it. */
@@ -281,7 +343,11 @@ TEST(branch_git_head_slug_reads_head_file) {
     ASSERT_STR_EQ(bi_head_slug(repo, slug, sizeof(slug)), "main");
     ASSERT_STR_EQ(bi_head_slug(sub, slug, sizeof(slug)), "main");
     ASSERT_EQ(bi_git(repo, "checkout -q -b topic/x-y"), 0);
-    ASSERT_STR_EQ(bi_head_slug(repo, slug, sizeof(slug)), "topic-x-y");
+    char *want = cbm_git_branch_slug("topic/x-y", false);
+    ASSERT_NOT_NULL(want);
+    ASSERT_EQ(strncmp(want, "topic-x-y-", 10), 0); /* plus the name's hash */
+    ASSERT_STR_EQ(bi_head_slug(repo, slug, sizeof(slug)), want);
+    free(want);
     ASSERT_EQ(bi_git(repo, "checkout -q --detach HEAD"), 0);
     ASSERT_STR_EQ(bi_head_slug(repo, slug, sizeof(slug)), "detached");
 
@@ -889,7 +955,7 @@ TEST(branch_identity_is_name_and_head) {
     ASSERT_EQ(bi_status_matches(srv), 1);
     ASSERT_TRUE(bi_head_matches_index(repo));
 
-    /* "a/b" and "a-b" share the slug "a-b" (and a slot), not an identity. */
+    /* "a/b" and "a-b": distinct identities (and slugs, and slots). */
     ASSERT_EQ(bi_git(repo, "branch -q a/b main"), 0);
     ASSERT_EQ(bi_git(repo, "branch -q a-b main"), 0);
     ASSERT_EQ(bi_git(repo, "checkout -q a/b"), 0);
@@ -3632,6 +3698,7 @@ SUITE(branch_index) {
     }
     RUN_TEST(branch_git_config_env_append);
     RUN_TEST(branch_slug_from_qn);
+    RUN_TEST(branch_slugs_never_collide);
     RUN_TEST(branch_git_head_slug_reads_head_file);
     RUN_TEST(branch_git_head_read_non_ascii_path);
     RUN_TEST(branch_git_head_read_caps_line_length);

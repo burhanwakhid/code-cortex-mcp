@@ -97,7 +97,9 @@ born branch, so the strict rule never verifies a repository on every run.
 The slug alone was not enough to decide whether a graph is current:
 
 - Every detached HEAD has the slug `detached`. A moved detached HEAD looked current.
-- Two branch names can slug alike (`a/b` and `a-b`).
+- Two branch names slugged alike in earlier builds (`a/b` and `a-b`). The slug now carries a
+  hash when it is not the name itself (see [Slot layout](#slot-layout)), but a database
+  stamped with an older slug still compares by name.
 - A pull keeps the branch name and moves the commit.
 - A branch name can contain the marker `.__branch__.`. The slug is the text after the
   `<project>.__branch__.` prefix, never after the last marker.
@@ -180,6 +182,13 @@ removed after that.
   sensitivity makes `Repo` and `repo` two checkouts), and only a vanished one is compared by
   its folded spelling. A slot from the earlier flat layout (`branches/<project>/<slot>.db`) is
   moved into the root's directory when it records that root.
+- The slug of a branch name keeps `[A-Za-z0-9._-]` and turns each run of anything else into
+  one `-` (`cbm_git_branch_slug`). Every detached HEAD is `detached` and a directory outside
+  git is `working-tree`. When the slug is not the branch name itself (a character replaced
+  or dropped, nothing left of an all-non-ASCII name, which becomes `branch`, or a branch
+  literally named `detached` or `working-tree`), `-` and 12 hex digits of the SHA-256 of the
+  whole name follow: `a/b` is `a-b-<hash>` and `a-b` stays `a-b`, so distinct names never
+  share a slot.
 - `<slot>` is the slug when it fits in 200 bytes. A longer slug becomes a prefix plus `-` and
   16 hex digits of the SHA-256 of the whole slug. The file name thus stays one path component
   with room for every suffix (`.db.unz.tmp-journal`), and distinct slugs keep distinct files.
@@ -224,7 +233,7 @@ would change on every export and start another.
 ### Content verification after an identity change
 
 The incremental pass normally trusts a stored row when size and mtime match. After a switch, a
-failed restore, two branches that share a slot, or a pull, the stored graph comes from another
+failed restore, two branches that share a slot (case-only names), or a pull, the stored graph comes from another
 checkout. There a file can change under the same size and mtime: timestamps have whole seconds,
 and `git checkout` can write two branches in the same second. When the identity that the
 database records differs from the checkout under the strict rule, that run settles same-size
@@ -447,8 +456,7 @@ between 0.3 and 3.3 s, against 1.6 to 47 s for the seeded runs of the same seque
   switch pays this; a restore does not.
 - **The restore's WAL peak equals the database size** (see [WAL during a restore](#wal-during-a-restore)).
 - **Park and restore need scratch space** equal to the database size, in the cache directory.
-- **Every detached HEAD shares one slot** (`detached`), and branch names that slug alike share
-  one slot. Both cost re-work only.
+- **Every detached HEAD shares one slot** (`detached`). That costs re-work only.
 - **Branch names that differ only in case share one slot file on a case-insensitive
   filesystem** (macOS and Windows defaults): `Feature` and `feature` both name
   `Feature.db.zst`. A switch between them parks the outgoing graph over the incoming slot. The

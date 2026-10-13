@@ -89,7 +89,12 @@ void cbm_git_test_on_head_probe(void (*callback)(const char *path, void *data), 
 #endif
 
 /* The filesystem-safe slug of a branch name, as cbm_git_context_resolve
- * computes branch_slug ("detached" when detached). Caller frees. */
+ * computes branch_slug ("detached" when detached, "working-tree" with no
+ * name). A name that is not its own slug -- a character outside
+ * [A-Za-z0-9._-], a leading '-', or the name "detached" or "working-tree" --
+ * gets '-' and 12 hex digits of the SHA-256 of the name appended, so two
+ * names never share a slug ("a/b" is "a-b-<hash>", "a-b" stays "a-b").
+ * Caller frees. */
 char *cbm_git_branch_slug(const char *branch, bool detached);
 
 /* Append key=value to the configuration git reads from the environment

@@ -4,6 +4,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/platform.h" /* cbm_is_dir — wide path on Windows */
+#include "foundation/sha256.h"
 #include "foundation/str_util.h"
 
 #include <ctype.h>
@@ -355,11 +356,26 @@ static char *derive_canonical_root(const char *input_path, const char *worktree_
     return root;
 }
 
+/* The slug of a branch name: [A-Za-z0-9._-] only, runs of anything else one
+ * '-'. "detached" (every detached HEAD) and "working-tree" (no git) are
+ * reserved. Whenever the slug is not the name itself -- a character was
+ * replaced or dropped ("a/b" and "a-b"), nothing was left (an all-non-ASCII
+ * name), or the name is a reserved one -- '-' and the first SLUG_HASH_HEX hex
+ * digits of the SHA-256 of the whole name follow, so distinct names keep
+ * distinct slugs (and slots). A name that is its own slug stays readable. */
+enum { SLUG_HASH_HEX = 12 };
+
 static char *slug_from_branch(const char *branch, bool detached) {
-    const char *fallback = detached ? "detached" : "working-tree";
-    const char *src = detached ? fallback : (branch && branch[0] ? branch : fallback);
+    if (detached) {
+        return git_strdup("detached");
+    }
+    if (!branch || !branch[0]) {
+        return git_strdup("working-tree");
+    }
+    const char *src = branch;
     size_t len = strlen(src);
-    char *slug = (char *)malloc(len + 1);
+    /* Room for "branch" (an empty slug) or the slug, then '-' and the hash. */
+    char *slug = (char *)malloc(len + sizeof("branch") + 1 + SLUG_HASH_HEX + 1);
     if (!slug) {
         return NULL;
     }
@@ -385,10 +401,17 @@ static char *slug_from_branch(const char *branch, bool detached) {
     }
     slug[j] = '\0';
 
-    if (slug[0] == '\0') {
-        free(slug);
-        return git_strdup(fallback);
+    bool reserved = strcmp(src, "detached") == 0 || strcmp(src, "working-tree") == 0;
+    if (strcmp(slug, src) == 0 && !reserved) {
+        return slug;
     }
+    if (j == 0) {
+        memcpy(slug, "branch", sizeof("branch"));
+        j = sizeof("branch") - 1;
+    }
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(src, len, digest);
+    snprintf(slug + j, 1 + SLUG_HASH_HEX + 1, "-%.*s", (int)SLUG_HASH_HEX, digest);
     return slug;
 }
 

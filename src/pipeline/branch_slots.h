@@ -27,7 +27,9 @@
  *
  * The slug names the slot: a branch name made filesystem-safe (git_context.h),
  * "detached" for every detached HEAD (one shared slot), and "working-tree"
- * outside git. Two branch names that slug alike ("a/b", "a-b") share a slot.
+ * outside git. A name that is not its own slug carries a hash of the name
+ * ("a/b" is "a-b-<hash>"), so distinct names keep distinct slots; names that
+ * differ only in case still share one on a case-insensitive filesystem.
  * Whether a database matches the checkout is decided on the full identity the
  * Branch node's properties record (real branch name, detached, HEAD commit),
  * never on the slug, so a shared slot costs re-work, not a missed switch.
