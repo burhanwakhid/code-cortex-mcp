@@ -268,7 +268,9 @@ full-text tables and vectors (`park_db`):
 2. Stream compression (zstd level 3, one frame with a content checksum) into
    `<slot>.db.zst.tmp`, then a rename to `<slot>.db.zst`.
 3. The scratch file is removed. A legacy uncompressed `<slot>.db` of the same branch is
-   superseded and removed.
+   superseded and removed. A crash between the rename and this removal leaves both files; the
+   restore of the `.db.zst` then removes the stale `.db` and its sidecars too
+   (`branch.stale_legacy_removed`).
 
 A restore decompresses the slot into `<slot>.db.unz` in the slot directory, carries the ADR into
 that copy, and installs it by content as before. A slot that does not decompress (truncated,

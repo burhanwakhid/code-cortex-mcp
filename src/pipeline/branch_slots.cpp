@@ -1131,6 +1131,22 @@ static bool find_slot(const char *dir, const char *slug, char *buf, size_t bufsz
     return slot_file(dir, slug, BS_DB_EXT_S, buf, bufsz) && slot_present(buf);
 }
 
+/* Remove the slot just restored. When it is a <slot>.db.zst, a legacy
+ * <slot>.db of the same branch goes too (with its sidecars): a park writes
+ * the .zst and then removes the legacy file, so a crash in between leaves
+ * both, and the stale .db would otherwise count against the cap and budget
+ * and be restored by a later switch to this branch as if it were current. */
+static void drop_restored_slot(const char *incoming, const char *dir, const char *slug) {
+    bs_event("unlink_incoming", incoming);
+    unlink_slot(incoming);
+    char legacy[BS_PATH_MAX];
+    if (ends_with(incoming, BS_ZST_EXT) &&
+        slot_file(dir, slug, BS_DB_EXT_S, legacy, sizeof(legacy)) && cbm_file_exists(legacy) &&
+        unlink_slot(legacy)) {
+        cbm_log_info("branch.stale_legacy_removed", "slot", legacy);
+    }
+}
+
 /* The uncompressed database to install from `incoming`: the slot itself when
  * it is a legacy <slot>.db, else a decompressed scratch copy written to
  * `scratch` (the caller removes it with unlink_scratch). durable: the copy is
@@ -1242,8 +1258,7 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
         if (ok) {
             sync_parent_dir(db_path);
             if (durable) {
-                bs_event("unlink_incoming", incoming);
-                unlink_slot(incoming);
+                drop_restored_slot(incoming, dir, slug);
             }
             cbm_log_info("branch.switch", "action", "restored", "to", slug, "from", "");
             return CBM_BRANCH_SWITCH_RESTORED;
@@ -1322,8 +1337,7 @@ static cbm_branch_switch_t switch_from(const char *db_path, const char *project,
             action = CBM_BRANCH_SWITCH_RESTORED;
             log_kv("branch.restore", "elapsed_ms", (int64_t)(cbm_now_ms() - t0), "unpack_ms",
                    unpack_ms, "wal_bytes", wal_size(db_path));
-            bs_event("unlink_incoming", incoming);
-            unlink_slot(incoming);
+            drop_restored_slot(incoming, dir, slug);
         } else {
             cbm_log_warn("branch.restore_failed", "to", slug, "action", "seeded");
         }

@@ -3145,6 +3145,41 @@ TEST(branch_legacy_uncompressed_slot_restores) {
     PASS();
 }
 
+/* A crash between compressing a park and removing the branch's legacy .db
+ * leaves both. Restoring the .zst removes the stale .db as well: it must not
+ * count against the cap, nor be restored by a later switch. */
+TEST(branch_restore_removes_stale_legacy_twin) {
+    char *repo = bi_make_repo("cbm_bi_twin");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    char zst[1400];
+    char legacy[1400];
+    char side[1500];
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* main parked as .zst */
+    bi_slot_file("main", ".db.zst", zst, sizeof(zst));
+    bi_slot_file("main", ".db", legacy, sizeof(legacy));
+    ASSERT_TRUE(cbm_branch_slot_decompress(zst, legacy)); /* the crash's leftover */
+    snprintf(side, sizeof(side), "%s-wal", legacy);
+    ASSERT_EQ(th_write_file(side, ""), 0);
+    ASSERT_TRUE(cbm_file_exists(zst));
+
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_STR_EQ(r.action, "restored");
+    ASSERT_FALSE(cbm_file_exists(zst));
+    ASSERT_FALSE(cbm_file_exists(legacy));
+    ASSERT_FALSE(cbm_file_exists(side));
+    ASSERT_FALSE(bi_is_parked("main"));
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 /* A slot that does not decompress (truncated) is not restored: the outgoing
  * graph stays in place as the seed and the run reindexes the difference. */
 TEST(branch_corrupt_slot_seeds) {
@@ -3879,6 +3914,7 @@ SUITE(branch_index) {
 #endif
     RUN_TEST(branch_compressed_slot_round_trip);
     RUN_TEST(branch_legacy_uncompressed_slot_restores);
+    RUN_TEST(branch_restore_removes_stale_legacy_twin);
     RUN_TEST(branch_corrupt_slot_seeds);
     RUN_TEST(branch_budget_evicts_oldest);
     RUN_TEST(branch_budget_parse);
