@@ -1006,8 +1006,13 @@ static std::string label(const db_entry_t &e) {
 }
 
 /* Whether the database's usage row moved past the one the sweep judged.
- * An unreadable row counts as used: the next sweep decides again. */
-static bool used_since_scan(const db_entry_t &e) {
+ * An unreadable row counts as used: the next sweep decides again. A real
+ * sweep wrote its updated row (e.row) before judging; a dry run wrote
+ * nothing, so the stored row is still the one the scan read (e.seen), and
+ * comparing with e.row would read the streak's in-memory increment as a
+ * streak that went back -- every root_gone verdict previewed as kept. */
+static bool used_since_scan(const db_entry_t &e, bool dry_run) {
+    const usage_row_t &judged = dry_run ? e.seen : e.row;
     sqlite3 *db = state_open(false);
     if (!db) {
         return true;
@@ -1022,8 +1027,8 @@ static bool used_since_scan(const db_entry_t &e) {
         sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
         int rc = sqlite3_step(st);
         if (rc == SQLITE_ROW) {
-            used = sqlite3_column_int64(st, 0) > e.row.last_used ||
-                   sqlite3_column_int(st, 1) < e.row.missing_checks;
+            used = sqlite3_column_int64(st, 0) > judged.last_used ||
+                   sqlite3_column_int(st, 1) < judged.missing_checks;
         } else {
             used = rc != SQLITE_DONE; /* no row: nothing recorded a use */
         }
@@ -1112,7 +1117,7 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
     }
     /* Under the gate, so a reader that opened, recorded its use and closed
      * since the scan is seen here: judge by the row as it is now. */
-    if (used_since_scan(e)) {
+    if (used_since_scan(e, dry)) {
         cbm_db_lease_release(gate);
         cbm_db_lease_release(canon);
         cbm_db_lease_release(lease);

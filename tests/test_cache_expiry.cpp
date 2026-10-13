@@ -1011,6 +1011,53 @@ TEST(cache_dry_run_changes_nothing) {
     PASS();
 }
 
+/* A dry run previews a missing root past its streak and grace as due, as
+ * the real sweep then removes it -- not as "used since the scan" because
+ * the preview's streak increment was never written. */
+static void ce_count_root_gone(const cbm_cache_expiry_item_t *it, void *ud) {
+    if (it->kind == CBM_EXPIRE_ROOT_GONE && !it->skipped) {
+        (*(int *)ud)++;
+    }
+}
+
+TEST(cache_dry_run_reports_root_gone_due) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_drygone"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    ce_make_db(&e, "gone", root, db, sizeof(db));
+    th_rmtree(root);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    int64_t t0 = (int64_t)time(NULL);
+    for (int day = 0; day < 3; day++) {
+        ASSERT_EQ(ce_sweep(&cfg, t0 + day * CE_DAY, false, &r), 0);
+    }
+    cbm_cache_sweep_opts_t o = {};
+    o.now = t0 + 8 * CE_DAY;
+    o.dry_run = true;
+    int due = 0;
+    o.report = ce_count_root_gone;
+    o.report_ud = &due;
+    ASSERT_EQ(cbm_cache_expiry_sweep(&cfg, &o, &r), 0);
+    ASSERT_EQ(r.projects, 1);
+    ASSERT_EQ(r.skipped, 0);
+    ASSERT_EQ(due, 1);
+    ASSERT_TRUE(cbm_file_exists(db));
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "gone", &lu, &checks);
+    ASSERT_EQ(checks, 3); /* the preview wrote no streak */
+    ASSERT_EQ(ce_sweep(&cfg, t0 + 8 * CE_DAY, false, &r), 0);
+    ASSERT_EQ(r.projects, 1); /* what the preview said */
+    ASSERT_FALSE(cbm_file_exists(db));
+    ce_teardown(&e);
+    PASS();
+}
+
 /* Trash: an expired database with its parked slots can be restored; the
  * next sweep a day later purges what is left in the trash. */
 TEST(cache_trash_restore_and_purge) {
@@ -3016,6 +3063,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_skips_leased_project);
     RUN_TEST(cache_skips_database_with_open_reader);
     RUN_TEST(cache_dry_run_changes_nothing);
+    RUN_TEST(cache_dry_run_reports_root_gone_due);
     RUN_TEST(cache_dry_run_applies_safety_checks_and_creates_nothing);
     RUN_TEST(cache_trash_restore_and_purge);
     RUN_TEST(cache_trash_purge_skips_leased_project);
