@@ -810,7 +810,9 @@ static char *hf_make_checkouts(void) {
                           "/repo/.worktrees/wt/src",
                           "/repo/nested/.git",
                           "/repo/nested/src",
-                          "/repo/sub"};
+                          "/repo/sub",
+                          "/repo/sepdir/src",
+                          "/elsewhere/sepdir.git"};
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
         snprintf(p, sizeof(p), "%s%s", base, dirs[i]);
         ok = ok && cbm_mkdir_p(p, 0755);
@@ -822,6 +824,11 @@ static char *hf_make_checkouts(void) {
     ok = ok && hf_write_file(p, "gitdir: ../.git/modules/sub\n");
     snprintf(p, sizeof(p), "%s/repo/.git/worktrees/wt/commondir", base);
     ok = ok && hf_write_file(p, "../..\n");
+    /* A repository made with --separate-git-dir: a gitlink to a git dir
+     * outside any superproject's "modules". A checkout of its own. */
+    snprintf(p, sizeof(p), "%s/repo/sepdir/.git", base);
+    snprintf(text, sizeof(text), "gitdir: %s/elsewhere/sepdir.git\n", base);
+    ok = ok && hf_write_file(p, text);
     /* A submodule at worktrees/sm: its gitdir's parent is named "worktrees". */
     snprintf(p, sizeof(p), "%s/repo/worktrees/sm/.git", base);
     ok = ok && hf_write_file(p, "gitdir: ../../.git/modules/worktrees/sm\n");
@@ -881,6 +888,15 @@ TEST(hook_walkup_stops_at_unindexed_checkout_root) {
     snprintf(p, sizeof(p), "%s/worktrees/sm", repo);
     ASSERT_EQ(cbm_git_checkout_root_kind(p), CBM_GIT_CHECKOUT_GITLINK);
     ASSERT_FALSE(cbm_git_is_linked_worktree(p));
+    ASSERT_TRUE(cbm_git_gitlink_is_submodule(p));
+    snprintf(p, sizeof(p), "%s/sub", repo);
+    ASSERT_TRUE(cbm_git_gitlink_is_submodule(p));
+    snprintf(p, sizeof(p), "%s/.worktrees/wt", repo);
+    ASSERT_FALSE(cbm_git_gitlink_is_submodule(p));
+    snprintf(p, sizeof(p), "%s/sepdir", repo);
+    ASSERT_EQ(cbm_git_checkout_root_kind(p), CBM_GIT_CHECKOUT_GITLINK);
+    ASSERT_FALSE(cbm_git_is_linked_worktree(p));
+    ASSERT_FALSE(cbm_git_gitlink_is_submodule(p));
     snprintf(p, sizeof(p), "%s/src/deep", repo);
     ASSERT_EQ(cbm_git_checkout_root_kind(p), CBM_GIT_CHECKOUT_NONE);
 
@@ -909,6 +925,14 @@ TEST(hook_walkup_stops_at_unindexed_checkout_root) {
     snprintf(want, sizeof(want), "repo_path = %s)", p);
     ASSERT_NOT_NULL(strstr(text, want));
     ASSERT_NULL(strstr(text, "linked git worktree"));
+    free(text);
+
+    /* A --separate-git-dir repository: a checkout of its own, same stop. */
+    snprintf(p, sizeof(p), "%s/sepdir/src", repo);
+    text = cbm_session_start_text_for_testing(p);
+    ASSERT_NOT_NULL(text);
+    ASSERT_NULL(strstr(text, parent));
+    ASSERT_NOT_NULL(strstr(text, "is not indexed"));
     free(text);
 
     /* Submodules (also one at worktrees/<name>): discovery indexes their
@@ -1016,8 +1040,8 @@ TEST(mcp_cwd_project_stops_at_unindexed_checkout_root) {
     ASSERT_NOT_NULL(cbm_mcp_cwd_project());
     ASSERT_STR_EQ(cbm_mcp_cwd_project(), parent);
 
-    const char *stops[] = {"/.worktrees/wt/src", "/nested/src"};
-    for (size_t i = 0; i < 2; i++) {
+    const char *stops[] = {"/.worktrees/wt/src", "/nested/src", "/sepdir/src"};
+    for (size_t i = 0; i < 3; i++) {
         snprintf(p, sizeof(p), "%s%s", repo, stops[i]);
         ASSERT_EQ(chdir(p), 0);
         cbm_mcp_reset_cwd_project_cache();

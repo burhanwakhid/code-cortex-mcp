@@ -1602,13 +1602,14 @@ static const char *cwd_project_name(void) {
             cbm_store_meta_close(meta);
             return g_cwd_project;
         }
-        /* An unindexed git checkout root (a linked worktree, a nested repo)
+        /* An unindexed git checkout root (a linked worktree, a nested repo,
+         * one made with --separate-git-dir)
          * ends the walk: the enclosing checkout's index is other code. A
          * submodule's gitlink does not: discovery indexes its files into the
          * enclosing checkout's graph. */
         cbm_git_checkout_kind_t kind = cbm_git_checkout_root_kind(dir);
         if (kind == CBM_GIT_CHECKOUT_MAIN ||
-            (kind == CBM_GIT_CHECKOUT_GITLINK && cbm_git_is_linked_worktree(dir))) {
+            (kind == CBM_GIT_CHECKOUT_GITLINK && !cbm_git_gitlink_is_submodule(dir))) {
             break;
         }
         char *slash = strrchr(dir, '/');

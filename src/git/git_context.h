@@ -60,6 +60,11 @@ cbm_git_checkout_kind_t cbm_git_checkout_root_kind(const char *dir);
 /* True when dir's .git is a gitlink naming "<common>/worktrees/<name>", i.e.
  * dir is a linked worktree rather than a submodule. Reads the small .git file. */
 bool cbm_git_is_linked_worktree(const char *dir);
+/* Whether dir's .git is a submodule's gitlink: its git dir is in a
+ * superproject's "modules" directory. False for a linked worktree and for a
+ * repository whose git dir was put elsewhere (git init --separate-git-dir),
+ * which are checkouts of their own. */
+bool cbm_git_gitlink_is_submodule(const char *dir);
 
 /* What HEAD of the checkout containing `root` names, read from files only (no
  * git subprocess, for callers on a latency budget). root may be any directory

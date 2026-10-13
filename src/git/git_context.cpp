@@ -955,3 +955,42 @@ bool cbm_git_is_linked_worktree(const char *dir) {
     const char *parent = strrchr(val, '/');
     return parent && strcmp(parent + 1, "worktrees") == 0;
 }
+
+bool cbm_git_gitlink_is_submodule(const char *dir) {
+    if (cbm_git_checkout_root_kind(dir) != CBM_GIT_CHECKOUT_GITLINK ||
+        cbm_git_is_linked_worktree(dir)) {
+        return false;
+    }
+    char path[CBM_SZ_4K];
+    snprintf(path, sizeof(path), "%s/.git", dir);
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return false;
+    }
+    char line[CBM_SZ_4K];
+    bool got = fgets(line, sizeof(line), f) != NULL;
+    fclose(f);
+    if (!got || strncmp(line, "gitdir:", 7) != 0) {
+        return false;
+    }
+    /* A submodule's admin directory lives in its superproject's git dir, at
+     * <git dir>/modules/<path> (nested: .../modules/a/modules/b). A gitlink
+     * whose target has no "modules" component is a repository of its own
+     * whose git dir was put elsewhere (git init --separate-git-dir): a
+     * checkout boundary, like a nested clone. */
+    for (char *c = line; *c; c++) {
+        if (*c == '\\') {
+            *c = '/';
+        }
+    }
+    const char *v = line + 7;
+    for (const char *m = strstr(v, "modules"); m; m = strstr(m + 1, "modules")) {
+        bool starts = m == v || m[-1] == '/' || m[-1] == ' ';
+        bool ends = m[7] == '/' || m[7] == '\0' || m[7] == '\n' || m[7] == '\r';
+        if (starts && ends) {
+            return true;
+        }
+    }
+    return false;
+}
+
