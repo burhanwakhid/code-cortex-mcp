@@ -1,6 +1,7 @@
 #ifndef CBM_ZSTD_STORE_H
 #define CBM_ZSTD_STORE_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -45,6 +46,13 @@ int64_t cbm_zstd_compress_stream(FILE *in, FILE *out, int64_t src_size, int leve
 // or corrupt frame, a checksum mismatch, trailing bytes, or more than max_out
 // decompressed bytes all fail. Returns the decompressed byte count, or -1.
 int64_t cbm_zstd_decompress_stream(FILE *in, FILE *out, uint64_t max_out);
+
+// cbm_zstd_decompress_stream, also telling apart why it failed: *data_error
+// (optional) is set true when the input itself is bad -- a corrupt, truncated
+// or over-max_out frame, a checksum mismatch, trailing bytes -- and false on
+// success and on a read or write error or no memory, which say nothing about
+// the input.
+int64_t cbm_zstd_decompress_stream_ex(FILE *in, FILE *out, uint64_t max_out, bool *data_error);
 
 #ifdef __cplusplus
 }

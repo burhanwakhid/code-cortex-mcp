@@ -201,6 +201,35 @@ TEST(zstd_stream_roundtrip_and_rejects) {
     fclose(o2);
     fclose(t);
 
+    /* The _ex form says whether the input was at fault: a garbled or
+     * truncated frame is, a good one is not. */
+    bool bad = false;
+    t = tmpfile();
+    fwrite(frame, 1, (size_t)clen, t);
+    rewind(t);
+    o2 = tmpfile();
+    ASSERT_EQ(cbm_zstd_decompress_stream_ex(t, o2, (uint64_t)N, &bad), -1);
+    ASSERT_TRUE(bad);
+    fclose(o2);
+    fclose(t);
+    t = tmpfile();
+    frame[clen / 2] ^= 0x5a; /* back to the good frame */
+    fwrite(frame, 1, (size_t)clen / 3, t);
+    rewind(t);
+    o2 = tmpfile();
+    ASSERT_EQ(cbm_zstd_decompress_stream_ex(t, o2, (uint64_t)N, &bad), -1);
+    ASSERT_TRUE(bad);
+    fclose(o2);
+    fclose(t);
+    t = tmpfile();
+    fwrite(frame, 1, (size_t)clen, t);
+    rewind(t);
+    o2 = tmpfile();
+    ASSERT_EQ(cbm_zstd_decompress_stream_ex(t, o2, (uint64_t)N, &bad), N);
+    ASSERT_FALSE(bad);
+    fclose(o2);
+    fclose(t);
+
     /* An empty input is one valid empty frame. */
     FILE *e = tmpfile();
     FILE *ez = tmpfile();

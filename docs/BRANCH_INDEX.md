@@ -272,7 +272,10 @@ full-text tables and vectors (`park_db`):
 
 A restore decompresses the slot into `<slot>.db.unz` in the slot directory, carries the ADR into
 that copy, and installs it by content as before. A slot that does not decompress (truncated,
-corrupt, failed checksum) is not restored: the run seeds instead. The next switch removes
+corrupt, failed checksum) is not restored: the run seeds instead, and the slot is removed
+(`branch.slot_corrupt` in the log), since no later switch could restore it either. A slot that
+failed for another reason (the scratch copy could not be written for want of space, a read
+error) stays (`branch.slot_unreadable`). The next switch removes
 scratch files that a crashed park or restore left behind (`sweep_scratch`). Scratch files are
 matched by their exact suffix (`.db.unz`, `.db.unz.tmp` and their SQLite sidecars, and
 `.db.zst.tmp`), never by a substring: a branch named `fix.db.unz` has the slot

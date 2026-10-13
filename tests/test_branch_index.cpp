@@ -3175,6 +3175,28 @@ TEST(branch_corrupt_slot_seeds) {
     ASSERT_EQ(bi_count("only_feature"), 0);
     char path[1400];
     ASSERT_FALSE(cbm_file_exists(bi_slot_file("main", ".db.unz", path, sizeof(path))));
+    /* The slot can never be restored: it is gone, not decompressed again on
+     * the next switch to main, and the outgoing branch's park is kept. */
+    ASSERT_FALSE(cbm_file_exists(zst));
+    ASSERT_FALSE(bi_is_parked("main"));
+    ASSERT_TRUE(bi_is_parked("feature"));
+
+    /* A garbled slot found with no live database (the restore-into-nothing
+     * path) goes too; the run indexes from scratch. */
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* main parked again, feature restored */
+    ASSERT_TRUE(bi_is_parked("main"));
+    ASSERT_EQ(th_write_file(zst, "garbage, not a zstd frame"), 0);
+    char db[1024];
+    bi_db_path(db, sizeof(db));
+    ASSERT_EQ(cbm_unlink(db), 0);
+    cbm_remove_db_sidecars(db);
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_NEQ(r.action, "restored");
+    ASSERT_EQ(bi_count("only_main"), 1);
+    ASSERT_FALSE(cbm_file_exists(zst));
 
     bi_cleanup(repo);
     PASS();

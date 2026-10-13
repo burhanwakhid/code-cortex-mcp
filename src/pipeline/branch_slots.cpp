@@ -650,8 +650,16 @@ static bool compress_file(const char *src, const char *dst) {
 }
 
 /* cbm_branch_slot_decompress; durable: out_path is on stable storage when
- * this returns true (a database about to replace the slot it came from). */
-static bool decompress_file(const char *slot, const char *out_path, bool durable) {
+ * this returns true (a database about to replace the slot it came from).
+ * *corrupt (optional) is set when the slot itself is bad -- a truncated or
+ * garbled frame, a checksum mismatch, an empty database -- as opposed to a
+ * failure to read it or to write the copy (a full disk), which says nothing
+ * about the slot. */
+static bool decompress_file(const char *slot, const char *out_path, bool durable,
+                            bool *corrupt = nullptr) {
+    if (corrupt) {
+        *corrupt = false;
+    }
     if (!slot || !out_path) {
         return false;
     }
@@ -662,7 +670,11 @@ static bool decompress_file(const char *slot, const char *out_path, bool durable
     }
     FILE *in = cbm_fopen(slot, "rb");
     FILE *out = in ? cbm_fopen(tmp, "wb") : NULL;
-    int64_t n = out ? cbm_zstd_decompress_stream(in, out, BS_MAX_UNPACKED_BYTES) : -1;
+    bool bad = false;
+    int64_t n = out ? cbm_zstd_decompress_stream_ex(in, out, BS_MAX_UNPACKED_BYTES, &bad) : -1;
+    if (corrupt) {
+        *corrupt = bad || n == 0;
+    }
     bool ok = n > 0 && (!durable || sync_stream(out, tmp));
     if (out && fclose(out) != 0) {
         ok = false;
@@ -1122,7 +1134,11 @@ static bool find_slot(const char *dir, const char *slug, char *buf, size_t bufsz
 /* The uncompressed database to install from `incoming`: the slot itself when
  * it is a legacy <slot>.db, else a decompressed scratch copy written to
  * `scratch` (the caller removes it with unlink_scratch). durable: the copy is
- * synced to stable storage, for a caller that renames it into place. */
+ * synced to stable storage, for a caller that renames it into place. A slot
+ * whose frame is corrupt (truncated, garbled, a failed checksum) can never be
+ * restored: it is removed (branch.slot_corrupt), so it neither counts against
+ * the cap and budget nor is decompressed again on every switch to its branch.
+ * One that failed for want of space or a read error stays. */
 static const char *open_incoming(const char *incoming, const char *dir, const char *slug,
                                  char *scratch, size_t scratch_sz, bool durable,
                                  int64_t *unpack_ms) {
@@ -1134,9 +1150,14 @@ static const char *open_incoming(const char *incoming, const char *dir, const ch
         return NULL;
     }
     unlink_scratch(scratch);
-    if (!decompress_file(incoming, scratch, durable)) {
-        cbm_log_warn("branch.slot_unreadable", "slot", incoming);
+    bool corrupt = false;
+    if (!decompress_file(incoming, scratch, durable, &corrupt)) {
         unlink_scratch(scratch);
+        if (corrupt && unlink_slot(incoming)) {
+            cbm_log_warn("branch.slot_corrupt", "slot", incoming, "action", "removed");
+        } else {
+            cbm_log_warn("branch.slot_unreadable", "slot", incoming);
+        }
         return NULL;
     }
     *unpack_ms = (int64_t)(cbm_now_ms() - t0);

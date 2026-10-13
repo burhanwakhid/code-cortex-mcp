@@ -1,6 +1,7 @@
 // zstd_store.c — Thin C wrappers around Zstandard.
 
 #include "vendored/zstd/zstd.h"
+#include "vendored/zstd/zstd_errors.h"
 
 #include "zstd_store.h"
 
@@ -89,6 +90,13 @@ int64_t cbm_zstd_compress_stream(FILE *in, FILE *out, int64_t src_size, int leve
 }
 
 int64_t cbm_zstd_decompress_stream(FILE *in, FILE *out, uint64_t max_out) {
+    return cbm_zstd_decompress_stream_ex(in, out, max_out, NULL);
+}
+
+int64_t cbm_zstd_decompress_stream_ex(FILE *in, FILE *out, uint64_t max_out, bool *data_error) {
+    if (data_error) {
+        *data_error = false;
+    }
     if (!in || !out) {
         return -1;
     }
@@ -99,6 +107,7 @@ int64_t cbm_zstd_decompress_stream(FILE *in, FILE *out, uint64_t max_out) {
     char *obuf = (char *)malloc(out_cap);
     uint64_t total = 0;
     bool ok = dctx && ibuf && obuf;
+    bool bad_data = false; /* the input itself is at fault, not I/O or memory */
     size_t last_ret = 1;
     bool frame_done = false;
     while (ok) {
@@ -109,6 +118,7 @@ int64_t cbm_zstd_decompress_stream(FILE *in, FILE *out, uint64_t max_out) {
         }
         if (frame_done) {
             ok = false; /* bytes after the one frame */
+            bad_data = true;
             break;
         }
         ZSTD_inBuffer input = {ibuf, got, 0};
@@ -117,16 +127,23 @@ int64_t cbm_zstd_decompress_stream(FILE *in, FILE *out, uint64_t max_out) {
             last_ret = ZSTD_decompressStream(dctx, &output, &input);
             if (ZSTD_isError(last_ret)) {
                 ok = false;
+                bad_data = ZSTD_getErrorCode(last_ret) != ZSTD_error_memory_allocation;
                 break;
             }
             total += output.pos;
-            if (total > max_out || (output.pos && fwrite(obuf, 1, output.pos, out) != output.pos)) {
+            if (total > max_out) {
+                ok = false;
+                bad_data = true;
+                break;
+            }
+            if (output.pos && fwrite(obuf, 1, output.pos, out) != output.pos) {
                 ok = false;
                 break;
             }
             if (last_ret == 0) {
                 frame_done = true;
                 ok = input.pos == input.size; /* trailing bytes in this read */
+                bad_data = !ok;
                 break;
             }
             /* A full output buffer may leave decoded bytes inside the
@@ -136,9 +153,15 @@ int64_t cbm_zstd_decompress_stream(FILE *in, FILE *out, uint64_t max_out) {
             }
         }
     }
-    ok = ok && frame_done; /* EOF inside the frame: truncated */
+    if (ok && !frame_done) {
+        ok = false; /* EOF inside the frame: truncated */
+        bad_data = true;
+    }
     free(ibuf);
     free(obuf);
     ZSTD_freeDCtx(dctx);
+    if (data_error) {
+        *data_error = !ok && bad_data;
+    }
     return ok ? (int64_t)total : -1;
 }
