@@ -3758,6 +3758,30 @@ TEST(branch_git_head_read_probes_filesystem_root) {
     PASS();
 }
 
+/* The submodule check's search for the superproject reaches the filesystem
+ * root: a superproject rooted at "/" has its .git there. */
+TEST(branch_gitlink_superproject_search_reaches_root) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && !defined(_WIN32)
+    char *tmp = th_mktempdir("cbm_bi_superroot");
+    ASSERT_NOT_NULL(tmp);
+    char sub[512];
+    snprintf(sub, sizeof(sub), "%s/a/sub", tmp);
+    ASSERT_TRUE(cbm_mkdir_p(sub, 0755));
+    char link[600];
+    snprintf(link, sizeof(link), "%s/.git", sub);
+    ASSERT_EQ(th_write_file(link, "gitdir: ../../.git/modules/sub\n"), 0);
+    std::vector<std::string> probes;
+    cbm_git_test_on_head_probe(bi_record_probe, &probes);
+    bool is_sub = cbm_git_gitlink_is_submodule(sub);
+    cbm_git_test_on_head_probe(NULL, NULL);
+    ASSERT_FALSE(is_sub); /* no enclosing repository at all */
+    ASSERT_FALSE(probes.empty());
+    ASSERT_STR_EQ(probes.back().c_str(), "/");
+    th_rmtree(tmp);
+#endif
+    PASS();
+}
+
 #ifndef _WIN32
 /* Copy the database at src to dst (a consistent snapshot). */
 static bool bi_vacuum_into(const char *src, const char *dst) {
@@ -3964,6 +3988,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_switch_keeps_unreadable_mode_skipped_file);
     RUN_TEST(branch_switch_keeps_mode_skipped_file_without_digest);
     RUN_TEST(branch_git_head_read_probes_filesystem_root);
+    RUN_TEST(branch_gitlink_superproject_search_reaches_root);
     RUN_TEST(branch_slot_path_keeps_room_for_scratch_suffix);
     RUN_TEST(branch_evict_skips_slot_that_stays);
 }

@@ -89,7 +89,8 @@ void cbm_git_head_free(cbm_git_head_t *head);
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* Callback told of every ".git" path cbm_git_head_read probes, in order, as
- * it walks up from the root. NULL clears. */
+ * it walks up from the root, and of every directory cbm_git_gitlink_is_submodule
+ * tries as the superproject. NULL clears. */
 void cbm_git_test_on_head_probe(void (*callback)(const char *path, void *data), void *data);
 #endif
 

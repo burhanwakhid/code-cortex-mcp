@@ -1012,11 +1012,29 @@ bool cbm_git_gitlink_is_submodule(const char *dir) {
         return false;
     }
     for (;;) {
-        char *slash = strrchr(up, '/');
-        if (!slash || slash == up || (slash == up + 2 && up[1] == ':')) {
-            return false; /* no enclosing repository */
+        bool at_root = (up[0] == '/' && up[1] == '\0') ||
+                       (up[1] == ':' && up[2] == '/' && up[3] == '\0');
+        if (at_root) {
+            return false; /* the filesystem root was probed: no superproject */
         }
-        *slash = '\0';
+        char *slash = strrchr(up, '/');
+        if (!slash) {
+            return false;
+        }
+        /* Keep a root's separator ("/", "C:/"): it is probed too, once -- a
+         * superproject rooted at the filesystem root has its .git there. */
+        if (slash == up) {
+            up[1] = '\0';
+        } else if (slash == up + 2 && up[1] == ':') {
+            up[3] = '\0';
+        } else {
+            *slash = '\0';
+        }
+#ifdef CBM_ENABLE_TEST_SEAMS
+        if (g_head_probe_cb) {
+            g_head_probe_cb(up, g_head_probe_data); /* each superproject candidate */
+        }
+#endif
         cbm_git_checkout_kind_t kind = cbm_git_checkout_root_kind(up);
         if (kind == CBM_GIT_CHECKOUT_NONE) {
             continue;
