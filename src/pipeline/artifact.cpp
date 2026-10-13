@@ -37,6 +37,7 @@ enum {
 #include <yyjson/yyjson.h>
 
 #include <atomic>
+#include <string>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -358,10 +359,54 @@ static void graph_generation(cbm_store_t *s, const char *project, int *format, c
 }
 
 /* Write artifact.json metadata. */
+/* A fingerprint of the payload file that binds artifact.json to it: the
+ * size and a SHA-256 of the first and last 64 KiB (a zstd frame ends with
+ * its content checksum, so two generations differ there). Not the mtime --
+ * a git checkout resets it, and a committed artifact must stay current on
+ * every clone -- and not a full hash, which on a large payload would cost
+ * seconds on every index run. An export interrupted between publishing the
+ * payload and the metadata leaves a payload whose fingerprint the metadata
+ * does not record: not current, exported again. */
+enum { ART_FP_EDGE = 64 * 1024 };
+
+static bool payload_fingerprint(const char *path, char out[CBM_SHA256_HEX_LEN + 1]) {
+    out[0] = '\0';
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return false;
+    }
+    long long size = (long long)ftell(f);
+    if (size < 0) {
+        fclose(f);
+        return false;
+    }
+    std::string buf = std::to_string(size) + ":";
+    size_t head = size < ART_FP_EDGE ? (size_t)size : (size_t)ART_FP_EDGE;
+    size_t tail = size - (long long)head < ART_FP_EDGE ? (size_t)(size - (long long)head)
+                                                       : (size_t)ART_FP_EDGE;
+    std::string chunk(head + tail, '\0');
+    bool ok = fseek(f, 0, SEEK_SET) == 0 && fread(&chunk[0], 1, head, f) == head;
+    if (ok && tail > 0) {
+        ok = fseek(f, (long)(size - (long long)tail), SEEK_SET) == 0 &&
+             fread(&chunk[head], 1, tail, f) == tail;
+    }
+    fclose(f);
+    if (!ok) {
+        return false;
+    }
+    buf += chunk;
+    cbm_sha256_hex(buf.data(), buf.size(), out);
+    return true;
+}
+
 static int write_metadata(const char *repo_path, const char *project_name, int nodes, int edges,
                           const char *branch_qn, const char *branch_name, const char *content_fp,
                           int index_format, const char *graph_gen, size_t original_size,
-                          size_t compressed_size, int compression_level) {
+                          size_t compressed_size, int compression_level, const char *payload_fp) {
     char commit[CBM_SZ_64] = "";
     git_head_hash(repo_path, commit, sizeof(commit));
 
@@ -391,6 +436,7 @@ static int write_metadata(const char *repo_path, const char *project_name, int n
     yyjson_mut_obj_add_str(doc, root, "content_fp", content_fp ? content_fp : "");
     yyjson_mut_obj_add_int(doc, root, "index_format", index_format);
     yyjson_mut_obj_add_str(doc, root, "graph_generation", graph_gen ? graph_gen : "");
+    yyjson_mut_obj_add_str(doc, root, "payload_fp", payload_fp ? payload_fp : "");
     yyjson_mut_obj_add_uint(doc, root, "original_size", (uint64_t)original_size);
     yyjson_mut_obj_add_uint(doc, root, "compressed_size", (uint64_t)compressed_size);
     yyjson_mut_obj_add_int(doc, root, "compression_level", compression_level);
@@ -820,9 +866,11 @@ static int export_locked(const char *db_path, const char *repo_path, const char 
 #endif
 
     /* Write metadata */
+    char payload_fp[CBM_SHA256_HEX_LEN + 1] = "";
+    (void)payload_fingerprint(zst_path, payload_fp); /* none: the metadata is never current */
     int mrc = write_metadata(repo_path, project_name, snap.nodes, snap.edges, snap.branch_qn,
                              snap.branch_name, snap.content_fp, snap.index_format, snap.graph_gen,
-                             db_size, (size_t)clen, compression_level);
+                             db_size, (size_t)clen, compression_level, payload_fp);
     snapshot_meta_free(&snap);
     if (mrc != 0) {
         cbm_unlink(zst_path);
@@ -1040,10 +1088,17 @@ bool cbm_artifact_is_current(const char *db_path, const char *repo_path, const c
     const char *a_fp = yyjson_get_str(root ? yyjson_obj_get(root, "content_fp") : NULL);
     yyjson_val *a_format = root ? yyjson_obj_get(root, "index_format") : NULL;
     const char *a_gen = yyjson_get_str(root ? yyjson_obj_get(root, "graph_generation") : NULL);
+    const char *a_pfp = yyjson_get_str(root ? yyjson_obj_get(root, "payload_fp") : NULL);
     bool current = false;
     /* Metadata from a build that did not record these is never current: one
      * export brings it up to date. */
-    if (a_qn && a_name && a_fp && a_fp[0] && yyjson_is_int(a_format) && a_gen && a_gen[0]) {
+    char zst_path[CBM_SZ_4K];
+    char now_pfp[CBM_SHA256_HEX_LEN + 1] = "";
+    bool payload_ok = a_pfp && a_pfp[0] &&
+                      artifact_path(zst_path, sizeof(zst_path), repo_path, CBM_ARTIFACT_FILENAME) &&
+                      payload_fingerprint(zst_path, now_pfp) && strcmp(now_pfp, a_pfp) == 0;
+    if (payload_ok && a_qn && a_name && a_fp && a_fp[0] && yyjson_is_int(a_format) && a_gen &&
+        a_gen[0]) {
         cbm_store_t *s = cbm_store_open_path_query(db_path);
         char *qn = NULL;
         char *name = NULL;

@@ -1957,6 +1957,36 @@ TEST(branch_artifact_stale_after_adr_update) {
     PASS();
 }
 
+/* An export interrupted after publishing the payload but before the
+ * metadata leaves a payload the metadata does not describe: not current. */
+TEST(branch_artifact_payload_mismatch_is_not_current) {
+    char *repo = bi_make_repo("cbm_bi_artpfp");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    snprintf(g_bi_project, sizeof(g_bi_project), "%s", cbm_pipeline_project_name(p));
+    snprintf(g_bi_root, sizeof(g_bi_root), "%s", cbm_pipeline_repo_path(p));
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    char db[1024];
+    bi_db_path(db, sizeof(db));
+    ASSERT_TRUE(cbm_artifact_is_current(db, repo, g_bi_project));
+    /* Another generation's payload in place, the metadata unchanged. */
+    char zst[1024];
+    snprintf(zst, sizeof(zst), "%s/.code-cortex/graph.db.zst", repo);
+    FILE *f = fopen(zst, "ab");
+    ASSERT_NOT_NULL(f);
+    fputs("another generation", f);
+    fclose(f);
+    ASSERT_FALSE(cbm_artifact_is_current(db, repo, g_bi_project));
+    bi_cleanup(repo);
+    PASS();
+}
+
 #ifdef CBM_ENABLE_TEST_SEAMS
 static void bi_write_adr_now(void *ud) {
     cbm_store_t *s = cbm_store_open_path((const char *)ud);
@@ -4021,6 +4051,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_stamp_only_switch_reexports_artifact);
     RUN_TEST(branch_committed_artifact_stays_current);
     RUN_TEST(branch_artifact_stale_after_adr_update);
+    RUN_TEST(branch_artifact_payload_mismatch_is_not_current);
     RUN_TEST(branch_artifact_adr_during_export_is_not_current);
     RUN_TEST(branch_dump_generation_is_sub_second);
     RUN_TEST(branch_restore_reexports_artifact);
