@@ -1823,6 +1823,41 @@ static bool bi_read_text(const char *path, char *buf, size_t n) {
     fclose(f);
     return true;
 }
+/* The dump's time is also the graph's generation (artifact freshness): two
+ * dumps in quick succession must not share it, or a re-dump of a different
+ * graph within one second would leave a stale artifact reading as current.
+ * The stamp carries a sub-second fraction, and readers keep parsing it. */
+static std::string bi_indexed_at(void) {
+    char db[1024];
+    cbm_store_t *s = cbm_store_open_path_query(bi_db_path(db, sizeof(db)));
+    cbm_project_t proj = {0};
+    std::string at;
+    if (s && cbm_store_get_project(s, g_bi_project, &proj) == CBM_STORE_OK && proj.indexed_at) {
+        at = proj.indexed_at;
+    }
+    cbm_project_free_fields(&proj);
+    cbm_store_close(s);
+    return at;
+}
+
+TEST(branch_dump_generation_is_sub_second) {
+    char *repo = bi_make_repo("cbm_bi_gen");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    std::string first = bi_indexed_at();
+    th_write_file(TH_PATH(repo, "src/gen.py"), "def gen_two():\n    return 2\n");
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* a change: a new dump, well within a second */
+    std::string second = bi_indexed_at();
+    ASSERT_FALSE(first.empty());
+    ASSERT_FALSE(second.empty());
+    ASSERT_TRUE(first.find('.') != std::string::npos); /* "...T12:34:56.123456Z" */
+    ASSERT_TRUE(first != second);
+    bi_cleanup(repo);
+    PASS();
+}
 
 /* The team artifact is committed. Committing it moves HEAD, which the Branch
  * node records; the artifact's freshness must not depend on it, or the next
@@ -3885,6 +3920,7 @@ SUITE(branch_index) {
 #endif
     RUN_TEST(branch_stamp_only_switch_reexports_artifact);
     RUN_TEST(branch_committed_artifact_stays_current);
+    RUN_TEST(branch_dump_generation_is_sub_second);
     RUN_TEST(branch_restore_reexports_artifact);
     RUN_TEST(branch_index_prompt_counts_parked_only_cache);
     RUN_TEST(branch_long_slug_slot_names);
