@@ -1179,6 +1179,14 @@ static bool store_still_at_path(const cbm_store_t *s) {
            ino == s->open_ino;
 }
 
+bool cbm_store_open_inode(const cbm_store_t *s, uint64_t *ino) {
+    if (!s || !ino || !s->open_id_known || s->open_id_raced) {
+        return false;
+    }
+    *ino = s->open_ino;
+    return true;
+}
+
 bool cbm_store_hold_read_gate(cbm_store_t *s) {
     if (!s || !s->db_path || s->read_gate) {
         return true;

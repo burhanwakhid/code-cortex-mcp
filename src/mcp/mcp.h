@@ -135,6 +135,9 @@ void cbm_mcp_test_sweep_hook(void (*callback)(int stage, void *data), void *data
  * lease released), in index_repository and cbm_mcp_index_in_process. NULL
  * clears. */
 void cbm_mcp_test_index_hook(void (*callback)(const char *project, void *data), void *data);
+/* Callback run when a tool call has just opened a project's database by
+ * name, before the server records which file it opened. NULL clears. */
+void cbm_mcp_test_store_open_hook(void (*callback)(const char *db_path, void *data), void *data);
 #endif
 
 /* Set external config store reference (for auto_index setting). Not owned. */

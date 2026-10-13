@@ -286,6 +286,12 @@ cbm_store_t *cbm_store_open_path_reader(const char *db_path);
  * or when the gate stays held exclusive past its wait (a move in progress). */
 bool cbm_store_hold_read_gate(cbm_store_t *s);
 
+/* The inode of the file this connection reads, as taken around its open.
+ * False when that is unknown: no inode on the platform (Windows), a path
+ * that could not be stat'ed, or a path that changed files during the open
+ * (the connection may then read either file). */
+bool cbm_store_open_inode(const cbm_store_t *s, uint64_t *ino);
+
 /* On-disk path of a file-backed store, or NULL for an in-memory (:memory:)
  * store. The returned pointer is owned by the store. */
 const char *cbm_store_db_path(const cbm_store_t *s);

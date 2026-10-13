@@ -2543,6 +2543,105 @@ TEST(cache_reader_gate_refuses_replaced_file) {
 #endif
 }
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && !defined(_WIN32)
+/* A copy of the database at src, taken with the backup API (WAL included). */
+static bool ce_backup_db(const char *src, const char *dst) {
+    sqlite3 *s = NULL;
+    sqlite3 *d = NULL;
+    bool ok = sqlite3_open(src, &s) == SQLITE_OK && sqlite3_open(dst, &d) == SQLITE_OK;
+    sqlite3_backup *bk = ok ? sqlite3_backup_init(d, "main", s, "main") : NULL;
+    ok = bk && sqlite3_backup_step(bk, -1) == SQLITE_DONE;
+    if (bk) {
+        ok = sqlite3_backup_finish(bk) == SQLITE_OK && ok;
+    }
+    sqlite3_close(d);
+    sqlite3_close(s);
+    return ok;
+}
+
+static bool ce_index_repo(const char *repo, char **project) {
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, CBM_MODE_FULL);
+    if (!p) {
+        return false;
+    }
+    bool ok = cbm_pipeline_run(p) == 0;
+    if (project) {
+        *project = strdup(cbm_pipeline_project_name(p));
+    }
+    cbm_pipeline_free(p);
+    return ok;
+}
+
+typedef struct {
+    const char *from;
+    const char *to;
+    int fired;
+} ce_replace_t;
+
+/* An index run replacing the database just after a tool call opened it. */
+static void ce_replace_after_open(const char *db_path, void *ud) {
+    ce_replace_t *r = (ce_replace_t *)ud;
+    if (r->fired++ == 0 && strcmp(db_path, r->to) == 0) {
+        (void)cbm_rename_replace(r->from, r->to);
+    }
+}
+#endif
+
+/* A tool call opens <project>.db, then (integrity check, project row) records
+ * the generation of the file at the path. When an index run replaced the
+ * file in between, the server must not take the new file's generation for
+ * the connection's: every later call would keep reading the deleted file.
+ * Found by scripts/branch-index-stress.py, where a server kept answering
+ * with another branch's graph from a deleted inode. */
+TEST(cache_store_generation_follows_opened_file) {
+#if !defined(CBM_ENABLE_TEST_SEAMS) || defined(_WIN32)
+    PASS(); /* needs the seam; no inode to compare on Windows */
+#else
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_genrace"));
+    char repo[700];
+    char f[800];
+    snprintf(repo, sizeof(repo), "%s/repo", e.base);
+    snprintf(f, sizeof(f), "%s/a.py", repo);
+    ASSERT_EQ(th_write_file(f, "def alpha_old():\n    return 1\n"), 0);
+    char *name = NULL;
+    ASSERT_TRUE(ce_index_repo(repo, &name));
+    char db[900];
+    char v1[900];
+    char v2[900];
+    snprintf(db, sizeof(db), "%s/%s.db", e.cache, name);
+    snprintf(v1, sizeof(v1), "%s/v1.copy", e.base);
+    snprintf(v2, sizeof(v2), "%s/v2.copy", e.base);
+    ASSERT_TRUE(ce_backup_db(db, v1));
+    ASSERT_EQ(th_write_file(f, "def beta_new():\n    return 2\n"), 0);
+    ASSERT_TRUE(ce_index_repo(repo, NULL));
+    ASSERT_TRUE(ce_backup_db(db, v2));
+    /* The live file holds the old graph; the replacement waits aside. */
+    cbm_remove_db_sidecars(db);
+    ASSERT_EQ(cbm_rename_replace(v1, db), 0);
+
+    ce_replace_t r = {v2, db, 0};
+    cbm_mcp_test_store_open_hook(ce_replace_after_open, &r);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char args[1200];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\"beta_new\"}", name);
+    char *first = cbm_mcp_handle_tool(srv, "search_graph", args); /* opens v1; v2 lands */
+    char *second = cbm_mcp_handle_tool(srv, "search_graph", args);
+    cbm_mcp_test_store_open_hook(NULL, NULL);
+    cbm_mcp_server_free(srv);
+    ASSERT_EQ(r.fired >= 1, true);
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    bool served_new = strstr(second, "\"beta_new\"") != NULL;
+    free(first);
+    free(second);
+    free(name);
+    ce_teardown(&e);
+    ASSERT_TRUE(served_new);
+    PASS();
+#endif
+}
+
 /* ── The server's background sweep ─────────────────────────────── */
 
 /* Enable automatic sweeps (test_main turns them off for the whole run) and
@@ -3350,6 +3449,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_renamed_db_with_unsafe_stem_expires);
     RUN_TEST(cache_busy_reader_gate_refuses_open);
     RUN_TEST(cache_reader_gate_refuses_replaced_file);
+    RUN_TEST(cache_store_generation_follows_opened_file);
     RUN_TEST(cache_server_initialize_runs_sweep);
     RUN_TEST(cache_server_sweep_keeps_ancestor_index);
     RUN_TEST(cache_trash_restore_puts_wal_back_first);

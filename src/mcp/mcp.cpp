@@ -1334,12 +1334,47 @@ void cbm_mcp_server_evict_idle(cbm_mcp_server_t *srv, int timeout_s) {
     srv->store_last_used = 0;
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void (*store_open_test_cb)(const char *, void *) = nullptr;
+static void *store_open_test_data = nullptr;
+
+void cbm_mcp_test_store_open_hook(void (*callback)(const char *db_path, void *data), void *data) {
+    store_open_test_cb = callback;
+    store_open_test_data = data;
+}
+#define STORE_OPEN_TEST_HOOK(path)                                                                 \
+    do {                                                                                           \
+        if (store_open_test_cb) {                                                                  \
+            store_open_test_cb(path, store_open_test_data);                                        \
+        }                                                                                          \
+    } while (0)
+#else
+#define STORE_OPEN_TEST_HOOK(path) ((void)0)
+#endif
+
+/* Record the generation of the file the cached store reads, for
+ * cbm_mcp_server_revalidate_store. It is stat'ed by path after the open, the
+ * integrity check and the project read, and an index run can replace the
+ * file in that time (a full rebuild deletes and recreates it; a restore with
+ * no live database renames one in). The path's generation would then be the
+ * new file's while the connection reads the old one, and every later call
+ * would find them "equal" and keep answering from the deleted file: the
+ * multi-process stress test saw a server serve another branch's graph that
+ * way, persistently. So the generation counts only when its inode is the
+ * one the open saw; otherwise it is recorded as never equal, and the next
+ * call reopens. */
 static void note_store_generation(cbm_mcp_server_t *srv, const char *path) {
     srv->store_gen_valid = false;
     if (!path || !path[0]) {
         return;
     }
     srv->store_gen_valid = cbm_file_generation(path, &srv->store_gen);
+    uint64_t ino = 0;
+    if (srv->store_gen_valid && srv->store_gen.ino != 0 &&
+        (!cbm_store_open_inode(srv->store, &ino) || ino != srv->store_gen.ino)) {
+        cbm_log_info("store.generation_raced", "path", path);
+        srv->store_gen.size = CBM_NOT_FOUND; /* cbm_file_gen_equal: never equal */
+    }
 }
 
 void cbm_mcp_server_revalidate_store(cbm_mcp_server_t *srv) {
@@ -1877,6 +1912,7 @@ static cbm_store_t *resolve_store_by_name(cbm_mcp_server_t *srv, const char *pro
      * cache expiry sweep does not move the file under this connection. */
     srv->store = path[0] ? cbm_store_open_path_reader(path) : NULL;
     if (srv->store) {
+        STORE_OPEN_TEST_HOOK(path);
         /* Check DB integrity — back up (never silently delete) a corrupt DB.
          *
          * #1206/#1037: the decision is tri-state, not a bool. The shallow
