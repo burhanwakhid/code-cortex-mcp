@@ -107,6 +107,67 @@ TEST(artifact_concurrent_exports_do_not_collide) {
     PASS();
 }
 
+/* Exports of different graphs into ONE repository at once (two projects
+ * indexed from one path under different names) publish one consistent pair:
+ * the metadata's node count is the payload's. Without the per-repository
+ * publish lock they shared the temp names and could pair one snapshot's
+ * payload with another's metadata. */
+TEST(artifact_concurrent_exports_one_repo_publish_one_pair) {
+    setup_artifact_test();
+    enum { N = 4 };
+    char repo[1024];
+    snprintf(repo, sizeof(repo), "%s/shared-repo", g_tmpdir);
+    cbm_mkdir_p(repo, 0755);
+    char dbs[N][1024];
+    for (int i = 0; i < N; i++) {
+        snprintf(dbs[i], sizeof(dbs[i]), "%s/shared%d.db", g_tmpdir, i);
+        create_test_db(dbs[i]);
+        cbm_store_t *s = cbm_store_open_path(dbs[i]);
+        for (int k = 0; k < i * 3; k++) { /* graph i has 2 + 3i nodes */
+            char sql[256];
+            snprintf(sql, sizeof(sql),
+                     "INSERT INTO nodes(project, label, name, qualified_name, file_path) "
+                     "VALUES('test-proj', 'Function', 'x%d', 'test-proj.x%d', 'x.c');",
+                     k, k);
+            cbm_store_exec(s, sql);
+        }
+        cbm_store_close(s);
+    }
+    int rcs[N];
+    std::vector<std::thread> threads;
+    for (int i = 0; i < N; i++) {
+        threads.emplace_back(
+            [&, i] { rcs[i] = cbm_artifact_export(dbs[i], repo, "test-proj", CBM_ARTIFACT_BEST); });
+    }
+    for (auto &t : threads) {
+        t.join();
+    }
+    for (int i = 0; i < N; i++) {
+        ASSERT_EQ(rcs[i], 0);
+    }
+    char meta[1100];
+    snprintf(meta, sizeof(meta), "%s/.code-cortex/artifact.json", repo);
+    FILE *f = fopen(meta, "rb");
+    ASSERT_NOT_NULL(f);
+    char text[8192] = {0};
+    size_t got = fread(text, 1, sizeof(text) - 1, f);
+    fclose(f);
+    ASSERT_TRUE(got > 0);
+    const char *nk = strstr(text, "\"nodes\":");
+    ASSERT_NOT_NULL(nk);
+    int meta_nodes = atoi(nk + strlen("\"nodes\":"));
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/shared-imported.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repo, import_db), 0);
+    cbm_store_t *s = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(s);
+    int payload_nodes = cbm_store_count_nodes(s, "test-proj");
+    cbm_store_close(s);
+    ASSERT_EQ(meta_nodes, payload_nodes);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
 /* An export removes the snapshot files (cbm_artifact_<pid>_<n>.db and its
  * sidecars) that a process which died mid-export left in the temp
  * directory; this process's own and a live process's stay. */
@@ -498,6 +559,7 @@ SUITE(artifact) {
     RUN_TEST(artifact_fast_export_snapshots_live_wal_store);
     RUN_TEST(store_deep_integrity_detects_page_corruption);
     RUN_TEST(artifact_concurrent_exports_do_not_collide);
+    RUN_TEST(artifact_concurrent_exports_one_repo_publish_one_pair);
     RUN_TEST(artifact_export_removes_orphaned_snapshots);
     RUN_TEST(artifact_export_fast_roundtrip);
     RUN_TEST(artifact_export_best_roundtrip);

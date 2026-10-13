@@ -16,6 +16,7 @@
 #include <limits.h>
 #include <string.h>
 #include <string>
+#include <algorithm>
 
 /* Canonicalize a Windows drive letter to upper-case in place: "c:/x" -> "C:/x".
  * Windows drive letters are case-insensitive, but a lowercase one (as agent
@@ -846,21 +847,35 @@ bool cbm_root_canonical(const char *root, char *out, size_t out_sz) {
     /* Gone (a removed worktree): the longest existing ancestor's final path
      * plus the missing tail, so the key is the one the checkout had while
      * it existed -- a junctioned ancestor resolved, as then. */
-    char full[_MAX_PATH];
-    if (!_fullpath(full, root, sizeof(full))) {
+    /* Absolute, "." and ".." folded, at any length (_fullpath stops at
+     * MAX_PATH, and a long removed checkout then lost its identity). */
+    std::string full;
+    {
+        wchar_t *w = cbm_utf8_to_wide(root);
+        DWORD need = w ? GetFullPathNameW(w, 0, NULL, NULL) : 0;
+        wchar_t *buf = need ? (wchar_t *)malloc((size_t)need * sizeof(wchar_t)) : NULL;
+        DWORD got = buf ? GetFullPathNameW(w, need, buf, NULL) : 0;
+        char *u = got && got < need ? cbm_wide_to_utf8(buf) : NULL;
+        if (u) {
+            full = u;
+        }
+        free(u);
+        free(buf);
+        free(w);
+    }
+    if (full.empty()) {
         return cbm_root_normalize(root, true, out, out_sz);
     }
-    for (char *c = full; *c; c++) {
-        if (*c == '\\') {
-            *c = '/';
-        }
+    if (full.compare(0, 4, "\\\\?\\") == 0) {
+        full.erase(0, 4);
     }
+    std::replace(full.begin(), full.end(), '\\', '/');
     std::string head(full);
     std::string tail;
     for (;;) {
         size_t cut = head.find_last_of('/');
         if (cut == std::string::npos || cut < 3) {
-            return cbm_root_normalize(full, true, out, out_sz);
+            return cbm_root_normalize(full.c_str(), true, out, out_sz);
         }
         tail = head.substr(cut) + tail;
         head.resize(cut);

@@ -668,6 +668,44 @@ void cbm_artifact_test_after_payload(void (*callback)(void *data), void *data) {
 }
 #endif
 
+/* One publisher per repository at a time. The payload and its metadata are
+ * written through fixed temp names and published as a pair, so two exports
+ * into one repository at once (two projects indexed from one path under
+ * different names: two index leases) could overwrite each other's temp files
+ * or pair one snapshot's payload with another's metadata. The lock is a
+ * lease on a cache-side name derived from the repository's canonical path:
+ * no file appears in the repository. Waits up to ART_PUBLISH_WAIT_MS. */
+enum { ART_PUBLISH_WAIT_MS = 10000, ART_PUBLISH_POLL_MS = 100 };
+
+static int artifact_publish_lock(const char *repo_path, cbm_db_lease_t **out) {
+    *out = NULL;
+    const char *cdir = cbm_resolve_cache_dir();
+    char canon[CBM_SZ_4K];
+    if (!cdir || !cdir[0] || !cbm_root_canonical(repo_path, canon, sizeof(canon))) {
+        return 0; /* no cache to lock in: publish unlocked, as before */
+    }
+    char hex[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(canon, strlen(canon), hex);
+    hex[16] = '\0';
+    char key[CBM_SZ_4K];
+    if (snprintf(key, sizeof(key), "%s/artifact-publish-%s.db", cdir, hex) >= (int)sizeof(key)) {
+        return 0;
+    }
+    for (int waited = 0;; waited += ART_PUBLISH_POLL_MS) {
+        int rc = cbm_db_lease_try_acquire(key, out);
+        if (rc != CBM_INDEX_BUSY) {
+            return 0; /* held, or no lock to be had (publish unlocked) */
+        }
+        if (waited >= ART_PUBLISH_WAIT_MS) {
+            return CBM_INDEX_BUSY;
+        }
+        cbm_usleep(ART_PUBLISH_POLL_MS * 1000);
+    }
+}
+
+static int export_locked(const char *db_path, const char *repo_path, const char *project_name,
+                         int quality);
+
 int cbm_artifact_export(const char *db_path, const char *repo_path, const char *project_name,
                         int quality) {
     clear_export_error();
@@ -691,6 +729,20 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
         return artifact_export_fail("prepare_artifact_dir", art_dir, "not_directory", 0);
     }
 
+    cbm_db_lease_t *publish = NULL;
+    if (artifact_publish_lock(repo_path, &publish) == CBM_INDEX_BUSY) {
+        cbm_log_warn("artifact.export.busy", "repo", repo_path, "reason",
+                     "another export into this repository is publishing");
+        return CBM_INDEX_BUSY; /* not current: the next run exports */
+    }
+    int export_rc = export_locked(db_path, repo_path, project_name, quality);
+    cbm_db_lease_release(publish);
+    return export_rc;
+}
+
+/* cbm_artifact_export's body, under the per-repository publish lock. */
+static int export_locked(const char *db_path, const char *repo_path, const char *project_name,
+                         int quality) {
     snapshot_meta_t snap = {};
     size_t db_size = 0;
     char *db_data = NULL;
