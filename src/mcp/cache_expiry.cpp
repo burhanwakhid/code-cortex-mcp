@@ -619,6 +619,11 @@ typedef enum { ROOT_PRESENT, ROOT_MISSING, ROOT_UNCERTAIN } root_state_t;
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 static std::string g_test_mount_parent;
+static std::string g_test_mount_table;
+
+void cbm_cache_expiry_test_mount_table(const char *path) {
+    g_test_mount_table = path ? path : "";
+}
 
 void cbm_cache_expiry_test_mount_parent(const char *dir) {
     g_test_mount_parent = dir ? dir : "";
@@ -669,6 +674,24 @@ static bool is_mount_parent(const std::string &dir) {
  * nearest existing ancestor is "/" or a mount parent (/Volumes, /mnt, ...)
  * may be an unmounted volume, and any error other than "no such file" (a
  * permission error, a network mount timing out) proves nothing: UNCERTAIN. */
+/* A mount-point field of fstab or the mount table, its octal escapes
+ * decoded: a space is written "\\040", a tab "\\011", a backslash "\\134".
+ * Compared undecoded, "/srv/My Disk" never matched its "/srv/My\\040Disk"
+ * entry, and an unmounted checkout there counted as deleted. */
+static std::string mount_field_decode(const char *field) {
+    std::string out;
+    for (const char *p = field; *p; p++) {
+        if (p[0] == '\\' && p[1] >= '0' && p[1] <= '3' && p[2] >= '0' && p[2] <= '7' &&
+            p[3] >= '0' && p[3] <= '7') {
+            out += (char)((p[1] - '0') * 64 + (p[2] - '0') * 8 + (p[3] - '0'));
+            p += 3;
+        } else {
+            out += *p;
+        }
+    }
+    return out;
+}
+
 /* Whether an existing directory looks like a mount point whose volume is
  * not mounted right now: it is named as a mount point in /etc/fstab or the
  * mount table, or it is empty (a mount point directory is) AND sits directly
@@ -700,7 +723,16 @@ static bool looks_like_mount_point(const std::string &dir) {
         }
     }
 #ifndef _WIN32
-    for (const char *table : {"/etc/fstab", "/proc/self/mounts"}) {
+    const char *tables[] = {"/etc/fstab", "/proc/self/mounts", NULL};
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (!g_test_mount_table.empty()) {
+        tables[2] = g_test_mount_table.c_str();
+    }
+#endif
+    for (const char *table : tables) {
+        if (!table) {
+            continue;
+        }
         FILE *f = fopen(table, "r");
         if (!f) {
             continue;
@@ -715,7 +747,7 @@ static bool looks_like_mount_point(const std::string &dir) {
             char *save = NULL;
             char *dev = strtok_r(line, " \t\n", &save);
             char *mnt = dev ? strtok_r(NULL, " \t\n", &save) : NULL;
-            found = mnt && dir == mnt;
+            found = mnt && dir == mount_field_decode(mnt);
         }
         fclose(f);
         if (found) {

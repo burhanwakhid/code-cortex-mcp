@@ -588,6 +588,42 @@ TEST(cache_root_behind_dangling_link_is_uncertain) {
     PASS();
 }
 
+/* A mount table encodes a space in a mount point as "\040": a checkout
+ * below an unmounted "/x/My Disk" is unavailable, not deleted. */
+TEST(cache_root_under_escaped_mount_point_is_uncertain) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && !defined(_WIN32)
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_mntesc"));
+    char mnt[700];
+    snprintf(mnt, sizeof(mnt), "%s/My Disk", e.base);
+    ASSERT_TRUE(cbm_mkdir_p(mnt, 0755));
+    char other[800];
+    snprintf(other, sizeof(other), "%s/not-empty.txt", mnt);
+    ASSERT_EQ(th_write_file(other, "x"), 0); /* only the table can say "mount point" */
+    char table[700];
+    snprintf(table, sizeof(table), "%s/fstab", e.base);
+    char line[1200];
+    snprintf(line, sizeof(line), "/dev/sdz1 %s/My\\040Disk ext4 defaults 0 0\n", e.base);
+    ASSERT_EQ(th_write_file(table, line), 0);
+    cbm_cache_expiry_test_mount_table(table);
+    char root[800];
+    snprintf(root, sizeof(root), "%s/repo", mnt);
+    char db[900];
+    ce_make_db(&e, "mntesc", root, db, sizeof(db));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, (int64_t)time(NULL), false, &r), 0);
+    cbm_cache_expiry_test_mount_table(NULL);
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "mntesc", &lu, &checks);
+    ASSERT_EQ(checks, 0); /* uncertain: no missing streak */
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
 /* A root named with non-ASCII characters, and one past the Windows MAX_PATH,
  * is present: the probe must not read either as "no such file" (the narrow
  * Windows stat does) and start a missing streak on a live checkout. */
@@ -3566,6 +3602,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_root_uncertain_never_counts);
     RUN_TEST(cache_truncated_memo_root_is_not_trusted);
     RUN_TEST(cache_root_under_empty_ancestor_is_uncertain);
+    RUN_TEST(cache_root_under_escaped_mount_point_is_uncertain);
     RUN_TEST(cache_removed_worktree_under_empty_dir_is_missing);
     RUN_TEST(cache_root_behind_dangling_link_is_uncertain);
     RUN_TEST(cache_root_unicode_and_long_is_present);

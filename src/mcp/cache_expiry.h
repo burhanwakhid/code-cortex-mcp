@@ -179,6 +179,9 @@ void cbm_cache_expiry_test_scan_hook(void (*callback)(void *data), void *data);
  * /mnt), so a test can lay out an unmounted mount point it can create.
  * NULL clears. */
 void cbm_cache_expiry_test_mount_parent(const char *dir);
+/* An extra mount table (fstab format) consulted after /etc/fstab and
+ * /proc/self/mounts. NULL or "" clears. */
+void cbm_cache_expiry_test_mount_table(const char *path);
 #endif
 
 #ifdef __cplusplus
