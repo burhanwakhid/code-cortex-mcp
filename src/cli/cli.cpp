@@ -5,6 +5,7 @@
  * All functions accept explicit paths for testability.
  */
 #include "cli/cli.h"
+#include "store/store.h" /* cbm_store_sqlite_open */
 #include "foundation/compat.h"
 #include "foundation/subprocess.h" /* cbm_subprocess_run (cbm_warm_binary) */
 #include "foundation/platform.h"
@@ -3510,19 +3511,30 @@ cbm_config_t *cbm_config_open(const char *cache_dir) {
     mkdirp(cache_dir, DIR_PERMS);
 
     sqlite3 *db = NULL;
-    if (sqlite3_open(dbpath, &db) != SQLITE_OK) {
+    /* The long-path-aware open: on Windows a cache path past MAX_PATH. */
+    if (cbm_store_sqlite_open(dbpath, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) !=
+        SQLITE_OK) {
         if (db) {
             sqlite3_close(db);
         }
         return NULL;
     }
-    /* _config.db is a rollback-journal database that other processes write
-     * all the time: usage rows (every hook and tool worker), the store_meta
-     * memo, the sweep's rows. A reader that meets one of those commits gets
-     * SQLITE_BUSY, and without a timeout a setting read then returned its
-     * default: an index run parked with branch_index_keep 8 instead of the
-     * configured 1, and a sweep could run with cache_expiry false or judge
-     * by the 90-day default a rule set to 0. Wait for the commit instead. */
+    /* Other processes write _config.db all the time: usage rows (every hook
+     * and tool worker), the store_meta memo, the sweep's rows. A reader that
+     * meets one of those commits gets SQLITE_BUSY, and without a timeout a
+     * setting read then returned its default: an index run parked with
+     * branch_index_keep 8 instead of the configured 1, and a sweep could run
+     * with cache_expiry false or judge by the 90-day default a rule set to 0.
+     * Wait for the commit instead. */
+    sqlite3_busy_timeout(db, CBM_CONFIG_BUSY_MS);
+    /* WAL from the first open, as every index database in the cache is: in
+     * rollback mode a committing writer locks every reader and writer out,
+     * and many processes recording their use at once starved one another.
+     * Converting later needs every other connection gone, so it is done
+     * here, while a fresh cache has none; best effort and without waiting
+     * (a busy existing cache converts on a later open). */
+    sqlite3_busy_timeout(db, 0);
+    (void)sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
     sqlite3_busy_timeout(db, CBM_CONFIG_BUSY_MS);
 
     /* Create table if not exists */

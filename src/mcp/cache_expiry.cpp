@@ -3,6 +3,7 @@
 #include "mcp/cache_expiry.h"
 
 #include "cli/cli.h" /* cbm_config_*, CBM_CONFIG_CACHE_EXPIRY* */
+#include "foundation/compat.h" /* cbm_usleep */
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h" /* CBM_INDEX_BUSY */
 #include "foundation/log.h"
@@ -40,7 +41,9 @@ enum { CE_PATH_MAX = 4096, CE_BUSY_MS = 200, CE_WRITE_BUSY_MS = 2500 };
 static const char *const CE_SIDECAR_SUFFIXES[] = {
     ".db-wal",        ".db-shm",        ".db-journal",       ".db.tmp",
     ".db.tmp-wal",    ".db.tmp-shm",    ".db.tmp-journal",   ".db.import_tmp",
-    ".db.import_tmp-wal", ".db.import_tmp-shm", ".db.import_tmp-journal"};
+    ".db.import_tmp-wal", ".db.import_tmp-shm", ".db.import_tmp-journal",
+    /* write_file_atomic adds its own ".tmp" to the import's temp name */
+    ".db.import_tmp.tmp"};
 
 /* ── Small helpers ──────────────────────────────────────────────── */
 
@@ -192,7 +195,7 @@ static bool state_has_table(sqlite3 *db, const char *name) {
  * committing writer locks readers out, and a dozen index runs recording their
  * use at once lost rows to the wait. The tables are created only when missing,
  * so an open in WAL mode never needs the write lock just to start. */
-static sqlite3 *state_open(bool create_tables, bool read_only = false, int busy_ms = CE_BUSY_MS) {
+static sqlite3 *state_open_once(bool create_tables, bool read_only, int busy_ms, int *err) {
     const char *cdir = cbm_resolve_cache_dir();
     if (!cdir || !cdir[0]) {
         return NULL;
@@ -207,8 +210,21 @@ static sqlite3 *state_open(bool create_tables, bool read_only = false, int busy_
                               read_only ? SQLITE_OPEN_READONLY
                                         : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) !=
         SQLITE_OK) {
+        *err = db ? sqlite3_extended_errcode(db) : SQLITE_NOMEM;
+        char os_errno[CBM_SZ_32];
+        snprintf(os_errno, sizeof(os_errno), "%d", db ? sqlite3_system_errno(db) : 0);
+        cbm_log_warn("cache.state.open_failed", "step", "open", "msg",
+                     db ? sqlite3_errmsg(db) : "no memory", "errno", os_errno);
         sqlite3_close(db);
         return NULL;
+    }
+    if (!read_only) {
+        /* Keep the -wal between connections. Every use, touch and sweep
+         * opens _config.db briefly; without this the last one to close
+         * deletes the -wal and the next open, racing it, can fail outright
+         * ("unable to open database file"), and that use goes unrecorded. */
+        int persist = 1;
+        (void)sqlite3_file_control(db, "main", SQLITE_FCNTL_PERSIST_WAL, &persist);
     }
     sqlite3_busy_timeout(db, busy_ms);
     if (!read_only) {
@@ -221,8 +237,13 @@ static sqlite3 *state_open(bool create_tables, bool read_only = false, int busy_
         }
         sqlite3_finalize(st);
         if (!wal) {
-            /* Best effort: busy now, the next writer's open converts it. */
+            /* Best effort, and without waiting: the switch needs every other
+             * connection gone, so while one is open it can only fail, and a
+             * busy wait here spent the whole budget of the write that
+             * follows. The next writer's open converts it. */
+            sqlite3_busy_timeout(db, 0);
             (void)sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+            sqlite3_busy_timeout(db, busy_ms);
         }
     }
     /* The DDL runs in an IMMEDIATE transaction: it takes the write lock
@@ -244,11 +265,36 @@ static sqlite3 *state_open(bool create_tables, bool read_only = false, int busy_
                      "key TEXT PRIMARY KEY, value TEXT NOT NULL);"
                      "COMMIT;",
                      NULL, NULL, NULL) != SQLITE_OK) {
+        *err = sqlite3_extended_errcode(db);
+        char code[CBM_SZ_32];
+        snprintf(code, sizeof(code), "%d", *err);
+        cbm_log_warn("cache.state.open_failed", "step", "create_tables", "code", code, "msg",
+                     sqlite3_errmsg(db));
         (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
         sqlite3_close(db);
         return NULL;
     }
     return db;
+}
+
+/* state_open_once, retried briefly on a transient failure: another
+ * connection opening, closing or recovering the WAL at the same moment
+ * (SQLITE_CANTOPEN, SQLITE_BUSY, SQLITE_PROTOCOL). A real failure -- a
+ * read-only directory, a full disk -- is not retried. The retries stay
+ * within busy_ms. */
+static sqlite3 *state_open(bool create_tables, bool read_only = false, int busy_ms = CE_BUSY_MS) {
+    enum { STEP_MS = 25 };
+    for (int waited = 0;; waited += STEP_MS) {
+        int err = SQLITE_OK;
+        sqlite3 *db = state_open_once(create_tables, read_only, busy_ms, &err);
+        int primary = err & 0xff;
+        bool transient =
+            primary == SQLITE_CANTOPEN || primary == SQLITE_BUSY || primary == SQLITE_PROTOCOL;
+        if (db || !transient || waited + STEP_MS > busy_ms) {
+            return db;
+        }
+        cbm_usleep(STEP_MS * 1000);
+    }
 }
 
 typedef struct {

@@ -1655,7 +1655,8 @@ TEST(cache_orphan_sidecars) {
     int64_t now = (int64_t)time(NULL);
     ce_make_db(&e, "live", root, db, sizeof(db));
     const char *gone[] = {"gone.db-wal",     "gone.db-shm",        "gone.db.tmp",
-                          "gone.db.tmp-wal", "gone.db.import_tmp", "gone.db.import_tmp-shm"};
+                          "gone.db.tmp-wal", "gone.db.import_tmp", "gone.db.import_tmp-shm",
+                          "gone.db.import_tmp.tmp"};
     const char *stay[] = {"live.db-wal", "gone.db.index.lock", "fresh.db-wal", "notes.txt"};
     char p[900];
     for (const char *n : gone) {
@@ -1672,7 +1673,7 @@ TEST(cache_orphan_sidecars) {
     ce_cfg(&cfg);
     cbm_cache_sweep_result_t r;
     ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
-    ASSERT_EQ(r.sidecars, 6);
+    ASSERT_EQ(r.sidecars, 7);
     for (const char *n : gone) {
         snprintf(p, sizeof(p), "%s/%s", e.cache, n);
         ASSERT_FALSE(cbm_file_exists(p));
@@ -1745,11 +1746,12 @@ TEST(cache_usage_touch_retries_after_busy) {
 }
 
 /* Many index runs recording their use at once, while another connection
- * keeps taking _config.db's lock (300 ms on, 300 ms off) for longer than the
- * sweep's reads wait:
- * every row lands. (In rollback mode an exclusive holder locks readers out,
- * and the open's table check gave up after 200 ms: rows were lost.) The
- * file ends up in WAL mode. */
+ * keeps taking _config.db's write lock in short transactions (50 ms on,
+ * 250 ms off, as a sweep's writes do): every row lands. (In rollback mode a
+ * committing writer locked readers out, and the open's table check gave up
+ * after 200 ms: rows were lost.) The file ends up in WAL mode. A lock held
+ * longer than the writers' wait (2.5 s) still drops a use; that is logged
+ * (cache.usage.not_recorded) and the next touch retries it. */
 TEST(cache_usage_concurrent_writers_all_recorded) {
     ce_env_t e;
     ASSERT_TRUE(ce_setup(&e, "cbm_ce_usagerace"));
@@ -1764,12 +1766,15 @@ TEST(cache_usage_concurrent_writers_all_recorded) {
         }
         sqlite3_busy_timeout(h, 5000);
         for (int i = 0; i < HOLDS; i++) {
-            if (sqlite3_exec(h, "BEGIN EXCLUSIVE;", NULL, NULL, NULL) == SQLITE_OK) {
+            /* A sweep-like writer: short write transactions, repeatedly.
+             * (A lock held most of the time would starve any bounded wait;
+             * that is not what the cache's writers do.) */
+            if (sqlite3_exec(h, "BEGIN IMMEDIATE;", NULL, NULL, NULL) == SQLITE_OK) {
                 holding = true;
-                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 sqlite3_exec(h, "COMMIT;", NULL, NULL, NULL);
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
         sqlite3_close(h);
     });

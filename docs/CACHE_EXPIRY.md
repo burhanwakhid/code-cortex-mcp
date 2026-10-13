@@ -36,7 +36,7 @@ The rules, in order of confidence:
 | `root_gone` | The recorded checkout root is missing on at least 3 sweeps, the first of them at least the grace period ago, and nothing used the database in the grace period. | 7 days |
 | `unused` | No tool call, hook or index run used the database for the threshold. | 90 days |
 | `slot` | A parked slot was parked longer ago than the threshold. | 30 days |
-| `sidecar` | A `-wal`, `-shm`, `-journal`, `.db.tmp` or `.db.import_tmp` file (or a `-wal`/`-shm`/`-journal` of those temp files) whose database is gone, or a scratch file (`.db.unz*`, `.db.zst.tmp`) beside the slots, or the `-wal`, `-shm` or `-journal` file of a legacy `.db` slot that is gone. | older than 1 hour |
+| `sidecar` | A `-wal`, `-shm`, `-journal`, `.db.tmp`, `.db.import_tmp` or `.db.import_tmp.tmp` file (or a `-wal`/`-shm`/`-journal` of those temp files) whose database is gone, or a scratch file (`.db.unz*`, `.db.zst.tmp`) beside the slots, or the `-wal`, `-shm` or `-journal` file of a legacy `.db` slot that is gone. | older than 1 hour |
 
 ### Root gone
 
@@ -362,6 +362,11 @@ Each removal logs one `cache.expire` line (kind, name, path, reason), each skip 
 
 ## Known limitations
 
+- A use is recorded with a bounded wait (2.5 s) for `_config.db`'s write lock. If something
+  holds that lock longer, the use is dropped with `cache.usage.not_recorded` in the log, and
+  the next use of that database within the hour records it, because the throttle only
+  remembers writes that landed. `_config.db` is in WAL mode from its first open, so readers
+  never wait on a writer.
 - A long-running server sweeps only at `initialize` and after index runs; a server that does
   neither for days does not sweep. Another session or `cache expire` does.
 - A project whose server stays up and idle for 90 days, with nothing queried and nothing
