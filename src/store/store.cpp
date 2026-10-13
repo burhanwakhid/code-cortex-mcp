@@ -1592,9 +1592,20 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
         return CBM_STORE_ERR;
     }
 
+    /* Both buffers must hold their whole path: a cut temp name could be
+     * dest_path itself (unlinked below, then written in place, no longer
+     * atomic) or another file; a cut directory name would create the wrong
+     * one. Refused rather than truncated. */
+    char dir[CBM_PATH_MAX];
+    char tmp_path[CBM_PATH_MAX];
+    int dn = snprintf(dir, sizeof(dir), "%s", dest_path);
+    int tn = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", dest_path);
+    if (dn <= 0 || (size_t)dn >= sizeof(dir) || tn <= 0 || (size_t)tn >= sizeof(tmp_path)) {
+        store_set_error(s, "dump: destination path too long");
+        return CBM_STORE_ERR;
+    }
+
     /* Ensure parent directory exists */
-    char dir[CBM_SZ_1K];
-    snprintf(dir, sizeof(dir), "%s", dest_path);
     char *sl = strrchr(dir, '/');
     if (sl) {
         *sl = '\0';
@@ -1606,8 +1617,6 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
     }
 
     /* Write to temp file for atomic swap */
-    char tmp_path[CBM_SZ_1K];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", dest_path);
     (void)cbm_unlink(tmp_path);
 
     sqlite3 *dest_db = NULL;

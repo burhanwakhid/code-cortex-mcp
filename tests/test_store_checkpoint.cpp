@@ -12,6 +12,8 @@
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include <foundation/constants.h>
+#include <foundation/platform.h>
 #include <store/store.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -183,7 +185,70 @@ TEST(dump_install_ignores_stale_wal_sidecar) {
     PASS();
 }
 
+#ifndef _WIN32
+/* A path of exactly `len` bytes under base: 100-byte directories (created),
+ * then a file name that makes up the rest. False when it cannot be built. */
+static bool tsc_long_path(const char *base, size_t len, char *out, size_t outsz) {
+    size_t n = (size_t)snprintf(out, outsz, "%s", base);
+    while (len > n + 1 + 150) {
+        char seg[101];
+        memset(seg, 'd', 100);
+        seg[100] = '\0';
+        n += (size_t)snprintf(out + n, outsz - n, "/%s", seg);
+        if (!cbm_mkdir_p(out, 0755)) {
+            return false;
+        }
+    }
+    size_t name = len - n - 1;
+    if (name < 4 || n + 1 + name >= outsz) {
+        return false;
+    }
+    out[n++] = '/';
+    memset(out + n, 'f', name - 3);
+    memcpy(out + n + name - 3, ".db", 4);
+    return strlen(out) == len;
+}
+#endif
+
+/* A destination whose temp name ("<dest>.tmp") does not fit the path buffer
+ * is refused before anything is touched: cut short, the temp name was the
+ * destination itself, which was unlinked first. One that fits is dumped. */
+TEST(dump_refuses_destination_too_long_for_temp) {
+#ifndef _WIN32
+    char *td = th_mktempdir("cbm_dumplong");
+    ASSERT_NOT_NULL(td);
+    char base[256];
+    snprintf(base, sizeof(base), "%s", td);
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "longp", "/tmp/longp"), CBM_STORE_OK);
+
+    /* (SQLite's own path limit, 512 bytes on POSIX, bounds what can be
+     * dumped at all; the temp name's truncation was the hazard past it.) */
+    static char fits[CBM_PATH_MAX + 64];
+    ASSERT_TRUE(tsc_long_path(base, 400, fits, sizeof(fits)));
+    ASSERT_EQ(cbm_store_dump_to_file(s, fits), CBM_STORE_OK);
+    ASSERT_TRUE(cbm_file_exists(fits));
+
+    static char too_long[CBM_PATH_MAX + 64];
+    ASSERT_TRUE(tsc_long_path(base, CBM_PATH_MAX - 1, too_long, sizeof(too_long)));
+    ASSERT_EQ(th_write_file(too_long, "old"), 0);
+    ASSERT_EQ(cbm_store_dump_to_file(s, too_long), CBM_STORE_ERR);
+    char buf[16] = {0};
+    FILE *f = fopen(too_long, "rb");
+    ASSERT_NOT_NULL(f);
+    size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    ASSERT_EQ((int)got, 3);
+    ASSERT_STR_EQ(buf, "old"); /* untouched */
+    cbm_store_close(s);
+    th_rmtree(base);
+#endif
+    PASS();
+}
+
 SUITE(store_checkpoint) {
     RUN_TEST(checkpoint_does_not_truncate_wal);
     RUN_TEST(dump_install_ignores_stale_wal_sidecar);
+    RUN_TEST(dump_refuses_destination_too_long_for_temp);
 }
