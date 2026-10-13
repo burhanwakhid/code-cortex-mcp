@@ -902,6 +902,55 @@ TEST(platform_root_matches_windows_unicode_case_and_junction) {
     PASS();
 }
 
+/* Windows: under a directory with NTFS per-directory case sensitivity,
+ * "Repo" and "repo" are two directories, and so two checkouts: their file
+ * identities decide, not the case-folded spelling. Skipped where the
+ * attribute cannot be set (fsutil needs the feature, sometimes admin). */
+TEST(platform_root_matches_windows_case_sensitive_dirs_differ) {
+#ifdef _WIN32
+    char *tmp = th_mktempdir("cbm_plat_cs");
+    ASSERT_NOT_NULL(tmp);
+    char base[300];
+    snprintf(base, sizeof(base), "%s", tmp);
+    char parent[400];
+    snprintf(parent, sizeof(parent), "%s\\cs", base);
+    ASSERT_TRUE(cbm_mkdir_p(parent, 0755));
+    char wp[400];
+    snprintf(wp, sizeof(wp), "%s", parent);
+    for (char *c = wp; *c; c++) {
+        if (*c == '/') {
+            *c = '\\';
+        }
+    }
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "fsutil file setCaseSensitiveInfo \"%s\" enable >nul 2>&1", wp);
+    if (system(cmd) != 0) {
+        th_rmtree(base);
+        SKIP_PLATFORM("per-directory case sensitivity cannot be enabled here");
+    }
+    char upper[500];
+    char lower[500];
+    char marker[600];
+    char other[600];
+    snprintf(upper, sizeof(upper), "%s\\Repo", parent);
+    snprintf(lower, sizeof(lower), "%s\\repo", parent);
+    snprintf(marker, sizeof(marker), "%s\\marker", upper);
+    snprintf(other, sizeof(other), "%s\\marker", lower);
+    ASSERT_TRUE(cbm_mkdir_p(upper, 0755));
+    ASSERT_TRUE(cbm_mkdir_p(lower, 0755));
+    ASSERT_EQ(th_write_file(marker, "x"), 0);
+    if (cbm_file_exists(other)) {
+        th_rmtree(base);
+        SKIP_PLATFORM("the directory still folds case");
+    }
+    ASSERT_FALSE(cbm_root_matches(upper, lower));
+    ASSERT_FALSE(cbm_root_matches(lower, upper));
+    ASSERT_TRUE(cbm_root_matches(upper, upper));
+    th_rmtree(base);
+#endif
+    PASS();
+}
+
 /* A relative root keeps every unresolved "..": "../../repo" is not "repo"
  * (and not another checkout's identity), while a resolvable one still pops
  * and an absolute path's leading ".." still folds to the root. */
@@ -960,6 +1009,7 @@ SUITE(platform) {
     RUN_TEST(platform_mmap_nonexistent);
     RUN_TEST(platform_readdir_reports_links_as_not_dirs);
     RUN_TEST(platform_root_matches_windows_unicode_case_and_junction);
+    RUN_TEST(platform_root_matches_windows_case_sensitive_dirs_differ);
     RUN_TEST(platform_root_normalize_keeps_unresolved_dotdot);
     RUN_TEST(platform_root_canonical_dot_is_cwd);
     RUN_TEST(platform_file_helpers_long_path);
