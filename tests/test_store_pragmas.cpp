@@ -97,6 +97,9 @@ TEST(journal_size_limit_default_and_env) {
     ASSERT_EQ(cbm_store_resolve_journal_size_limit(), -1LL);
     cbm_setenv("CBM_SQLITE_JOURNAL_SIZE_LIMIT", "12x", 1);
     ASSERT_EQ(cbm_store_resolve_journal_size_limit(), 268435456LL);
+    /* Out of range (strtoll saturates): the default, not "unlimited". */
+    cbm_setenv("CBM_SQLITE_JOURNAL_SIZE_LIMIT", "99999999999999999999999", 1);
+    ASSERT_EQ(cbm_store_resolve_journal_size_limit(), 268435456LL);
     cbm_unsetenv("CBM_SQLITE_JOURNAL_SIZE_LIMIT");
     PASS();
 }

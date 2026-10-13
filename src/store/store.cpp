@@ -585,9 +585,12 @@ int64_t cbm_store_resolve_journal_size_limit(void) {
         return jsl_default;
     }
     char *end = NULL;
+    errno = 0;
     long long parsed = strtoll(buf, &end, BASE_10);
-    if (end == buf || *end != '\0') {
-        return jsl_default; /* malformed: the default, never a failed open */
+    /* Malformed or out of range (strtoll saturates, ERANGE): the default,
+     * never a failed open and never an unbounded WAL from a typo. */
+    if (end == buf || *end != '\0' || errno == ERANGE) {
+        return jsl_default;
     }
     return parsed < 0 ? -1 : (int64_t)parsed;
 }

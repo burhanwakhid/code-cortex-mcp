@@ -866,7 +866,9 @@ bool cbm_root_canonical(const char *root, char *out, size_t out_sz) {
     if (full.empty()) {
         return cbm_root_normalize(root, true, out, out_sz);
     }
-    if (full.compare(0, 4, "\\\\?\\") == 0) {
+    if (full.compare(0, 8, "\\\\?\\UNC\\") == 0) {
+        full.replace(0, 8, "\\\\"); /* \\?\UNC\server\share -> \\server\share */
+    } else if (full.compare(0, 4, "\\\\?\\") == 0) {
         full.erase(0, 4);
     }
     std::replace(full.begin(), full.end(), '\\', '/');
