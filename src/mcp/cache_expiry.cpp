@@ -551,6 +551,14 @@ static root_state_t root_state(const std::string &root) {
     if (errno != ENOENT && errno != ENOTDIR) {
         return ROOT_UNCERTAIN;
     }
+    /* A link that is there but leads nowhere -- a symlink or junction to a
+     * volume that is not mounted -- says nothing about whether the checkout
+     * behind it still exists: uncertain, here and on the walk up. cbm_stat
+     * follows links, so a dangling one reads as "no such file" and the walk
+     * would go on to a real ancestor and call the root deleted. */
+    if (cbm_is_link(root.c_str())) {
+        return ROOT_UNCERTAIN;
+    }
     std::string dir = root;
 #ifdef _WIN32
     /* A stored Windows root is written with backslashes; the walk up splits
@@ -578,6 +586,16 @@ static root_state_t root_state(const std::string &root) {
         }
 #endif
         if (cbm_stat(dir.c_str(), &st) == 0) {
+            /* Windows stats a junction itself, not its target: a dangling
+             * one "exists". An ancestor that is a link must lead somewhere
+             * that can be listed, else it is the unmounted case above. */
+            if (cbm_is_link(dir.c_str())) {
+                cbm_dir_t *probe = cbm_opendir(dir.c_str());
+                if (!probe) {
+                    return ROOT_UNCERTAIN;
+                }
+                cbm_closedir(probe);
+            }
             /* The nearest existing ancestor: a mount parent, or itself a
              * mount point with nothing mounted (/mnt/data of an unmounted
              * /mnt/data/repo), means unavailable, not deleted. */
@@ -586,6 +604,9 @@ static root_state_t root_state(const std::string &root) {
         }
         if (errno != ENOENT && errno != ENOTDIR) {
             return ROOT_UNCERTAIN;
+        }
+        if (cbm_is_link(dir.c_str())) {
+            return ROOT_UNCERTAIN; /* a dangling link on the way up */
         }
         if (dir == "/" || (dir.size() == 3 && dir[1] == ':')) {
             return ROOT_UNCERTAIN; /* the root itself is unreachable */

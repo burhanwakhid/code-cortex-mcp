@@ -349,7 +349,9 @@ Each removal logs one `cache.expire` line (kind, name, path, reason), each skip 
 - Root classification treats a drive root as a mount parent; a stored Windows root is walked up
   on either separator. The nearest existing ancestor of a missing root that is an empty
   directory, or is named as a mount point in `/etc/fstab` or the mount table, is taken for an
-  unmounted volume (`/mnt/data` of `/mnt/data/repo`): uncertain, never a missing streak. A root the memo (`_config.db`) recorded is used only when it is shorter
+  unmounted volume (`/mnt/data` of `/mnt/data/repo`): uncertain, never a missing streak. So is
+  a root that is, or lies under, a dangling link (a symlink or junction to a volume that is not
+  mounted): the link says nothing about whether the checkout behind it exists. A root the memo (`_config.db`) recorded is used only when it is shorter
   than the memo column (1024 bytes): one that fills it may be truncated, and the database's own
   `projects` row is read instead. A slot whose unlink is refused (a read-only cache, a sharing violation)
   is logged `cache.expire.skipped` and neither reported nor counted as reclaimed. When a

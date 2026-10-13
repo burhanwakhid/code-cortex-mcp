@@ -473,6 +473,88 @@ TEST(cache_root_under_empty_ancestor_is_uncertain) {
     PASS();
 }
 
+/* A directory link at link pointing to target: a symlink, or on Windows a
+ * junction (no privilege needed). False when the system refused one. */
+static bool ce_dir_link(const char *link, const char *target) {
+#ifdef _WIN32
+    char wl[800];
+    char wt[800];
+    snprintf(wl, sizeof(wl), "%s", link);
+    snprintf(wt, sizeof(wt), "%s", target);
+    for (char *c = wl; *c; c++) {
+        *c = *c == '/' ? '\\' : *c;
+    }
+    for (char *c = wt; *c; c++) {
+        *c = *c == '/' ? '\\' : *c;
+    }
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "cmd /c mklink /J \"%s\" \"%s\" >nul 2>&1", wl, wt);
+    return system(cmd) == 0 && cbm_is_link(link);
+#else
+    return symlink(target, link) == 0;
+#endif
+}
+
+static void ce_dir_unlink(const char *link) {
+#ifdef _WIN32
+    (void)cbm_rmdir(link);
+#else
+    (void)cbm_unlink(link);
+#endif
+}
+
+/* A root reached through a link to a volume that is not mounted (the link
+ * dangles) is unavailable, not deleted: no streak, whether the link is an
+ * ancestor of the root or the root itself. */
+TEST(cache_root_behind_dangling_link_is_uncertain) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_dangle"));
+    char work[700];
+    char sibling[800];
+    char vol[700];
+    char volrepo[800];
+    snprintf(work, sizeof(work), "%s/work", e.base);
+    snprintf(sibling, sizeof(sibling), "%s/other-repo", work);
+    snprintf(vol, sizeof(vol), "%s/volume", e.base);
+    snprintf(volrepo, sizeof(volrepo), "%s/repo", vol);
+    ASSERT_TRUE(cbm_mkdir_p(sibling, 0755));
+    ASSERT_TRUE(cbm_mkdir_p(volrepo, 0755));
+    char via[800];
+    char direct[800];
+    snprintf(via, sizeof(via), "%s/ext", work);
+    snprintf(direct, sizeof(direct), "%s/linked-repo", work);
+    if (!ce_dir_link(via, vol) || !ce_dir_link(direct, volrepo)) {
+        ce_dir_unlink(via);
+        ce_teardown(&e);
+        PASS(); /* no links on this filesystem */
+    }
+    th_rmtree(vol); /* the volume goes away; both links dangle */
+    char r1[900];
+    char r2[900];
+    snprintf(r1, sizeof(r1), "%s/repo", via);
+    snprintf(r2, sizeof(r2), "%s/gone-repo", work);
+    char db[800];
+    ce_make_db(&e, "via", r1, db, sizeof(db));
+    ce_make_db(&e, "direct", direct, db, sizeof(db));
+    ce_make_db(&e, "deleted", r2, db, sizeof(db));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, (int64_t)time(NULL), false, &r), 0);
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "via", &lu, &checks);
+    ASSERT_EQ(checks, 0);
+    ce_usage(&e, "direct", &lu, &checks);
+    ASSERT_EQ(checks, 0);
+    ce_usage(&e, "deleted", &lu, &checks);
+    ASSERT_EQ(checks, 1); /* a plain missing root still counts */
+    ce_dir_unlink(via);
+    ce_dir_unlink(direct);
+    ce_teardown(&e);
+    PASS();
+}
+
 /* A root named with non-ASCII characters, and one past the Windows MAX_PATH,
  * is present: the probe must not read either as "no such file" (the narrow
  * Windows stat does) and start a missing streak on a live checkout. */
@@ -2923,6 +3005,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_root_uncertain_never_counts);
     RUN_TEST(cache_truncated_memo_root_is_not_trusted);
     RUN_TEST(cache_root_under_empty_ancestor_is_uncertain);
+    RUN_TEST(cache_root_behind_dangling_link_is_uncertain);
     RUN_TEST(cache_root_unicode_and_long_is_present);
     RUN_TEST(cache_mass_missing_and_env_change_count_nothing);
     RUN_TEST(cache_refuses_unknown_cache_dir);
