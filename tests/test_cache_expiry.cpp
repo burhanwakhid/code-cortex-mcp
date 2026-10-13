@@ -22,8 +22,12 @@
 
 #include "sqlite3.h"
 #include <atomic>
+#include <ctype.h>
+#include <errno.h>
 #include <new>
 #include <string>
+#include <thread>
+#include <vector>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2367,6 +2371,548 @@ TEST(cache_server_sweep_joined_before_watcher_drop) {
 }
 #endif
 
+/* ── Fixes that landed without a test of their own ──────────────── */
+
+static bool ce_copy_file(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    FILE *out = in ? fopen(dst, "wb") : NULL;
+    bool ok = in && out;
+    char buf[8192];
+    size_t n;
+    while (ok && (n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        ok = fwrite(buf, 1, n, out) == n;
+    }
+    ok = ok && !ferror(in);
+    if (out && fclose(out) != 0) {
+        ok = false;
+    }
+    if (in) {
+        fclose(in);
+    }
+    return ok;
+}
+
+/* A database whose last commit is only in its WAL, copied to dst (the main
+ * file) and dst-wal while the connection still holds both: closing it would
+ * checkpoint the WAL away. Table t holds 'in-main' and 'in-wal'. */
+static bool ce_make_db_with_wal(const char *scratch, const char *dst) {
+    sqlite3 *db = NULL;
+    bool ok = sqlite3_open(scratch, &db) == SQLITE_OK &&
+              sqlite3_exec(db,
+                           "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;"
+                           "CREATE TABLE t(v TEXT); INSERT INTO t VALUES('in-main');"
+                           "PRAGMA wal_checkpoint(TRUNCATE);"
+                           "INSERT INTO t VALUES('in-wal');",
+                           NULL, NULL, NULL) == SQLITE_OK;
+    std::string wal = std::string(scratch) + "-wal";
+    ok = ok && cbm_file_size(wal.c_str()) > 0 && ce_copy_file(scratch, dst) &&
+         ce_copy_file(wal.c_str(), (std::string(dst) + "-wal").c_str());
+    sqlite3_close(db);
+    return ok;
+}
+
+/* Rows of table t in the database at path (v = value; every row when value
+ * is NULL), -1 when unreadable. */
+static int ce_rows(const char *path, const char *value) {
+    sqlite3 *db = NULL;
+    int n = -1;
+    if (sqlite3_open(path, &db) == SQLITE_OK) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT count(*) FROM t WHERE ?1 IS NULL OR v = ?1;", -1, &st,
+                               NULL) == SQLITE_OK) {
+            if (value) {
+                sqlite3_bind_text(st, 1, value, -1, SQLITE_STATIC);
+            }
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                n = sqlite3_column_int(st, 0);
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return n;
+}
+
+/* cache restore puts the saved WAL back before the main file: when the WAL
+ * cannot go back (here a directory stands where it goes), the main file
+ * stays in the trash with it rather than being restored without the commits
+ * only the WAL holds. Once the way is clear, the restored database has them. */
+TEST(cache_trash_restore_puts_wal_back_first) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_rswal"));
+    int64_t now = (int64_t)time(NULL);
+    char entry[800];
+    snprintf(entry, sizeof(entry), "%s/trash/%lld-rw", e.cache, (long long)(now - CE_DAY));
+    ASSERT_TRUE(cbm_mkdir_p(entry, 0755));
+    char scratch[700];
+    snprintf(scratch, sizeof(scratch), "%s/scratch.db", e.base);
+    char saved[900];
+    char saved_wal[900];
+    snprintf(saved, sizeof(saved), "%s/rw.db", entry);
+    snprintf(saved_wal, sizeof(saved_wal), "%s/rw.db-wal", entry);
+    ASSERT_TRUE(ce_make_db_with_wal(scratch, saved));
+    char live[800];
+    char live_wal[800];
+    char block[900];
+    snprintf(live, sizeof(live), "%s/rw.db", e.cache);
+    snprintf(live_wal, sizeof(live_wal), "%s/rw.db-wal", e.cache);
+    snprintf(block, sizeof(block), "%s/x", live_wal);
+    ASSERT_TRUE(cbm_mkdir_p(block, 0755));
+    char msg[512];
+    ASSERT_NEQ(cbm_cache_trash_restore("rw", msg, sizeof(msg)), 0);
+    ASSERT_FALSE(cbm_file_exists(live));
+    ASSERT_TRUE(cbm_file_exists(saved));
+    ASSERT_TRUE(cbm_file_exists(saved_wal));
+    th_rmtree(live_wal);
+    ASSERT_EQ(cbm_cache_trash_restore("rw", msg, sizeof(msg)), 0);
+    ASSERT_EQ(ce_rows(live, "in-wal"), 1);
+    ASSERT_EQ(ce_rows(live, NULL), 2);
+    ce_teardown(&e);
+    PASS();
+}
+
+/* A restore whose main file does not go back (here it is missing from the
+ * entry) moves the WAL it already put back into the entry again: no WAL is
+ * left beside a database that is not there. */
+TEST(cache_trash_restore_failed_main_moves_wal_back) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_rsundo"));
+    int64_t now = (int64_t)time(NULL);
+    char entry[800];
+    snprintf(entry, sizeof(entry), "%s/trash/%lld-ru", e.cache, (long long)(now - CE_DAY));
+    ASSERT_TRUE(cbm_mkdir_p(entry, 0755));
+    char scratch[700];
+    snprintf(scratch, sizeof(scratch), "%s/scratch.db", e.base);
+    char saved[900];
+    char saved_wal[900];
+    snprintf(saved, sizeof(saved), "%s/ru.db", entry);
+    snprintf(saved_wal, sizeof(saved_wal), "%s/ru.db-wal", entry);
+    ASSERT_TRUE(ce_make_db_with_wal(scratch, saved));
+    ASSERT_EQ(cbm_unlink(saved), 0);
+    char live[800];
+    char live_wal[800];
+    snprintf(live, sizeof(live), "%s/ru.db", e.cache);
+    snprintf(live_wal, sizeof(live_wal), "%s/ru.db-wal", e.cache);
+    char msg[512];
+    ASSERT_NEQ(cbm_cache_trash_restore("ru", msg, sizeof(msg)), 0);
+    ASSERT_FALSE(cbm_file_exists(live));
+    ASSERT_FALSE(cbm_file_exists(live_wal));
+    ASSERT_TRUE(cbm_file_exists(saved_wal));
+    ce_teardown(&e);
+    PASS();
+}
+
+/* cbm_config_get's value is the calling thread's: two threads reading
+ * different keys through one handle (the server's auto-index and sweep
+ * threads beside the main thread) never see each other's value. */
+TEST(cache_config_get_value_is_per_thread) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_cfgthr"));
+    cbm_config_t *cfg = cbm_config_open(e.cache);
+    ASSERT_NOT_NULL(cfg);
+    std::string va(300, 'a');
+    std::string vb(37, 'b');
+    ASSERT_EQ(cbm_config_set(cfg, "ce_thread_a", va.c_str()), 0);
+    ASSERT_EQ(cbm_config_set(cfg, "ce_thread_b", vb.c_str()), 0);
+    std::atomic<bool> go{false};
+    std::atomic<int> wrong{0};
+    auto reader = [&](const char *key, const std::string &want) {
+        while (!go.load()) {
+            std::this_thread::yield();
+        }
+        for (int i = 0; i < 20000; i++) {
+            const char *v = cbm_config_get(cfg, key, "");
+            if (want != v) {
+                wrong.fetch_add(1);
+            }
+        }
+    };
+    std::thread ta(reader, "ce_thread_a", std::cref(va));
+    std::thread tb(reader, "ce_thread_b", std::cref(vb));
+    go.store(true);
+    ta.join();
+    tb.join();
+    cbm_config_close(cfg);
+    ASSERT_EQ(wrong.load(), 0);
+    ce_teardown(&e);
+    PASS();
+}
+
+/* root_path and missing_checks of the usage row keyed `key` ("" and -1 when
+ * absent). */
+static void ce_usage_root(const ce_env_t *e, const char *key, std::string *root, int *checks) {
+    *root = "";
+    *checks = -1;
+    char p[700];
+    snprintf(p, sizeof(p), "%s/_config.db", e->cache);
+    sqlite3 *db = NULL;
+    sqlite3_open(p, &db);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT root_path, missing_checks FROM cache_usage WHERE db_name=?1",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, key, -1, SQLITE_STATIC);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *r = (const char *)sqlite3_column_text(st, 0);
+            *root = r ? r : "";
+            *checks = sqlite3_column_int(st, 1);
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+}
+
+/* A query touch (no root) racing an index run's usage write never puts the
+ * old root and missing streak back: both write under the write lock, the
+ * touch re-reading the row there. Each round starts both at once. */
+TEST(cache_usage_write_keeps_concurrent_root) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_rmw"));
+    enum { ROUNDS = 200 };
+    int64_t now = (int64_t)time(NULL);
+    std::vector<std::string> dbs;
+    for (int k = 0; k < ROUNDS; k++) {
+        dbs.push_back(std::string(e.cache) + "/rmwrace" + std::to_string(k) + ".db");
+        /* Last used two hours ago, so the touch writes. */
+        ASSERT_TRUE(cbm_cache_usage_set(dbs[k].c_str(), now - 7200, "/old/root"));
+    }
+    char cp[700];
+    snprintf(cp, sizeof(cp), "%s/_config.db", e.cache);
+    sqlite3 *h = NULL;
+    ASSERT_EQ(sqlite3_open(cp, &h), SQLITE_OK);
+    char sql[256];
+    snprintf(sql, sizeof(sql),
+             "UPDATE cache_usage SET missing_since = %lld, missing_checks = 2 "
+             "WHERE db_name LIKE 'rmwrace%%';",
+             (long long)(now - CE_DAY));
+    ASSERT_EQ(sqlite3_exec(h, sql, NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_close(h);
+
+    std::atomic<int> arrived{0};
+    auto start_round = [&](int k) {
+        arrived.fetch_add(1);
+        while (arrived.load() < 2 * (k + 1)) {
+            std::this_thread::yield();
+        }
+    };
+    std::thread toucher([&] {
+        for (int k = 0; k < ROUNDS; k++) {
+            start_round(k);
+            cbm_cache_usage_touch(dbs[k].c_str(), NULL);
+        }
+    });
+    std::thread indexer([&] {
+        for (int k = 0; k < ROUNDS; k++) {
+            start_round(k);
+            (void)cbm_cache_usage_set(dbs[k].c_str(), 0, "/new/root");
+        }
+    });
+    toucher.join();
+    indexer.join();
+    int stale = 0;
+    for (int k = 0; k < ROUNDS; k++) {
+        std::string key = "rmwrace" + std::to_string(k) + ".db";
+        std::string root;
+        int checks;
+        ce_usage_root(&e, key.c_str(), &root, &checks);
+        stale += root != "/new/root" || checks != 0;
+    }
+    ASSERT_EQ(stale, 0);
+    ce_teardown(&e);
+    PASS();
+}
+
+/* An orphan sidecar whose unlink is refused (a read-only cache directory)
+ * is neither reported nor counted; once the directory is writable again it
+ * is. */
+TEST(cache_orphan_sidecar_unlink_refused_not_reported) {
+#ifndef _WIN32
+    if (geteuid() == 0) {
+        PASS(); /* root ignores directory permissions */
+    }
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_sidero"));
+    int64_t now = (int64_t)time(NULL);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0); /* the sweep's own lock file */
+    char side[800];
+    char gone[800];
+    snprintf(side, sizeof(side), "%s/gone.db-wal", e.cache);
+    snprintf(gone, sizeof(gone), "%s/gone.db", e.cache);
+    ASSERT_EQ(th_write_file(side, "x"), 0);
+    ce_age(side, now - 2 * 3600);
+    /* The lease's lock file is there already (it is never unlinked), so
+     * the lease needs no new entry in the read-only directory. */
+    cbm_db_lease_t *lease = NULL;
+    ASSERT_EQ(cbm_db_lease_try_acquire(gone, &lease), 0);
+    cbm_db_lease_release(lease);
+    ASSERT_EQ(chmod(e.cache, 0555), 0);
+    int rc = ce_sweep(&cfg, now, false, &r);
+    chmod(e.cache, 0755);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.sidecars, 0);
+    ASSERT_EQ(r.bytes, 0);
+    ASSERT_TRUE(cbm_file_exists(side));
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.sidecars, 1);
+    ASSERT_FALSE(cbm_file_exists(side));
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
+/* Windows: a root on a UNC share (\\server\share\repo) is absolute: once
+ * the checkout is gone below a share that is still there, its missing streak
+ * starts. Uses the administrative share of the temp directory's drive. */
+TEST(cache_root_gone_on_unc_share_counts) {
+#ifdef _WIN32
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_unc"));
+    if (!isalpha((unsigned char)e.base[0]) || e.base[1] != ':') {
+        ce_teardown(&e);
+        SKIP_PLATFORM("temp directory is not on a drive letter");
+    }
+    char unc_base[700];
+    snprintf(unc_base, sizeof(unc_base), "\\\\localhost\\%c$%s", e.base[0], e.base + 2);
+    for (char *c = unc_base; *c; c++) {
+        if (*c == '/') {
+            *c = '\\';
+        }
+    }
+    if (!cbm_is_dir(unc_base)) {
+        ce_teardown(&e);
+        SKIP_PLATFORM("no administrative share \\\\localhost\\<drive>$");
+    }
+    char root[800];
+    snprintf(root, sizeof(root), "%s\\gone\\repo", unc_base);
+    char db[800];
+    ce_make_db(&e, "unc", root, db, sizeof(db));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, (int64_t)time(NULL), false, &r), 0);
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "unc", &lu, &checks);
+    ASSERT_EQ(checks, 1); /* missing, not uncertain */
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
+/* A WAL that can neither be moved into the trash nor deleted (here a
+ * directory stands in its place, and another at its destination) is never
+ * left beside a missing database: the main file goes back and the removal
+ * fails. Once the WAL can go, the removal goes through. */
+TEST(cache_remove_project_wal_stuck_rolls_back) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_walstuck"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    ce_make_db(&e, "ws", root, db, sizeof(db));
+    char wal[900];
+    char wal_in[1000];
+    snprintf(wal, sizeof(wal), "%s-wal", db);
+    snprintf(wal_in, sizeof(wal_in), "%s/x", wal);
+    ASSERT_TRUE(cbm_mkdir_p(wal_in, 0755));
+    int64_t now = (int64_t)time(NULL);
+    char entry[800];
+    snprintf(entry, sizeof(entry), "%s/trash/%lld-ws", e.cache, (long long)now);
+    char blocked[1000];
+    snprintf(blocked, sizeof(blocked), "%s/ws.db-wal/x", entry);
+    ASSERT_TRUE(cbm_mkdir_p(blocked, 0755));
+    char moved[900];
+    snprintf(moved, sizeof(moved), "%s/ws.db", entry);
+    int parked = -1;
+    ASSERT_EQ(cbm_cache_remove_project(db, "ws", entry, &parked), -1);
+    ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_FALSE(cbm_file_exists(moved));
+    th_rmtree(wal);
+    ASSERT_EQ(cbm_cache_remove_project(db, "ws", entry, &parked), 0);
+    ASSERT_FALSE(cbm_file_exists(db));
+    ASSERT_TRUE(cbm_file_exists(moved));
+    ce_teardown(&e);
+    PASS();
+}
+
+#ifndef _WIN32
+typedef struct {
+    int n;
+    bool removed;
+    bool skipped;
+    int64_t bytes;
+    std::string reason;
+} ce_item_rec_t;
+
+static void ce_record_sl(const cbm_cache_expiry_item_t *it, void *ud) {
+    ce_item_rec_t *rec = (ce_item_rec_t *)ud;
+    if (it->kind == CBM_EXPIRE_UNUSED && it->name && strcmp(it->name, "sl") == 0) {
+        rec->n++;
+        rec->removed = it->removed;
+        rec->skipped = it->skipped != NULL;
+        rec->bytes = it->bytes;
+        rec->reason = it->reason ? it->reason : "";
+    }
+}
+#endif
+
+/* A project whose database went but whose parked slot stayed (a read-only
+ * slot directory) is reported removed -- not kept -- with the slots'
+ * refusal in its reason, and only the bytes that went are counted. */
+TEST(cache_sweep_reports_project_with_slots_left) {
+#ifndef _WIN32
+    if (geteuid() == 0) {
+        PASS(); /* root ignores directory permissions */
+    }
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_slleft"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "sl", root, db, sizeof(db));
+    int64_t db_bytes = cbm_file_size(db);
+    ASSERT_GT(db_bytes, 0);
+    char sdir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(db, "sl", root, sdir, sizeof(sdir)));
+    ASSERT_TRUE(cbm_mkdir_p(sdir, 0755));
+    char slot[1300];
+    snprintf(slot, sizeof(slot), "%s/main.db.zst", sdir);
+    std::string big(256 * 1024, 'z');
+    ASSERT_EQ(th_write_file(slot, big.c_str()), 0);
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 100 * CE_DAY, NULL));
+    /* The project's slot directory cannot move into the trash (a directory
+     * changing parent needs write access to itself), and the slot in its
+     * root's directory cannot be deleted. */
+    std::string pdir(sdir, strrchr(sdir, '/') - sdir);
+    ASSERT_EQ(chmod(sdir, 0555), 0);
+    ASSERT_EQ(chmod(pdir.c_str(), 0555), 0);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ce_item_rec_t rec = {0, false, false, 0, ""};
+    cbm_cache_sweep_opts_t o = {};
+    o.now = now;
+    o.report = ce_record_sl;
+    o.report_ud = &rec;
+    int rc = cbm_cache_expiry_sweep(&cfg, &o, &r);
+    chmod(pdir.c_str(), 0755);
+    chmod(sdir, 0755);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(rec.n, 1);
+    ASSERT_TRUE(rec.removed);
+    ASSERT_FALSE(rec.skipped);
+    ASSERT_TRUE(rec.reason.find("could not be removed") != std::string::npos);
+    ASSERT_EQ(rec.bytes, db_bytes); /* the database only: the slot stayed */
+    ASSERT_EQ(r.projects, 1);
+    ASSERT_EQ(r.skipped, 0);
+    ASSERT_EQ(r.bytes, db_bytes);
+    ASSERT_FALSE(cbm_file_exists(db));
+    ASSERT_TRUE(cbm_file_exists(slot));
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
+#ifdef __linux__
+/* A mount point named in /proc/self/mounts that is none of the fixed mount
+ * parents, has entries (so the empty-directory rule cannot decide) and has
+ * no entry `child`. "" when there is none. */
+static std::string ce_listed_mount_point(const char *child) {
+    static const char *const parents[] = {"/",
+                                          "/Volumes",
+                                          "/mnt",
+                                          "/media",
+                                          "/run/media",
+                                          "/net",
+                                          "/Network",
+                                          "/System/Volumes",
+                                          "/private/var/automount",
+                                          "/afs",
+                                          "/cifs",
+                                          "/nfs"};
+    FILE *f = fopen("/proc/self/mounts", "r");
+    if (!f) {
+        return "";
+    }
+    std::string found;
+    char line[4096];
+    while (found.empty() && fgets(line, sizeof(line), f)) {
+        char dev[1024];
+        char mnt[2048];
+        if (sscanf(line, "%1023s %2047s", dev, mnt) != 2 || strchr(mnt, '\\')) {
+            continue; /* an escaped name (a space in it) */
+        }
+        bool parent = strncmp(mnt, "/media/", 7) == 0 || strncmp(mnt, "/run/media/", 11) == 0;
+        for (const char *p : parents) {
+            parent = parent || strcmp(mnt, p) == 0;
+        }
+        if (parent || !cbm_is_dir(mnt)) {
+            continue;
+        }
+        bool any = false;
+        cbm_dir_t *d = cbm_opendir(mnt);
+        if (d) {
+            cbm_dirent_t *ent;
+            while (!any && (ent = cbm_readdir(d)) != NULL) {
+                any = strcmp(ent->name, ".") != 0 && strcmp(ent->name, "..") != 0;
+            }
+            cbm_closedir(d);
+        }
+        std::string probe = std::string(mnt) + "/" + child;
+        struct stat st;
+        if (any && stat(probe.c_str(), &st) != 0 && errno == ENOENT) {
+            found = mnt;
+        }
+    }
+    fclose(f);
+    return found;
+}
+#endif
+
+/* A missing root whose nearest existing ancestor is a mount point in the
+ * mount table (not one of the fixed mount parents, and not empty) is
+ * unavailable, not deleted: no missing streak. A root below an ordinary
+ * directory still starts one. */
+TEST(cache_root_under_listed_mount_point_is_uncertain) {
+#ifdef __linux__
+    char child[64];
+    snprintf(child, sizeof(child), "cbm-no-such-%d", (int)getpid());
+    std::string mnt = ce_listed_mount_point(child);
+    if (mnt.empty()) {
+        FAIL("no usable mount point in /proc/self/mounts");
+    }
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_mtab"));
+    char r1[2200];
+    snprintf(r1, sizeof(r1), "%s/%s/repo", mnt.c_str(), child);
+    char busy[700];
+    snprintf(busy, sizeof(busy), "%s/work/other-repo", e.base);
+    ASSERT_TRUE(cbm_mkdir_p(busy, 0755));
+    char r2[800];
+    snprintf(r2, sizeof(r2), "%s/work/repo", e.base);
+    char db[800];
+    ce_make_db(&e, "unmounted", r1, db, sizeof(db));
+    ce_make_db(&e, "deleted", r2, db, sizeof(db));
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, (int64_t)time(NULL), false, &r), 0);
+    int64_t lu;
+    int checks;
+    ce_usage(&e, "unmounted", &lu, &checks);
+    ASSERT_EQ(checks, 0);
+    ce_usage(&e, "deleted", &lu, &checks);
+    ASSERT_EQ(checks, 1);
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
 SUITE(cache_expiry) {
     RUN_TEST(cache_root_gone_needs_streak_and_grace);
     RUN_TEST(cache_root_gone_but_used_is_kept);
@@ -2421,6 +2967,15 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_reader_gate_refuses_replaced_file);
     RUN_TEST(cache_server_initialize_runs_sweep);
     RUN_TEST(cache_server_sweep_keeps_ancestor_index);
+    RUN_TEST(cache_trash_restore_puts_wal_back_first);
+    RUN_TEST(cache_trash_restore_failed_main_moves_wal_back);
+    RUN_TEST(cache_config_get_value_is_per_thread);
+    RUN_TEST(cache_usage_write_keeps_concurrent_root);
+    RUN_TEST(cache_orphan_sidecar_unlink_refused_not_reported);
+    RUN_TEST(cache_root_gone_on_unc_share_counts);
+    RUN_TEST(cache_remove_project_wal_stuck_rolls_back);
+    RUN_TEST(cache_sweep_reports_project_with_slots_left);
+    RUN_TEST(cache_root_under_listed_mount_point_is_uncertain);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(cache_server_sweep_joined_before_watcher_drop);
     RUN_TEST(cache_server_sweep_survives_exception);
