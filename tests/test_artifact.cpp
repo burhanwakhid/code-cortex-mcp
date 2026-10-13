@@ -10,6 +10,13 @@
 
 #include <sys/stat.h>
 #include <stdio.h>
+#ifdef _WIN32
+#include <process.h> /* _getpid */
+#define getpid _getpid
+#else
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include <thread>
 #include <vector>
 
@@ -96,6 +103,57 @@ TEST(artifact_concurrent_exports_do_not_collide) {
         ASSERT_EQ(cbm_store_count_edges(s, "test-proj"), 1);
         cbm_store_close(s);
     }
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* An export removes the snapshot files (cbm_artifact_<pid>_<n>.db and its
+ * sidecars) that a process which died mid-export left in the temp
+ * directory; this process's own and a live process's stay. */
+static long artifact_dead_pid(void) {
+#ifdef _WIN32
+    return 0x7FFFFFF0L; /* no such process: OpenProcess fails */
+#else
+    pid_t child = fork();
+    if (child == 0) {
+        _exit(0);
+    }
+    if (child < 0) {
+        return -1;
+    }
+    int status = 0;
+    (void)waitpid(child, &status, 0);
+    return (long)child;
+#endif
+}
+
+TEST(artifact_export_removes_orphaned_snapshots) {
+    setup_artifact_test();
+    create_test_db(g_db);
+    long dead = artifact_dead_pid();
+    ASSERT_GT(dead, 0);
+    char orphan[1024];
+    char orphan_wal[1100];
+    char mine[1024];
+    char unrelated[1024];
+    snprintf(orphan, sizeof(orphan), "%s/cbm_artifact_%ld_7.db", cbm_tmpdir(), dead);
+    snprintf(orphan_wal, sizeof(orphan_wal), "%s-wal", orphan);
+    snprintf(mine, sizeof(mine), "%s/cbm_artifact_%ld_999999.db", cbm_tmpdir(), (long)getpid());
+    snprintf(unrelated, sizeof(unrelated), "%s/cbm_artifact_%ld_7.dbx", cbm_tmpdir(), dead);
+    const char *files[] = {orphan, orphan_wal, mine, unrelated};
+    for (const char *f : files) {
+        FILE *fp = fopen(f, "wb");
+        ASSERT_NOT_NULL(fp);
+        fputs("snapshot", fp);
+        fclose(fp);
+    }
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+    ASSERT_FALSE(cbm_file_exists(orphan));
+    ASSERT_FALSE(cbm_file_exists(orphan_wal));
+    ASSERT_TRUE(cbm_file_exists(mine));      /* this process: maybe mid-export */
+    ASSERT_TRUE(cbm_file_exists(unrelated)); /* not a snapshot name */
+    (void)cbm_unlink(mine);
+    (void)cbm_unlink(unrelated);
     cleanup_dir(g_tmpdir);
     PASS();
 }
@@ -440,6 +498,7 @@ SUITE(artifact) {
     RUN_TEST(artifact_fast_export_snapshots_live_wal_store);
     RUN_TEST(store_deep_integrity_detects_page_corruption);
     RUN_TEST(artifact_concurrent_exports_do_not_collide);
+    RUN_TEST(artifact_export_removes_orphaned_snapshots);
     RUN_TEST(artifact_export_fast_roundtrip);
     RUN_TEST(artifact_export_best_roundtrip);
     RUN_TEST(artifact_exists_check);

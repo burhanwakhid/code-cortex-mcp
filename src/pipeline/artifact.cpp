@@ -49,6 +49,7 @@ enum {
 #include <process.h> /* _getpid */
 #define getpid _getpid
 #else
+#include <signal.h> /* kill: is an orphaned snapshot's owner alive */
 #include <unistd.h> /* getpid */
 #endif
 #include <unistd.h>
@@ -470,6 +471,70 @@ static const char *DROP_INDEXES_SQL = "DROP INDEX IF EXISTS idx_nodes_label;"
 
 /* ── Export helpers ───────────────────────────────────────────────── */
 
+/* Whether process pid is gone for sure. Unknown (no permission to ask, a
+ * pid reused by another process) counts as alive: its file is kept. */
+static bool snapshot_owner_gone(long pid) {
+    if (pid <= 0) {
+        return false;
+    }
+#ifdef _WIN32
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+    if (h) {
+        DWORD code = 0;
+        bool exited = GetExitCodeProcess(h, &code) && code != STILL_ACTIVE;
+        CloseHandle(h);
+        return exited;
+    }
+    return GetLastError() == ERROR_INVALID_PARAMETER; /* no such process */
+#else
+    return kill((pid_t)pid, 0) != 0 && errno == ESRCH;
+#endif
+}
+
+/* Remove export snapshots a crashed process left in the temp directory:
+ * cbm_artifact_<pid>_<n>.db and its SQLite sidecars, for a pid that no
+ * longer runs. prepare_snapshot_db unlinks its own file when it finishes, so
+ * only a process that died mid-export leaves one -- a copy of a whole graph
+ * that nothing else ever removes. This process's own files, and a live
+ * process's, are left alone. */
+static void sweep_orphan_snapshots(void) {
+    const char *tmp = cbm_tmpdir();
+    cbm_dir_t *d = tmp ? cbm_opendir(tmp) : NULL;
+    if (!d) {
+        return;
+    }
+    static const char prefix[] = "cbm_artifact_";
+    const long self = (long)getpid();
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        const char *name = ent->name;
+        if (ent->is_dir || strncmp(name, prefix, sizeof(prefix) - 1) != 0) {
+            continue;
+        }
+        const char *p = name + sizeof(prefix) - 1;
+        char *end = NULL;
+        long pid = strtol(p, &end, 10);
+        if (end == p || *end != '_' || !(end[1] >= '0' && end[1] <= '9')) {
+            continue;
+        }
+        p = end + 1;
+        while (*p >= '0' && *p <= '9') {
+            p++;
+        }
+        bool ours = strcmp(p, ".db") == 0 || strcmp(p, ".db-wal") == 0 ||
+                    strcmp(p, ".db-shm") == 0 || strcmp(p, ".db-journal") == 0;
+        if (!ours || pid == self || !snapshot_owner_gone(pid)) {
+            continue;
+        }
+        char path[CBM_SZ_4K];
+        int n = snprintf(path, sizeof(path), "%s/%s", tmp, name);
+        if (n > 0 && (size_t)n < sizeof(path) && !cbm_is_link(path) && cbm_unlink(path) == 0) {
+            cbm_log_info("artifact.orphan_snapshot_removed", "path", path);
+        }
+    }
+    cbm_closedir(d);
+}
+
 /* Prepare a stripped DB copy for best-quality export.
  * VACUUM INTO → (optionally) drop indexes → VACUUM. Returns malloc'd buffer
  * or NULL. VACUUM INTO runs on BOTH quality levels: it is the consistent
@@ -482,6 +547,7 @@ static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool str
      * and the CLI, two projects in one process) never VACUUM INTO, read
      * and unlink the same file. */
     static std::atomic<unsigned> seq{0};
+    sweep_orphan_snapshots();
     char tmp_path[CBM_SZ_4K];
     snprintf(tmp_path, sizeof(tmp_path), "%s/cbm_artifact_%ld_%u.db", cbm_tmpdir(),
              (long)getpid(), seq.fetch_add(1, std::memory_order_relaxed));
