@@ -225,9 +225,15 @@ static sqlite3 *state_open(bool create_tables, bool read_only = false, int busy_
             (void)sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
         }
     }
+    /* The DDL runs in an IMMEDIATE transaction: it takes the write lock
+     * first, under the busy wait. As a bare statement it reads the schema
+     * and then asks for the write lock, which SQLite refuses at once,
+     * without waiting, while another connection is about to write -- many
+     * first opens of a fresh cache at once all failed. */
     if (create_tables &&
         !(state_has_table(db, "cache_usage") && state_has_table(db, "cache_sweep")) &&
         sqlite3_exec(db,
+                     "BEGIN IMMEDIATE;"
                      "CREATE TABLE IF NOT EXISTS cache_usage ("
                      "db_name TEXT PRIMARY KEY,"
                      "last_used INTEGER NOT NULL DEFAULT 0,"
@@ -235,8 +241,10 @@ static sqlite3 *state_open(bool create_tables, bool read_only = false, int busy_
                      "missing_since INTEGER NOT NULL DEFAULT 0,"
                      "missing_checks INTEGER NOT NULL DEFAULT 0);"
                      "CREATE TABLE IF NOT EXISTS cache_sweep ("
-                     "key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+                     "key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+                     "COMMIT;",
                      NULL, NULL, NULL) != SQLITE_OK) {
+        (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
         sqlite3_close(db);
         return NULL;
     }
