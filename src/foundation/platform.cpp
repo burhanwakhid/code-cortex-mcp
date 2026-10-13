@@ -898,41 +898,34 @@ bool cbm_root_canonical(const char *root, char *out, size_t out_sz) {
         }
     }
 #else
-    /* Lexical form first, so "x/./gone/.." still resolves through x. A
-     * relative root that folds to nothing (".", "sub/..") is the current
-     * directory: resolved as ".", never hashed as "" -- every checkout
-     * opened as "." would share one slot key otherwise. */
-    char lex[CBM_ROOT_MAX];
+    /* The path as given, where it exists: the filesystem applies ".." after
+     * following a symlink ("a/link/../repo" with link -> other/sub is
+     * other/repo), so nothing is folded before it is resolved. */
     char real[PATH_MAX];
-    /* The path as given first, where it exists: the filesystem applies ".."
-     * after following a symlink ("a/link/../repo" with link -> other/sub is
-     * other/repo), and folding ".." lexically first named another checkout.
-     * The lexical form only for a path that does not resolve as given. */
     if (realpath(root, real)) {
         return cbm_root_normalize(real, false, out, out_sz);
     }
-    if (!cbm_root_normalize(root, false, lex, sizeof(lex))) {
-        return false;
-    }
-    const char *probe = lex[0] ? lex : ".";
-    if (realpath(probe, real)) {
-        return cbm_root_normalize(real, false, out, out_sz);
-    }
-    if (!lex[0]) {
-        return false;
-    }
     /* Gone (a removed worktree): made absolute, then the longest existing
-     * ancestor resolved and the missing tail appended -- the key the
-     * checkout had while it existed (macOS /tmp -> /private/tmp, a relative
-     * root against the cwd). Hashing the unresolved spelling addressed
-     * another slot directory, and cleanup left the parked branches. */
-    std::string abs_path = lex;
+     * ancestor OF THE SPELLING AS GIVEN resolved and the rest appended raw
+     * -- a ".." in the rest then applies to a resolved directory, as the
+     * filesystem would apply it -- and only the result folded. The key is
+     * the one the checkout had while it existed (macOS /tmp ->
+     * /private/tmp, a relative root against the cwd); folding first could
+     * give it another, existing checkout's identity. A root that folds to
+     * nothing ("sub/..") is the current directory, never "". */
+    std::string abs_path = root;
+    if (abs_path.empty()) {
+        return false;
+    }
     if (abs_path[0] != '/') {
         char cwd[PATH_MAX];
         if (!getcwd(cwd, sizeof(cwd))) {
-            return cbm_root_normalize(lex, false, out, out_sz);
+            return cbm_root_normalize(root, false, out, out_sz);
         }
         abs_path = std::string(cwd) + "/" + abs_path;
+    }
+    while (abs_path.size() > 1 && abs_path.back() == '/') {
+        abs_path.pop_back();
     }
     std::string head = abs_path;
     std::string tail;
@@ -961,17 +954,13 @@ bool cbm_root_matches(const char *recorded, const char *dir) {
     if (strcmp(recorded, dir) == 0) {
         return true;
     }
-    /* Both sides canonical: separators, drive-letter case, "."/".." and
-     * trailing separators folded, symlinks resolved where the path exists
-     * (macOS /tmp -> /private/tmp; on Windows _fullpath and case folding).
-     * A recorded root that no longer exists still compares lexically. */
+    /* Both exist: their file identities decide. One is gone: their
+     * canonical forms (cbm_root_canonical) -- separators, drive-letter case,
+     * "."/".." and trailing separators folded after the longest existing
+     * ancestor is resolved (macOS /tmp -> /private/tmp; on Windows the final
+     * path and case folding). */
     char a[CBM_ROOT_MAX];
     char b[CBM_ROOT_MAX];
-#ifdef _WIN32
-    const bool fold = true;
-#else
-    const bool fold = false;
-#endif
 #ifdef _WIN32
     /* The fold assumes the volume ignores case. A directory can opt into
      * case sensitivity (per-directory on NTFS), where "Repo" and "repo"
@@ -994,13 +983,10 @@ bool cbm_root_matches(const char *recorded, const char *dir) {
         return ia.st_dev == ib.st_dev && ia.st_ino == ib.st_ino;
     }
 #endif
-    if (cbm_root_normalize(recorded, fold, a, sizeof(a)) &&
-        cbm_root_normalize(dir, fold, b, sizeof(b)) && strcmp(a, b) == 0) {
-        return true; /* lexically equal: no filesystem access needed */
-    }
-    if (cbm_root_canonical(recorded, a, sizeof(a)) && cbm_root_canonical(dir, b, sizeof(b)) &&
-        strcmp(a, b) == 0) {
-        return true;
-    }
-    return false; /* one of them is gone and they spell differently */
+    /* One of them is gone: their canonical forms decide, each resolved
+     * through its longest existing ancestor before anything is folded. (A
+     * lexical fold of the spellings alone took "a/link/../repo" for
+     * "a/repo".) */
+    return cbm_root_canonical(recorded, a, sizeof(a)) && cbm_root_canonical(dir, b, sizeof(b)) &&
+           strcmp(a, b) == 0;
 }

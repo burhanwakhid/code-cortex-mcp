@@ -1049,6 +1049,18 @@ TEST(platform_root_key_survives_removed_checkout) {
     snprintf(via, sizeof(via), "%s/../repo", hop);
     ASSERT_TRUE(cbm_root_matches(via, other_repo));
     ASSERT_FALSE(cbm_root_matches(via, real_repo));
+    /* The target gone, the other checkout still there: the vanished root
+     * keeps ITS key, never real/repo's. */
+    char k_via[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    char k_real[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    char k_other[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    ASSERT_TRUE(cbm_branch_root_key(other_repo, k_other, sizeof(k_other)));
+    ASSERT_EQ(rmdir(other_repo), 0);
+    ASSERT_TRUE(cbm_branch_root_key(via, k_via, sizeof(k_via)));
+    ASSERT_TRUE(cbm_branch_root_key(real_repo, k_real, sizeof(k_real)));
+    ASSERT_STR_EQ(k_via, k_other);
+    ASSERT_TRUE(strcmp(k_via, k_real) != 0);
+    ASSERT_FALSE(cbm_root_matches(via, real_repo));
     (void)unlink(hop);
     (void)unlink(link_dir);
     th_rmtree(base);
