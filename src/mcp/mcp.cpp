@@ -4209,8 +4209,29 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     // Keep path as requested. Canonicalization chooses the lock identity only;
     // deleting a cache symlink must unlink that entry, not its backing database.
 
+    /* Which checkout the database is: the root it records, read under both
+     * gates. Two directories can derive one project name (/x/a-b/repo,
+     * /x/a/b-repo) and share <name>.db, while their parked slots are filed
+     * per root. A path argument names one of them (g_expected_root): a
+     * database the other indexed is not its to delete -- the ownership
+     * check every read applies -- and only that path's slots go. Given a
+     * bare name, the slots of the root the database records go with it;
+     * every root's only when nothing records one (no database left). */
+    char owner[CBM_SZ_4K] = "";
+    if (cbm_file_exists(path)) {
+        cbm_store_t *os = cbm_store_open_path_query(path);
+        cbm_project_t proj = {0};
+        if (os && cbm_store_get_project(os, name, &proj) == CBM_STORE_OK) {
+            snprintf(owner, sizeof(owner), "%s", proj.root_path ? proj.root_path : "");
+            cbm_project_free_fields(&proj);
+        }
+        cbm_store_close(os);
+    }
+    bool foreign = g_expected_root[0] && owner[0] && !cbm_root_matches(owner, g_expected_root);
+    const char *slot_root = g_expected_root[0] ? g_expected_root : owner;
+
     /* Close store if it's the project being deleted */
-    if (srv->current_project && strcmp(srv->current_project, name) == 0) {
+    if (!foreign && srv->current_project && strcmp(srv->current_project, name) == 0) {
         if (srv->owns_store && srv->store) {
             cbm_store_close(srv->store);
             srv->store = NULL;
@@ -4223,12 +4244,21 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
      * usage rows while both gates are held -- the same removal cache expiry
      * uses (cbm_cache_remove_project). Parked branches can outlive a main
      * file that is already gone; they are kept when the main file could not
-     * be removed: the project still exists, and its branches with it. */
+     * be removed: the project still exists, and its branches with it. A
+     * database another directory indexed stays, as if absent; the slots of
+     * the named directory still go. */
     const char *status = "not_found";
     const char *error_detail = NULL;
     bool is_error = false;
     int parked_deleted = 0;
-    int removed = cbm_cache_remove_project(path, name, NULL, &parked_deleted);
+    int removed = 1;
+    if (foreign) {
+        cbm_log_info("project.name_collision", "project", name, "indexed_root", owner, "wanted",
+                     g_expected_root);
+        parked_deleted = cbm_branch_slots_delete_root(path, name, g_expected_root);
+    } else {
+        removed = cbm_cache_remove_project_root(path, name, slot_root, &parked_deleted);
+    }
     bool slots_left = removed == 2;
     if (removed == 0 || slots_left) {
         status = "deleted";
@@ -4245,7 +4275,7 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     cbm_pipeline_unlock();
     cbm_db_lease_release(lease);
 
-    if (srv->watcher) {
+    if (srv->watcher && !foreign) {
         cbm_watcher_unwatch(srv->watcher, name);
     }
 
@@ -4256,6 +4286,12 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "project", name);
     yyjson_mut_obj_add_str(doc, root, "status", status);
+    if (foreign) {
+        yyjson_mut_obj_add_strcpy(doc, root, "kept_database_of", owner);
+        yyjson_mut_obj_add_str(doc, root, "note",
+                               "the database under this name was indexed from another directory "
+                               "(a project-name collision); it is kept");
+    }
     if (parked_deleted > 0) {
         yyjson_mut_obj_add_int(doc, root, "parked_branches_deleted", parked_deleted);
     }

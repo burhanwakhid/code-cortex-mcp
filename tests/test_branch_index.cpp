@@ -2142,6 +2142,99 @@ TEST(branch_slots_reject_other_roots) {
     PASS();
 }
 
+/* delete_project for one of two checkouts that derive the same project name
+ * deletes only what is that checkout's: its parked slots, and the shared
+ * database only when that checkout indexed it last. */
+static int bi_slot_count(const char *root) {
+    char db[1024];
+    char **list = NULL;
+    int n = cbm_branch_slots_list(bi_db_path(db, sizeof(db)), g_bi_project, root, &list);
+    cbm_branch_slots_free_list(list, n);
+    return n;
+}
+
+static char *bi_delete_by_path(cbm_mcp_server_t *srv, const char *dir) {
+    char fwd[600];
+    snprintf(fwd, sizeof(fwd), "%s", dir);
+    for (char *p = fwd; *p; p++) {
+        *p = *p == '\\' ? '/' : *p; /* no JSON escaping needed */
+    }
+    char args[800];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\"}", fwd);
+    return cbm_mcp_handle_tool(srv, "delete_project", args);
+}
+
+TEST(branch_delete_project_keeps_other_roots) {
+    char *made = th_mktempdir("cbm_bi_delcoll");
+    ASSERT_NOT_NULL(made);
+    char base[256];
+    snprintf(base, sizeof(base), "%s", made);
+    char a[512];
+    char b[512];
+    snprintf(a, sizeof(a), "%s/a/b-repo", base);
+    snprintf(b, sizeof(b), "%s/a-b/repo", base);
+    ASSERT_TRUE(bi_repo_at(a, "from_a"));
+    ASSERT_TRUE(bi_repo_at(b, "from_b"));
+    char ra[1024];
+    char rb[1024];
+
+    /* B parks its main, then A indexes over B's live database and parks
+     * its own main: both roots have a slot, and the live database is A's. */
+    ASSERT_EQ(bi_index(b, -1).rc, 0);
+    snprintf(rb, sizeof(rb), "%s", g_bi_root);
+    ASSERT_EQ(bi_git(b, "checkout -q -b other"), 0);
+    ASSERT_EQ(bi_index(b, -1).rc, 0);
+    ASSERT_EQ(bi_index(a, -1).rc, 0);
+    snprintf(ra, sizeof(ra), "%s", g_bi_root);
+    ASSERT_EQ(bi_git(a, "checkout -q -b feature"), 0);
+    ASSERT_EQ(bi_index(a, -1).rc, 0);
+    ASSERT_EQ(bi_slot_count(ra), 1);
+    ASSERT_EQ(bi_slot_count(rb), 1);
+    char db[1024];
+    bi_db_path(db, sizeof(db));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* Deleting B: A's live database stays, B's slot goes, A's stays. */
+    char *resp = bi_delete_by_path(srv, b);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "kept_database_of"));
+    free(resp);
+    ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_EQ(bi_count("from_a"), 1);
+    ASSERT_EQ(bi_slot_count(rb), 0);
+    ASSERT_EQ(bi_slot_count(ra), 1);
+
+    /* B's slot again; deleting A takes the database and A's slot only. */
+    ASSERT_EQ(bi_git(b, "checkout -q main"), 0);
+    ASSERT_EQ(bi_index(b, -1).rc, 0); /* over A's database: no switch */
+    ASSERT_EQ(bi_git(b, "checkout -q other"), 0);
+    ASSERT_EQ(bi_index(b, -1).rc, 0); /* B's main parked */
+    ASSERT_EQ(bi_index(a, -1).rc, 0); /* the live database is A's again */
+    ASSERT_EQ(bi_slot_count(rb), 1);
+    resp = bi_delete_by_path(srv, a);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\\\"status\\\":\\\"deleted\\\""));
+    free(resp);
+    ASSERT_FALSE(cbm_file_exists(db));
+    ASSERT_EQ(bi_slot_count(ra), 0);
+    ASSERT_EQ(bi_slot_count(rb), 1);
+
+    /* By bare name, with no database left: every root's slots go. */
+    char args[1200];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\"}", g_bi_project);
+    resp = cbm_mcp_handle_tool(srv, "delete_project", args);
+    free(resp);
+    ASSERT_EQ(bi_slot_count(rb), 0);
+    cbm_mcp_server_free(srv);
+
+    (void)cbm_branch_slots_delete_all(db, g_bi_project);
+    cbm_unlink(db);
+    cbm_remove_db_sidecars(db);
+    th_rmtree(base);
+    PASS();
+}
+
 /* Root normalization is a pure string function, so Windows spellings are
  * checked on every platform; the comparison and the slot key build on it. */
 TEST(branch_root_normalize_and_key) {
@@ -3581,6 +3674,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_requested_export_failure_fails_run);
 #endif
     RUN_TEST(branch_slots_reject_other_roots);
+    RUN_TEST(branch_delete_project_keeps_other_roots);
     RUN_TEST(branch_root_normalize_and_key);
     RUN_TEST(branch_legacy_slot_adopted);
     RUN_TEST(branch_switch_purges_changed_mode_skipped_file);

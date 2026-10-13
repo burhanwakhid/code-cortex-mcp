@@ -210,6 +210,13 @@ void cbm_branch_slots_free_info(cbm_branch_slot_info_t *info, int count);
  * the number of databases removed. */
 int cbm_branch_slots_delete_all(const char *db_path, const char *project);
 
+/* Whether the database at path was indexed from root (cbm_root_matches): a
+ * derived project name can be another directory's, and so can its slots.
+ * True when root is empty, and for a database that cannot be read or records
+ * no project row or no root: nothing says it is another directory's. A
+ * foreign database is logged (branch.foreign_db). */
+bool cbm_branch_db_root_matches(const char *path, const char *project, const char *root);
+
 /* Delete only the parked databases of project that belong to the checkout
  * at root (its root-key directory), then the directories left empty. Two
  * checkouts that derive the same project name keep separate slots; a prune

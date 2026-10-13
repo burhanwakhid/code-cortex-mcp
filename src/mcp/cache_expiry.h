@@ -150,6 +150,14 @@ bool cbm_cache_expiry_due(const cbm_cache_expiry_cfg_t *cfg, int64_t now);
 int cbm_cache_remove_project(const char *db_path, const char *project, const char *trash_entry,
                              int *parked);
 
+/* cbm_cache_remove_project without a trash entry, removing only the parked
+ * slots of the checkout at root (cbm_branch_slots_delete_root): two
+ * directories that derive one project name keep separate slots, and deleting
+ * one must not take the other's. root NULL or "" is every root's. The caller
+ * has checked that the database is root's (cbm_branch_db_root_matches). */
+int cbm_cache_remove_project_root(const char *db_path, const char *project, const char *root,
+                                  int *parked);
+
 /* Put a trashed database back: `which` is a trash entry name
  * ("<epoch>-<project>") or a project name (its newest entry). Fails when the
  * project has a database again. msg receives a one-line outcome. */

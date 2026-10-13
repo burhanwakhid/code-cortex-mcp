@@ -686,8 +686,23 @@ void cbm_cache_expiry_test_scan_hook(void (*callback)(void *data), void *data) {
 
 static bool trash_dir_usable(const std::string &tdir);
 
+static int remove_project(const char *db_path, const char *project, const char *root,
+                          const char *trash_entry, int *parked);
+
 int cbm_cache_remove_project(const char *db_path, const char *project, const char *trash_entry,
                              int *parked) {
+    return remove_project(db_path, project, NULL, trash_entry, parked);
+}
+
+int cbm_cache_remove_project_root(const char *db_path, const char *project, const char *root,
+                                  int *parked) {
+    return remove_project(db_path, project, root && root[0] ? root : NULL, NULL, parked);
+}
+
+/* root NULL: every root's parked slots; else only that checkout's (and never
+ * moved to the trash: trash_entry is NULL then). */
+static int remove_project(const char *db_path, const char *project, const char *root,
+                          const char *trash_entry, int *parked) {
     if (parked) {
         *parked = 0;
     }
@@ -741,10 +756,11 @@ int cbm_cache_remove_project(const char *db_path, const char *project, const cha
     }
     cbm_cache_usage_forget(db_path);
     char **slots = NULL;
-    int n = cbm_branch_slots_list(db_path, project, NULL, &slots);
+    int n = cbm_branch_slots_list(db_path, project, root, &slots);
     cbm_branch_slots_free_list(slots, n);
     char sdir[CE_PATH_MAX];
-    if (trash_entry && n > 0 && cbm_branch_slots_dir(db_path, project, NULL, sdir, sizeof(sdir))) {
+    if (trash_entry && !root && n > 0 &&
+        cbm_branch_slots_dir(db_path, project, NULL, sdir, sizeof(sdir))) {
         char dst[CE_PATH_MAX];
         snprintf(dst, sizeof(dst), "%s/branches", trash_entry);
         if (!linked && cbm_mkdir_p(trash_entry, 0755) && cbm_rename_replace(sdir, dst) == 0) {
@@ -754,7 +770,8 @@ int cbm_cache_remove_project(const char *db_path, const char *project, const cha
             return rc;
         }
     }
-    int removed = cbm_branch_slots_delete_all(db_path, project);
+    int removed = root ? cbm_branch_slots_delete_root(db_path, project, root)
+                       : cbm_branch_slots_delete_all(db_path, project);
     if (parked) {
         *parked = removed;
     }
@@ -762,7 +779,7 @@ int cbm_cache_remove_project(const char *db_path, const char *project, const cha
      * would restore graph data the caller was told is gone: reported, not
      * hidden behind the main file's success. */
     slots = NULL;
-    int left = cbm_branch_slots_list(db_path, project, NULL, &slots);
+    int left = cbm_branch_slots_list(db_path, project, root, &slots);
     cbm_branch_slots_free_list(slots, left);
     if (left > 0) {
         char buf[32];

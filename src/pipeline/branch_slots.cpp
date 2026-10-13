@@ -1010,10 +1010,7 @@ static cbm_branch_switch_t switch_from(const char *db_path, const char *project,
                                        const char *indexed, const char *dir, const char *incoming,
                                        bs_limits_t lim);
 
-/* Whether the database at path was indexed from root (cbm_root_matches): a
- * derived project name can be another directory's, and so can its slots. A
- * database with no project row or no recorded root is accepted. */
-static bool db_root_matches(const char *path, const char *project, const char *root) {
+bool cbm_branch_db_root_matches(const char *path, const char *project, const char *root) {
     if (!root || !root[0]) {
         return true;
     }
@@ -1210,7 +1207,7 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
      * reindexes over it as it always has. Checked only when a switch is due,
      * so a run on the same branch opens nothing extra. */
     cbm_branch_switch_t action = CBM_BRANCH_SWITCH_NONE;
-    if (strcmp(indexed, slug) != 0 && db_root_matches(db_path, project, root)) {
+    if (strcmp(indexed, slug) != 0 && cbm_branch_db_root_matches(db_path, project, root)) {
         bs_limits_t lim = {keep, budget};
         action = switch_from(db_path, project, slug, indexed, dir,
                              have_incoming ? incoming : NULL, lim);

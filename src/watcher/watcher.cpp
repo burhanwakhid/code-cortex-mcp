@@ -436,7 +436,9 @@ static const char *itoa_buf(int v) {
 
 /* Remove the project's database and the parked slots of the checkout at
  * root_path. Only that checkout's: a second checkout deriving the same
- * project name keeps its own slots (separated by root key). */
+ * project name keeps its own slots (separated by root key), and the shared
+ * <project>.db when that checkout indexed it last -- the database records
+ * its root, checked under the lease (cbm_branch_db_root_matches). */
 static int delete_cached_project_db(const char *project_name, const char *root_path) {
     if (!cbm_validate_project_name(project_name)) {
         return CBM_NOT_FOUND;
@@ -458,6 +460,13 @@ static int delete_cached_project_db(const char *project_name, const char *root_p
     // Preserve unlink's original symlink-entry semantics. The canonical target
     // is only the shared lease identity, never an expanded deletion scope.
     const char *path = requested;
+    if (root_path && root_path[0] && cbm_file_exists(path) &&
+        !cbm_branch_db_root_matches(path, project_name, root_path)) {
+        cbm_log_info("watcher.prune.kept_foreign_db", "project", project_name, "root", root_path);
+        (void)cbm_branch_slots_delete_root(path, project_name, root_path);
+        cbm_db_lease_release(lease);
+        return 0;
+    }
     if (cbm_unlink(path) != 0 && errno != ENOENT) {
         cbm_db_lease_release(lease);
         return CBM_NOT_FOUND;

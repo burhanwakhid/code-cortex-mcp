@@ -488,7 +488,9 @@ Set the config keys with `code-cortex-mcp config set <key> <value>`.
 logs `branch.park` (`elapsed_ms`, `slot_bytes`, `db_bytes`) and `branch.restore` (`elapsed_ms`,
 `unpack_ms`, `wal_bytes`) to standard error.
 
-To remove parked slots, use `delete_project` (the project's slots of every root go with it) or
+To remove parked slots, use `delete_project` (the slots of the checkout it deletes: the path
+given, else the root the database records, else every root's when no database is left; a live
+database that another directory indexed is kept) or
 the index reset of `install`, `uninstall` and `update`, which also clears slots whose
 `<project>.db` is gone. `delete_project` and the reset keep a project's slots when its live
 database cannot be removed. The watcher's prune of a deleted checkout removes its slots too.

@@ -213,8 +213,9 @@ root again (one `stat`) and skips the database when the root is no longer missin
 remounted or a checkout restored since the scan.
 
 The removal is `cbm_cache_remove_project`, which `delete_project` also uses: the database, its
-WAL and SHM, its parked slots of every root, its `store_meta` row and its usage row go together.
-The one difference is the destination. The other paths that remove a database (the watcher's
+WAL and SHM, its parked slots, its `store_meta` row and its usage row go together. The
+differences are the destination, and the slots: expiry moves those of every root,
+`delete_project` deletes those of one checkout (see [Known limitations](#known-limitations)). The other paths that remove a database (the watcher's
 prune of a missing root, the quarantine of a corrupt file) also forget both rows
 (`cbm_cache_usage_forget`), so a database later built at that path does not inherit a stale root
 or missing-root streak. `uninstall` removes `_config.db` with the other `*.db` files, rows
@@ -336,8 +337,15 @@ Each removal logs one `cache.expire` line (kind, name, path, reason), each skip 
   project). A sweep from another process can expire it as unused.
 - The watcher's own prune of a watched root that stays missing for 10 minutes (`watcher.cpp`)
   still deletes directly, not through the trash. It removes the parked slots of that checkout
-  only (its root key); a second checkout deriving the same project name keeps its slots, but
-  the shared `<project>.db` goes regardless of which checkout it was indexed from.
+  only (its root key). A second checkout deriving the same project name keeps its slots, and
+  keeps the shared `<project>.db` when that database records the second checkout's root (the
+  ownership check reads use, `cbm_branch_db_root_matches`, under the index lease;
+  `watcher.prune.kept_foreign_db` in the log). `delete_project` applies the same check: given
+  a path, it keeps a database another directory indexed (`kept_database_of` in the result)
+  and removes only that path's slots; given a bare name, it removes the slots of the root that
+  the database records, and every root's only when no database is left
+  (`cbm_cache_remove_project_root`). Expiry still moves the slots of every root with an
+  expired database.
 - Root classification treats a drive root as a mount parent; a stored Windows root is walked up
   on either separator. The nearest existing ancestor of a missing root that is an empty
   directory, or is named as a mount point in `/etc/fstab` or the mount table, is taken for an
