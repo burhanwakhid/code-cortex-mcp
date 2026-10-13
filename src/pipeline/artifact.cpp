@@ -877,6 +877,12 @@ static int export_locked(const char *db_path, const char *repo_path, const char 
         snapshot_meta_free(&snap);
         return artifact_export_fail("write_artifact", repo_path, "path_too_long", 0);
     }
+    /* The fingerprint of the bytes being published, taken from the buffer
+     * itself: a reread of the file could fingerprint a replacement written
+     * meanwhile (another exporter, a checkout) under this snapshot's
+     * metadata. Always present, so the import always verifies it. */
+    char payload_fp[CBM_SHA256_HEX_LEN + 1];
+    payload_fingerprint_bytes(compressed, (size_t)clen, payload_fp);
     artifact_file_error_t ioerr;
     int wrc = write_file_atomic(zst_path, compressed, (size_t)clen, &ioerr);
     free(compressed);
@@ -893,8 +899,6 @@ static int export_locked(const char *db_path, const char *repo_path, const char 
 #endif
 
     /* Write metadata */
-    char payload_fp[CBM_SHA256_HEX_LEN + 1] = "";
-    (void)payload_fingerprint(zst_path, payload_fp); /* none: the metadata is never current */
     int mrc = write_metadata(repo_path, project_name, snap.nodes, snap.edges, snap.branch_qn,
                              snap.branch_name, snap.content_fp, snap.index_format, snap.graph_gen,
                              db_size, (size_t)clen, compression_level, payload_fp);
