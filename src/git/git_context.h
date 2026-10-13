@@ -81,6 +81,12 @@ typedef struct {
 int cbm_git_head_read(const char *root, cbm_git_head_t *out);
 void cbm_git_head_free(cbm_git_head_t *head);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Callback told of every ".git" path cbm_git_head_read probes, in order, as
+ * it walks up from the root. NULL clears. */
+void cbm_git_test_on_head_probe(void (*callback)(const char *path, void *data), void *data);
+#endif
+
 /* The filesystem-safe slug of a branch name, as cbm_git_context_resolve
  * computes branch_slug ("detached" when detached). Caller frees. */
 char *cbm_git_branch_slug(const char *branch, bool detached);

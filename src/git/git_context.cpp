@@ -581,6 +581,16 @@ static bool read_branch_sha(const char *common, const char *branch, char *sha, s
     return found;
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void (*g_head_probe_cb)(const char *, void *) = nullptr;
+static void *g_head_probe_data = nullptr;
+
+void cbm_git_test_on_head_probe(void (*callback)(const char *path, void *data), void *data) {
+    g_head_probe_cb = callback;
+    g_head_probe_data = data;
+}
+#endif
+
 int cbm_git_head_read(const char *root, cbm_git_head_t *out) {
     if (!out) {
         return CBM_NOT_FOUND;
@@ -609,6 +619,11 @@ int cbm_git_head_read(const char *root, cbm_git_head_t *out) {
         }
         bool at_root = (len == 1 && top[0] == '/') || (len == 3 && top[1] == ':');
         int n = snprintf(path, sizeof(path), "%s%s.git", top, at_root ? "" : "/");
+#ifdef CBM_ENABLE_TEST_SEAMS
+        if (g_head_probe_cb && n > 0 && (size_t)n < sizeof(path)) {
+            g_head_probe_cb(path, g_head_probe_data);
+        }
+#endif
         if (n > 0 && (size_t)n < sizeof(path) && cbm_stat(path, &st) == 0) {
             break;
         }

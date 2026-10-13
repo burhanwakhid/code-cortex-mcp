@@ -22,6 +22,7 @@
 #include <pipeline/pipeline.h>
 #include <pipeline/pipeline_internal.h> /* cbm_pipeline_test_set_brief_recompute_max */
 #include <store/store.h>
+#include <foundation/constants.h>
 #include <foundation/platform.h>
 #include <foundation/sha256.h>
 
@@ -29,6 +30,8 @@
 #include "sqlite3.h"
 #include <stdlib.h>
 #include <string.h>
+#include <string>
+#include <vector>
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -3227,6 +3230,160 @@ TEST(branch_switch_keeps_mode_skipped_file_without_digest) {
     PASS();
 }
 
+/* ── Fixes that landed without a test of their own ──────────────── */
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void bi_record_probe(const char *path, void *ud) {
+    ((std::vector<std::string> *)ud)->push_back(path);
+}
+#endif
+
+/* The direct HEAD reader's walk up from a root reaches the filesystem root
+ * itself: "/.git" (a repository rooted at "/") and "C:\.git" (at a drive
+ * root, the separator kept -- "C:" alone is drive-relative) are probed last. */
+TEST(branch_git_head_read_probes_filesystem_root) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    std::vector<std::string> posix;
+    std::vector<std::string> drive;
+    cbm_git_head_t head;
+    cbm_git_test_on_head_probe(bi_record_probe, &posix);
+    (void)cbm_git_head_read("/cbm-no-such-top-dir/sub", &head);
+    cbm_git_head_free(&head);
+    cbm_git_test_on_head_probe(bi_record_probe, &drive);
+    (void)cbm_git_head_read("C:\\cbm-no-such-top-dir\\sub", &head);
+    cbm_git_head_free(&head);
+    cbm_git_test_on_head_probe(NULL, NULL);
+    ASSERT_EQ(posix.size(), 3);
+    ASSERT_STR_EQ(posix[0].c_str(), "/cbm-no-such-top-dir/sub/.git");
+    ASSERT_STR_EQ(posix[1].c_str(), "/cbm-no-such-top-dir/.git");
+    ASSERT_STR_EQ(posix[2].c_str(), "/.git");
+    ASSERT_EQ(drive.size(), 3);
+    ASSERT_STR_EQ(drive[1].c_str(), "C:\\cbm-no-such-top-dir/.git");
+    ASSERT_STR_EQ(drive[2].c_str(), "C:\\.git");
+#else
+    SKIP("requires CBM_TEST_SEAMS");
+#endif
+    PASS();
+}
+
+#ifndef _WIN32
+/* Copy the database at src to dst (a consistent snapshot). */
+static bool bi_vacuum_into(const char *src, const char *dst) {
+    sqlite3 *h = NULL;
+    sqlite3_stmt *st = NULL;
+    bool ok = sqlite3_open(src, &h) == SQLITE_OK &&
+              sqlite3_prepare_v2(h, "VACUUM INTO ?1;", -1, &st, NULL) == SQLITE_OK &&
+              sqlite3_bind_text(st, 1, dst, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+              sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    sqlite3_close(h);
+    return ok;
+}
+#endif
+
+/* A slot path that leaves less room in the path buffer than the longest
+ * scratch suffix is refused (the switch stays in place) instead of letting
+ * "<slot>.tmp" truncate back to the slot path itself; one with room parks.
+ * The database path is padded with empty components ("dir////p.db"), which
+ * SQLite folds and the slot directory keeps, to reach the limit without a
+ * path SQLite cannot open. */
+TEST(branch_slot_path_keeps_room_for_scratch_suffix) {
+#ifndef _WIN32
+    char *repo = bi_make_repo("cbm_bi_slotlen");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* main */
+    char src[1024];
+    bi_db_path(src, sizeof(src));
+    char key[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    ASSERT_TRUE(cbm_branch_root_key(g_bi_root, key, sizeof(key)));
+    char name[CBM_BRANCH_SLOT_NAME_MAX + 1];
+    ASSERT_TRUE(cbm_branch_slot_name("main", name, sizeof(name)));
+    char *tmp = th_mktempdir("cbm_bi_slotlen_db");
+    ASSERT_NOT_NULL(tmp);
+    char base[256];
+    snprintf(base, sizeof(base), "%s", tmp);
+    std::string tail = std::string("/branches/") + g_bi_project + "/" + key + "/" + name + ".db.zst";
+    /* The slot path's length: the longest that still parks, the shortest
+     * refused, and one byte short of the buffer (where ".tmp" truncated
+     * to the slot path itself). */
+    const size_t lens[] = {CBM_PATH_MAX - 17, CBM_PATH_MAX - 16, CBM_PATH_MAX - 1};
+    for (int i = 0; i < 3; i++) {
+        char sub[300];
+        snprintf(sub, sizeof(sub), "%s/c%d", base, i);
+        ASSERT_TRUE(cbm_mkdir_p(sub, 0755));
+        ASSERT_TRUE(strlen(sub) + tail.size() <= lens[i]);
+        std::string dir = std::string(sub) + std::string(lens[i] - strlen(sub) - tail.size(), '/');
+        std::string db = dir + "/p.db";
+        std::string slot = dir + tail;
+        ASSERT_EQ(slot.size(), lens[i]);
+        ASSERT_TRUE(bi_vacuum_into(src, db.c_str()));
+        char *from = NULL;
+        cbm_branch_switch_t act =
+            cbm_branch_slots_switch(db.c_str(), g_bi_project, "feature", g_bi_root, 8, 0, &from);
+        free(from);
+        if (i == 0) {
+            ASSERT_EQ(act, CBM_BRANCH_SWITCH_SEEDED);
+            ASSERT_TRUE(cbm_file_exists(slot.c_str()));
+        } else {
+            ASSERT_EQ(act, CBM_BRANCH_SWITCH_IN_PLACE);
+            ASSERT_FALSE(cbm_file_exists(slot.c_str()));
+        }
+    }
+    th_rmtree(base);
+    bi_cleanup(repo);
+#endif
+    PASS();
+}
+
+/* Windows: a parked slot that refuses to go (held open without delete
+ * sharing) is skipped by the eviction and not counted as gone: the next
+ * oldest goes instead, and the cap is still met. */
+TEST(branch_evict_skips_slot_that_stays) {
+#ifdef _WIN32
+    char *repo = bi_make_repo("cbm_bi_evheld");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    ASSERT_EQ(bi_index_lim(repo, 2, 0).rc, 0); /* main */
+    char db[1024];
+    char dir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(bi_db_path(db, sizeof(db)), g_bi_project, g_bi_root, dir,
+                                     sizeof(dir)));
+    ASSERT_TRUE(cbm_mkdir_p(dir, 0755));
+    char a[1400];
+    char b[1400];
+    char c[1400];
+    bi_slot_file("old-a", ".db.zst", a, sizeof(a));
+    bi_slot_file("old-b", ".db.zst", b, sizeof(b));
+    bi_slot_file("old-c", ".db.zst", c, sizeof(c));
+    ASSERT_EQ(th_write_file(a, "a"), 0);
+    ASSERT_EQ(th_write_file(b, "b"), 0);
+    ASSERT_EQ(th_write_file(c, "c"), 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    cbm_usleep(600000);
+    cbm_usleep(600000);
+    FILE *held = fopen(a, "rb"); /* no FILE_SHARE_DELETE: the unlink is refused */
+    ASSERT_NOT_NULL(held);
+    bi_run_t rr = bi_index_lim(repo, 2, 0); /* parks main: four slots, cap two */
+    fclose(held);
+    ASSERT_EQ(rr.rc, 0);
+    ASSERT_TRUE(cbm_file_exists(a));
+    ASSERT_FALSE(cbm_file_exists(b));
+    ASSERT_FALSE(cbm_file_exists(c)); /* the held slot did not count as gone */
+    ASSERT_TRUE(bi_is_parked("main"));
+    char **list = NULL;
+    int n = bi_parked(&list);
+    cbm_branch_slots_free_list(list, n);
+    ASSERT_EQ(n, 2);
+    bi_cleanup(repo);
+#endif
+    PASS();
+}
+
 SUITE(branch_index) {
     char probe[64];
     snprintf(probe, sizeof(probe), "git --version >%s 2>&1", bi_null_dev());
@@ -3305,4 +3462,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_git_head_read_trailing_slash_root);
     RUN_TEST(branch_switch_keeps_unreadable_mode_skipped_file);
     RUN_TEST(branch_switch_keeps_mode_skipped_file_without_digest);
+    RUN_TEST(branch_git_head_read_probes_filesystem_root);
+    RUN_TEST(branch_slot_path_keeps_room_for_scratch_suffix);
+    RUN_TEST(branch_evict_skips_slot_that_stays);
 }
