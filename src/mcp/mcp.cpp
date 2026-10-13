@@ -1362,19 +1362,30 @@ void cbm_mcp_test_store_open_hook(void (*callback)(const char *db_path, void *da
  * multi-process stress test saw a server serve another branch's graph that
  * way, persistently. So the generation counts only when its inode is the
  * one the open saw; otherwise it is recorded as never equal, and the next
- * call reopens. */
+ * call reopens.
+ *
+ * The same holds when nothing is at the path any more: an incremental run
+ * unlinks the file and only renames its re-dump in when the dump is done,
+ * so the stat can fail while the connection reads the deleted file. An
+ * unknown generation used to leave store_gen_valid false, which
+ * cbm_mcp_server_revalidate_store reads as "never revalidate": the stress
+ * test saw a tool worker answer from the deleted pre-switch graph for every
+ * call until it exited. A failed stat is recorded as never equal too. */
 static void note_store_generation(cbm_mcp_server_t *srv, const char *path) {
     srv->store_gen_valid = false;
     if (!path || !path[0]) {
         return;
     }
-    srv->store_gen_valid = cbm_file_generation(path, &srv->store_gen);
+    bool at_path = cbm_file_generation(path, &srv->store_gen);
     uint64_t ino = 0;
-    if (srv->store_gen_valid && srv->store_gen.ino != 0 &&
-        (!cbm_store_open_inode(srv->store, &ino) || ino != srv->store_gen.ino)) {
-        cbm_log_info("store.generation_raced", "path", path);
+    bool raced = !at_path || (srv->store_gen.ino != 0 && (!cbm_store_open_inode(srv->store, &ino) ||
+                                                          ino != srv->store_gen.ino));
+    if (raced) {
+        cbm_log_info("store.generation_raced", "path", path, "reason",
+                     at_path ? "replaced" : "file_gone");
         srv->store_gen.size = CBM_NOT_FOUND; /* cbm_file_gen_equal: never equal */
     }
+    srv->store_gen_valid = true;
 }
 
 void cbm_mcp_server_revalidate_store(cbm_mcp_server_t *srv) {

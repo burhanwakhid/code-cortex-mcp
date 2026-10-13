@@ -2647,6 +2647,75 @@ TEST(cache_store_generation_follows_opened_file) {
 #endif
 }
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && !defined(_WIN32)
+/* An incremental run unlinking the database just after a tool call opened
+ * it (dump_and_persist removes the file before its re-dump lands). */
+static void ce_move_aside_after_open(const char *db_path, void *ud) {
+    ce_replace_t *r = (ce_replace_t *)ud;
+    if (r->fired++ == 0 && strcmp(db_path, r->from) == 0) {
+        (void)rename(r->from, r->to);
+    }
+}
+#endif
+
+/* The incremental's window: the tool call opens <project>.db, the file is
+ * unlinked before the call stats the path, and the re-dump lands later. The
+ * connection reads the deleted file, so the next call must reopen; an
+ * unknown generation used to mean "never revalidate", and the stress
+ * harness saw a tool worker serve the deleted pre-switch graph for every
+ * call until it exited. */
+TEST(cache_store_generation_file_gone_after_open) {
+#if !defined(CBM_ENABLE_TEST_SEAMS) || defined(_WIN32)
+    PASS(); /* needs the seam; an open file cannot be unlinked on Windows */
+#else
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_gengone"));
+    char repo[700];
+    char f[800];
+    snprintf(repo, sizeof(repo), "%s/repo", e.base);
+    snprintf(f, sizeof(f), "%s/a.py", repo);
+    ASSERT_EQ(th_write_file(f, "def alpha_old():\n    return 1\n"), 0);
+    char *name = NULL;
+    ASSERT_TRUE(ce_index_repo(repo, &name));
+    char db[900];
+    char v1[900];
+    char v2[900];
+    char aside[900];
+    snprintf(db, sizeof(db), "%s/%s.db", e.cache, name);
+    snprintf(v1, sizeof(v1), "%s/v1.copy", e.base);
+    snprintf(v2, sizeof(v2), "%s/v2.copy", e.base);
+    snprintf(aside, sizeof(aside), "%s/unlinked.db", e.base);
+    ASSERT_TRUE(ce_backup_db(db, v1));
+    ASSERT_EQ(th_write_file(f, "def beta_new():\n    return 2\n"), 0);
+    ASSERT_TRUE(ce_index_repo(repo, NULL));
+    ASSERT_TRUE(ce_backup_db(db, v2));
+    cbm_remove_db_sidecars(db);
+    ASSERT_EQ(cbm_rename_replace(v1, db), 0);
+
+    ce_replace_t r = {db, aside, 0};
+    cbm_mcp_test_store_open_hook(ce_move_aside_after_open, &r);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char args[1200];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\"beta_new\"}", name);
+    char *first = cbm_mcp_handle_tool(srv, "search_graph", args); /* opens v1; it goes */
+    ASSERT_FALSE(cbm_file_exists(db));
+    ASSERT_EQ(cbm_rename_replace(v2, db), 0); /* the re-dump lands */
+    char *second = cbm_mcp_handle_tool(srv, "search_graph", args);
+    cbm_mcp_test_store_open_hook(NULL, NULL);
+    cbm_mcp_server_free(srv);
+    ASSERT_EQ(r.fired >= 1, true);
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    bool served_new = strstr(second, "\"beta_new\"") != NULL;
+    free(first);
+    free(second);
+    free(name);
+    ce_teardown(&e);
+    ASSERT_TRUE(served_new);
+    PASS();
+#endif
+}
+
 /* ── The server's background sweep ─────────────────────────────── */
 
 /* Enable automatic sweeps (test_main turns them off for the whole run) and
@@ -3458,6 +3527,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_busy_reader_gate_refuses_open);
     RUN_TEST(cache_reader_gate_refuses_replaced_file);
     RUN_TEST(cache_store_generation_follows_opened_file);
+    RUN_TEST(cache_store_generation_file_gone_after_open);
     RUN_TEST(cache_server_initialize_runs_sweep);
     RUN_TEST(cache_server_sweep_keeps_ancestor_index);
     RUN_TEST(cache_trash_restore_puts_wal_back_first);
