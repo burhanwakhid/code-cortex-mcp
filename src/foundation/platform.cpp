@@ -457,7 +457,7 @@ bool cbm_env_long_warn(const char *name, long min, long max, long *out, const ch
 /* ── Home directory (cross-platform) ──────────────────────────── */
 
 const char *cbm_get_home_dir(void) {
-    static char buf[CBM_SZ_1K];
+    static thread_local char buf[CBM_SZ_1K]; /* per thread: see cbm_resolve_cache_dir */
     char tmp[CBM_SZ_256] = "";
 
     cbm_safe_getenv("HOME", tmp, sizeof(tmp), NULL);
@@ -479,7 +479,7 @@ const char *cbm_get_home_dir(void) {
 /* ── App config directories (cross-platform) ─────────────────── */
 
 const char *cbm_app_config_dir(void) {
-    static char buf[CBM_SZ_1K];
+    static thread_local char buf[CBM_SZ_1K]; /* per thread: see cbm_resolve_cache_dir */
     char tmp[CBM_SZ_256] = "";
 #ifdef _WIN32
     cbm_safe_getenv("APPDATA", tmp, sizeof(tmp), NULL);
@@ -512,7 +512,7 @@ const char *cbm_app_config_dir(void) {
 
 const char *cbm_app_local_dir(void) {
 #ifdef _WIN32
-    static char buf[CBM_SZ_1K];
+    static thread_local char buf[CBM_SZ_1K]; /* per thread: see cbm_resolve_cache_dir */
     char tmp[CBM_SZ_256] = "";
     cbm_safe_getenv("LOCALAPPDATA", tmp, sizeof(tmp), NULL);
     if (tmp[0]) {
@@ -533,8 +533,14 @@ const char *cbm_app_local_dir(void) {
 
 /* ── Cache directory ─────────────────────────────────────────── */
 
+/* These path helpers return a buffer the caller only reads. It is per
+ * thread: the server resolves paths on its main, sweep and auto-index
+ * threads at once, and one shared buffer, rewritten by every call, handed a
+ * reader a half-written path ("unable to open database file", ENOENT, on
+ * _config.db -- a use left unrecorded). */
+
 const char *cbm_resolve_cache_dir(void) {
-    static char buf[CBM_SZ_1K];
+    static thread_local char buf[CBM_SZ_1K]; /* per thread: see cbm_resolve_cache_dir */
     char tmp[CBM_SZ_256] = "";
     cbm_safe_getenv("CBM_CACHE_DIR", tmp, sizeof(tmp), NULL);
     if (tmp[0]) {
