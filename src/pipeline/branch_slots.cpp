@@ -16,6 +16,7 @@
 #include "sqlite3.h"
 #include <yyjson/yyjson.h>
 
+#include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -283,25 +284,53 @@ bool cbm_branch_id_same(const cbm_branch_id_t *indexed, const cbm_branch_id_t *c
              strcmp(indexed->head_sha, current->head_sha) != 0);
 }
 
+/* Whether a file named name would be a Windows device: its part before the
+ * first '.' is CON, PRN, AUX, NUL, COM0-9 or LPT0-9 in any case ("con",
+ * "Nul.db.zst", "com1.x" all are). Checked on every platform, so a slot has
+ * one name wherever the cache is. */
+static bool windows_reserved_name(const char *name) {
+    size_t n = strcspn(name, ".");
+    if (n != 3 && n != 4) {
+        return false;
+    }
+    char base[5];
+    for (size_t i = 0; i < n; i++) {
+        base[i] = (char)tolower((unsigned char)name[i]);
+    }
+    base[n] = '\0';
+    if (n == 3) {
+        return strcmp(base, "con") == 0 || strcmp(base, "prn") == 0 ||
+               strcmp(base, "aux") == 0 || strcmp(base, "nul") == 0;
+    }
+    return (strncmp(base, "com", 3) == 0 || strncmp(base, "lpt", 3) == 0) &&
+           isdigit((unsigned char)base[3]);
+}
+
 /* The slot file name for slug: the slug itself when it is short enough to be
  * one path component with room for every suffix this module and SQLite add
  * ("<name>.db.tmp-journal", "<name>.db-wal", ...). A longer slug -- a long or
  * deeply nested branch name, which git allows -- becomes a prefix of it plus
  * '-' and 16 hex digits of the SHA-256 of the whole slug, so distinct slugs
- * keep distinct slots and the same slug always maps to the same file. */
+ * keep distinct slots and the same slug always maps to the same file. A slug
+ * that is a Windows device name gets '_' in front as well. */
 bool cbm_branch_slot_name(const char *slug, char *buf, size_t bufsz) {
     if (!slug || !buf || bufsz <= CBM_BRANCH_SLOT_NAME_MAX) {
         return false;
     }
     size_t len = strlen(slug);
-    if (len <= CBM_BRANCH_SLOT_NAME_MAX) {
+    bool reserved = windows_reserved_name(slug);
+    if (len <= CBM_BRANCH_SLOT_NAME_MAX && !reserved) {
         snprintf(buf, bufsz, "%s", slug);
         return true;
     }
     enum { HASH_HEX = 16, PREFIX = CBM_BRANCH_SLOT_NAME_MAX - HASH_HEX - 1 };
     char digest[CBM_SHA256_HEX_LEN + 1];
     cbm_sha256_hex(slug, len, digest);
-    snprintf(buf, bufsz, "%.*s-%.*s", (int)PREFIX, slug, (int)HASH_HEX, digest);
+    /* A device name ("con", "nul.x") is no file on Windows: '_' in front
+     * makes the part before the first '.' another word, and the hash keeps
+     * it apart from a branch really named "_con". */
+    snprintf(buf, bufsz, "%s%.*s-%.*s", reserved ? "_" : "", (int)(PREFIX - (reserved ? 1 : 0)),
+             slug, (int)HASH_HEX, digest);
     return true;
 }
 

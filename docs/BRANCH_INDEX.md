@@ -192,6 +192,9 @@ removed after that.
 - `<slot>` is the slug when it fits in 200 bytes. A longer slug becomes a prefix plus `-` and
   16 hex digits of the SHA-256 of the whole slug. The file name thus stays one path component
   with room for every suffix (`.db.unz.tmp-journal`), and distinct slugs keep distinct files.
+  A slug that Windows reads as a device (`con`, `prn`, `aux`, `nul`, `com0`-`com9`,
+  `lpt0`-`lpt9` before its first `.`, in any case, so also `Nul.feature`) gets `_` in front
+  and the same hash after (`_con-<hash>`), on every platform.
 - The `branches/` subdirectory keeps parked files out of every cache scan, which reads only
   top-level `*.db` files.
 

@@ -111,8 +111,10 @@ enum {
 
 /* The slot file stem for slug (cbm_branch_slots_list reports these): the slug
  * itself up to CBM_BRANCH_SLOT_NAME_MAX bytes, else a prefix of it plus '-'
- * and 16 hex digits of the SHA-256 of the whole slug. bufsz must exceed
- * CBM_BRANCH_SLOT_NAME_MAX. */
+ * and 16 hex digits of the SHA-256 of the whole slug. A slug that would name a
+ * Windows device (CON, PRN, AUX, NUL, COM0-9, LPT0-9 before its first '.', any
+ * case) gets '_' in front and the hash after, on every platform. bufsz must
+ * exceed CBM_BRANCH_SLOT_NAME_MAX. */
 bool cbm_branch_slot_name(const char *slug, char *buf, size_t bufsz);
 
 /* The identity recorded on project's Branch node: its properties, or for a

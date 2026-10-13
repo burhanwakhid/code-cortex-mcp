@@ -1972,6 +1972,49 @@ TEST(branch_long_slug_slot_names) {
     PASS();
 }
 
+/* A slug that is a Windows device name (in any case, also with an
+ * extension) never names a slot file as it is: the file would be the device.
+ * The mangled name is a real file in the slot directory, distinct per slug;
+ * other names are left alone. */
+TEST(branch_slot_name_avoids_windows_devices) {
+    const char *reserved[] = {"con",  "CON", "Nul",   "aux",     "prn.x", "com1",
+                              "COM9", "lpt1", "lpt9.db", "con.feature"};
+    const char *plain[] = {"main", "console", "com10", "con-x", "lpt", "nul_", "auxiliary"};
+    char *dir = th_mktempdir("cbm_bi_dev");
+    ASSERT_NOT_NULL(dir);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", dir);
+    char names[10][CBM_BRANCH_SLOT_NAME_MAX + 1];
+    for (int i = 0; i < 10; i++) {
+        ASSERT_TRUE(cbm_branch_slot_name(reserved[i], names[i], sizeof(names[i])));
+        ASSERT_EQ(names[i][0], '_');
+        ASSERT_STR_NEQ(names[i], reserved[i]);
+        for (int k = 0; k < i; k++) {
+            ASSERT_STR_NEQ(names[i], names[k]);
+        }
+        char path[600];
+        snprintf(path, sizeof(path), "%s/%s.db.zst", saved, names[i]);
+        ASSERT_EQ(th_write_file(path, "slot"), 0);
+        ASSERT_TRUE(cbm_is_regular_file(path));
+    }
+    int files = 0;
+    cbm_dir_t *d = cbm_opendir(saved);
+    ASSERT_NOT_NULL(d);
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        files += !ent->is_dir && ent->name[0] == '_';
+    }
+    cbm_closedir(d);
+    ASSERT_EQ(files, 10); /* ten files, none of them a device */
+    for (const char *p : plain) {
+        char name[CBM_BRANCH_SLOT_NAME_MAX + 1];
+        ASSERT_TRUE(cbm_branch_slot_name(p, name, sizeof(name)));
+        ASSERT_STR_EQ(name, p);
+    }
+    th_rmtree(saved);
+    PASS();
+}
+
 /* Branches with ~300- and ~900-byte names (the longest this host's git can
  * create: a loose ref path must fit PATH_MAX) park, restore and repeat like
  * any other: a repeat run is not a switch, and the slot file is bounded. */
@@ -3736,6 +3779,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_restore_reexports_artifact);
     RUN_TEST(branch_index_prompt_counts_parked_only_cache);
     RUN_TEST(branch_long_slug_slot_names);
+    RUN_TEST(branch_slot_name_avoids_windows_devices);
     RUN_TEST(branch_long_names_park_and_restore);
 #ifndef _WIN32
     RUN_TEST(branch_requested_export_failure_fails_run);
