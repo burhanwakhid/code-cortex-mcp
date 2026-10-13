@@ -58,9 +58,12 @@ missing or uncertain (`root_state`):
   directories, a Windows drive root). An external disk that is not mounted looks like this. An
   uncertain root never counts.
 
-A root must be missing on 3 sweeps, and the first of those must be at least 7 days old. Sweeps
-run at most once a day, so the 3 sweeps are at least 2 days apart, and a single bad moment (a
-remount, a checkout that is moved and moved back) does not count 3 times. The database must also
+A root must be missing on 3 sweeps, and the first of those must be at least 7 days old.
+Automatic sweeps run at most once a day, so their 3 sweeps are at least 2 days apart, and a
+single bad moment (a remount, a checkout that is moved and moved back) does not count 3 times.
+A manual `cache expire` is not held to the interval: three of them in a row count 3 missing
+sweeps within seconds. The 7 days from the first missing sweep still have to pass, so a
+checkout that comes back within them is kept. The database must also
 be unused for the same 7 days: a project that someone queries by name after its checkout moved
 stays.
 
@@ -328,7 +331,10 @@ code-cortex-mcp cache restore <project>  # put the newest trashed database of <p
 
 `--dry-run` decides with the same rules and writes nothing: no removal, no usage rows, no
 missing streaks, no sweep time — not even a cache directory, `_config.db` or its tables when
-they do not exist yet. A project the real sweep would skip (its index lease held, a reader on
+they do not exist yet. "Nothing" means no content: its SQLite connections are read-only, but
+SQLite still maps each WAL database's `-shm` index for a read and can update its mtime (or
+create it when it is missing). Opening without the shared-memory index (`immutable=1`) is not
+safe on a database that a live process may be writing. A project the real sweep would skip (its index lease held, a reader on
 its gate, a read transaction open, used since the scan, root present again) is shown kept with
 that reason, not as removable. "Used since the scan" compares the stored row with the one the
 scan read, since the preview writes no streak of its own: a missing root past its streak and
