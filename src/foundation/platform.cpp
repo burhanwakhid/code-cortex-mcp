@@ -686,17 +686,25 @@ bool cbm_root_normalize(const char *in, bool fold_case, char *out, size_t out_sz
         return false;
     }
     for (size_t i = 0; i <= n; i++) {
+#ifdef _WIN32
         char c = in[i] == '\\' ? '/' : in[i];
+#else
+        char c = in[i]; /* POSIX: a backslash is a filename character */
+#endif
         work[i] = fold_case ? (char)tolower((unsigned char)c) : c;
     }
 #ifdef _WIN32
     free(folded);
 #endif
-    /* Prefix: a drive ("c:"), a UNC share ("//"), or a POSIX root ("/");
-     * none for a relative path. The drive letter's case never matters. */
+    /* Prefix: on Windows a drive ("c:", its letter's case never matters) or
+     * a UNC share ("//"); a root ("/"); none for a relative path. POSIX has
+     * neither drives nor shares -- "C:/repo" is a relative path and "//x"
+     * is "/x" -- so those rules stay Windows-only, or distinct POSIX paths
+     * would fold into one checkout. */
     size_t o = 0;
     const char *p = work;
     bool absolute = false;
+#ifdef _WIN32
     if (isalpha((unsigned char)p[0]) && p[1] == ':') {
         if (o + 2 >= out_sz) {
             free(work);
@@ -710,6 +718,7 @@ bool cbm_root_normalize(const char *in, bool fold_case, char *out, size_t out_sz
         out[o++] = '/';
         p++;
     }
+#endif
     if (p[0] == '/') {
         absolute = true;
     }
@@ -895,6 +904,13 @@ bool cbm_root_canonical(const char *root, char *out, size_t out_sz) {
      * opened as "." would share one slot key otherwise. */
     char lex[CBM_ROOT_MAX];
     char real[PATH_MAX];
+    /* The path as given first, where it exists: the filesystem applies ".."
+     * after following a symlink ("a/link/../repo" with link -> other/sub is
+     * other/repo), and folding ".." lexically first named another checkout.
+     * The lexical form only for a path that does not resolve as given. */
+    if (realpath(root, real)) {
+        return cbm_root_normalize(real, false, out, out_sz);
+    }
     if (!cbm_root_normalize(root, false, lex, sizeof(lex))) {
         return false;
     }
@@ -968,6 +984,15 @@ bool cbm_root_matches(const char *recorded, const char *dir) {
     if (ida && idb) {
         return sa == sb && ha == hb && la == lb;
     }
+#else
+    /* Both exist: device and inode decide, before any spelling is folded.
+     * The filesystem applies ".." after following a symlink, so a lexical
+     * fold ("a/link/../repo" -> "a/repo") could name another checkout. */
+    struct stat ia;
+    struct stat ib;
+    if (stat(recorded, &ia) == 0 && stat(dir, &ib) == 0) {
+        return ia.st_dev == ib.st_dev && ia.st_ino == ib.st_ino;
+    }
 #endif
     if (cbm_root_normalize(recorded, fold, a, sizeof(a)) &&
         cbm_root_normalize(dir, fold, b, sizeof(b)) && strcmp(a, b) == 0) {
@@ -977,14 +1002,5 @@ bool cbm_root_matches(const char *recorded, const char *dir) {
         strcmp(a, b) == 0) {
         return true;
     }
-#ifdef _WIN32
     return false; /* one of them is gone and they spell differently */
-#else
-    /* A case-insensitive volume: two spellings of one directory realpath to
-     * different strings, but are one inode. */
-    struct stat sa;
-    struct stat sb;
-    return stat(recorded, &sa) == 0 && stat(dir, &sb) == 0 && sa.st_dev == sb.st_dev &&
-           sa.st_ino == sb.st_ino;
-#endif
 }

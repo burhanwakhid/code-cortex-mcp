@@ -1029,6 +1029,27 @@ TEST(platform_root_key_survives_removed_checkout) {
     ASSERT_TRUE(cbm_branch_root_key("rel-repo", gone, sizeof(gone)));
     ASSERT_EQ(chdir(old_cwd), 0);
     ASSERT_STR_EQ(live, gone);
+
+    /* ".." after a symlink is applied after following it, as the
+     * filesystem does: base/real/hop -> base/other/sub, so
+     * base/real/hop/../repo is base/other/repo, not base/real/repo. */
+    char other_sub[600];
+    char other_repo[600];
+    char real_repo[600];
+    char hop[600];
+    snprintf(other_sub, sizeof(other_sub), "%s/other/sub", base);
+    snprintf(other_repo, sizeof(other_repo), "%s/other/repo", base);
+    snprintf(real_repo, sizeof(real_repo), "%s/repo", real_dir);
+    snprintf(hop, sizeof(hop), "%s/hop", real_dir);
+    ASSERT_TRUE(cbm_mkdir_p(other_sub, 0755));
+    ASSERT_TRUE(cbm_mkdir_p(other_repo, 0755));
+    ASSERT_TRUE(cbm_mkdir_p(real_repo, 0755));
+    ASSERT_EQ(symlink(other_sub, hop), 0);
+    char via[700];
+    snprintf(via, sizeof(via), "%s/../repo", hop);
+    ASSERT_TRUE(cbm_root_matches(via, other_repo));
+    ASSERT_FALSE(cbm_root_matches(via, real_repo));
+    (void)unlink(hop);
     (void)unlink(link_dir);
     th_rmtree(base);
 #endif

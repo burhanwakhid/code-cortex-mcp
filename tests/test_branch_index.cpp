@@ -2489,6 +2489,7 @@ TEST(branch_delete_project_keeps_other_roots) {
  * checked on every platform; the comparison and the slot key build on it. */
 TEST(branch_root_normalize_and_key) {
     char out[256];
+#ifdef _WIN32
     ASSERT_TRUE(cbm_root_normalize("C:\\Users\\Me\\repo\\", true, out, sizeof(out)));
     ASSERT_STR_EQ(out, "c:/users/me/repo");
     ASSERT_TRUE(cbm_root_normalize("c:/Users/Me/./x/../repo", true, out, sizeof(out)));
@@ -2497,6 +2498,16 @@ TEST(branch_root_normalize_and_key) {
     ASSERT_STR_EQ(out, "c:/");
     ASSERT_TRUE(cbm_root_normalize("\\\\srv\\share\\x\\", true, out, sizeof(out)));
     ASSERT_STR_EQ(out, "//srv/share/x");
+#else
+    /* POSIX has no drives, shares or backslash separators: distinct paths
+     * stay distinct. */
+    ASSERT_TRUE(cbm_root_normalize("/tmp/a\\b/repo", false, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "/tmp/a\\b/repo");
+    ASSERT_TRUE(cbm_root_normalize("C:/Repo", false, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "C:/Repo");
+    ASSERT_TRUE(cbm_root_normalize("//x/y", false, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "/x/y");
+#endif
     ASSERT_TRUE(cbm_root_normalize("/a/./b//../c/", false, out, sizeof(out)));
     ASSERT_STR_EQ(out, "/a/c");
     ASSERT_TRUE(cbm_root_normalize("/..", false, out, sizeof(out)));
