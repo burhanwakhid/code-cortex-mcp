@@ -12926,6 +12926,36 @@ static void detect_session(cbm_mcp_server_t *srv) {
             snprintf(srv->session_project, sizeof(srv->session_project), "%s", pname);
             free(pname);
         }
+        /* A session started in a subdirectory of an indexed checkout belongs
+         * to that project, as the tool calls' cwd resolution and the sweep's
+         * exemption already say. The name derived from cwd itself names no
+         * database: the watcher and the startup branch check would look for
+         * it and find nothing, and with auto_index on the subdirectory would
+         * be indexed as a second project. Take the project the walk-up finds
+         * and the root it records; with nothing indexed, the cwd stays the
+         * session root. Only a project named after its root: the watcher
+         * re-indexes by root path, which derives the name, so watching a
+         * custom-named index would build a second database under that name. */
+        const char *indexed = cwd_project_name();
+        if (indexed && indexed[0]) {
+            char db_path[CBM_SZ_1K];
+            project_db_path(indexed, db_path, sizeof(db_path));
+            cbm_store_t *store = db_path[0] ? cbm_store_open_path_query(db_path) : NULL;
+            cbm_project_t proj = {0};
+            char *derived = NULL;
+            if (store && cbm_store_get_project(store, indexed, &proj) == CBM_STORE_OK &&
+                proj.root_path && proj.root_path[0] &&
+                strlen(proj.root_path) < sizeof(srv->session_root) &&
+                (derived = cbm_project_name_from_path(proj.root_path)) != NULL &&
+                strcmp(derived, indexed) == 0) {
+                snprintf(srv->session_project, sizeof(srv->session_project), "%s", indexed);
+                snprintf(srv->session_root, sizeof(srv->session_root), "%s", proj.root_path);
+                cbm_log_info("session.root.indexed", "project", indexed, "path", proj.root_path);
+            }
+            free(derived);
+            cbm_project_free_fields(&proj);
+            cbm_store_close(store);
+        }
     }
 }
 

@@ -6196,6 +6196,107 @@ TEST(tool_project_resolves_from_cwd) {
 #endif
 }
 
+#ifndef _WIN32
+#include <cli/cli.h>
+#include <watcher/watcher.h>
+
+/* A server started in a subdirectory of an indexed checkout takes that
+ * project as its session: the watcher registers it under its root, and with
+ * auto_index on the subdirectory is not indexed as a second project. */
+TEST(session_in_subdirectory_uses_indexed_ancestor) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm_subdir_cache_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    char made[256];
+    snprintf(made, sizeof(made), "/tmp/cbm_subdir_repo_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(made));
+    char *repo = realpath(made, NULL); /* the canonical root index_repository records */
+    ASSERT_NOT_NULL(repo);
+    char sub[512];
+    snprintf(sub, sizeof(sub), "%s/src", repo);
+    ASSERT_TRUE(cbm_mkdir_p(sub, 0755));
+    char src_file[600];
+    snprintf(src_file, sizeof(src_file), "%s/a.py", sub);
+    ASSERT_EQ(th_write_file(src_file, "def sub_fn():\n    return 1\n"), 0);
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    const char *saved_upd = getenv("CBM_UPDATE_CHECK");
+    char *saved_upd_copy = saved_upd ? strdup(saved_upd) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_UPDATE_CHECK", "0", 1);
+
+    char *pname = cbm_project_name_from_path(repo);
+    char *sub_name = cbm_project_name_from_path(sub);
+    ASSERT_NOT_NULL(pname);
+    ASSERT_NOT_NULL(sub_name);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, pname);
+    cbm_store_t *st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+    cbm_store_upsert_project(st, pname, repo);
+    cbm_store_close(st);
+    char sub_db[512];
+    snprintf(sub_db, sizeof(sub_db), "%s/%s.db", cache, sub_name);
+
+    cbm_config_t *cfg = cbm_config_open(cache);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true"), 0);
+
+    char old_cwd[1024];
+    ASSERT_NOT_NULL(getcwd(old_cwd, sizeof(old_cwd)));
+    ASSERT_EQ(chdir(sub), 0);
+    cbm_mcp_reset_cwd_project_cache();
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    cbm_mcp_server_set_watcher(srv, w);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{"
+             "\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},"
+             "\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    cbm_mcp_server_join_threads(srv); /* an auto-index, had one started */
+    bool watched = cbm_watcher_is_watched(w, pname);
+    int watch_count = cbm_watcher_watch_count(w);
+    bool second_db = cbm_file_exists(sub_db);
+    cbm_mcp_server_set_watcher(srv, NULL);
+    cbm_mcp_server_set_config(srv, NULL);
+    cbm_mcp_server_free(srv);
+    cbm_watcher_free(w);
+    cbm_config_close(cfg);
+
+    ASSERT_EQ(chdir(old_cwd), 0);
+    cbm_mcp_reset_cwd_project_cache();
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_upd_copy) {
+        cbm_setenv("CBM_UPDATE_CHECK", saved_upd_copy, 1);
+        free(saved_upd_copy);
+    } else {
+        cbm_unsetenv("CBM_UPDATE_CHECK");
+    }
+    th_rmtree(cache);
+    th_rmtree(repo);
+    free(repo);
+    free(pname);
+    free(sub_name);
+
+    ASSERT_TRUE(watched);
+    ASSERT_EQ(watch_count, 1);
+    ASSERT_FALSE(second_db);
+    PASS();
+}
+#endif
+
+
 TEST(hook_edit_impact_note) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -8312,6 +8413,9 @@ SUITE(mcp) {
     RUN_TEST(tool_inspect_symbol_ambiguous_returns_suggestions);
     RUN_TEST(tool_search_code_max_bytes_truncates_with_continuation);
     RUN_TEST(tool_project_resolves_from_cwd);
+#ifndef _WIN32
+    RUN_TEST(session_in_subdirectory_uses_indexed_ancestor);
+#endif
     RUN_TEST(hook_edit_impact_note);
     /* #518/#519 — BM25 prose search */
     RUN_TEST(bm25_finds_section_by_its_prose_issue518);
