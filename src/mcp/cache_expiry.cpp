@@ -25,6 +25,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 /* CE_BUSY_MS bounds a wait in the sweep's own reads and probes. A use
@@ -924,6 +925,10 @@ const char *cbm_cache_expiry_kind_str(cbm_cache_expiry_kind_t kind) {
 typedef struct {
     const cbm_cache_sweep_opts_t *opts;
     cbm_cache_sweep_result_t *res;
+    /* Projects a dry run reported as removed: their parked slots are in
+     * the project's bytes already, as the real sweep moves them with it,
+     * so the slot pass does not report them again. */
+    std::unordered_set<std::string> previewed;
 } sweep_ctx_t;
 
 static void report(sweep_ctx_t *c, cbm_cache_expiry_kind_t kind, const std::string &name,
@@ -1202,6 +1207,7 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
         report(c, kind, label(e), e.path, bytes, reason, false, NULL);
         c->res->projects++;
         c->res->bytes += bytes;
+        c->previewed.insert(e.name);
         return;
     }
     int parked = 0;
@@ -1263,7 +1269,7 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
     if (!opts) {
         opts = &none;
     }
-    sweep_ctx_t c = {opts, res};
+    sweep_ctx_t c = {opts, res, {}};
     int64_t now = opts->now > 0 ? opts->now : (int64_t)time(NULL);
 
     /* Refuse to judge a cache directory that does not look like this user's:
@@ -1529,7 +1535,7 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
     int64_t scratch_before = cfg->scratch_s > 0 ? now - cfg->scratch_s : 0;
     for (const auto &p : pdirs) {
         std::string dbp = std::string(cdir) + "/" + p + ".db";
-        if (kept(opts, p.c_str())) {
+        if (kept(opts, p.c_str()) || c.previewed.count(p)) {
             continue;
         }
         cbm_db_lease_t *lease = NULL;

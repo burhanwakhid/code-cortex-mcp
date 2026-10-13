@@ -1109,6 +1109,43 @@ TEST(cache_dry_run_leaves_memo_schema) {
     PASS();
 }
 
+/* A project due for removal takes its parked slots with it: the preview
+ * counts them once, in the project's bytes, as the real sweep does -- not
+ * again as old slots of their own. */
+TEST(cache_dry_run_counts_project_slots_once) {
+#ifndef _WIN32
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_dryslots"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "old", root, db, sizeof(db));
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 200 * CE_DAY, NULL));
+    char sdir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(db, "old", root, sdir, sizeof(sdir)));
+    ASSERT_TRUE(cbm_mkdir_p(sdir, 0755));
+    char slot[1300];
+    snprintf(slot, sizeof(slot), "%s/feature.db.zst", sdir);
+    ASSERT_EQ(th_write_file(slot, "a parked slot, aged past the slot expiry"), 0);
+    ce_age(slot, now - 60 * CE_DAY);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t dry;
+    ASSERT_EQ(ce_sweep(&cfg, now, true, &dry), 0);
+    ASSERT_EQ(dry.projects, 1);
+    ASSERT_EQ(dry.slots, 0);
+    cbm_cache_sweep_result_t real;
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &real), 0);
+    ASSERT_EQ(real.projects, 1);
+    ASSERT_EQ(real.slots, 0);
+    ASSERT_EQ(dry.bytes, real.bytes);
+    ce_teardown(&e);
+#endif
+    PASS();
+}
+
 /* A dry run previews a missing root past its streak and grace as due, as
  * the real sweep then removes it -- not as "used since the scan" because
  * the preview's streak increment was never written. */
@@ -3248,6 +3285,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_dry_run_changes_nothing);
     RUN_TEST(cache_dry_run_reports_root_gone_due);
     RUN_TEST(cache_dry_run_leaves_memo_schema);
+    RUN_TEST(cache_dry_run_counts_project_slots_once);
     RUN_TEST(cache_dry_run_applies_safety_checks_and_creates_nothing);
     RUN_TEST(cache_trash_restore_and_purge);
     RUN_TEST(cache_trash_purge_skips_leased_project);

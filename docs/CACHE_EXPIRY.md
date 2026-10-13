@@ -332,7 +332,9 @@ they do not exist yet. A project the real sweep would skip (its index lease held
 its gate, a read transaction open, used since the scan, root present again) is shown kept with
 that reason, not as removable. "Used since the scan" compares the stored row with the one the
 scan read, since the preview writes no streak of its own: a missing root past its streak and
-grace is shown as due, as the real sweep then removes it. A preview probes the index lease and the reader gate without creating or
+grace is shown as due, as the real sweep then removes it. The parked slots of a project shown
+as removed are counted once, in its size, and not listed again as old slots: the real sweep
+moves them with the project. A preview probes the index lease and the reader gate without creating or
 holding their lock files, and does not run the quiescence check (a checkpoint, which writes).
 It opens `_config.db` read-only, for the usage rows and for the `store_meta` memo
 (`cbm_store_meta_open_readonly`): the ordinary memo open replaces a v1 memo table and creates
