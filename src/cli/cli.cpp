@@ -3655,14 +3655,19 @@ static void cache_report(const cbm_cache_expiry_item_t *it, void *ud) {
            it->skipped ? " [" : "", it->skipped ? it->skipped : "", it->skipped ? "]" : "");
 }
 
+static void cache_usage(FILE *out) {
+    (void)fprintf(out,
+                  "Usage: code-cortex-mcp cache <command>\n\n"
+                  "Commands:\n"
+                  "  expire [--dry-run [--now EPOCH]]  Move stale indexes to the trash, drop old\n"
+                  "                                    parked branches and orphan files\n"
+                  "  trash                             List trashed indexes\n"
+                  "  restore <entry|project>           Put a trashed index back\n");
+}
+
 int cbm_cmd_cache(int argc, char **argv) {
     if (argc < 1 || !argv) {
-        printf("Usage: code-cortex-mcp cache <command>\n\n"
-               "Commands:\n"
-               "  expire [--dry-run [--now EPOCH]]  Move stale indexes to the trash, drop old\n"
-               "                                    parked branches and orphan files\n"
-               "  trash                             List trashed indexes\n"
-               "  restore <entry|project>           Put a trashed index back\n");
+        cache_usage(stdout);
         return 0;
     }
     if (strcmp(argv[0], "expire") == 0) {
@@ -3672,7 +3677,18 @@ int cbm_cmd_cache(int argc, char **argv) {
             if (strcmp(argv[i], "--dry-run") == 0 || strcmp(argv[i], "-n") == 0) {
                 dry = true;
             } else if (strcmp(argv[i], "--now") == 0 && i + 1 < argc) {
-                now = strtoll(argv[++i], NULL, 10);
+                /* The whole argument must be a positive epoch: strtoll stops
+                 * at the first non-digit, and "abc" (0) silently previewed at
+                 * the real time. */
+                const char *arg = argv[++i];
+                char *end = NULL;
+                errno = 0;
+                long long v = strtoll(arg, &end, 10);
+                if (!arg[0] || !end || *end != '\0' || errno != 0 || v <= 0) {
+                    (void)fprintf(stderr, "--now needs a positive epoch in seconds: %s\n", arg);
+                    return CLI_TRUE;
+                }
+                now = (int64_t)v;
             } else {
                 (void)fprintf(stderr, "unknown option: %s\n", argv[i]);
                 return CLI_TRUE;
@@ -3689,6 +3705,17 @@ int cbm_cmd_cache(int argc, char **argv) {
         if (dry && (!cdir0 || !cbm_is_dir(cdir0))) {
             printf("Cache expiry preview: no cache directory yet, nothing to sweep\n");
             return 0; /* a preview creates nothing, the cache included */
+        }
+        /* A cache with no _config.db is one the sweep refuses to judge (a
+         * fresh or foreign directory), so there is nothing it would do: the
+         * preview says so and succeeds, and creates nothing. */
+        if (dry) {
+            char cfgdb[CLI_BUF_1K];
+            int n = snprintf(cfgdb, sizeof(cfgdb), "%s/_config.db", cdir0);
+            if (n > 0 && (size_t)n < sizeof(cfgdb) && !cbm_file_exists(cfgdb)) {
+                printf("Cache expiry preview: %s has no _config.db, nothing to sweep\n", cdir0);
+                return 0;
+            }
         }
         cbm_cache_expiry_cfg_t cfg;
         cbm_cache_expiry_cfg_load(&cfg, NULL);
@@ -3722,7 +3749,12 @@ int cbm_cmd_cache(int argc, char **argv) {
         }
         return 0;
     }
-    if (strcmp(argv[0], "restore") == 0 && argc >= 2) {
+    if (strcmp(argv[0], "restore") == 0 && argc < 2) {
+        (void)fprintf(stderr, "cache restore needs a trash entry or project name\n\n");
+        cache_usage(stderr);
+        return CLI_TRUE;
+    }
+    if (strcmp(argv[0], "restore") == 0) {
         char msg[CLI_BUF_1K];
         int rc = cbm_cache_trash_restore(argv[1], msg, sizeof(msg));
         (void)fprintf(rc == 0 ? stdout : stderr, "%s\n", msg);

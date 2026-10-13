@@ -4567,6 +4567,91 @@ TEST(cli_index_enumeration_skips_internal_cache_dbs) {
     PASS();
 }
 
+/* cbm_cmd_cache with stderr captured into err (truncated to n-1). */
+static int cli_cache_capture(int argc, char **argv, char *err, size_t n) {
+    err[0] = '\0';
+    char path[512];
+    char *dir = th_mktempdir("cbm_cli_cache_err");
+    if (!dir) {
+        return -100;
+    }
+    char dir_copy[256];
+    snprintf(dir_copy, sizeof(dir_copy), "%s", dir);
+    snprintf(path, sizeof(path), "%s/stderr.txt", dir_copy);
+    FILE *f = fopen(path, "wb+");
+    if (!f) {
+        th_rmtree(dir_copy);
+        return -100;
+    }
+    fflush(stderr);
+    int saved = dup(2);
+    dup2(fileno(f), 2);
+    int rc = cbm_cmd_cache(argc, argv);
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    rewind(f);
+    size_t got = fread(err, 1, n - 1, f);
+    err[got] = '\0';
+    fclose(f);
+    th_rmtree(dir_copy);
+    return rc;
+}
+
+/* `cache` argument checks: --now takes a whole positive epoch (not "abc",
+ * which used to preview at the real time), `restore` without an argument
+ * prints usage (not "unknown cache command"), and a preview of a cache with
+ * no _config.db finds nothing to sweep, succeeds and creates nothing. */
+TEST(cli_cache_argument_checks) {
+    char *made = th_mktempdir("cbm_cli_cache_args");
+    ASSERT_NOT_NULL(made);
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s", made);
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char a_expire[] = "expire";
+    char a_dry[] = "--dry-run";
+    char a_now[] = "--now";
+    char a_abc[] = "abc";
+    char a_partial[] = "12x";
+    char a_restore[] = "restore";
+    char err[2048];
+
+    char *bad_now[] = {a_expire, a_dry, a_now, a_abc};
+    int rc_abc = cli_cache_capture(4, bad_now, err, sizeof(err));
+    bool abc_named = strstr(err, "--now") != NULL;
+    char *partial_now[] = {a_expire, a_dry, a_now, a_partial};
+    int rc_partial = cli_cache_capture(4, partial_now, err, sizeof(err));
+
+    char *restore[] = {a_restore};
+    int rc_restore = cli_cache_capture(1, restore, err, sizeof(err));
+    bool restore_usage = strstr(err, "Usage:") != NULL && strstr(err, "unknown") == NULL;
+
+    char *preview[] = {a_expire, a_dry};
+    int rc_preview = cli_cache_capture(2, preview, err, sizeof(err));
+    char cfgdb[512];
+    snprintf(cfgdb, sizeof(cfgdb), "%s/_config.db", cache);
+    bool created = cbm_file_exists(cfgdb);
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(cache);
+    ASSERT_NEQ(rc_abc, 0);
+    ASSERT_TRUE(abc_named);
+    ASSERT_NEQ(rc_partial, 0);
+    ASSERT_NEQ(rc_restore, 0);
+    ASSERT_TRUE(restore_usage);
+    ASSERT_EQ(rc_preview, 0);
+    ASSERT_FALSE(created);
+    PASS();
+}
+
 TEST(cli_remove_indexes_respects_lease) {
     char root[256] = "/tmp/cbm_cleanup_lease_XXXXXX";
     ASSERT(cbm_mkdtemp(root));
@@ -4812,6 +4897,7 @@ SUITE(cli) {
     RUN_TEST(cli_uninstall_help_changes_nothing);
     RUN_TEST(cli_stdin_gate_schema_shapes);
     RUN_TEST(cli_stdin_kind_classifies_file_and_pipe);
+    RUN_TEST(cli_cache_argument_checks);
     RUN_TEST(cli_build_args_json_array_flag_accepts_json_literal);
     RUN_TEST(cli_build_args_json_array_flag_checks_item_type);
     RUN_TEST(cli_sha256_matches_fips_vectors);
