@@ -16,6 +16,7 @@
 #include <sqlite3.h>
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -423,8 +424,14 @@ static int cfg_parse_int(const std::string &v, bool found, int def) {
         return def;
     }
     char *end = NULL;
-    long n = strtol(v.c_str(), &end, 10);
-    return end && *end == '\0' ? (int)n : def;
+    errno = 0;
+    long long n = strtoll(v.c_str(), &end, 10);
+    /* Out of int's range is the default, never a wrapped value: 4294967297
+     * days narrowed to 1 and expired everything after a day. */
+    if (!end || *end != '\0' || errno == ERANGE || n < INT_MIN || n > INT_MAX) {
+        return def;
+    }
+    return (int)n;
 }
 
 static void cfg_load_read_only(cbm_cache_expiry_cfg_t *out) {

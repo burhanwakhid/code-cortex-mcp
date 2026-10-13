@@ -1001,6 +1001,20 @@ TEST(cache_dry_run_reads_settings_read_only) {
     cbm_cache_expiry_cfg_t cfg;
     cbm_cache_expiry_cfg_load(&cfg, NULL);
     ASSERT_EQ(cfg.unused_s, 3 * (int64_t)CE_DAY);
+    /* Out of int's range: the default, not a wrapped 1 day. */
+    ASSERT_EQ(sqlite3_open(cp, &h), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(h,
+                           "INSERT OR REPLACE INTO config(key, value) "
+                           "VALUES('cache_expiry_unused_days', '4294967297');",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(h);
+    cbm_cache_expiry_cfg_load(&cfg, NULL);
+    ASSERT_EQ(cfg.unused_s, (int64_t)CBM_CACHE_EXPIRY_UNUSED_DAYS * CE_DAY);
+    cbm_config_t *cc = cbm_config_open(e.cache);
+    ASSERT_NOT_NULL(cc);
+    ASSERT_EQ(cbm_config_get_int(cc, "cache_expiry_unused_days", 90), 90);
+    cbm_config_close(cc);
     /* A _config.db without the config table: the preview leaves it so. */
     char other[700];
     snprintf(other, sizeof(other), "%s/bare", e.base);

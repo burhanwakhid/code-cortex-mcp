@@ -3615,8 +3615,11 @@ int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val) {
         return default_val;
     }
     char *endptr;
-    long v = strtol(val, &endptr, CLI_STRTOL_BASE);
-    if (endptr == val || *endptr != '\0') {
+    errno = 0;
+    long long v = strtoll(val, &endptr, CLI_STRTOL_BASE);
+    /* Out of int's range is the default, never a wrapped value (a retention
+     * of 4294967297 days narrowed to 1). */
+    if (endptr == val || *endptr != '\0' || errno == ERANGE || v < INT_MIN || v > INT_MAX) {
         return default_val;
     }
     return (int)v;
