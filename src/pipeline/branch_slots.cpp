@@ -1072,6 +1072,13 @@ static bool adopt_legacy_slot(const char *db_path, const char *project, const ch
         !cbm_file_exists(legacy)) {
         return false;
     }
+    /* A link in a legacy slot's place is no slot: adopted, it would be
+     * renamed into the root's directory, and the restore's ADR carry would
+     * write into whatever it points at (slot_present refuses the same). */
+    if (cbm_is_link(legacy)) {
+        cbm_log_warn("branch.slot_link", "path", legacy);
+        return false;
+    }
     cbm_store_t *s = cbm_store_open_path_query(legacy);
     cbm_project_t proj = {0};
     bool mine = s && cbm_store_get_project(s, project, &proj) == CBM_STORE_OK && proj.root_path &&

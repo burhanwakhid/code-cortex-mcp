@@ -2419,6 +2419,58 @@ TEST(branch_legacy_slot_adopted) {
     PASS();
 }
 
+/* A symlink in a legacy slot's place is not adopted: it stays where it is,
+ * nothing is restored from it, and the restore's ADR carry never writes into
+ * the database it points at. */
+TEST(branch_legacy_slot_link_not_adopted) {
+#ifndef _WIN32
+    char *repo = bi_make_repo("cbm_bi_legacy_link");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    ASSERT_EQ(bi_index(repo, -1).rc, 0); /* main parked (namespaced) */
+
+    char db[1024];
+    char ns[1100];
+    char flat[1100];
+    char from[1300];
+    char link[1300];
+    char outside[600];
+    bi_db_path(db, sizeof(db));
+    ASSERT_TRUE(cbm_branch_slots_dir(db, g_bi_project, repo, ns, sizeof(ns)));
+    ASSERT_TRUE(cbm_branch_slots_dir(db, g_bi_project, NULL, flat, sizeof(flat)));
+    snprintf(from, sizeof(from), "%s/main.db.zst", ns);
+    snprintf(link, sizeof(link), "%s/main.db", flat);
+    char *odir = th_mktempdir("cbm_bi_outside");
+    ASSERT_NOT_NULL(odir);
+    char outdir[256];
+    snprintf(outdir, sizeof(outdir), "%s", odir);
+    snprintf(outside, sizeof(outside), "%s/outside.db", outdir);
+    ASSERT_TRUE(cbm_branch_slot_decompress(from, outside));
+    ASSERT_EQ(cbm_unlink(from), 0);
+    ASSERT_EQ(symlink(outside, link), 0);
+    ASSERT_EQ(bi_adr_put("LIVE-ADR"), CBM_STORE_OK); /* the carry would write it */
+
+    ASSERT_EQ(bi_git(repo, "checkout -q main"), 0);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_STR_NEQ(r.action, "restored");
+    ASSERT_TRUE(cbm_is_link(link)); /* left in place */
+    cbm_store_t *s = cbm_store_open_path_query(outside);
+    ASSERT_NOT_NULL(s);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(s, g_bi_project, &adr), CBM_STORE_NOT_FOUND);
+    cbm_store_close(s);
+    (void)cbm_unlink(link);
+    th_rmtree(outdir);
+    bi_cleanup(repo);
+#endif
+    PASS();
+}
+
 /* Index repo in `mode` into the default cache database. */
 static bi_run_t bi_index_mode(const char *repo, cbm_index_mode_t mode) {
     bi_run_t r = {CBM_NOT_FOUND, "", "", -1};
@@ -3788,6 +3840,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_delete_project_keeps_other_roots);
     RUN_TEST(branch_root_normalize_and_key);
     RUN_TEST(branch_legacy_slot_adopted);
+    RUN_TEST(branch_legacy_slot_link_not_adopted);
     RUN_TEST(branch_switch_purges_changed_mode_skipped_file);
     RUN_TEST(incremental_purges_stale_artifact_dir_rows);
     RUN_TEST(branch_foreign_live_db_same_identity_rebuilds);
