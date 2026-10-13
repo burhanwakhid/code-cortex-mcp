@@ -326,7 +326,18 @@ its gate, a read transaction open, used since the scan, root present again) is s
 that reason, not as removable. "Used since the scan" compares the stored row with the one the
 scan read, since the preview writes no streak of its own: a missing root past its streak and
 grace is shown as due, as the real sweep then removes it. A preview probes the index lease and the reader gate without creating or
-holding their lock files, and does not run the quiescence check (a checkpoint, which writes). It also lists the roots that are missing but still in their
+holding their lock files, and does not run the quiescence check (a checkpoint, which writes).
+It opens `_config.db` read-only, for the usage rows and for the `store_meta` memo
+(`cbm_store_meta_open_readonly`): the ordinary memo open replaces a v1 memo table and creates
+the current one, and a read-write connection can checkpoint as it closes.
+
+A probe takes the lock for an instant (`LOCK_EX|LOCK_NB`, then unlocks). A reader that asks
+for the reader gate in that instant waits (up to 2 s, polling) and does not notice. An index
+run that tries the index lease in that instant fails with "busy", exactly as it would against a
+real sweep that holds the lease: an `index_repository` call reports the project as being
+indexed and can be retried, the watcher and the auto-index defer and retry on their next
+poll. The window is one lock and unlock, and a non-blocking probe that does not conflict
+with a holder cannot exist with `flock`/`LockFileEx` alone, so this is accepted. It also lists the roots that are missing but still in their
 grace period (`watch`). `--now EPOCH` previews a sweep as of another time and is accepted only
 with `--dry-run`: a real sweep dates its trash entries and usage rows with its clock, so a past
 time would let the next sweep purge the trash at once and a future time would trash everything.

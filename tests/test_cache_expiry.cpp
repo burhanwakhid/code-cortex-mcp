@@ -1051,6 +1051,61 @@ TEST(cache_dry_run_changes_nothing) {
     PASS();
 }
 
+/* Whether _config.db of the test cache has table `name`. */
+static bool ce_config_has_table(const ce_env_t *e, const char *name) {
+    char p[700];
+    snprintf(p, sizeof(p), "%s/_config.db", e->cache);
+    sqlite3 *db = NULL;
+    bool has = false;
+    if (sqlite3_open_v2(p, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                               -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
+            has = sqlite3_step(st) == SQLITE_ROW;
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return has;
+}
+
+/* A dry run reads the store_meta memo without the ordinary open's schema
+ * upkeep: a v1 memo table is not dropped, the current one not created, and
+ * no usage table appears. The real sweep does both. */
+TEST(cache_dry_run_leaves_memo_schema) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_drymemo"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    ce_make_db(&e, "memo", root, db, sizeof(db));
+    char cfgp[700];
+    snprintf(cfgp, sizeof(cfgp), "%s/_config.db", e.cache);
+    sqlite3 *c = NULL;
+    ASSERT_EQ(sqlite3_open(cfgp, &c), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(c,
+                           "DROP TABLE IF EXISTS store_meta_v2; DROP TABLE IF EXISTS cache_usage;"
+                           "CREATE TABLE store_meta(db_name TEXT);",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(c);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, (int64_t)time(NULL), true, &r), 0);
+    ASSERT_TRUE(ce_config_has_table(&e, "store_meta"));
+    ASSERT_FALSE(ce_config_has_table(&e, "store_meta_v2"));
+    ASSERT_FALSE(ce_config_has_table(&e, "cache_usage"));
+    ASSERT_EQ(ce_sweep(&cfg, (int64_t)time(NULL), false, &r), 0);
+    ASSERT_FALSE(ce_config_has_table(&e, "store_meta"));
+    ASSERT_TRUE(ce_config_has_table(&e, "store_meta_v2"));
+    ASSERT_TRUE(ce_config_has_table(&e, "cache_usage"));
+    ce_teardown(&e);
+    PASS();
+}
+
 /* A dry run previews a missing root past its streak and grace as due, as
  * the real sweep then removes it -- not as "used since the scan" because
  * the preview's streak increment was never written. */
@@ -3105,6 +3160,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_skips_database_with_open_reader);
     RUN_TEST(cache_dry_run_changes_nothing);
     RUN_TEST(cache_dry_run_reports_root_gone_due);
+    RUN_TEST(cache_dry_run_leaves_memo_schema);
     RUN_TEST(cache_dry_run_applies_safety_checks_and_creates_nothing);
     RUN_TEST(cache_trash_restore_and_purge);
     RUN_TEST(cache_trash_purge_skips_leased_project);

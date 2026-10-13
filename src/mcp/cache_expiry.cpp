@@ -170,7 +170,11 @@ static bool remove_tree(const char *dir) {
 
 /* ── State in _config.db ────────────────────────────────────────── */
 
-static sqlite3 *state_open(bool create_tables) {
+/* read_only: a connection that cannot write at all -- not a row, not a
+ * table, not the checkpoint a read-write connection may run as it closes --
+ * for the dry run, which promises to write nothing (create_tables is then
+ * ignored). */
+static sqlite3 *state_open(bool create_tables, bool read_only = false) {
     const char *cdir = cbm_resolve_cache_dir();
     if (!cdir || !cdir[0]) {
         return NULL;
@@ -178,7 +182,12 @@ static sqlite3 *state_open(bool create_tables) {
     char path[CE_PATH_MAX];
     snprintf(path, sizeof(path), "%s/_config.db", cdir);
     sqlite3 *db = NULL;
-    if (cbm_store_sqlite_open(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) !=
+    if (read_only) {
+        create_tables = false;
+    }
+    if (cbm_store_sqlite_open(path, &db,
+                              read_only ? SQLITE_OPEN_READONLY
+                                        : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) !=
         SQLITE_OK) {
         sqlite3_close(db);
         return NULL;
@@ -614,12 +623,18 @@ static root_state_t root_state(const std::string &root) {
     }
 }
 
+/* The memo, for lookups. A dry run opens it read-only: the ordinary open
+ * may drop a v1 table and create the current one in _config.db. */
+static cbm_store_meta_db_t *meta_open(bool dry_run) {
+    return dry_run ? cbm_store_meta_open_readonly() : cbm_store_meta_open();
+}
+
 /* The root a database records, without the store layer: the memo row at the
  * file's current generation, else one read of its projects table. */
-static std::string learn_root(const char *path, const char *project) {
+static std::string learn_root(const char *path, const char *project, bool dry_run) {
     cbm_file_gen_t gen;
     if (cbm_file_generation(path, &gen)) {
-        cbm_store_meta_db_t *meta = cbm_store_meta_open();
+        cbm_store_meta_db_t *meta = meta_open(dry_run);
         cbm_store_meta_row_t row;
         /* A memo root that fills its column may be truncated (the memo keeps
          * CBM_STORE_META_PATH_MAX bytes): such a root would read as missing
@@ -666,11 +681,12 @@ static std::string learn_root(const char *path, const char *project) {
  * database, or one some other tool keeps in the cache directory: no index
  * of ours, so the sweep never judges it by its filename (nor removes it). A
  * memo row names only an index. */
-static std::string learn_project(const char *path, const std::string &stem, bool *is_index) {
+static std::string learn_project(const char *path, const std::string &stem, bool dry_run,
+                                 bool *is_index) {
     *is_index = true;
     cbm_file_gen_t gen;
     if (cbm_file_generation(path, &gen)) {
-        cbm_store_meta_db_t *meta = cbm_store_meta_open();
+        cbm_store_meta_db_t *meta = meta_open(dry_run);
         cbm_store_meta_row_t row;
         bool hit = cbm_store_meta_get(meta, path, &gen, &row) && row.project[0];
         cbm_store_meta_close(meta);
@@ -1020,7 +1036,7 @@ static std::string label(const db_entry_t &e) {
  * streak that went back -- every root_gone verdict previewed as kept. */
 static bool used_since_scan(const db_entry_t &e, bool dry_run) {
     const usage_row_t &judged = dry_run ? e.seen : e.row;
-    sqlite3 *db = state_open(false);
+    sqlite3 *db = state_open(false, dry_run);
     if (!db) {
         return true;
     }
@@ -1239,7 +1255,7 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
     }
     /* A preview creates no state tables either: rows it cannot read are
      * "never seen", which is what a real sweep would record first. */
-    sqlite3 *db = state_open(!opts->dry_run);
+    sqlite3 *db = state_open(true, opts->dry_run);
     if (!db) {
         cbm_db_lease_release(sweep_lease);
         refuse(res, "cannot open _config.db");
@@ -1285,7 +1301,7 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
                     continue;
                 }
                 bool is_index = true;
-                std::string name = learn_project(path.c_str(), stem, &is_index);
+                std::string name = learn_project(path.c_str(), stem, opts->dry_run, &is_index);
                 if (!is_index) {
                     cbm_log_info("cache.expire.skipped", "kind", "database", "path",
                                  path.c_str(), "reason", "not_an_index");
@@ -1336,7 +1352,7 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
             e.row.last_used = now;
         }
         if (e.row.root.empty()) {
-            e.row.root = learn_root(e.path.c_str(), e.name.c_str());
+            e.row.root = learn_root(e.path.c_str(), e.name.c_str(), opts->dry_run);
         }
         e.state = e.row.root.empty() ? ROOT_UNCERTAIN : root_state(e.row.root);
         known += e.state != ROOT_UNCERTAIN;

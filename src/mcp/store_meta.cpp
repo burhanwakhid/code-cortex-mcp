@@ -104,6 +104,34 @@ cbm_store_meta_db_t *cbm_store_meta_open(void) {
     return h;
 }
 
+cbm_store_meta_db_t *cbm_store_meta_open_readonly(void) {
+    if (sm_disabled()) {
+        return NULL;
+    }
+    const char *cdir = cbm_resolve_cache_dir();
+    if (!cdir || !cdir[0]) {
+        return NULL;
+    }
+    char path[SM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/_config.db", cdir);
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+        return NULL;
+    }
+    sqlite3 *db = NULL;
+    if (cbm_store_sqlite_open(path, &db, SQLITE_OPEN_READONLY) != SQLITE_OK) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    sqlite3_busy_timeout(db, SM_BUSY_TIMEOUT_MS);
+    cbm_store_meta_db_t *h = (cbm_store_meta_db_t *)calloc(1, sizeof(*h));
+    if (!h) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    h->db = db;
+    return h;
+}
+
 void cbm_store_meta_close(cbm_store_meta_db_t *h) {
     if (!h) {
         return;
