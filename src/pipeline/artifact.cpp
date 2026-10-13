@@ -373,60 +373,52 @@ static void graph_generation(cbm_store_t *s, const char *project, int *format, c
 }
 
 /* Write artifact.json metadata. */
-/* A fingerprint of the payload file that binds artifact.json to it: the
- * size and a SHA-256 of the first and last 64 KiB (a zstd frame ends with
- * its content checksum, so two generations differ there). Not the mtime --
- * a git checkout resets it, and a committed artifact must stay current on
- * every clone -- and not a full hash, which on a large payload would cost
- * seconds on every index run. An export interrupted between publishing the
- * payload and the metadata leaves a payload whose fingerprint the metadata
- * does not record: not current, exported again. */
-enum { ART_FP_EDGE = 64 * 1024 };
-
-/* The fingerprint of a payload held in memory (the import reads it whole). */
-static void payload_fingerprint_bytes(const char *data, size_t size,
-                                      char out[CBM_SHA256_HEX_LEN + 1]) {
-    size_t head = size < (size_t)ART_FP_EDGE ? size : (size_t)ART_FP_EDGE;
-    size_t tail = size - head < (size_t)ART_FP_EDGE ? size - head : (size_t)ART_FP_EDGE;
-    std::string buf = std::to_string((long long)size) + ":";
-    buf.append(data, head);
-    buf.append(data + size - tail, tail);
-    cbm_sha256_hex(buf.data(), buf.size(), out);
+/* The payload's fingerprint, binding artifact.json to it: a SHA-256 of the
+ * whole compressed file. Not the mtime -- a git checkout resets it, and a
+ * committed artifact must stay current on every clone -- and not a sample
+ * of the bytes: ZSTD_compress writes no content checksum, so two payloads
+ * of one size could share any sampled bytes. An export interrupted between
+ * publishing the payload and the metadata leaves a payload whose
+ * fingerprint the metadata does not record: not current, and refused by
+ * the import. */
+static void sha256_to_hex(const uint8_t digest[CBM_SHA256_DIGEST_LEN],
+                          char out[CBM_SHA256_HEX_LEN + 1]) {
+    static const char hexd[] = "0123456789abcdef";
+    for (int k = 0; k < CBM_SHA256_DIGEST_LEN; k++) {
+        out[2 * k] = hexd[digest[k] >> 4];
+        out[2 * k + 1] = hexd[digest[k] & 0xf];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
 }
 
+/* The fingerprint of a payload held in memory (export, import). */
+static void payload_fingerprint_bytes(const char *data, size_t size,
+                                      char out[CBM_SHA256_HEX_LEN + 1]) {
+    cbm_sha256_hex(data, size, out);
+}
+
+/* The fingerprint of the payload file, streamed (freshness check). */
 static bool payload_fingerprint(const char *path, char out[CBM_SHA256_HEX_LEN + 1]) {
     out[0] = '\0';
     FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return false;
     }
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        return false;
+    cbm_sha256_ctx ctx;
+    cbm_sha256_init(&ctx);
+    std::string buf(1 << 20, '\0');
+    size_t n;
+    while ((n = fread(&buf[0], 1, buf.size(), f)) > 0) {
+        cbm_sha256_update(&ctx, buf.data(), n);
     }
-    long long size = (long long)ftell(f);
-    if (size < 0) {
-        fclose(f);
-        return false;
-    }
-    size_t head = size < ART_FP_EDGE ? (size_t)size : (size_t)ART_FP_EDGE;
-    size_t tail = size - (long long)head < ART_FP_EDGE ? (size_t)(size - (long long)head)
-                                                       : (size_t)ART_FP_EDGE;
-    /* The same bytes payload_fingerprint_bytes hashes: the head, then the
-     * tail, laid out as if the file were read whole. */
-    std::string chunk(head + tail, '\0');
-    bool ok = fseek(f, 0, SEEK_SET) == 0 && fread(&chunk[0], 1, head, f) == head;
-    if (ok && tail > 0) {
-        ok = fseek(f, (long)(size - (long long)tail), SEEK_SET) == 0 &&
-             fread(&chunk[head], 1, tail, f) == tail;
-    }
+    bool ok = !ferror(f);
     fclose(f);
     if (!ok) {
         return false;
     }
-    std::string buf = std::to_string(size) + ":";
-    buf += chunk;
-    cbm_sha256_hex(buf.data(), buf.size(), out);
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&ctx, digest);
+    sha256_to_hex(digest, out);
     return true;
 }
 
