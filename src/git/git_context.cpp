@@ -459,9 +459,19 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
         out->head_sha = git_strdup("");
     }
 
-    if (git_capture(path, "symbolic-ref --quiet --short HEAD", &out->branch) != 0) {
+    /* The full ref, then "refs/heads/" removed: the name cbm_git_head_read
+     * takes from the HEAD file. --short abbreviates to the shortest
+     * unambiguous name, so a tag of the same name made it "heads/v1.2" here
+     * and "v1.2" there, and the two identities never matched. */
+    if (git_capture(path, "symbolic-ref --quiet HEAD", &out->branch) != 0) {
         out->branch = git_strdup("DETACHED");
         out->is_detached = true;
+    } else if (out->branch) {
+        static const char heads[] = "refs/heads/";
+        if (strncmp(out->branch, heads, sizeof(heads) - 1) == 0) {
+            memmove(out->branch, out->branch + sizeof(heads) - 1,
+                    strlen(out->branch) - (sizeof(heads) - 1) + 1);
+        }
     }
 
     out->is_worktree =

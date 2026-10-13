@@ -2570,6 +2570,41 @@ TEST(branch_session_pending_legacy_once) {
     PASS();
 }
 
+/* A branch with the name of a tag: `git symbolic-ref --short` prints
+ * "heads/v1.2" for it, the HEAD file says "refs/heads/v1.2". The index run
+ * and the file reader must name it the same, or every session start says the
+ * index is for another branch. */
+TEST(branch_name_shared_with_tag_matches_head_file) {
+    char *repo = bi_make_repo("cbm_bi_tagname");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    ASSERT_EQ(bi_git(repo, "tag v1.2"), 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q -b v1.2"), 0);
+
+    cbm_git_context_t ctx;
+    ASSERT_EQ(cbm_git_context_resolve(repo, &ctx), 0);
+    char ctx_branch[128];
+    snprintf(ctx_branch, sizeof(ctx_branch), "%s", ctx.branch ? ctx.branch : "");
+    cbm_git_context_free(&ctx);
+    ASSERT_STR_EQ(ctx_branch, "v1.2");
+    cbm_git_head_t head = {0};
+    ASSERT_EQ(cbm_git_head_read(repo, &head), 0);
+    char head_branch[128];
+    snprintf(head_branch, sizeof(head_branch), "%s", head.branch ? head.branch : "");
+    cbm_git_head_free(&head);
+    ASSERT_STR_EQ(head_branch, "v1.2");
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    char db[1024];
+    bi_db_path(db, sizeof(db));
+    ASSERT_FALSE(cbm_mcp_checkout_differs_from_index(repo, g_bi_project, db));
+
+    bi_cleanup(repo);
+    PASS();
+}
+
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* SessionStart after a checkout made while no server ran: the stored brief
  * describes the indexed branch, so the text says the checkout moved, naming
@@ -3518,6 +3553,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_artifact_bootstrap_adopted_by_importer);
 #endif
     RUN_TEST(branch_session_pending_legacy_once);
+    RUN_TEST(branch_name_shared_with_tag_matches_head_file);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(branch_session_start_notes_moved_checkout);
 #endif

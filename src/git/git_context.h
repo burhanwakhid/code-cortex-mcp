@@ -66,7 +66,8 @@ bool cbm_git_is_linked_worktree(const char *dir);
  * inside the checkout: the nearest enclosing `.git` (directory, or gitlink
  * file of a linked worktree or submodule) wins, as for git. Reads HEAD, the
  * gitdir's "commondir", the loose branch ref and packed-refs. branch is
- * the name `git symbolic-ref --short HEAD` prints (NULL when detached; free
+ * the ref HEAD names with "refs/heads/" removed, as cbm_git_context_resolve
+ * derives it (NULL when detached; free
  * with cbm_git_head_free);
  * head_sha is "" when the branch has no commit yet or its ref could not be
  * read from files. Returns non-zero when no enclosing checkout is found,
