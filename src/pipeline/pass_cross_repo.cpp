@@ -1034,9 +1034,23 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
         char tgt_path[CR_PATH_BUF];
         cr_db_path(tgt, tgt_path, sizeof(tgt_path));
 
-        /* Open target store read-write (for bidirectional edge writes) */
-        cbm_store_t *tgt_store = cbm_store_open_path(tgt_path);
+        /* Open target store read-write (for bidirectional edge writes), but
+         * only a database that exists, and under its reader gate for as long
+         * as the pass uses it. Opened with CREATE and no gate, a target the
+         * cache expiry sweep moved to trash mid-pass took edges into the
+         * trashed file, and one moved before the open came back as an empty
+         * new database, which then made `cache restore` refuse. A gate held
+         * exclusive (a move in progress) or a missing target: skip it. A gate
+         * that cannot be had at all (read-only cache, no lock file) leaves the
+         * open ungated, as for a reader: the sweep cannot take it either. */
+        cbm_db_lease_t *gate = NULL;
+        int grc = cbm_db_read_gate_acquire(tgt_path, false, &gate);
+        if (grc == CBM_INDEX_BUSY) {
+            continue;
+        }
+        cbm_store_t *tgt_store = cbm_store_open_path_existing(tgt_path);
         if (!tgt_store) {
+            cbm_db_lease_release(gate);
             continue;
         }
 
@@ -1062,6 +1076,7 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
         result.projects_scanned++;
 
         cbm_store_close(tgt_store);
+        cbm_db_lease_release(gate);
     }
 
     cbm_store_close(src_store);

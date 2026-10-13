@@ -260,6 +260,10 @@ cbm_store_t *cbm_store_open_memory(void);
 /* Open a file-backed database at the given path. Creates if needed. */
 cbm_store_t *cbm_store_open_path(const char *db_path);
 
+/* cbm_store_open_path, read-write, on an existing database only: NULL when
+ * there is no file at db_path, never an empty new one. */
+cbm_store_t *cbm_store_open_path_existing(const char *db_path);
+
 /* Open an existing file-backed database for querying only. Opened READ-ONLY
  * (no SQLITE_OPEN_CREATE, no write pragmas) so queries never mutate the DB and
  * work on a read-only file / filesystem. Returns NULL if the file does not

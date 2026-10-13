@@ -15,6 +15,7 @@
 #include <mcp/index_supervisor.h>
 #include <mcp/store_meta.h> /* custom-name cwd resolution test */
 #include <pipeline/pipeline.h>
+#include <pipeline/pass_cross_repo.h>
 #include <store/store.h>
 #include <yyjson/yyjson.h>
 #include <sqlite3.h> /* legacy four-column nodes_fts fixture (#518) */
@@ -3041,6 +3042,63 @@ TEST(tool_index_repository_cross_repo_rejects_non_string_targets) {
 
     cbm_mcp_server_free(srv);
     cbm_rmdir(tmp_dir);
+    PASS();
+}
+
+/* The cross-repo pass opens other projects' databases only when they exist
+ * and under their reader gate: a missing target (moved to trash, never
+ * indexed) is skipped, not created empty, and one whose gate is held
+ * exclusive (a move in progress) is skipped untouched. */
+TEST(cross_repo_never_creates_missing_target) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s", th_mktempdir("cbm_xrepo_gate"));
+    ASSERT_TRUE(cache[0] != '\0');
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char src_db[512];
+    char tgt_db[512];
+    char missing_db[512];
+    snprintf(src_db, sizeof(src_db), "%s/xr-src.db", cache);
+    snprintf(tgt_db, sizeof(tgt_db), "%s/xr-tgt.db", cache);
+    snprintf(missing_db, sizeof(missing_db), "%s/xr-missing.db", cache);
+    const char *dbs[] = {src_db, tgt_db};
+    const char *names[] = {"xr-src", "xr-tgt"};
+    for (int i = 0; i < 2; i++) {
+        cbm_store_t *st = cbm_store_open_path(dbs[i]);
+        ASSERT_NOT_NULL(st);
+        cbm_store_upsert_project(st, names[i], cache);
+        cbm_store_close(st);
+    }
+
+    const char *missing[] = {"xr-missing"};
+    cbm_cross_repo_result_t r = cbm_cross_repo_match("xr-src", missing, 1);
+    bool created = cbm_file_exists(missing_db);
+    int scanned_missing = r.projects_scanned;
+
+    const char *present[] = {"xr-tgt"};
+    r = cbm_cross_repo_match("xr-src", present, 1);
+    int scanned_present = r.projects_scanned;
+
+    cbm_db_lease_t *gate = NULL;
+    int grc = cbm_db_read_gate_acquire(tgt_db, true, &gate);
+    r = cbm_cross_repo_match("xr-src", present, 1);
+    int scanned_moving = r.projects_scanned;
+    cbm_db_lease_release(gate);
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(cache);
+    ASSERT_FALSE(created);
+    ASSERT_EQ(scanned_missing, 0);
+    ASSERT_EQ(scanned_present, 1);
+    ASSERT_EQ(grc, 0);
+    ASSERT_EQ(scanned_moving, 0);
     PASS();
 }
 
@@ -8218,6 +8276,7 @@ SUITE(mcp) {
     RUN_TEST(tool_unknown_project_skips_nonregular_cache_db);
 #endif
     RUN_TEST(tool_index_repository_cross_repo_rejects_non_string_targets);
+    RUN_TEST(cross_repo_never_creates_missing_target);
     RUN_TEST(tool_index_repository_resolves_root_path_from_project_name_issue1211);
     RUN_TEST(index_format_stale_db_rebuilds_once_issue769);
     RUN_TEST(index_recovery_quarantines_exit_nonzero);

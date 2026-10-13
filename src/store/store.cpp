@@ -901,19 +901,20 @@ static int store_authorizer(void *user_data, int action, const char *p3, const c
     }
 }
 
-static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
+static cbm_store_t *store_open_internal(const char *path, bool in_memory, bool create = true) {
     cbm_store_t *s = (cbm_store_t *)calloc(CBM_ALLOC_ONE, sizeof(cbm_store_t));
     if (!s) {
         return NULL;
     }
 
-    int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+    int flags = SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0);
     if (in_memory) {
         flags |= SQLITE_OPEN_MEMORY;
     }
 
     int rc = cbm_store_sqlite_open(path, &s->db, flags);
     if (rc != SQLITE_OK) {
+        sqlite3_close(s->db); /* a failed open still allocates the handle */
         free(s);
         return NULL;
     }
@@ -959,6 +960,13 @@ cbm_store_t *cbm_store_open_path(const char *db_path) {
         return NULL;
     }
     return store_open_internal(db_path, false);
+}
+
+cbm_store_t *cbm_store_open_path_existing(const char *db_path) {
+    if (!db_path) {
+        return NULL;
+    }
+    return store_open_internal(db_path, false, false);
 }
 
 const char *cbm_store_db_path(const cbm_store_t *s) {
