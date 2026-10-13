@@ -12819,6 +12819,14 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     memcpy(saved, g_expected_root, sizeof(saved));
     char *result = handle_tool_impl(srv, tool_name, args_json);
     memcpy(g_expected_root, saved, sizeof(saved));
+    /* Cached statements are reset on their next use, so the call's last
+     * queries still hold a read snapshot. Release it now, not when the next
+     * request starts: an idle connection would otherwise pin the snapshot
+     * for as long as the client is quiet, and block a WAL reset (a cache
+     * restore's checkpoint) all that time. */
+    if (srv && srv->store) {
+        cbm_store_end_reads(srv->store);
+    }
     return result;
 }
 

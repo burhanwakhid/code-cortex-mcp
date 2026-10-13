@@ -6368,6 +6368,73 @@ TEST(delete_path_arg_does_not_scope_later_calls) {
 }
 #endif
 
+/* A tool call leaves no statement of the server's cached store holding a
+ * read open: an idle connection would otherwise keep its read snapshot until
+ * the next request, and block a WAL reset (after a cache restore) for as
+ * long as the client stays quiet. */
+TEST(tool_call_ends_reads_on_cached_store) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s", th_mktempdir("cbm_endreads"));
+    ASSERT_TRUE(cache[0] != '\0');
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/endreads-proj.db", cache);
+    cbm_store_t *st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+    cbm_store_upsert_project(st, "endreads-proj", cache);
+    for (int i = 0; i < 5; i++) {
+        char name[32];
+        char qn[64];
+        snprintf(name, sizeof(name), "EndReads%d", i);
+        snprintf(qn, sizeof(qn), "endreads-proj.%s", name);
+        cbm_node_t n = {0};
+        n.project = "endreads-proj";
+        n.label = "Function";
+        n.name = name;
+        n.qualified_name = qn;
+        n.file_path = "a.go";
+        n.start_line = i + 1;
+        n.end_line = i + 1;
+        cbm_store_upsert_node(st, &n);
+    }
+    cbm_store_close(st);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    const char *calls[][2] = {
+        {"search_graph", "{\"project\":\"endreads-proj\",\"name_pattern\":\"EndReads\",\"limit\":1}"},
+        {"index_status", "{\"project\":\"endreads-proj\"}"},
+        {"get_architecture", "{\"project\":\"endreads-proj\"}"},
+    };
+    int busy = 0;
+    bool had_store = false;
+    for (auto &call : calls) {
+        char *resp = cbm_mcp_handle_tool(srv, call[0], call[1]);
+        ASSERT_NOT_NULL(resp);
+        free(resp);
+        cbm_store_t *cached = cbm_mcp_server_store(srv);
+        sqlite3 *db = cached ? cbm_store_get_db(cached) : NULL;
+        had_store = had_store || db != NULL;
+        for (sqlite3_stmt *s = db ? sqlite3_next_stmt(db, NULL) : NULL; s;
+             s = sqlite3_next_stmt(db, s)) {
+            busy += sqlite3_stmt_busy(s) ? 1 : 0;
+        }
+    }
+    cbm_mcp_server_free(srv);
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(cache);
+    ASSERT_TRUE(had_store);
+    ASSERT_EQ(busy, 0);
+    PASS();
+}
 
 TEST(hook_edit_impact_note) {
     char tmp[256];
@@ -8489,6 +8556,7 @@ SUITE(mcp) {
     RUN_TEST(session_in_subdirectory_uses_indexed_ancestor);
     RUN_TEST(delete_path_arg_does_not_scope_later_calls);
 #endif
+    RUN_TEST(tool_call_ends_reads_on_cached_store);
     RUN_TEST(hook_edit_impact_note);
     /* #518/#519 — BM25 prose search */
     RUN_TEST(bm25_finds_section_by_its_prose_issue518);
