@@ -271,6 +271,10 @@ entry that is itself a link.
   another sweep runs.
 - `_config.db`, `.index.lock` and `.read.lock` files, and files whose names this module does
   not write.
+- A `*.db` file that is no index: one whose `projects` table cannot be queried (not an SQLite
+  database, or another tool's SQLite file without that table). It is never judged by its
+  filename (`cache.expire.skipped` with `not_an_index`). A database known to the `store_meta`
+  memo is an index.
 
 ## Alternatives that lost
 

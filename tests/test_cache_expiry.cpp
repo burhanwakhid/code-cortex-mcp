@@ -686,6 +686,46 @@ TEST(cache_unused_expires) {
     PASS();
 }
 
+/* A *.db in the cache directory that is no index of ours -- not SQLite at
+ * all, or an SQLite file without a projects table -- is never judged by its
+ * filename, however long unused: files this module did not write stay. */
+TEST(cache_foreign_db_files_are_not_judged) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_foreign"));
+    char root[700];
+    char stale[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    ce_make_db(&e, "stale", root, stale, sizeof(stale));
+    char text[800];
+    char other[800];
+    snprintf(text, sizeof(text), "%s/notes.db", e.cache);
+    snprintf(other, sizeof(other), "%s/tool-state.db", e.cache);
+    ASSERT_EQ(th_write_file(text, "not an sqlite database"), 0);
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(other, &db), SQLITE_OK);
+    sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES(1);", NULL, NULL, NULL);
+    sqlite3_close(db);
+    const char *paths[] = {stale, text, other};
+    for (const char *p : paths) {
+        ASSERT_TRUE(cbm_cache_usage_set(p, now - 200 * CE_DAY, NULL));
+    }
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    cbm_cache_sweep_result_t r;
+    ASSERT_EQ(ce_sweep(&cfg, now, true, &r), 0);
+    ASSERT_EQ(r.projects, 1); /* only the index, in the preview too */
+    ASSERT_EQ(ce_sweep(&cfg, now, false, &r), 0);
+    ASSERT_EQ(r.projects, 1);
+    ASSERT_FALSE(cbm_file_exists(stale));
+    ASSERT_TRUE(cbm_file_exists(text));
+    ASSERT_TRUE(cbm_file_exists(other));
+    ASSERT_EQ(ce_trash_count(&e), 1);
+    ce_teardown(&e);
+    PASS();
+}
+
 /* The session's project and the watched ones are never expired. */
 static bool ce_keep_w(const char *project, void *ud) {
     return strcmp(project, (const char *)ud) == 0;
@@ -3057,6 +3097,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_mass_missing_and_env_change_count_nothing);
     RUN_TEST(cache_refuses_unknown_cache_dir);
     RUN_TEST(cache_unused_expires);
+    RUN_TEST(cache_foreign_db_files_are_not_judged);
     RUN_TEST(cache_keeps_session_and_watched);
     RUN_TEST(cache_root_gone_windows_separators);
     RUN_TEST(cache_slot_unlink_refused_not_counted);

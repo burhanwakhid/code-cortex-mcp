@@ -661,8 +661,13 @@ static std::string learn_root(const char *path, const char *project) {
 
 /* The project a database file holds: its one primary `projects` row, the
  * rule the query-time fallback scan uses, else the filename stem. A legacy
- * or renamed file is served under that internal name. */
-static std::string learn_project(const char *path, const std::string &stem) {
+ * or renamed file is served under that internal name. *is_index is false
+ * for a file whose `projects` table cannot even be queried -- not an SQLite
+ * database, or one some other tool keeps in the cache directory: no index
+ * of ours, so the sweep never judges it by its filename (nor removes it). A
+ * memo row names only an index. */
+static std::string learn_project(const char *path, const std::string &stem, bool *is_index) {
+    *is_index = true;
     cbm_file_gen_t gen;
     if (cbm_file_generation(path, &gen)) {
         cbm_store_meta_db_t *meta = cbm_store_meta_open();
@@ -676,11 +681,13 @@ static std::string learn_project(const char *path, const std::string &stem) {
     std::string name;
     int rows = 0;
     sqlite3 *db = NULL;
+    *is_index = false;
     if (cbm_store_sqlite_open(path, &db, SQLITE_OPEN_READONLY) == SQLITE_OK) {
         sqlite3_busy_timeout(db, CE_BUSY_MS);
         sqlite3_stmt *st = NULL;
         if (sqlite3_prepare_v2(db, "SELECT name FROM projects WHERE instr(name, '::') = 0 LIMIT 2;",
                                -1, &st, NULL) == SQLITE_OK) {
+            *is_index = true;
             while (sqlite3_step(st) == SQLITE_ROW) {
                 const char *t = (const char *)sqlite3_column_text(st, 0);
                 name = t ? t : "";
@@ -1277,7 +1284,13 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
                                  path.c_str(), "reason", "is_link");
                     continue;
                 }
-                std::string name = learn_project(path.c_str(), stem);
+                bool is_index = true;
+                std::string name = learn_project(path.c_str(), stem, &is_index);
+                if (!is_index) {
+                    cbm_log_info("cache.expire.skipped", "kind", "database", "path",
+                                 path.c_str(), "reason", "not_an_index");
+                    continue;
+                }
                 if (cbm_validate_project_name(name.c_str())) {
                     dbs.push_back({name, stem, path, {}, ROOT_UNCERTAIN, {}, false});
                 }
