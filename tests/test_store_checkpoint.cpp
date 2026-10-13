@@ -16,6 +16,7 @@
 #include <foundation/platform.h>
 #include <store/store.h>
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -219,6 +220,14 @@ TEST(dump_refuses_destination_too_long_for_temp) {
     ASSERT_NOT_NULL(td);
     char base[256];
     snprintf(base, sizeof(base), "%s", td);
+#ifndef _WIN32
+    /* The resolved form: on macOS /tmp is /private/tmp, and a path built to
+     * the limit from the shorter spelling exceeds it once resolved. */
+    char real[PATH_MAX];
+    if (realpath(td, real)) {
+        snprintf(base, sizeof(base), "%s", real);
+    }
+#endif
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
     ASSERT_EQ(cbm_store_upsert_project(s, "longp", "/tmp/longp"), CBM_STORE_OK);
