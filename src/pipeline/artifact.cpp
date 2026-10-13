@@ -332,10 +332,12 @@ static size_t read_metadata_original_size(const char *repo_path) {
 }
 
 /* The graph's generation: the index format it was written under (PRAGMA
- * user_version) and the time of the dump that wrote it (projects.indexed_at,
- * which only a dump sets). A rebuild from unchanged sources, after a format
- * or extractor upgrade, keeps the Branch node and the content fingerprint
- * but moves this. */
+ * user_version), the time of the dump that wrote it (projects.indexed_at,
+ * which only a dump sets), and a digest of the project's ADR. A rebuild from
+ * unchanged sources, after a format or extractor upgrade, keeps the Branch
+ * node and the content fingerprint but moves the dump time; a manage_adr
+ * write moves neither, nor the files, so without the ADR digest a
+ * no-change index kept distributing the old ADR. */
 static void graph_generation(cbm_store_t *s, const char *project, int *format, char *gen,
                              size_t gen_sz) {
     *format = 0;
@@ -343,7 +345,14 @@ static void graph_generation(cbm_store_t *s, const char *project, int *format, c
     (void)cbm_store_get_format_version(s, format);
     cbm_project_t proj = {0};
     if (cbm_store_get_project(s, project, &proj) == CBM_STORE_OK) {
-        snprintf(gen, gen_sz, "%s", proj.indexed_at ? proj.indexed_at : "");
+        cbm_adr_t adr = {0};
+        char adr_hex[CBM_SHA256_HEX_LEN + 1] = "none";
+        if (cbm_store_adr_get(s, project, &adr) == CBM_STORE_OK && adr.content) {
+            cbm_sha256_hex(adr.content, strlen(adr.content), adr_hex);
+            adr_hex[16] = '\0'; /* a short digest is plenty to tell ADRs apart */
+        }
+        cbm_store_adr_free(&adr);
+        snprintf(gen, gen_sz, "%s|adr:%s", proj.indexed_at ? proj.indexed_at : "", adr_hex);
         cbm_project_free_fields(&proj);
     }
 }
