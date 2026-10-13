@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <limits.h>
 #include <string.h>
+#include <string>
 
 /* Canonicalize a Windows drive letter to upper-case in place: "c:/x" -> "C:/x".
  * Windows drive letters are case-insensitive, but a lowercase one (as agent
@@ -835,11 +836,39 @@ bool cbm_root_canonical(const char *root, char *out, size_t out_sz) {
      * resolved, 8.3 names expanded, the volume's own spelling of the case),
      * else _fullpath: absolute, "." and ".." folded, lexically. */
     char *final_utf8 = win_dir_final_path(root);
+    if (final_utf8) {
+        bool ok = cbm_root_normalize(final_utf8, true, out, out_sz);
+        free(final_utf8);
+        return ok;
+    }
+    /* Gone (a removed worktree): the longest existing ancestor's final path
+     * plus the missing tail, so the key is the one the checkout had while
+     * it existed -- a junctioned ancestor resolved, as then. */
     char full[_MAX_PATH];
-    const char *src = final_utf8 ? final_utf8 : (_fullpath(full, root, sizeof(full)) ? full : root);
-    bool ok = cbm_root_normalize(src, true, out, out_sz);
-    free(final_utf8);
-    return ok;
+    if (!_fullpath(full, root, sizeof(full))) {
+        return cbm_root_normalize(root, true, out, out_sz);
+    }
+    for (char *c = full; *c; c++) {
+        if (*c == '\\') {
+            *c = '/';
+        }
+    }
+    std::string head(full);
+    std::string tail;
+    for (;;) {
+        size_t cut = head.find_last_of('/');
+        if (cut == std::string::npos || cut < 3) {
+            return cbm_root_normalize(full, true, out, out_sz);
+        }
+        tail = head.substr(cut) + tail;
+        head.resize(cut);
+        char *anc = win_dir_final_path(head.c_str());
+        if (anc) {
+            std::string joined = std::string(anc) + tail;
+            free(anc);
+            return cbm_root_normalize(joined.c_str(), true, out, out_sz);
+        }
+    }
 #else
     /* Lexical form first, so "x/./gone/.." still resolves through x. A
      * relative root that folds to nothing (".", "sub/..") is the current
@@ -854,7 +883,39 @@ bool cbm_root_canonical(const char *root, char *out, size_t out_sz) {
     if (realpath(probe, real)) {
         return cbm_root_normalize(real, false, out, out_sz);
     }
-    return lex[0] && cbm_root_normalize(lex, false, out, out_sz);
+    if (!lex[0]) {
+        return false;
+    }
+    /* Gone (a removed worktree): made absolute, then the longest existing
+     * ancestor resolved and the missing tail appended -- the key the
+     * checkout had while it existed (macOS /tmp -> /private/tmp, a relative
+     * root against the cwd). Hashing the unresolved spelling addressed
+     * another slot directory, and cleanup left the parked branches. */
+    std::string abs_path = lex;
+    if (abs_path[0] != '/') {
+        char cwd[PATH_MAX];
+        if (!getcwd(cwd, sizeof(cwd))) {
+            return cbm_root_normalize(lex, false, out, out_sz);
+        }
+        abs_path = std::string(cwd) + "/" + abs_path;
+    }
+    std::string head = abs_path;
+    std::string tail;
+    for (;;) {
+        size_t cut = head.find_last_of('/');
+        if (cut == std::string::npos) {
+            return cbm_root_normalize(abs_path.c_str(), false, out, out_sz);
+        }
+        tail = head.substr(cut) + tail;
+        head.resize(cut == 0 ? 1 : cut);
+        if (realpath(head.c_str(), real)) {
+            std::string joined = std::string(real) + tail; /* "//x" folds to "/x" */
+            return cbm_root_normalize(joined.c_str(), false, out, out_sz);
+        }
+        if (head == "/") {
+            return cbm_root_normalize(abs_path.c_str(), false, out, out_sz);
+        }
+    }
 #endif
 }
 

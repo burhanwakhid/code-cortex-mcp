@@ -550,7 +550,49 @@ static void sweep_orphan_snapshots(void) {
  * snapshot — the store runs in WAL mode, so raw main-file bytes miss
  * committed transactions still in the -wal and can be mid-checkpoint torn
  * (#895). Only the index-stripping is BEST-only. */
-static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool strip_indexes) {
+/* What artifact.json says about the graph, read from the snapshot itself:
+ * the payload and its metadata are then one state by construction. Reading
+ * the live database before and after (an ADR written meanwhile, without the
+ * index lease) could not prove that: A -> B -> A around the snapshot passed
+ * the comparison with B in the payload. */
+typedef struct {
+    int nodes;
+    int edges;
+    char *branch_qn;
+    char *branch_name;
+    char content_fp[CBM_SHA256_HEX_LEN + 1];
+    int index_format;
+    char graph_gen[CBM_SZ_64];
+} snapshot_meta_t;
+
+static void snapshot_meta_free(snapshot_meta_t *m) {
+    free(m->branch_qn);
+    free(m->branch_name);
+    m->branch_qn = NULL;
+    m->branch_name = NULL;
+}
+
+static void graph_generation(cbm_store_t *s, const char *project, int *format, char *gen,
+                             size_t gen_sz);
+
+static void read_snapshot_meta(const char *snap_path, const char *project, snapshot_meta_t *m) {
+    cbm_store_t *s = cbm_store_open_path_query(snap_path);
+    if (!s) {
+        return;
+    }
+    m->nodes = cbm_store_count_nodes(s, project);
+    m->edges = cbm_store_count_edges(s, project);
+    /* A failed read is CBM_STORE_ERR; never record it as a count. */
+    m->nodes = m->nodes < 0 ? 0 : m->nodes;
+    m->edges = m->edges < 0 ? 0 : m->edges;
+    (void)cbm_store_get_branch_dup(s, project, &m->branch_qn, &m->branch_name, NULL);
+    (void)cbm_store_content_fingerprint(s, project, m->content_fp);
+    graph_generation(s, project, &m->index_format, m->graph_gen, sizeof(m->graph_gen));
+    cbm_store_close(s);
+}
+
+static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool strip_indexes,
+                                 const char *project, snapshot_meta_t *meta) {
     /* One snapshot file per export: the name carries the pid and a
      * per-process counter, so two exports at once (two servers, a server
      * and the CLI, two projects in one process) never VACUUM INTO, read
@@ -584,6 +626,9 @@ static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool str
         cbm_unlink(tmp_path);
         return NULL;
     }
+
+    /* The metadata comes from this copy, before its indexes are dropped. */
+    read_snapshot_meta(tmp_path, project, meta);
 
     /* Strip indexes from the copy for better compression (BEST only). */
     if (strip_indexes) {
@@ -646,40 +691,28 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
         return artifact_export_fail("prepare_artifact_dir", art_dir, "not_directory", 0);
     }
 
-    /* The generation the snapshot is taken at: read before it, compared with
-     * the one read after. manage_adr writes without the index lease, so an
-     * ADR committed between the snapshot and the metadata read would put the
-     * new ADR's digest in artifact.json beside a payload holding the old ADR,
-     * and the pair would read as current indefinitely. */
-    char gen_before[CBM_SZ_64] = "";
-    {
-        int fmt = 0;
-        cbm_store_t *pre = cbm_store_open_path_query(db_path);
-        if (pre) {
-            graph_generation(pre, project_name, &fmt, gen_before, sizeof(gen_before));
-            cbm_store_close(pre);
-        }
-    }
-
+    snapshot_meta_t snap = {};
     size_t db_size = 0;
     char *db_data = NULL;
     int compression_level = ART_ZSTD_FAST;
 
     if (quality == CBM_ARTIFACT_BEST) {
         compression_level = ART_ZSTD_BEST;
-        db_data = prepare_snapshot_db(db_path, &db_size, true);
+        db_data = prepare_snapshot_db(db_path, &db_size, true, project_name, &snap);
     } else {
         /* FAST keeps zstd-3 and its indexes, but still snapshots via
          * VACUUM INTO: the raw main-file bytes of a live WAL store are a
          * torn copy (#895). */
-        db_data = prepare_snapshot_db(db_path, &db_size, false);
+        db_data = prepare_snapshot_db(db_path, &db_size, false, project_name, &snap);
     }
 
     if (!db_data || db_size == 0) {
         free(db_data);
         if (cbm_artifact_export_last_error()) {
+            snapshot_meta_free(&snap);
             return CBM_NOT_FOUND;
         }
+        snapshot_meta_free(&snap);
         return artifact_export_fail("read_db", db_path, "empty_or_unreadable", errno);
     }
 
@@ -690,6 +723,7 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     char *compressed = (char *)malloc(bound);
     if (!compressed) {
         free(db_data);
+        snapshot_meta_free(&snap);
         return artifact_export_fail("compress", NULL, "alloc_compressed_buffer", 0);
     }
 
@@ -698,6 +732,7 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
 
     if (clen <= 0) {
         free(compressed);
+        snapshot_meta_free(&snap);
         return artifact_export_fail("compress", NULL, "zstd_compress", 0);
     }
 
@@ -705,6 +740,7 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     char zst_path[CBM_SZ_4K];
     if (!artifact_path(zst_path, sizeof(zst_path), repo_path, CBM_ARTIFACT_FILENAME)) {
         free(compressed);
+        snapshot_meta_free(&snap);
         return artifact_export_fail("write_artifact", repo_path, "path_too_long", 0);
     }
     artifact_file_error_t ioerr;
@@ -712,6 +748,7 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     free(compressed);
 
     if (wrc != 0) {
+        snapshot_meta_free(&snap);
         return artifact_export_fail("write_artifact", zst_path, ioerr.err, ioerr.err_no);
     }
 
@@ -721,40 +758,11 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     }
 #endif
 
-    /* Get node/edge counts for metadata */
-    int nodes = 0;
-    int edges = 0;
-    char *branch_qn = NULL;
-    char *branch_name = NULL;
-    char content_fp[CBM_SHA256_HEX_LEN + 1] = "";
-    int index_format = 0;
-    char graph_gen[CBM_SZ_64] = "";
-    cbm_store_t *count_store = cbm_store_open_path(db_path);
-    if (count_store) {
-        nodes = cbm_store_count_nodes(count_store, project_name);
-        edges = cbm_store_count_edges(count_store, project_name);
-        (void)cbm_store_get_branch_dup(count_store, project_name, &branch_qn, &branch_name, NULL);
-        (void)cbm_store_content_fingerprint(count_store, project_name, content_fp);
-        graph_generation(count_store, project_name, &index_format, graph_gen, sizeof(graph_gen));
-        cbm_store_close(count_store);
-        /* A failed read is CBM_STORE_ERR; never record it as a count. */
-        nodes = nodes < 0 ? 0 : nodes;
-        edges = edges < 0 ? 0 : edges;
-    }
-    if (strcmp(gen_before, graph_gen) != 0) {
-        /* Moved during the export (an ADR written meanwhile): the payload's
-         * generation is not known for sure. Record none, so the artifact is
-         * never taken for current and the next run exports it again. */
-        cbm_log_info("artifact.export.generation_moved", "project", project_name);
-        graph_gen[0] = '\0';
-    }
-
     /* Write metadata */
-    int mrc = write_metadata(repo_path, project_name, nodes, edges, branch_qn, branch_name,
-                             content_fp, index_format, graph_gen, db_size, (size_t)clen,
-                             compression_level);
-    free(branch_qn);
-    free(branch_name);
+    int mrc = write_metadata(repo_path, project_name, snap.nodes, snap.edges, snap.branch_qn,
+                             snap.branch_name, snap.content_fp, snap.index_format, snap.graph_gen,
+                             db_size, (size_t)clen, compression_level);
+    snapshot_meta_free(&snap);
     if (mrc != 0) {
         cbm_unlink(zst_path);
         return CBM_NOT_FOUND;

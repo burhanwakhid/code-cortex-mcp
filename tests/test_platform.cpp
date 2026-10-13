@@ -990,6 +990,44 @@ TEST(platform_root_canonical_dot_is_cwd) {
     PASS();
 }
 
+/* A checkout's slot key is the same after the checkout is gone as while it
+ * existed, so cleanup addresses its slots: through a symlinked ancestor (the
+ * macOS /tmp case) and for a relative root. */
+TEST(platform_root_key_survives_removed_checkout) {
+#ifndef _WIN32
+    char *base = th_mktempdir("cbm_plat_rkey");
+    ASSERT_NOT_NULL(base);
+    char real_dir[512];
+    char link_dir[512];
+    snprintf(real_dir, sizeof(real_dir), "%s/real", base);
+    snprintf(link_dir, sizeof(link_dir), "%s/link", base);
+    ASSERT_TRUE(cbm_mkdir_p(real_dir, 0755));
+    ASSERT_EQ(symlink(real_dir, link_dir), 0);
+    char root[600];
+    snprintf(root, sizeof(root), "%s/repo", link_dir);
+    ASSERT_TRUE(cbm_mkdir_p(root, 0755));
+    char live[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    char gone[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    ASSERT_TRUE(cbm_branch_root_key(root, live, sizeof(live)));
+    ASSERT_EQ(rmdir(root), 0);
+    ASSERT_TRUE(cbm_branch_root_key(root, gone, sizeof(gone)));
+    ASSERT_STR_EQ(live, gone);
+
+    char old_cwd[1024];
+    ASSERT_NOT_NULL(getcwd(old_cwd, sizeof(old_cwd)));
+    ASSERT_EQ(chdir(link_dir), 0);
+    ASSERT_TRUE(cbm_mkdir_p("rel-repo", 0755));
+    ASSERT_TRUE(cbm_branch_root_key("rel-repo", live, sizeof(live)));
+    ASSERT_EQ(rmdir("rel-repo"), 0);
+    ASSERT_TRUE(cbm_branch_root_key("rel-repo", gone, sizeof(gone)));
+    ASSERT_EQ(chdir(old_cwd), 0);
+    ASSERT_STR_EQ(live, gone);
+    (void)unlink(link_dir);
+    th_rmtree(base);
+#endif
+    PASS();
+}
+
 SUITE(platform) {
     RUN_TEST(regex_compile_refuses_oversized_expansion);
     RUN_TEST(regex_compile_accepts_expansion_under_budget);
@@ -1012,6 +1050,7 @@ SUITE(platform) {
     RUN_TEST(platform_root_matches_windows_case_sensitive_dirs_differ);
     RUN_TEST(platform_root_normalize_keeps_unresolved_dotdot);
     RUN_TEST(platform_root_canonical_dot_is_cwd);
+    RUN_TEST(platform_root_key_survives_removed_checkout);
     RUN_TEST(platform_file_helpers_long_path);
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);
