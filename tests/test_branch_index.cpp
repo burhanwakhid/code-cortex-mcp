@@ -349,6 +349,45 @@ TEST(branch_git_head_read_non_ascii_path) {
     PASS();
 }
 
+/* The file reader caps a line at 4 KiB: an over-long HEAD is not found
+ * (no unbounded allocation), and an over-long packed-refs line is skipped
+ * without hiding the branch's ref after it. */
+TEST(branch_git_head_read_caps_line_length) {
+    char *tmp = th_mktempdir("cbm_bi_longline");
+    ASSERT_NOT_NULL(tmp);
+    char repo[512];
+    snprintf(repo, sizeof(repo), "%s", tmp);
+    char p[900];
+    snprintf(p, sizeof(p), "%s/.git/refs/heads", repo);
+    ASSERT_TRUE(cbm_mkdir_p(p, 0755));
+    static char big[10000];
+    snprintf(big, sizeof(big), "ref: refs/heads/");
+    size_t used = strlen(big);
+    memset(big + used, 'x', 6000);
+    big[used + 6000] = '\n';
+    big[used + 6001] = '\0';
+    snprintf(p, sizeof(p), "%s/.git/HEAD", repo);
+    ASSERT_TRUE(bi_put(p, big));
+    cbm_git_head_t head;
+    ASSERT_NEQ(cbm_git_head_read(repo, &head), 0);
+    cbm_git_head_free(&head);
+
+    /* main only in packed-refs, after a 6000-byte line. */
+    ASSERT_TRUE(bi_put(p, "ref: refs/heads/main\n"));
+    static char packed[10000];
+    memset(packed, 'y', 6000);
+    snprintf(packed + 6000, sizeof(packed) - 6000,
+             "\n0123456789abcdef0123456789abcdef01234567 refs/heads/main\n");
+    snprintf(p, sizeof(p), "%s/.git/packed-refs", repo);
+    ASSERT_TRUE(bi_put(p, packed));
+    ASSERT_EQ(cbm_git_head_read(repo, &head), 0);
+    ASSERT_STR_EQ(head.branch, "main");
+    ASSERT_STR_EQ(head.head_sha, "0123456789abcdef0123456789abcdef01234567");
+    cbm_git_head_free(&head);
+    th_rmtree(repo);
+    PASS();
+}
+
 /* main → feature → main → feature: each switch parks the outgoing graph, the
  * first visit to a branch seeds from the other, a revisit restores. */
 TEST(branch_switch_parks_and_restores) {
@@ -3502,6 +3541,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_slug_from_qn);
     RUN_TEST(branch_git_head_slug_reads_head_file);
     RUN_TEST(branch_git_head_read_non_ascii_path);
+    RUN_TEST(branch_git_head_read_caps_line_length);
     RUN_TEST(branch_switch_parks_and_restores);
     RUN_TEST(branch_restore_keeps_recreated_empty_file);
     RUN_TEST(branch_switch_detached_shares_one_slot);

@@ -69,6 +69,10 @@ static const bool g_git_longpaths_env = git_longpaths_env_init();
 enum {
     GIT_CMD_MAX = 1024,
     GIT_OUTPUT_MAX = 4096,
+    /* Longest line read_line_dup returns. A loose ref's path must fit
+     * PATH_MAX, so no branch name git can create comes near it; a longer
+     * line is a damaged or hostile file, not a name. */
+    GIT_LINE_MAX = 4096,
 };
 
 static char *git_strdup(const char *s) {
@@ -94,10 +98,13 @@ static void trim_newlines(char *s) {
     }
 }
 
-/* One whole line from fp, newline stripped, however long (fgets into a fixed
- * buffer would cut a long branch name, and differently on each reader).
- * NULL at end of file. Caller frees. */
-static char *read_line_dup(FILE *fp) {
+/* One whole line from fp, newline stripped (fgets into a fixed buffer would
+ * cut a long branch name, and differently on each reader). A line longer than
+ * GIT_LINE_MAX is consumed and not returned: NULL with *too_long set, so a
+ * reader treats it as not found instead of growing without bound on a huge
+ * HEAD or packed-refs line. NULL at end of file. Caller frees. */
+static char *read_line_dup(FILE *fp, bool *too_long) {
+    *too_long = false;
     size_t cap = 128;
     size_t len = 0;
     char *buf = (char *)malloc(cap);
@@ -106,6 +113,13 @@ static char *read_line_dup(FILE *fp) {
     }
     int c = EOF;
     while ((c = fgetc(fp)) != EOF && c != '\n') {
+        if (len >= GIT_LINE_MAX) {
+            while ((c = fgetc(fp)) != EOF && c != '\n') {
+            }
+            free(buf);
+            *too_long = true;
+            return NULL;
+        }
         if (len + 1 >= cap) {
             char *grown = (char *)realloc(buf, cap * 2);
             if (!grown) {
@@ -167,7 +181,8 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
         return CBM_NOT_FOUND;
     }
 
-    char *line = read_line_dup(fp);
+    bool too_long = false;
+    char *line = read_line_dup(fp, &too_long);
     /* Drain: closing early would hand git SIGPIPE. */
     for (int ch = fgetc(fp); ch != EOF; ch = fgetc(fp)) {}
     int rc = cbm_pclose(fp);
@@ -513,7 +528,8 @@ static char *read_first_line_dup(const char *path) {
     if (!fp) {
         return NULL;
     }
-    char *line = read_line_dup(fp);
+    bool too_long = false;
+    char *line = read_line_dup(fp, &too_long);
     (void)fclose(fp);
     return line;
 }
@@ -573,7 +589,12 @@ static bool read_branch_sha(const char *common, const char *branch, char *sha, s
     path = str_cat3(common, "/packed-refs", "");
     FILE *fp = path ? cbm_fopen(path, "rb") : NULL;
     free(path);
-    while (fp && ref && !found && (line = read_line_dup(fp)) != NULL) {
+    bool too_long = false;
+    while (fp && ref && !found &&
+           ((line = read_line_dup(fp, &too_long)) != NULL || too_long)) {
+        if (!line) {
+            continue; /* an over-long line names no branch we can have */
+        }
         char *space = strchr(line, ' ');
         if (line[0] != '#' && line[0] != '^' && space) {
             *space = '\0';
