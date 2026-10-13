@@ -980,6 +980,81 @@ TEST(cache_linked_db_and_slot_are_ignored) {
     PASS();
 }
 
+/* The preview reads its settings through a read-only connection: a
+ * _config.db that holds only the usage tables (no config table yet) gets no
+ * config table from `cache expire --dry-run`, and a setting that is there is
+ * still honoured. */
+TEST(cache_dry_run_reads_settings_read_only) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_cfgro"));
+    char cp[700];
+    snprintf(cp, sizeof(cp), "%s/_config.db", e.cache);
+    /* Settings present: honoured through the read-only path. */
+    sqlite3 *h = NULL;
+    ASSERT_EQ(sqlite3_open(cp, &h), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(h,
+                           "INSERT OR REPLACE INTO config(key, value) "
+                           "VALUES('cache_expiry_unused_days', '3');",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(h);
+    cbm_cache_expiry_cfg_t cfg;
+    cbm_cache_expiry_cfg_load(&cfg, NULL);
+    ASSERT_EQ(cfg.unused_s, 3 * (int64_t)CE_DAY);
+    /* A _config.db without the config table: the preview leaves it so. */
+    char other[700];
+    snprintf(other, sizeof(other), "%s/bare", e.base);
+    ASSERT_TRUE(cbm_mkdir_p(other, 0755));
+    char bare[800];
+    snprintf(bare, sizeof(bare), "%s/_config.db", other);
+    ASSERT_EQ(sqlite3_open(bare, &h), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(h,
+                           "CREATE TABLE cache_usage(db_name TEXT PRIMARY KEY, last_used INTEGER "
+                           "NOT NULL DEFAULT 0, root_path TEXT NOT NULL DEFAULT '', missing_since "
+                           "INTEGER NOT NULL DEFAULT 0, missing_checks INTEGER NOT NULL DEFAULT 0);"
+                           "CREATE TABLE cache_sweep(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(h);
+    cbm_setenv("CBM_CACHE_DIR", other, 1);
+    cbm_cache_expiry_cfg_load(&cfg, NULL);
+    ASSERT_EQ(cfg.unused_s, (int64_t)CBM_CACHE_EXPIRY_UNUSED_DAYS * CE_DAY);
+    cbm_cache_sweep_result_t r;
+    (void)ce_sweep(&cfg, (int64_t)time(NULL), true, &r);
+    cbm_setenv("CBM_CACHE_DIR", e.cache, 1);
+    ASSERT_EQ(sqlite3_open(bare, &h), SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(h, "SELECT count(*) FROM sqlite_master WHERE name = 'config';",
+                                 -1, &st, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+    int tables = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    sqlite3_close(h);
+    ASSERT_EQ(tables, 0);
+    ce_teardown(&e);
+    PASS();
+}
+
+/* An index run or a trash restore holds the lease before the database
+ * exists: a preview's probe sees it busy, not free. */
+TEST(cache_lease_probe_sees_lease_before_database) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_probenew"));
+    char db[800];
+    snprintf(db, sizeof(db), "%s/notyet.db", e.cache);
+    ASSERT_FALSE(cbm_file_exists(db));
+    ASSERT_EQ(cbm_db_lease_probe(db), 0); /* nothing held, nothing there */
+    cbm_db_lease_t *lease = NULL;
+    ASSERT_EQ(cbm_db_lease_try_acquire(db, &lease), 0);
+    ASSERT_FALSE(cbm_file_exists(db));
+    ASSERT_EQ(cbm_db_lease_probe(db), CBM_INDEX_BUSY);
+    cbm_db_lease_release(lease);
+    ASSERT_EQ(cbm_db_lease_probe(db), 0);
+    ce_teardown(&e);
+    PASS();
+}
+
 /* A project being indexed (its lease held) is skipped, and expired by a
  * later sweep once the lease is free. */
 TEST(cache_skips_leased_project) {
@@ -3494,6 +3569,8 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_dry_run_leaves_memo_schema);
     RUN_TEST(cache_dry_run_counts_project_slots_once);
     RUN_TEST(cache_dry_run_applies_safety_checks_and_creates_nothing);
+    RUN_TEST(cache_dry_run_reads_settings_read_only);
+    RUN_TEST(cache_lease_probe_sees_lease_before_database);
     RUN_TEST(cache_trash_restore_and_purge);
     RUN_TEST(cache_trash_purge_skips_leased_project);
     RUN_TEST(cache_renamed_db_kept_by_project);

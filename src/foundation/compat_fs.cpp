@@ -1393,8 +1393,47 @@ static int db_lock_probe(const char *db_path, const char *suffix) {
     char *target = db_path && db_path[0] && strlen(db_path) < DB_LEASE_PATH_MAX - 32
                        ? db_lease_real_path(db_path, &missing)
                        : NULL;
+    if (!target && missing) {
+        /* No database yet -- but an index run or a trash restore takes the
+         * lease BEFORE the file appears, so the lock file can be held
+         * already. It sits beside the database under the parent's real
+         * path, as the lease derives it; resolve that without creating
+         * anything (no parent: no lock file can exist). */
+        char parent[DB_LEASE_PATH_MAX];
+        snprintf(parent, sizeof(parent), "%s", db_path);
+        char *slash = strrchr(parent, '/');
+#ifdef _WIN32
+        char *backslash = strrchr(parent, '\\');
+        if (backslash && (!slash || backslash > slash)) {
+            slash = backslash;
+        }
+#endif
+        if (!slash || !slash[1]) {
+            return 0;
+        }
+        char leaf[DB_LEASE_PATH_MAX];
+        snprintf(leaf, sizeof(leaf), "%s", slash + 1);
+        if (slash == parent) {
+            slash[1] = '\0'; /* "/x.db": the parent is "/" */
+        } else {
+            *slash = '\0';
+        }
+        bool parent_missing = false;
+        char *real_parent = db_lease_real_path(parent, &parent_missing);
+        if (!real_parent) {
+            return parent_missing ? 0 : -1;
+        }
+        size_t need = strlen(real_parent) + 1 + strlen(leaf) + 1;
+        target = (char *)malloc(need);
+        if (!target) {
+            free(real_parent);
+            return -1;
+        }
+        snprintf(target, need, "%s/%s", real_parent, leaf);
+        free(real_parent);
+    }
     if (!target) {
-        return missing ? 0 : -1; /* no database: nothing holds its locks */
+        return -1;
     }
     char lock_path[DB_LEASE_PATH_MAX];
     int n = snprintf(lock_path, sizeof(lock_path), "%s%s", target, suffix);

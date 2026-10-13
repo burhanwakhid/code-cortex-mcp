@@ -386,6 +386,75 @@ static void sweep_put(sqlite3 *db, const char *key, const std::string &value) {
 
 /* ── Configuration ──────────────────────────────────────────────── */
 
+/* A setting from _config.db's config table through a read-only connection:
+ * NULL when the file, the table or the key is absent. */
+static std::string cfg_read_value(sqlite3 *db, const char *key, bool *found) {
+    *found = false;
+    std::string v;
+    sqlite3_stmt *st = NULL;
+    if (db && sqlite3_prepare_v2(db, "SELECT value FROM config WHERE key = ?1;", -1, &st, NULL) ==
+                  SQLITE_OK) {
+        sqlite3_bind_text(st, 1, key, -1, SQLITE_STATIC);
+        if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0)) {
+            v = (const char *)sqlite3_column_text(st, 0);
+            *found = true;
+        }
+    }
+    sqlite3_finalize(st);
+    return v;
+}
+
+/* cbm_config_get_bool / _int's parsing, on a value read above. */
+static bool cfg_parse_bool(const std::string &v, bool found, bool def) {
+    if (!found) {
+        return def;
+    }
+    if (v == "true" || v == "1" || v == "on") {
+        return true;
+    }
+    if (v == "false" || v == "0" || v == "off") {
+        return false;
+    }
+    return def;
+}
+
+static int cfg_parse_int(const std::string &v, bool found, int def) {
+    if (!found || v.empty()) {
+        return def;
+    }
+    char *end = NULL;
+    long n = strtol(v.c_str(), &end, 10);
+    return end && *end == '\0' ? (int)n : def;
+}
+
+static void cfg_load_read_only(cbm_cache_expiry_cfg_t *out) {
+    const char *dir = cbm_resolve_cache_dir();
+    if (!dir || !dir[0]) {
+        return;
+    }
+    std::string path = std::string(dir) + "/_config.db";
+    if (!cbm_file_exists(path.c_str())) {
+        return;
+    }
+    sqlite3 *db = NULL;
+    if (cbm_store_sqlite_open(path.c_str(), &db, SQLITE_OPEN_READONLY) != SQLITE_OK) {
+        sqlite3_close(db);
+        return;
+    }
+    sqlite3_busy_timeout(db, CE_WRITE_BUSY_MS);
+    bool f = false;
+    std::string v = cfg_read_value(db, CBM_CONFIG_CACHE_EXPIRY, &f);
+    out->enabled = cfg_parse_bool(v, f, true);
+    v = cfg_read_value(db, CBM_CONFIG_CACHE_EXPIRY_UNUSED_DAYS, &f);
+    out->unused_s = (int64_t)cfg_parse_int(v, f, CBM_CACHE_EXPIRY_UNUSED_DAYS) * CBM_CACHE_DAY_S;
+    v = cfg_read_value(db, CBM_CONFIG_CACHE_EXPIRY_ROOT_GRACE_DAYS, &f);
+    out->root_grace_s =
+        (int64_t)cfg_parse_int(v, f, CBM_CACHE_EXPIRY_ROOT_GRACE_DAYS) * CBM_CACHE_DAY_S;
+    v = cfg_read_value(db, CBM_CONFIG_CACHE_EXPIRY_SLOT_DAYS, &f);
+    out->slot_s = (int64_t)cfg_parse_int(v, f, CBM_CACHE_EXPIRY_SLOT_DAYS) * CBM_CACHE_DAY_S;
+    sqlite3_close(db);
+}
+
 void cbm_cache_expiry_cfg_load(cbm_cache_expiry_cfg_t *out, struct cbm_config *cfg) {
     out->enabled = true;
     out->unused_s = (int64_t)CBM_CACHE_EXPIRY_UNUSED_DAYS * CBM_CACHE_DAY_S;
@@ -395,17 +464,13 @@ void cbm_cache_expiry_cfg_load(cbm_cache_expiry_cfg_t *out, struct cbm_config *c
     out->trash_s = CBM_CACHE_EXPIRY_TRASH_S;
     out->scratch_s = CBM_CACHE_EXPIRY_SCRATCH_S;
     out->interval_s = CBM_CACHE_EXPIRY_INTERVAL_S;
-    cbm_config_t *owned = NULL;
     if (!cfg) {
-        /* Opened only when it exists: cbm_config_open would create the
-         * cache directory and _config.db, and a preview (`cache expire
-         * --dry-run` before anything was indexed) must write nothing. */
-        const char *dir = cbm_resolve_cache_dir();
-        std::string cfgdb = dir ? std::string(dir) + "/_config.db" : "";
-        owned = dir && cbm_file_exists(cfgdb.c_str()) ? cbm_config_open(dir) : NULL;
-        cfg = owned;
-    }
-    if (cfg) {
+        /* The settings are read through a read-only connection, never
+         * cbm_config_open: that one creates the cache directory, _config.db
+         * and its config table and switches the journal mode, and a preview
+         * (`cache expire --dry-run`) must write nothing. */
+        cfg_load_read_only(out);
+    } else {
         out->enabled = cbm_config_get_bool(cfg, CBM_CONFIG_CACHE_EXPIRY, true);
         out->unused_s = (int64_t)cbm_config_get_int(cfg, CBM_CONFIG_CACHE_EXPIRY_UNUSED_DAYS,
                                                     CBM_CACHE_EXPIRY_UNUSED_DAYS) *
@@ -418,7 +483,6 @@ void cbm_cache_expiry_cfg_load(cbm_cache_expiry_cfg_t *out, struct cbm_config *c
                                                   CBM_CACHE_EXPIRY_SLOT_DAYS) *
                       CBM_CACHE_DAY_S;
     }
-    cbm_config_close(owned);
     const char *env = getenv("CBM_CACHE_EXPIRY");
     if (env && strcmp(env, "0") == 0) {
         out->enabled = false;
