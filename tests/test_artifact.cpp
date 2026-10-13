@@ -168,6 +168,44 @@ TEST(artifact_concurrent_exports_one_repo_publish_one_pair) {
     PASS();
 }
 
+/* No publish lock to be had (a read-only cache): the export fails closed
+ * rather than publishing unlocked through the shared temp names. */
+TEST(artifact_export_fails_closed_without_publish_lock) {
+#ifndef _WIN32
+    if (geteuid() == 0) {
+        PASS(); /* root ignores directory permissions */
+    }
+    setup_artifact_test();
+    char repo[1024];
+    char db[1024];
+    char rocache[1024];
+    snprintf(repo, sizeof(repo), "%s/lockless-repo", g_tmpdir);
+    snprintf(db, sizeof(db), "%s/lockless.db", g_tmpdir);
+    snprintf(rocache, sizeof(rocache), "%s/ro-cache", g_tmpdir);
+    cbm_mkdir_p(repo, 0755);
+    cbm_mkdir_p(rocache, 0755);
+    create_test_db(db);
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", rocache, 1);
+    ASSERT_EQ(chmod(rocache, 0555), 0);
+    int rc = cbm_artifact_export(db, repo, "test-proj", CBM_ARTIFACT_FAST);
+    chmod(rocache, 0755);
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    ASSERT_NEQ(rc, 0);
+    char meta[1100];
+    snprintf(meta, sizeof(meta), "%s/.code-cortex/artifact.json", repo);
+    ASSERT_FALSE(cbm_file_exists(meta));
+    cleanup_dir(g_tmpdir);
+#endif
+    PASS();
+}
+
 /* An export removes the snapshot files (cbm_artifact_<pid>_<n>.db and its
  * sidecars) that a process which died mid-export left in the temp
  * directory; this process's own and a live process's stay. */
@@ -560,6 +598,7 @@ SUITE(artifact) {
     RUN_TEST(store_deep_integrity_detects_page_corruption);
     RUN_TEST(artifact_concurrent_exports_do_not_collide);
     RUN_TEST(artifact_concurrent_exports_one_repo_publish_one_pair);
+    RUN_TEST(artifact_export_fails_closed_without_publish_lock);
     RUN_TEST(artifact_export_removes_orphaned_snapshots);
     RUN_TEST(artifact_export_fast_roundtrip);
     RUN_TEST(artifact_export_best_roundtrip);

@@ -1415,6 +1415,8 @@ static int db_lock_probe(const char *db_path, const char *suffix) {
         snprintf(leaf, sizeof(leaf), "%s", slash + 1);
         if (slash == parent) {
             slash[1] = '\0'; /* "/x.db": the parent is "/" */
+        } else if (slash == parent + 2 && parent[1] == ':') {
+            slash[1] = '\0'; /* "C:\x.db": the parent is "C:\", not drive-relative "C:" */
         } else {
             *slash = '\0';
         }

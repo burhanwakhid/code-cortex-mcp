@@ -1112,9 +1112,14 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     uint64_t post_dev = 0;
     uint64_t post_ino = 0;
     bool post_known = store_file_id(db_path, &post_dev, &post_ino);
-    if (pre_known && post_known) {
+    if (pre_known) {
+        /* A path with no file at the second stat changed under the open
+         * (moved to trash, replaced): the connection may read the old inode,
+         * so it is a race as much as a different file is. Unknown here, and a
+         * path recreated before store_still_at_path asks, was taken on the
+         * path's existence alone. */
         s->open_id_known = true;
-        s->open_id_raced = pre_dev != post_dev || pre_ino != post_ino;
+        s->open_id_raced = !post_known || pre_dev != post_dev || pre_ino != post_ino;
         s->open_dev = pre_dev;
         s->open_ino = pre_ino;
     }

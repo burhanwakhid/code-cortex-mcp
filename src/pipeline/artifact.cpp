@@ -693,8 +693,13 @@ static int artifact_publish_lock(const char *repo_path, cbm_db_lease_t **out) {
     }
     for (int waited = 0;; waited += ART_PUBLISH_POLL_MS) {
         int rc = cbm_db_lease_try_acquire(key, out);
+        if (rc == 0) {
+            return 0;
+        }
         if (rc != CBM_INDEX_BUSY) {
-            return 0; /* held, or no lock to be had (publish unlocked) */
+            /* No lock to be had (a read-only cache): publishing unlocked would
+             * reopen the race the lock is for. Fail closed. */
+            return CBM_NOT_FOUND;
         }
         if (waited >= ART_PUBLISH_WAIT_MS) {
             return CBM_INDEX_BUSY;
@@ -730,10 +735,14 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     }
 
     cbm_db_lease_t *publish = NULL;
-    if (artifact_publish_lock(repo_path, &publish) == CBM_INDEX_BUSY) {
+    int lrc = artifact_publish_lock(repo_path, &publish);
+    if (lrc == CBM_INDEX_BUSY) {
         cbm_log_warn("artifact.export.busy", "repo", repo_path, "reason",
                      "another export into this repository is publishing");
         return CBM_INDEX_BUSY; /* not current: the next run exports */
+    }
+    if (lrc != 0) {
+        return artifact_export_fail("publish_lock", repo_path, "lock_unavailable", 0);
     }
     int export_rc = export_locked(db_path, repo_path, project_name, quality);
     cbm_db_lease_release(publish);
