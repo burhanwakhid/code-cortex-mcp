@@ -6296,6 +6296,78 @@ TEST(session_in_subdirectory_uses_indexed_ancestor) {
 }
 #endif
 
+#ifndef _WIN32
+/* Child of delete_path_arg_does_not_scope_later_calls: marks the process as
+ * the supervising host (irreversible, hence the fork). 0 = pass. */
+static int expected_root_leak_check(const char *cache) {
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/leak-proj.db", cache);
+    cbm_store_t *st = cbm_store_open_path(db_path);
+    if (!st) {
+        return 2;
+    }
+    cbm_store_upsert_project(st, "leak-proj", cache);
+    cbm_node_t n = {0};
+    n.project = "leak-proj";
+    n.label = "Function";
+    n.name = "LeakProbe";
+    n.qualified_name = "leak-proj.LeakProbe";
+    n.file_path = "a.go";
+    n.start_line = 1;
+    n.end_line = 2;
+    cbm_store_upsert_node(st, &n);
+    cbm_store_close(st);
+
+    cbm_unsetenv("CBM_TOOL_SUPERVISOR");
+    cbm_index_supervisor_mark_host(); /* delete_project takes the wrapped path */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return 3;
+    }
+    /* The pipeline lock is held, so the wrapped delete answers "busy" without
+     * spawning a worker; its project argument (a path) was read before that. */
+    cbm_pipeline_lock();
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"delete_project\",\"arguments\":{\"project\":\"/nonexistent/elsewhere\"}}}");
+    cbm_pipeline_unlock();
+    bool busy = resp && strstr(resp, "cannot run while indexing") != NULL;
+    free(resp);
+    if (!busy) {
+        cbm_mcp_server_free(srv);
+        return 4;
+    }
+    /* A later in-process call for a project indexed from another directory
+     * must not be scoped to that path. */
+    resp = cbm_mcp_handle_tool(srv, "search_graph",
+                               "{\"project\":\"leak-proj\",\"name_pattern\":\"LeakProbe\"}");
+    bool found = resp && strstr(resp, "LeakProbe") != NULL && !strstr(resp, "not found");
+    free(resp);
+    cbm_mcp_server_free(srv);
+    return found ? 0 : 5;
+}
+
+TEST(delete_path_arg_does_not_scope_later_calls) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s", th_mktempdir("cbm_rootleak"));
+    ASSERT_TRUE(cache[0] != '\0');
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(60);
+        _exit(expected_root_leak_check(cache));
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    th_rmtree(cache);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    PASS();
+}
+#endif
+
 
 TEST(hook_edit_impact_note) {
     char tmp[256];
@@ -8415,6 +8487,7 @@ SUITE(mcp) {
     RUN_TEST(tool_project_resolves_from_cwd);
 #ifndef _WIN32
     RUN_TEST(session_in_subdirectory_uses_indexed_ancestor);
+    RUN_TEST(delete_path_arg_does_not_scope_later_calls);
 #endif
     RUN_TEST(hook_edit_impact_note);
     /* #518/#519 — BM25 prose search */

@@ -1453,8 +1453,10 @@ static bool project_db_exists(const char *project) {
 
 /* The directory the current tool call's project must have been indexed from,
  * or "": set by a walk-up level (cbm_mcp_expect_project_root) or by a project
- * argument given as a path, cleared at the start of every tool call. Per
- * process, like g_project_note. */
+ * argument given as a path. Not cleared per call: cbm_mcp_handle_tool and
+ * every other reader of a project argument outside a tool call save it and
+ * restore it afterwards, so a path argument scopes only its own call and a
+ * caller's walk-up level stays in force. Per process, like g_project_note. */
 static char g_expected_root[CBM_SZ_4K];
 
 void cbm_mcp_expect_project_root(const char *dir) {
@@ -13490,9 +13492,17 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
         bool wrap_tool = mcp_tool_known(tool_name) && strcmp(tool_name, "index_repository") != 0 &&
                          cbm_tool_supervisor_should_wrap();
-        char *delete_project = wrap_tool && strcmp(tool_name, "delete_project") == 0
-                                   ? get_project_arg(tool_args)
-                                   : NULL;
+        /* get_project_arg records a path argument's directory as the
+         * expected root (normalize_project_arg); this lookup is not a tool
+         * call, so put the expectation back, or it would scope every later
+         * call in this process to that directory. */
+        char *delete_project = NULL;
+        if (wrap_tool && strcmp(tool_name, "delete_project") == 0) {
+            char saved_root[sizeof(g_expected_root)];
+            memcpy(saved_root, g_expected_root, sizeof(saved_root));
+            delete_project = get_project_arg(tool_args);
+            memcpy(g_expected_root, saved_root, sizeof(saved_root));
+        }
         bool delete_locked = false;
         if (delete_project) {
             delete_locked = cbm_pipeline_try_lock();
