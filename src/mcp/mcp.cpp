@@ -13639,7 +13639,14 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
                 char delete_path[CBM_SZ_1K];
                 project_db_path(delete_project, delete_path, sizeof(delete_path));
                 bool delete_gone = delete_path[0] && !cbm_file_exists(delete_path);
-                if (((usable_response && !response_error) || delete_gone) && srv->watcher) {
+                /* A worker that kept the database because another checkout
+                 * owns it (a project-name collision: "kept_database_of")
+                 * leaves that checkout's watch in place, as the in-process
+                 * handler does; unwatching by name would stop its
+                 * re-indexing. */
+                bool kept_foreign = result_json && strstr(result_json, "kept_database_of");
+                if (((usable_response && !response_error && !kept_foreign) || delete_gone) &&
+                    srv->watcher) {
                     cbm_watcher_unwatch(srv->watcher, delete_project);
                 }
                 cbm_pipeline_unlock();
