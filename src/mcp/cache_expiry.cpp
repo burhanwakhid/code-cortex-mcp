@@ -170,11 +170,28 @@ static bool remove_tree(const char *dir) {
 
 /* ── State in _config.db ────────────────────────────────────────── */
 
+/* Whether table `name` exists, from a statement's prepare (a schema read). */
+static bool state_has_table(sqlite3 *db, const char *name) {
+    std::string sql = std::string("SELECT 1 FROM ") + name + " LIMIT 0;";
+    sqlite3_stmt *st = NULL;
+    bool ok = sqlite3_prepare_v2(db, sql.c_str(), -1, &st, NULL) == SQLITE_OK;
+    sqlite3_finalize(st);
+    return ok;
+}
+
 /* read_only: a connection that cannot write at all -- not a row, not a
  * table, not the checkpoint a read-write connection may run as it closes --
  * for the dry run, which promises to write nothing (create_tables is then
- * ignored). */
-static sqlite3 *state_open(bool create_tables, bool read_only = false) {
+ * ignored).
+ *
+ * busy_ms bounds every wait on this connection, the open's own included: a
+ * caller that records a use passes CE_WRITE_BUSY_MS. A writer's open also
+ * puts _config.db in WAL mode (once; it persists in the file), as every index
+ * database in the cache directory already is: in the default rollback mode a
+ * committing writer locks readers out, and a dozen index runs recording their
+ * use at once lost rows to the wait. The tables are created only when missing,
+ * so an open in WAL mode never needs the write lock just to start. */
+static sqlite3 *state_open(bool create_tables, bool read_only = false, int busy_ms = CE_BUSY_MS) {
     const char *cdir = cbm_resolve_cache_dir();
     if (!cdir || !cdir[0]) {
         return NULL;
@@ -192,8 +209,23 @@ static sqlite3 *state_open(bool create_tables, bool read_only = false) {
         sqlite3_close(db);
         return NULL;
     }
-    sqlite3_busy_timeout(db, CE_BUSY_MS);
+    sqlite3_busy_timeout(db, busy_ms);
+    if (!read_only) {
+        sqlite3_stmt *st = NULL;
+        bool wal = false;
+        if (sqlite3_prepare_v2(db, "PRAGMA journal_mode;", -1, &st, NULL) == SQLITE_OK &&
+            sqlite3_step(st) == SQLITE_ROW) {
+            const char *mode = (const char *)sqlite3_column_text(st, 0);
+            wal = mode && strcmp(mode, "wal") == 0;
+        }
+        sqlite3_finalize(st);
+        if (!wal) {
+            /* Best effort: busy now, the next writer's open converts it. */
+            (void)sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+        }
+    }
     if (create_tables &&
+        !(state_has_table(db, "cache_usage") && state_has_table(db, "cache_sweep")) &&
         sqlite3_exec(db,
                      "CREATE TABLE IF NOT EXISTS cache_usage ("
                      "db_name TEXT PRIMARY KEY,"
@@ -342,11 +374,13 @@ void cbm_cache_expiry_cfg_load(cbm_cache_expiry_cfg_t *out, struct cbm_config *c
 
 bool cbm_cache_usage_set(const char *db_path, int64_t last_used, const char *root_path) {
     const char *key = cbm_store_meta_key(db_path);
-    sqlite3 *db = key[0] ? state_open(true) : NULL;
+    sqlite3 *db = key[0] ? state_open(true, false, CE_WRITE_BUSY_MS) : NULL;
     if (!db) {
+        if (key[0]) {
+            cbm_log_warn("cache.usage.not_recorded", "db", key, "reason", "config_unavailable");
+        }
         return false;
     }
-    sqlite3_busy_timeout(db, CE_WRITE_BUSY_MS);
     /* Read-modify-write under the write lock: a query touch (no root) in
      * another process reading the row before this and writing after it
      * would put the old root and missing streak back. */
@@ -367,6 +401,9 @@ bool cbm_cache_usage_set(const char *db_path, int64_t last_used, const char *roo
             (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
         }
     }
+    if (!ok) {
+        cbm_log_warn("cache.usage.not_recorded", "db", key, "reason", sqlite3_errmsg(db));
+    }
     sqlite3_close(db);
     return ok;
 }
@@ -383,10 +420,7 @@ void cbm_cache_usage_forget(const char *db_path) {
     cbm_store_meta_db_t *meta = cbm_store_meta_open();
     cbm_store_meta_forget(meta, db_path);
     cbm_store_meta_close(meta);
-    sqlite3 *db = state_open(false);
-    if (db) {
-        sqlite3_busy_timeout(db, CE_WRITE_BUSY_MS);
-    }
+    sqlite3 *db = state_open(false, false, CE_WRITE_BUSY_MS);
     usage_forget(db, key);
     sqlite3_close(db);
     std::lock_guard<std::mutex> g(g_touch_mu);
@@ -410,11 +444,11 @@ void cbm_cache_usage_touch(const char *db_path, const char *root_path) {
     }
     /* Read first: a hook process lands here once per database it opens, and
      * a read never takes _config.db's write lock. */
-    sqlite3 *db = state_open(true);
+    sqlite3 *db = state_open(true, false, CE_WRITE_BUSY_MS);
     if (!db) {
+        cbm_log_warn("cache.usage.not_recorded", "db", key, "reason", "config_unavailable");
         return;
     }
-    sqlite3_busy_timeout(db, CE_WRITE_BUSY_MS);
     usage_row_t r = usage_get(db, key);
     bool fresh = r.found && now - r.last_used < CBM_CACHE_USAGE_RESOLUTION_S;
     bool root_known = !root_path || (r.root == root_path && r.missing_checks == 0);
@@ -439,6 +473,9 @@ void cbm_cache_usage_touch(const char *db_path, const char *root_path) {
             if (!ok) {
                 (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
             }
+        }
+        if (!ok) {
+            cbm_log_warn("cache.usage.not_recorded", "db", key, "reason", sqlite3_errmsg(db));
         }
     }
     sqlite3_close(db);

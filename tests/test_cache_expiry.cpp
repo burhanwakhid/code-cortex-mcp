@@ -22,9 +22,12 @@
 
 #include "sqlite3.h"
 #include <atomic>
+#include <chrono>
 #include <ctype.h>
 #include <errno.h>
 #include <new>
+#include <thread>
+#include <vector>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1674,6 +1677,90 @@ TEST(cache_usage_touch_retries_after_busy) {
     PASS();
 }
 
+/* Many index runs recording their use at once, while another connection
+ * keeps taking _config.db's lock (300 ms on, 300 ms off) for longer than the
+ * sweep's reads wait:
+ * every row lands. (In rollback mode an exclusive holder locks readers out,
+ * and the open's table check gave up after 200 ms: rows were lost.) The
+ * file ends up in WAL mode. */
+TEST(cache_usage_concurrent_writers_all_recorded) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_usagerace"));
+    char cp[700];
+    snprintf(cp, sizeof(cp), "%s/_config.db", e.cache);
+    enum { THREADS = 12, PER = 6, HOLDS = 10 };
+    std::atomic<bool> holding{false};
+    std::thread holder([&] {
+        sqlite3 *h = NULL;
+        if (sqlite3_open(cp, &h) != SQLITE_OK) {
+            return;
+        }
+        sqlite3_busy_timeout(h, 5000);
+        for (int i = 0; i < HOLDS; i++) {
+            if (sqlite3_exec(h, "BEGIN EXCLUSIVE;", NULL, NULL, NULL) == SQLITE_OK) {
+                holding = true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                sqlite3_exec(h, "COMMIT;", NULL, NULL, NULL);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        }
+        sqlite3_close(h);
+    });
+    for (int i = 0; i < 200 && !holding; i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::atomic<int> failed{0};
+    std::vector<std::thread> writers;
+    for (int t = 0; t < THREADS; t++) {
+        writers.emplace_back([&, t] {
+            for (int k = 0; k < PER; k++) {
+                char p[900];
+                snprintf(p, sizeof(p), "%s/w%02d_%d.db", e.cache, t, k);
+                char root[900];
+                snprintf(root, sizeof(root), "%s/root%02d_%d", e.base, t, k);
+                if (k % 2 == 0) {
+                    if (!cbm_cache_usage_set(p, (int64_t)time(NULL), root)) {
+                        failed++;
+                    }
+                } else {
+                    cbm_cache_usage_touch(p, root);
+                }
+                cbm_store_meta_close(cbm_store_meta_open());
+            }
+        });
+    }
+    for (auto &w : writers) {
+        w.join();
+    }
+    holder.join();
+    ASSERT_EQ(failed.load(), 0);
+    /* With the holder gone, the next writer's open converts at the latest. */
+    char last[900];
+    snprintf(last, sizeof(last), "%s/after.db", e.cache);
+    ASSERT_TRUE(cbm_cache_usage_set(last, (int64_t)time(NULL), NULL));
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(cp, &db), SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    int rows = -1;
+    if (sqlite3_prepare_v2(db, "SELECT count(*) FROM cache_usage WHERE db_name LIKE 'w%';", -1,
+                           &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        rows = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    char mode[16] = "";
+    if (sqlite3_prepare_v2(db, "PRAGMA journal_mode;", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        snprintf(mode, sizeof(mode), "%s", (const char *)sqlite3_column_text(st, 0));
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    ASSERT_EQ(rows, THREADS * PER);
+    ASSERT_STR_EQ(mode, "wal");
+    ce_teardown(&e);
+    PASS();
+}
+
 /* A use recorded between the sweep's scan and the move (another process's
  * tool call; the keep callback runs in that window) keeps the database. */
 static bool ce_touch_between(const char *project, void *ud) {
@@ -3179,6 +3266,7 @@ SUITE(cache_expiry) {
 #endif
     RUN_TEST(cache_usage_touch_is_throttled);
     RUN_TEST(cache_usage_touch_retries_after_busy);
+    RUN_TEST(cache_usage_concurrent_writers_all_recorded);
     RUN_TEST(cache_used_since_scan_is_kept);
     RUN_TEST(cache_touch_during_scan_lands);
     RUN_TEST(cache_index_and_query_record_use);

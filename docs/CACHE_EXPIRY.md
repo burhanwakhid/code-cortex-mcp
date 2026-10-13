@@ -98,9 +98,16 @@ The write is throttled twice. A process remembers, per database, when it last re
 skips the next hour of calls with one map lookup. The first call of a process (each hook is its
 own process) reads the row from `_config.db` and writes only when the row is an hour old. A read
 never takes `_config.db`'s write lock, so a hook pays one SQLite open and one indexed read, once
-per database it opens. The write waits up to 2.5 seconds for a busy `_config.db`. The
-in-process throttle starts only after the row is current: when the write still fails, the next
-call tries again.
+per database it opens. The open, the read and the write wait up to 2.5 seconds for a busy
+`_config.db`. The in-process throttle starts only after the row is current: when the write
+still fails, the next call tries again, and the loss is logged (`cache.usage.not_recorded`).
+
+`_config.db` is in WAL mode, like every index database in the cache directory: the first
+open that records a use switches it (`PRAGMA journal_mode=WAL`, kept in the file). In the
+default rollback mode a committing writer locks every reader out, and a dozen index runs
+recording their use at once lost up to half of their rows to that wait (measured: 12 parallel
+runs into a fresh cache kept 17 to 23 rows of 40). The usage tables are created only when
+missing, so an open never takes the write lock just to start.
 
 A database seen for the first time starts its clock at that sweep. Its file mtime is not used:
 the mtime is the last index run, and a database queried daily but indexed long ago would then
