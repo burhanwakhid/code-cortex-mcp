@@ -1289,7 +1289,7 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
 /* Register one definition and create DEFINES + DEFINES_METHOD edges. Returns edge count. */
 static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel,
-                                 int *reg_entries) {
+                                 CBMLanguage lang, int *reg_entries) {
     int edges = 0;
     if (!def->name || !def->qualified_name || !def->label) {
         return 0;
@@ -1297,7 +1297,7 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
      * (helpers.cpp) — see pass_definitions.cpp for the per-label rationale. */
     if (cbm_label_is_registry_symbol(def->label)) {
-        cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
+        cbm_registry_add_lang(ctx->registry, def->name, def->qualified_name, def->label, lang);
         (*reg_entries)++;
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -1488,7 +1488,8 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         /* Register callable symbols + DEFINES/DEFINES_METHOD edges */
         for (int d = 0; d < result->defs.count; d++) {
-            defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel, &reg_entries);
+            defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel,
+                                                   files[i].language, &reg_entries);
         }
 
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map);

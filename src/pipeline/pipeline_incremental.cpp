@@ -551,7 +551,14 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     if (!incr_label_is_registry_symbol(node->label)) {
         return;
     }
-    cbm_registry_add(r, node->name, node->qualified_name, node->label);
+    /* The language matters only to a C# reference-assembly stub (a `.ref.`
+     * QN), so only those pay for the filename lookup. */
+    CBMLanguage lang = CBM_LANG_COUNT;
+    if (node->qualified_name && strstr(node->qualified_name, ".ref.") && node->file_path) {
+        const char *slash = strrchr(node->file_path, '/');
+        lang = cbm_language_for_filename(slash ? slash + 1 : node->file_path);
+    }
+    cbm_registry_add_lang(r, node->name, node->qualified_name, node->label, lang);
 }
 
 /* Run parallel or sequential extract+resolve for changed files. */
@@ -788,8 +795,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     if (n_changed > 0 && (size_t)n_changed <= SIZE_MAX / INCR_SOURCE_DIGEST_STRIDE) {
         changed_digests.assign((size_t)n_changed * INCR_SOURCE_DIGEST_STRIDE, '\0');
     } else if (n_changed > 0) {
-        cbm_log_error("incremental.err", "phase", "source_digest_alloc", "reason",
-                      "size_overflow");
+        cbm_log_error("incremental.err", "phase", "source_digest_alloc", "reason", "size_overflow");
     }
     int ci = 0;
     for (int i = 0; i < file_count; i++) {
@@ -921,8 +927,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     for (int i = 0; i < ci; ++i) {
         const char *digest = changed_digests.empty()
                                  ? nullptr
-                                 : changed_digests.data() +
-                                       (size_t)i * INCR_SOURCE_DIGEST_STRIDE;
+                                 : changed_digests.data() + (size_t)i * INCR_SOURCE_DIGEST_STRIDE;
         if (changed_versions[(size_t)i] && digest && digest[0] != '\0') {
             memcpy(changed_versions[(size_t)i]->sha256, digest, INCR_SOURCE_DIGEST_STRIDE);
         }

@@ -87,6 +87,11 @@ struct cbm_registry {
 
     /* byName: simpleName → qn_array_t* (heap-owned) */
     CBMHashTable *by_name;
+
+    /* C# reference-assembly stubs (`.../ref/<Asm>.cs` definitions): a set of
+     * QNs borrowed from `exact`'s keys. NULL until the first one registers,
+     * so a repository without them pays nothing (candidate_outranks_on_tie). */
+    CBMHashTable *csharp_ref_stubs;
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -163,48 +168,100 @@ static int candidate_score(const char *candidate_qn, const char *module_qn) {
     return score;
 }
 
-/* Number of '.'-separated segments in a QN: how deeply the definition is
- * nested (file depth + enclosing types). */
-static int qn_depth(const char *qn) {
-    int depth = 1;
-    for (const char *p = qn; *p; p++) {
-        if (*p == '.') {
-            depth++;
-        }
+/* How plainly a candidate is something a call can target, lower = better: a
+ * function or method; then any other definition (a class for a constructor
+ * call, a macro, a type); then a candidate whose label is unknown; last a
+ * variable or field, which a call reaches only when it holds a function. */
+enum {
+    REG_RANK_CALLABLE = 0,
+    REG_RANK_OTHER_DEF = 1,
+    REG_RANK_UNKNOWN = 2,
+    REG_RANK_DATA = 3,
+};
+
+static int callable_rank(const cbm_registry_t *r, const char *qn) {
+    const char *label = r ? (const char *)cbm_ht_get(r->exact, qn) : NULL;
+    if (!label) {
+        return REG_RANK_UNKNOWN;
     }
-    return depth;
+    if (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0) {
+        return REG_RANK_CALLABLE;
+    }
+    if (strcmp(label, "Variable") == 0 || strcmp(label, "Field") == 0) {
+        return REG_RANK_DATA;
+    }
+    return REG_RANK_OTHER_DEF;
 }
 
-/* Total order among candidates that tie on candidate_score. The least nested
- * definition wins — a top-level function over a same-named member two types
- * deep, include/linux over tools/virtio/linux (upstream's kernel probe:
- * `sg_set_buf`, `dev_name`) — then the lexicographically smaller QN. A pure
- * function of the candidate set, never of the order it was built in. */
-static bool candidate_outranks_on_tie(const char *candidate, const char *best) {
-    int cd = qn_depth(candidate);
-    int bd = qn_depth(best);
-    if (cd != bd) {
-        return cd < bd;
+/* A .NET reference assembly (`src/libraries/<Asm>/ref/<Asm>.cs`) declares an
+ * assembly's public surface with `throw null` bodies in one shallow file; a
+ * call that could equally mean the implementation means the implementation.
+ * C# only (registered through cbm_registry_add_lang): elsewhere a `ref`
+ * directory is an ordinary name. */
+static bool csharp_reference_stub(const cbm_registry_t *r, const char *qn) {
+    return r && r->csharp_ref_stubs && cbm_ht_get(r->csharp_ref_stubs, qn) != NULL;
+}
+
+/* Total order among candidates that tie on candidate_score. Bucket position
+ * (registration order) must never decide (upstream's kernel probe:
+ * `dev_name` flipping between twenty same-named struct fields, `sg_set_buf`
+ * between include/linux and tools/virtio). The rule, a pure function of the
+ * candidate set (O9):
+ *   1. the more plainly callable candidate (`dev_name` the function over the
+ *      struct fields; Kotlin `where(...)` the method over the property);
+ *   2. for C#, an implementation over a reference-assembly stub;
+ *   3. the lexicographically smaller QN (include/linux over tools/virtio).
+ * Nesting depth is deliberately not a criterion (upstream 51364158): "least
+ * nested wins" sent django's `Model.objects.filter` to the template
+ * `Library.filter`, one segment shallower than `QuerySet.filter`.
+ * `best_rank` is callable_rank(r, best), cached by the caller so a tie costs
+ * one label lookup. */
+static bool candidate_outranks_on_tie(const cbm_registry_t *r, const char *candidate,
+                                      int candidate_rank, const char *best, int best_rank) {
+    if (candidate_rank != best_rank) {
+        return candidate_rank < best_rank;
+    }
+    bool cs = csharp_reference_stub(r, candidate);
+    bool bs = csharp_reference_stub(r, best);
+    if (cs != bs) {
+        return !cs;
     }
     return strcmp(candidate, best) < 0;
 }
 
-/* Pick candidate with highest composite score (test-deprioritization + namespace proximity). */
-static const char *best_by_import_distance(const char **candidates, int count,
-                                           const char *module_qn) {
+/* Pick candidate with highest composite score (test-deprioritization + namespace
+ * proximity), ties settled by candidate_outranks_on_tie. */
+static const char *best_by_import_distance(const cbm_registry_t *r, const char **candidates,
+                                           int count, const char *module_qn) {
     const char *best = NULL;
     int best_score = CBM_NOT_FOUND;
+    int best_rank = REG_RANK_UNKNOWN;
+    bool best_rank_known = false;
     for (int i = 0; i < count; i++) {
         int score = candidate_score(candidates[i], module_qn);
-        /* Score ties break on the candidates themselves (nesting depth, then
+        /* Score ties break on the candidates themselves (kind, C# stub, then
          * lexicographic QN), not array position — the candidate array order
          * reflects registry insertion order, and an order-sensitive pick let
          * equally-scored ambiguous names (e.g. two Makefiles both defining an
-         * `echo` target) resolve differently between identical runs. */
-        if (score > best_score ||
-            (score == best_score && best && candidate_outranks_on_tie(candidates[i], best))) {
+         * `echo` target) resolve differently between identical runs. The
+         * kind is looked up only on a tie, and the best's only once. */
+        if (score > best_score) {
             best_score = score;
             best = candidates[i];
+            best_rank_known = false;
+            continue;
+        }
+        if (score != best_score || !best) {
+            continue;
+        }
+        if (!best_rank_known) {
+            best_rank = callable_rank(r, best);
+            best_rank_known = true;
+        }
+        int rank = callable_rank(r, candidates[i]);
+        if (candidate_outranks_on_tie(r, candidates[i], rank, best, best_rank)) {
+            best = candidates[i];
+            best_rank = rank;
         }
     }
     return best;
@@ -696,6 +753,9 @@ void cbm_registry_free(cbm_registry_t *r) {
     /* by_name first: its items borrow exact's keys. */
     cbm_ht_foreach(r->by_name, free_qn_array, NULL);
     cbm_ht_free(r->by_name);
+    if (r->csharp_ref_stubs) {
+        cbm_ht_free(r->csharp_ref_stubs); /* keys borrowed from exact */
+    }
     cbm_ht_foreach(r->exact, free_label, NULL);
     cbm_ht_free(r->exact);
     for (int i = 0; i < r->label_pool_n; i++) {
@@ -708,6 +768,11 @@ void cbm_registry_free(cbm_registry_t *r) {
 
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label) {
+    cbm_registry_add_lang(r, name, qualified_name, label, CBM_LANG_COUNT);
+}
+
+void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
+                           const char *label, CBMLanguage lang) {
     (void)name;
     if (!r || !qualified_name || !label) {
         return;
@@ -754,6 +819,15 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
         cbm_ht_set(r->by_name, strdup(simple), arr);
     }
     cbm_da_push(arr, (char *)owned_qn);
+
+    if (lang == CBM_LANG_CSHARP && strstr(owned_qn, ".ref.") != NULL) {
+        if (!r->csharp_ref_stubs) {
+            r->csharp_ref_stubs = cbm_ht_create(REG_INIT_CAP);
+        }
+        if (r->csharp_ref_stubs) {
+            cbm_ht_set(r->csharp_ref_stubs, owned_qn, (void *)owned_qn);
+        }
+    }
 }
 
 /* ── Lookup ──────────────────────────────────────────────────────── */
@@ -902,8 +976,9 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
 }
 
 /* Strategy 4: multiple candidates with import filtering. */
-static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const char *module_qn,
-                                                   const char **import_vals, int import_count) {
+static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, const qn_array_t *arr,
+                                                   const char *module_qn, const char **import_vals,
+                                                   int import_count) {
     const char *filtered[CBM_SZ_256];
     int fcount = 0;
     for (int i = 0; i < arr->count && fcount < CBM_SZ_256; i++) {
@@ -916,14 +991,14 @@ static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const 
         return (cbm_resolution_t){filtered[0], "suffix_match", conf, arr->count};
     }
     if (fcount > SKIP_ONE) {
-        const char *best = best_by_import_distance(filtered, fcount, module_qn);
+        const char *best = best_by_import_distance(r, filtered, fcount, module_qn);
         if (best) {
             double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, fcount);
             return (cbm_resolution_t){best, "suffix_match", conf, fcount};
         }
     }
     /* No import-reachable — use all candidates with penalty */
-    const char *best = best_by_import_distance((const char **)arr->items, arr->count, module_qn);
+    const char *best = best_by_import_distance(r, (const char **)arr->items, arr->count, module_qn);
     if (best) {
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH * REG_HALF_PENALTY, arr->count);
         return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
@@ -1118,9 +1193,9 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
 
     /* Strategy 4: multiple candidates */
     if (import_vals && import_count > 0) {
-        return resolve_multi_with_imports(arr, module_qn, import_vals, import_count);
+        return resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count);
     }
-    const char *best = best_by_import_distance((const char **)arr->items, arr->count, module_qn);
+    const char *best = best_by_import_distance(r, (const char **)arr->items, arr->count, module_qn);
     if (best) {
         if (!receiver_chain_admits(callee_name, best)) {
             return empty_result();
@@ -1300,7 +1375,7 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
     if (fcount == 0) {
         /* No import-reachable — use originals with penalty */
         const char *best =
-            best_by_import_distance((const char **)arr->items, arr->count, module_qn);
+            best_by_import_distance(r, (const char **)arr->items, arr->count, module_qn);
         if (!best) {
             return no_match;
         }
@@ -1314,7 +1389,7 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
             {fptr[0], "fuzzy", candidate_count_penalty(CONF_FUZZY_SINGLE, arr->count), arr->count},
             true};
     }
-    const char *best = best_by_import_distance(fptr, fcount, module_qn);
+    const char *best = best_by_import_distance(r, fptr, fcount, module_qn);
     if (!best) {
         return no_match;
     }

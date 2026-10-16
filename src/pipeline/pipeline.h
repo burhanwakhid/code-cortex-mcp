@@ -221,6 +221,12 @@ void cbm_registry_free(cbm_registry_t *r);
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label);
 
+/* cbm_registry_add with the definition's language (CBM_LANG_COUNT: unknown).
+ * The language settles one suffix_match tie: a C# reference-assembly stub
+ * (`.ref.` in its QN) loses to an equally good implementation. */
+void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
+                           const char *label, CBMLanguage lang);
+
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.
  * Returns result with qualified_name="" if unresolved. */
