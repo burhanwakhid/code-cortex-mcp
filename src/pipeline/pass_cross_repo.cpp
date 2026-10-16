@@ -40,9 +40,10 @@ enum {
     CR_INIT_CAP = 32,
     CR_COL_3 = 3,
     CR_COL_4 = 4,
-    CR_SCHEME_SKIP = 3,      /* strlen("://") */
-    CR_ROUTE_PREFIX_LEN = 9, /* strlen("__route__") */
-    CR_ANY_LEN = 3,          /* strlen("ANY") */
+    CR_SCHEME_SKIP = 3,          /* strlen("://") */
+    CR_IPV4_LOOPBACK_PREFIX = 4, /* strlen("127.") */
+    CR_ROUTE_PREFIX_LEN = 9,     /* strlen("__route__") */
+    CR_ANY_LEN = 3,              /* strlen("ANY") */
 };
 
 #define CR_MS_PER_SEC 1000.0
@@ -197,11 +198,16 @@ static bool cr_url_names_remote_host(const char *url) {
     if (len == 0) {
         return false;
     }
-    static const char *const loopback[] = {"localhost", "127.0.0.1", "0.0.0.0", "[::1]"};
+    static const char *const loopback[] = {"localhost", "0.0.0.0", "[::1]"};
     for (const char *name : loopback) {
         if (strlen(name) == len && strncasecmp(host, name, len) == 0) {
             return false;
         }
+    }
+    /* 127.0.0.0/8 is loopback as a whole, not only 127.0.0.1. */
+    if (len > CR_IPV4_LOOPBACK_PREFIX && strncmp(host, "127.", CR_IPV4_LOOPBACK_PREFIX) == 0 &&
+        strspn(host, "0123456789.") >= len) {
+        return false;
     }
     return true;
 }

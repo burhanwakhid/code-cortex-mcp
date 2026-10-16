@@ -9656,10 +9656,12 @@ static void search_scan_buffer(std::string &out, const search_scan_patterns_t *p
     }
 }
 
-/* A file larger than this is not scanned: it is past any source file the
- * indexer keeps, and the reader must stay bounded when a path turns into an
- * endless pseudo-file (a symlink retargeted after indexing). */
-static constexpr size_t SEARCH_SCAN_FILE_MAX = (size_t)1 << 30;
+/* A file larger than this is not scanned. The indexer keeps files up to
+ * CBM_DEFAULT_MAX_FILE_SIZE (2 MiB) unless told otherwise, so this only drops
+ * outliers -- a path grown or retargeted to an endless pseudo-file after
+ * indexing -- and it bounds a request's buffers to SEARCH_SCAN_THREADS times
+ * this cap. */
+static constexpr size_t SEARCH_SCAN_FILE_MAX = (size_t)64 << 20;
 
 /* The cap, which test builds can lower (CBM_TEST_SEARCH_SCAN_FILE_MAX=<bytes>)
  * to exercise it on small fixtures. */
