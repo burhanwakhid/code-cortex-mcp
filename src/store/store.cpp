@@ -436,7 +436,18 @@ static int init_schema(cbm_store_t *s) {
     "CASE WHEN properties LIKE '%\"docstring\"%' AND json_valid(properties) " \
     "THEN json_extract(properties, '$.docstring') END"
 
-enum { FTS_SQL_BUF = 512 };
+/* nodes_fts.qualified_name: the QN without the C-macro fence. A macro's QN is
+ * `<module>.NAME#macro` (CBM_MACRO_QN_SUFFIX in internal/cbm/cbm.h), and `#`
+ * separates tokens, so the fence would add the word "macro" to every macro
+ * node a second time (the label column already says Macro). On a C repository
+ * that is thousands of rows outscoring the few nodes that carry the word in
+ * their NAME, enough to push those out of the BM25 candidate window. */
+#define FTS_QN_EXPR                                                        \
+    "CASE WHEN label = 'Macro' AND substr(qualified_name, -6) = '#macro' " \
+    "THEN substr(qualified_name, 1, length(qualified_name) - 6) "          \
+    "ELSE qualified_name END"
+
+enum { FTS_SQL_BUF = 768 };
 
 /* Does nodes_fts carry `body`? CREATE VIRTUAL TABLE IF NOT EXISTS never widens
  * an older four-column table, and naming a missing column fails the backfill. */
@@ -456,7 +467,7 @@ static bool fts_backfill_try(cbm_store_t *s, bool with_body, bool camel) {
     char sql[FTS_SQL_BUF];
     int n = snprintf(sql, sizeof(sql),
                      "INSERT INTO nodes_fts (rowid, name, qualified_name, label, file_path%s)"
-                     " SELECT id, %s, qualified_name, label, file_path%s FROM nodes;",
+                     " SELECT id, %s, " FTS_QN_EXPR ", label, file_path%s FROM nodes;",
                      with_body ? ", body" : "", camel ? "cbm_camel_split(name)" : "name",
                      with_body ? ", " FTS_BODY_EXPR : "");
     if (n <= 0 || (size_t)n >= sizeof(sql)) {

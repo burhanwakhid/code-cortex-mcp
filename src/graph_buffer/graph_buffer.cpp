@@ -909,9 +909,27 @@ int cbm_gbuf_duplicate_edge_ids(const cbm_gbuf_t *gb) {
  * everything else about them is identical, so without it the merge order chose
  * the blob. A full tie is the same entity re-upserted → refresh in place.
  * Kind-disambiguated QNs (the real cure) remain a follow-up. */
+/* First key of the canonical same-QN collision order: how strong a claim the
+ * entity has on a qualified name. A macro is the weakest: when a "Macro" and
+ * a definition share a QN, the definition, which carries the body, the
+ * signature and every edge, owns it whichever comes first.
+ *
+ * C-preprocessor macros no longer get here: their QN carries its own
+ * namespace (`...#macro`, CBM_MACRO_QN_SUFFIX) and cannot equal a definition's.
+ * What is left is any other grammar that labels a def "Macro" under a plain
+ * QN next to a same-named definition in one module. */
+static int gb_qn_claim_rank(const char *label) {
+    return (label && strcmp(label, "Macro") == 0) ? 0 : 1;
+}
+
 static int node_collision_cmp(const cbm_gbuf_node_t *existing, const char *label, const char *name,
                               const char *file_path, int start_line, const char *properties_json) {
-    int c = strcmp(file_path ? file_path : "", existing->file_path ? existing->file_path : "");
+    /* Ahead of everything below, a definition beats a macro (gb_qn_claim_rank). */
+    int c = gb_qn_claim_rank(existing->label) - gb_qn_claim_rank(label);
+    if (c != 0) {
+        return c;
+    }
+    c = strcmp(file_path ? file_path : "", existing->file_path ? existing->file_path : "");
     if (c == 0) {
         c = existing->start_line - start_line;
     }

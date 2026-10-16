@@ -6835,6 +6835,50 @@ TEST(tool_trace_call_path_qn_fallback_frees_name_miss) {
     PASS();
 }
 
+/* Tie rule for the C-macro namespace (PR C1): a typedef and its rename macro
+ * (`typedef struct state_s\n    state_t;` + `#define state_t NS(state_t)`) are
+ * two nodes with one name, `<module>.state_t` and `<module>.state_t#macro`, and
+ * here the same line span. The name resolves to the definition: without the
+ * macro ranking below it, the two tie and trace_path answers "ambiguous". */
+TEST(tool_trace_path_definition_beats_c_macro_c1) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "tie-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/tie");
+    cbm_node_t type = {.project = proj,
+                       .label = "Type",
+                       .name = "state_t",
+                       .qualified_name = "tie-proj.xxhash.state_t",
+                       .file_path = "xxhash.h",
+                       .start_line = 653,
+                       .end_line = 654};
+    cbm_node_t macro = {.project = proj,
+                        .label = "Macro",
+                        .name = "state_t",
+                        .qualified_name = "tie-proj.xxhash.state_t#macro",
+                        .file_path = "xxhash.h",
+                        .start_line = 429,
+                        .end_line = 430}; /* equal span: a tie without the rule */
+    ASSERT_GT(cbm_store_upsert_node(st, &type), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &macro), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"function_name\":\"state_t\",\"project\":\"tie-proj\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "ambiguous"));
+    ASSERT_NULL(strstr(inner, "suggestions"));
+    ASSERT_NULL(strstr(inner, "function not found"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 
 /* ── In-process search_code scan (upstream c9cacdf0, fork seam) ──────
  * The scoped scan used to shell out to `xargs grep -Hn` and now runs in
@@ -7675,6 +7719,79 @@ TEST(search_code_early_errors_release_path_filter_regex) {
     PASS();
 }
 
+/* ── C-macro namespace (PR C1) ────────────────────────────────── */
+
+/* A C macro's QN ends in "#macro", which no caller spells. get_code_snippet
+ * still returns the macro for its short name, for a dotted suffix and for the
+ * QN it had before the fence (`<module>.<NAME>`); when a definition owns that
+ * QN or that name, the definition is the answer. */
+TEST(snippet_c_macro_namespace_c1) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+
+    cbm_node_t only_macro = {.project = "test-project",
+                             .label = "Macro",
+                             .name = "MAX_LEN",
+                             .qualified_name = "test-project.lib.cfg.MAX_LEN#macro",
+                             .file_path = "main.go",
+                             .start_line = 7,
+                             .end_line = 8};
+    cbm_node_t type = {.project = "test-project",
+                       .label = "Type",
+                       .name = "state_t",
+                       .qualified_name = "test-project.lib.xx.state_t",
+                       .file_path = "main.go",
+                       .start_line = 3,
+                       .end_line = 3};
+    cbm_node_t shadowed_macro = {.project = "test-project",
+                                 .label = "Macro",
+                                 .name = "state_t",
+                                 .qualified_name = "test-project.lib.xx.state_t#macro",
+                                 .file_path = "main.go",
+                                 .start_line = 11,
+                                 .end_line = 12};
+    ASSERT_GT(cbm_store_upsert_node(st, &only_macro), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &type), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &shadowed_macro), 0);
+
+    static const char *const macro_inputs[] = {
+        "{\"qualified_name\":\"MAX_LEN\",\"project\":\"test-project\"}",
+        "{\"qualified_name\":\"cfg.MAX_LEN\",\"project\":\"test-project\"}",
+        "{\"qualified_name\":\"test-project.lib.cfg.MAX_LEN\",\"project\":\"test-project\"}",
+        "{\"qualified_name\":\"test-project.lib.cfg.MAX_LEN#macro\",\"project\":\"test-project\"}"};
+    for (size_t i = 0; i < sizeof(macro_inputs) / sizeof(macro_inputs[0]); i++) {
+        char *resp = call_snippet(srv, macro_inputs[i]);
+        ASSERT_NOT_NULL(resp);
+        if (!strstr(resp, "\"qualified_name\":\"test-project.lib.cfg.MAX_LEN#macro\"")) {
+            fprintf(stderr, "  [c1-snippet] %s -> %.300s\n", macro_inputs[i], resp);
+        }
+        ASSERT_NOT_NULL(strstr(resp, "\"qualified_name\":\"test-project.lib.cfg.MAX_LEN#macro\""));
+        ASSERT_NOT_NULL(strstr(resp, "\"label\":\"Macro\""));
+        free(resp);
+    }
+
+    static const char *const definition_inputs[] = {
+        "{\"qualified_name\":\"test-project.lib.xx.state_t\",\"project\":\"test-project\"}",
+        "{\"qualified_name\":\"xx.state_t\",\"project\":\"test-project\"}",
+        "{\"qualified_name\":\"state_t\",\"project\":\"test-project\"}"};
+    for (size_t i = 0; i < sizeof(definition_inputs) / sizeof(definition_inputs[0]); i++) {
+        char *resp = call_snippet(srv, definition_inputs[i]);
+        ASSERT_NOT_NULL(resp);
+        if (!strstr(resp, "\"label\":\"Type\"")) {
+            fprintf(stderr, "  [c1-snippet] %s -> %.300s\n", definition_inputs[i], resp);
+        }
+        ASSERT_NOT_NULL(strstr(resp, "\"qualified_name\":\"test-project.lib.xx.state_t\""));
+        ASSERT_NOT_NULL(strstr(resp, "\"label\":\"Type\""));
+        free(resp);
+    }
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 
 SUITE(mcp) {
     RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
@@ -7918,4 +8035,6 @@ SUITE(mcp) {
     RUN_TEST(search_code_rejects_quote_in_file_pattern);
     RUN_TEST(search_code_matches_stay_inside_project_root);
     RUN_TEST(search_code_early_errors_release_path_filter_regex);
+    RUN_TEST(tool_trace_path_definition_beats_c_macro_c1);
+    RUN_TEST(snippet_c_macro_namespace_c1);
 }

@@ -287,16 +287,41 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node(const cbm_gbuf
     if (direct) {
         return direct;
     }
+    /* Exact retries, in tie-rule order (CBM_MACRO_QN_SUFFIX): the definition
+     * first -- the QN as given, then with the project prefix -- and only when
+     * neither names a node the C-preprocessor macro of that name, in the same
+     * two spellings. The macro case is a prototype the C resolver knows whose
+     * only node in the graph is its rename macro (`extern T f(...);` plus
+     * `#define f f_v2`). */
+    bool add_prefix = false;
     if (project_name && project_name[0]) {
         size_t proj_len = strlen(project_name);
-        if (!(strncmp(callee_qn, project_name, proj_len) == 0 && callee_qn[proj_len] == '.')) {
-            char buf[CBM_SZ_1K];
-            int written = snprintf(buf, sizeof(buf), "%s.%s", project_name, callee_qn);
-            if (written > 0 && (size_t)written < sizeof(buf)) {
-                const cbm_gbuf_node_t *prefixed = cbm_gbuf_find_by_qn(gbuf, buf);
-                if (prefixed) {
-                    return prefixed;
-                }
+        add_prefix =
+            !(strncmp(callee_qn, project_name, proj_len) == 0 && callee_qn[proj_len] == '.');
+    }
+    char buf[CBM_SZ_1K];
+    if (add_prefix) {
+        int written = snprintf(buf, sizeof(buf), "%s.%s", project_name, callee_qn);
+        if (written > 0 && (size_t)written < sizeof(buf)) {
+            const cbm_gbuf_node_t *prefixed = cbm_gbuf_find_by_qn(gbuf, buf);
+            if (prefixed) {
+                return prefixed;
+            }
+        }
+    }
+    int mwritten = snprintf(buf, sizeof(buf), "%s" CBM_MACRO_QN_SUFFIX, callee_qn);
+    if (mwritten > 0 && (size_t)mwritten < sizeof(buf)) {
+        const cbm_gbuf_node_t *macro = cbm_gbuf_find_by_qn(gbuf, buf);
+        if (macro) {
+            return macro;
+        }
+    }
+    if (add_prefix) {
+        mwritten = snprintf(buf, sizeof(buf), "%s.%s" CBM_MACRO_QN_SUFFIX, project_name, callee_qn);
+        if (mwritten > 0 && (size_t)mwritten < sizeof(buf)) {
+            const cbm_gbuf_node_t *macro = cbm_gbuf_find_by_qn(gbuf, buf);
+            if (macro) {
+                return macro;
             }
         }
     }

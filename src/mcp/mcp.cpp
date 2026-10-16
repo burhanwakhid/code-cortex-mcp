@@ -5198,6 +5198,17 @@ static long node_resolution_score(const cbm_node_t *n) {
             label_rank = RES_RANK_OTHER;
         }
     }
+    /* Tie rule (CBM_MACRO_QN_SUFFIX): a name that is both a definition and a C
+     * macro -- a typedef or enumerator next to its rename macro -- resolves to
+     * the definition. The macro scores just under every other definition, and
+     * still above Module/File; without this a one-line typedef and its macro
+     * tie on span and the name reads as ambiguous. */
+    size_t qn_len = n->qualified_name ? strlen(n->qualified_name) : 0;
+    size_t fence_len = sizeof(CBM_MACRO_QN_SUFFIX) - SKIP_ONE;
+    if (label_rank == RES_RANK_OTHER && qn_len > fence_len &&
+        strcmp(n->qualified_name + qn_len - fence_len, CBM_MACRO_QN_SUFFIX) == 0) {
+        return RES_RANK_OTHER * (long)RES_LABEL_WEIGHT - SKIP_ONE;
+    }
     long span = (long)n->end_line - (long)n->start_line;
     if (span < 0) {
         span = 0;
@@ -8252,6 +8263,19 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     if (suffix_count == 0 && (strstr(qn, "::") || strchr(qn, '.'))) {
         /* "Class::method" / a partial QN with more scope than the graph keeps. */
         find_nodes_by_scoped_name(store, effective_project, qn, &suffix_nodes, &suffix_count);
+    }
+
+    /* Tier 3: the C-macro namespace. A macro's QN is `<module>.<NAME>#macro`
+     * (CBM_MACRO_QN_SUFFIX), out of reach of '%.X'. Tried only when no
+     * definition answered to the name above (tie rule), for a short name, a
+     * partial QN, or the macro's plain QN. */
+    char macro_qn[CBM_SZ_512];
+    int macro_len = snprintf(macro_qn, sizeof(macro_qn), "%s" CBM_MACRO_QN_SUFFIX, qn);
+    if (suffix_count == 0 && macro_len > 0 && (size_t)macro_len < sizeof(macro_qn)) {
+        cbm_store_free_nodes(suffix_nodes, suffix_count);
+        suffix_nodes = NULL;
+        cbm_store_find_nodes_by_qn_suffix(store, effective_project, macro_qn, &suffix_nodes,
+                                          &suffix_count);
     }
 
     if (suffix_count == SKIP_ONE) {

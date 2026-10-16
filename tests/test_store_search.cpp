@@ -7,6 +7,7 @@
 #include "../src/foundation/log.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "cbm.h" /* CBM_MACRO_QN_SUFFIX — the fence the FTS feed strips */
 #include <store/store.h>
 #include "sqlite3.h" /* vendored/sqlite3 — raw nodes_fts MATCH probes */
 #include <stdint.h>
@@ -1904,6 +1905,47 @@ TEST(store_search_anchored_invalid_regex_keeps_error) {
     PASS();
 }
 
+/* A C macro's QN ends in "#macro" (CBM_MACRO_QN_SUFFIX) and `#` separates tokens, so
+ * indexing that QN as it is would give every macro node the word "macro" a second time
+ * (its label already says Macro). On redis that is 5,513 rows outscoring the two nodes
+ * that carry the word in their NAME: tre_expand_macro fell out of the 2,000-row BM25
+ * candidate window and out of the result for the query `macro`. The qualified_name
+ * column therefore gets a Macro's QN without the fence, and only a Macro's. (FORK: one
+ * wholesale rebuild writer; upstream's delta-merge rebuild does not exist here.) */
+TEST(store_fts_macro_qn_fence_adds_no_token_c1) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "p", "/tmp/p");
+    cbm_node_t macro = {.project = "p",
+                        .label = "Macro",
+                        .name = "LIMIT",
+                        .qualified_name = "p.cfg.LIMIT" CBM_MACRO_QN_SUFFIX,
+                        .file_path = "cfg.h"};
+    cbm_node_t named = {.project = "p",
+                        .label = "Function",
+                        .name = "expandMacro",
+                        .qualified_name = "p.cfg.expandMacro",
+                        .file_path = "cfg.c"};
+    /* not a Macro: a QN that merely ends like the fence keeps all its tokens */
+    cbm_node_t other = {.project = "p",
+                        .label = "Function",
+                        .name = "odd",
+                        .qualified_name = "p.cfg.odd#macro",
+                        .file_path = "cfg.c"};
+    ASSERT_TRUE(cbm_store_upsert_node(s, &macro) > 0);
+    ASSERT_TRUE(cbm_store_upsert_node(s, &named) > 0);
+    ASSERT_TRUE(cbm_store_upsert_node(s, &other) > 0);
+
+    ASSERT_EQ(cbm_store_fts_rebuild(s), CBM_STORE_OK);
+    ASSERT_EQ(fts_match_count(s, "qualified_name:LIMIT"), 1); /* the QN stays searchable */
+    ASSERT_EQ(fts_match_count(s, "label:Macro"), 1);
+    ASSERT_EQ(fts_match_count(s, "qualified_name:macro"), 1); /* `odd` alone */
+    ASSERT_EQ(fts_match_count(s, "name:Macro"), 1);           /* expandMacro, camel-split */
+
+    cbm_store_close(s);
+    PASS();
+}
+
 
 SUITE(store_search) {
     RUN_TEST(store_search_by_label);
@@ -1982,4 +2024,5 @@ SUITE(store_search) {
     RUN_TEST(store_search_anchored_invalid_regex_keeps_error);
     RUN_TEST(store_search_anchored_small_label_keeps_plain_scan);
     RUN_TEST(store_schema_counts_ties_in_name_order);
+    RUN_TEST(store_fts_macro_qn_fence_adds_no_token_c1);
 }

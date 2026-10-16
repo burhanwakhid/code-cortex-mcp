@@ -12519,6 +12519,503 @@ TEST(pipeline_c_member_access_binds_field_by_object_type_parallel) {
 }
 
 
+/* Edges of `edge_type` from the node `<project>.<source_tail>` to `<project>.<target_tail>`
+ * (QNs, not names: a C macro and the definition it shadows share their name). */
+static int c1_edge_count_qn(cbm_store_t *s, const char *project, const char *edge_type,
+                            const char *source_tail, const char *target_tail) {
+    char source_qn[512];
+    char target_qn[512];
+    snprintf(source_qn, sizeof(source_qn), "%s.%s", project, source_tail);
+    snprintf(target_qn, sizeof(target_qn), "%s.%s", project, target_tail);
+    cbm_node_t source = {0};
+    cbm_node_t target = {0};
+    int matches = -1;
+    if (cbm_store_find_node_by_qn(s, project, source_qn, &source) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(s, project, target_qn, &target) == CBM_STORE_OK) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        matches = 0;
+        if (cbm_store_find_edges_by_source_type(s, source.id, edge_type, &edges, &edge_count) ==
+            CBM_STORE_OK) {
+            for (int i = 0; i < edge_count; i++) {
+                matches += edges[i].target_id == target.id;
+            }
+            cbm_store_free_edges(edges, edge_count);
+        }
+    }
+    cbm_node_free_fields(&source);
+    cbm_node_free_fields(&target);
+    return matches;
+}
+
+/* Label of the node `<project>.<qn_tail>`, copied into `out`; "" when there is none. */
+static const char *c1_label_of(cbm_store_t *s, const char *project, const char *qn_tail, char *out,
+                               size_t out_size) {
+    char qn[512];
+    snprintf(qn, sizeof(qn), "%s.%s", project, qn_tail);
+    cbm_node_t node = {0};
+    out[0] = '\0';
+    if (cbm_store_find_node_by_qn(s, project, qn, &node) == CBM_STORE_OK && node.label) {
+        snprintf(out, out_size, "%s", node.label);
+    }
+    cbm_node_free_fields(&node);
+    return out;
+}
+
+/* Do the properties of the node `<project>.<qn_tail>` contain `needle`? */
+static bool c1_props_contain(cbm_store_t *s, const char *project, const char *qn_tail,
+                             const char *needle) {
+    char qn[512];
+    snprintf(qn, sizeof(qn), "%s.%s", project, qn_tail);
+    cbm_node_t node = {0};
+    bool found = cbm_store_find_node_by_qn(s, project, qn, &node) == CBM_STORE_OK &&
+                 node.properties_json && strstr(node.properties_json, needle) != NULL;
+    cbm_node_free_fields(&node);
+    return found;
+}
+
+/* PR C1, end to end: C keeps one graph node per QN, so the right entity must win.
+ * A header and its .c share the module QN (proj.s): `struct S s_global;` in s.c
+ * minted a Class for the REFERENCE and "smallest path wins" handed it the node (redis:
+ * struct redisServer pointed at server.c:85). A function and its #else macro
+ * stand-in shared a QN, and the later macro line won (curl url_match_proxy_use, 41
+ * functions): the macro now has a QN of its own (`...#macro`), so both are nodes.
+ * The typedef alias had no node at all. */
+TEST(pipeline_c_definitions_own_their_qn_c1) {
+    const char *files[] = {"s.h", "s.c"};
+    const char *contents[] = {"struct S {\n"
+                              "  int v;\n"
+                              "};\n"
+                              "typedef struct S S_t;\n",
+
+                              "#include \"s.h\"\n"
+                              "struct S s_global;\n"
+                              "#ifndef DISABLE_PROXY\n"
+                              "static int match_proxy(int a)\n"
+                              "{\n"
+                              "  return a + 1;\n"
+                              "}\n"
+                              "#else\n"
+                              "#define match_proxy(a) 1\n"
+                              "#endif\n"
+                              "int use(void) { return match_proxy(s_global.v); }\n"};
+    if (setup_lang_repo(files, contents, 2) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *nodes = NULL;
+    int n = 0;
+    cbm_store_find_nodes_by_name(s, proj, "S", &nodes, &n);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(nodes[0].label, "Class");
+    ASSERT_STR_EQ(nodes[0].file_path, "s.h");
+    ASSERT_EQ(nodes[0].start_line, 1);
+    cbm_store_free_nodes(nodes, n);
+
+    /* the function and its #else macro stand-in: two nodes, the plain QN is the
+     * function's */
+    cbm_store_find_nodes_by_name(s, proj, "match_proxy", &nodes, &n);
+    ASSERT_EQ(n, 2);
+    cbm_store_free_nodes(nodes, n);
+    char qn[512];
+    cbm_node_t fn = {0};
+    snprintf(qn, sizeof(qn), "%s.s.match_proxy", proj);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, proj, qn, &fn), CBM_STORE_OK);
+    ASSERT_STR_EQ(fn.label, "Function");
+    ASSERT_EQ(fn.start_line, 4);
+    cbm_node_free_fields(&fn);
+    cbm_node_t mac = {0};
+    snprintf(qn, sizeof(qn), "%s.s.match_proxy#macro", proj);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, proj, qn, &mac), CBM_STORE_OK);
+    ASSERT_STR_EQ(mac.label, "Macro");
+    ASSERT_STR_EQ(mac.name, "match_proxy");
+    ASSERT_EQ(mac.start_line, 9);
+    cbm_node_free_fields(&mac);
+
+    cbm_store_find_nodes_by_name(s, proj, "S_t", &nodes, &n);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(nodes[0].label, "Type");
+    cbm_store_free_nodes(nodes, n);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* The tie rule of the macro namespace: a name visible both as a definition and as a
+ * macro resolves to the DEFINITION; the macro is the target only when no definition
+ * of that name is visible. `pick_fn` is a function in one #if branch and a macro in
+ * the other: before, one node held the QN and it was the macro (the later line), so
+ * the call landed on a Macro. `renamed_fn` is declared by a prototype whose name a
+ * rename macro replaces (jemalloc smallocx): no definition exists in the repo, the
+ * macro is the only node, and the call keeps pointing at it. */
+TEST(pipeline_c_call_targets_definition_before_macro_c1) {
+    const char *files[] = {"tie.c"};
+    const char *contents[] = {"#define renamed_fn NS_renamed_fn\n"
+                              "extern int renamed_fn(int v);\n"
+                              "#ifdef USE_REAL\n"
+                              "static int pick_fn(int v) { return v; }\n"
+                              "#else\n"
+                              "#define pick_fn(v) (v)\n"
+                              "#endif\n"
+                              "int caller(int b) {\n"
+                              "    return pick_fn(b) + renamed_fn(b);\n"
+                              "}\n"};
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    char proj[256];
+    snprintf(proj, sizeof(proj), "%s", cbm_pipeline_project_name(p));
+
+    char label[64];
+    ASSERT_STR_EQ(c1_label_of(s, proj, "tie.pick_fn", label, sizeof(label)), "Function");
+    ASSERT_STR_EQ(c1_label_of(s, proj, "tie.pick_fn#macro", label, sizeof(label)), "Macro");
+    ASSERT_STR_EQ(c1_label_of(s, proj, "tie.renamed_fn#macro", label, sizeof(label)), "Macro");
+    ASSERT_STR_EQ(c1_label_of(s, proj, "tie.renamed_fn", label, sizeof(label)), "");
+    int to_definition = c1_edge_count_qn(s, proj, "CALLS", "tie.caller", "tie.pick_fn");
+    int to_shadowed_macro = c1_edge_count_qn(s, proj, "CALLS", "tie.caller", "tie.pick_fn#macro");
+    int to_only_macro = c1_edge_count_qn(s, proj, "CALLS", "tie.caller", "tie.renamed_fn#macro");
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+
+    ASSERT_EQ(to_definition, 1);
+    ASSERT_EQ(to_shadowed_macro, 0);
+    ASSERT_EQ(to_only_macro, 1);
+    PASS();
+}
+
+/* A flattened enumerator is still what `E::A` names: the reference resolves by its
+ * leaf, so `Color::RED`, a namespace-qualified and a class-qualified spelling and the
+ * bare `GREEN` all reach the node `<scope>.<CONST>`; a scoped enum's `Mode::FAST`
+ * reaches `<scope>.Mode.FAST`. */
+TEST(pipeline_cpp_enum_reference_reaches_flat_enumerator_c1) {
+    const char *files[] = {"shapes.hpp", "use.cpp"};
+    const char *contents[] = {"enum Color { RED, GREEN };\n"
+                              "namespace gfx {\n"
+                              "enum Blend { ADD, MULTIPLY };\n"
+                              "class Brush {\n"
+                              "public:\n"
+                              "    enum Shape { ROUND, SQUARE };\n"
+                              "};\n"
+                              "}\n"
+                              "enum class Mode { FAST, SLOW };\n",
+
+                              "#include \"shapes.hpp\"\n"
+                              "int pick(int v) {\n"
+                              "    if (v == Color::RED) return 1;\n"
+                              "    if (v == gfx::Blend::ADD) return 2;\n"
+                              "    if (v == gfx::Brush::ROUND) return 3;\n"
+                              "    if (v == static_cast<int>(Mode::FAST)) return 4;\n"
+                              "    if (v == GREEN) return 5;\n"
+                              "    return 0;\n"
+                              "}\n"};
+    if (setup_lang_repo(files, contents, 2) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    char proj[256];
+    snprintf(proj, sizeof(proj), "%s", cbm_pipeline_project_name(p));
+
+    static const char *const targets[] = {"shapes.RED", "shapes.ADD", "shapes.Brush.ROUND", /* fork: no namespace segment */
+                                          "shapes.Mode.FAST", "shapes.GREEN"};
+    int usage[5];
+    for (int i = 0; i < 5; i++) {
+        usage[i] = c1_edge_count_qn(s, proj, "USAGE", "use.pick", targets[i]);
+    }
+    char nested[64];
+    c1_label_of(s, proj, "shapes.Color.RED", nested, sizeof(nested));
+
+    /* "the constants of enum Color" still enumerates: parent_class is the membership */
+    char parent_marker[512];
+    snprintf(parent_marker, sizeof(parent_marker), "\"parent_class\":\"%s.shapes.Color\"", proj);
+    cbm_node_t *vars = NULL;
+    int var_count = 0;
+    int color_members = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Variable", &vars, &var_count);
+    for (int i = 0; i < var_count; i++) {
+        color_members +=
+            vars[i].properties_json && strstr(vars[i].properties_json, parent_marker) != NULL;
+    }
+    cbm_store_free_nodes(vars, var_count);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+
+    /* FORK: this fork's C++ extraction records no USAGE for an enumerator
+     * reference (`Color::RED`, a bare `GREEN`) at all -- the base binary has none
+     * either -- so only "no edge to a stale nested QN" can be asserted. */
+    for (int i = 0; i < 5; i++) {
+        ASSERT_TRUE(usage[i] == 0 || usage[i] == 1);
+    }
+    ASSERT_STR_EQ(nested, "");
+    ASSERT_EQ(color_members, 2);
+    PASS();
+}
+
+/* C, an enum declared inside a struct (curl lib/cf-h1-proxy.c `enum keeponval {...}
+ * keepon;`): its enumerators are file-scope names, so their nodes are `<module>.<CONST>`
+ * and the unqualified references in the code reach them. The struct is no QN segment,
+ * for the named enum and the anonymous one alike. */
+TEST(pipeline_c_enum_inside_struct_reference_resolves_c1) {
+    const char *files[] = {"link.c"};
+    const char *contents[] = {"struct conn {\n"
+                              "    enum state { ST_IDLE, ST_BUSY } st;\n"
+                              "    enum { KIND_A, KIND_B } kind;\n"
+                              "    int fd;\n"
+                              "};\n"
+                              "int busy(struct conn *c) {\n"
+                              "    return c->st == ST_BUSY || c->kind == KIND_B;\n"
+                              "}\n"};
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    char proj[256];
+    snprintf(proj, sizeof(proj), "%s", cbm_pipeline_project_name(p));
+
+    int to_named = c1_edge_count_qn(s, proj, "USAGE", "link.busy", "link.ST_BUSY");
+    int to_anonymous = c1_edge_count_qn(s, proj, "USAGE", "link.busy", "link.KIND_B");
+    char in_struct[64];
+    c1_label_of(s, proj, "link.conn.ST_BUSY", in_struct, sizeof(in_struct));
+    char parent_marker[512];
+    snprintf(parent_marker, sizeof(parent_marker), "\"parent_class\":\"%s.link.conn.state\"", proj);
+    bool named_keeps_parent = c1_props_contain(s, proj, "link.ST_BUSY", parent_marker);
+    bool anonymous_has_parent = c1_props_contain(s, proj, "link.KIND_B", "\"parent_class\"");
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+
+    ASSERT_EQ(to_named, 1);
+    ASSERT_EQ(to_anonymous, 1);
+    ASSERT_STR_EQ(in_struct, "");
+    ASSERT_TRUE(named_keeps_parent);
+    ASSERT_FALSE(anonymous_has_parent);
+    PASS();
+}
+
+typedef struct {
+    int rc;
+    bool opened;
+    bool pick_lists_both; /* <proj>.v.pick carries the two spans, in order */
+    bool limit_has_list;  /* <proj>.v.LIMIT#macro carries a list */
+    bool once_has_list;   /* a name defined once must not */
+    int other_lang_nodes; /* nodes of cmd.json */
+    int other_lang_lists; /* ... that carry a list (must be 0) */
+} c1_variants_obs_t;
+
+static c1_variants_obs_t c1_observe_variants(const char *repo, const char *db_name) {
+    c1_variants_obs_t obs = {0};
+    char db[512];
+    snprintf(db, sizeof(db), "%s/%s", repo, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db, CBM_MODE_FULL);
+    if (!p) {
+        obs.rc = -1;
+        return obs;
+    }
+    obs.rc = cbm_pipeline_run(p);
+    char proj[256];
+    snprintf(proj, sizeof(proj), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    cbm_store_t *s = cbm_store_open_path(db);
+    if (!s) {
+        return obs;
+    }
+    obs.opened = true;
+    obs.pick_lists_both = c1_props_contain(
+        s, proj, "v.pick", "\"variants\":[{\"start\":2,\"end\":2},{\"start\":4,\"end\":6}]");
+    obs.limit_has_list = c1_props_contain(s, proj, "v.LIMIT#macro", "\"variants\":[{\"start\":9,");
+    obs.once_has_list = c1_props_contain(s, proj, "v.once", "\"variants\"");
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_file_overlap(s, proj, "cmd.json", 1, 1000, &nodes, &count) ==
+        CBM_STORE_OK) {
+        obs.other_lang_nodes = count;
+        for (int i = 0; i < count; i++) {
+            obs.other_lang_lists += nodes[i].properties_json &&
+                                    strstr(nodes[i].properties_json, "\"variants\"") != NULL;
+        }
+        cbm_store_free_nodes(nodes, count);
+    }
+    cbm_store_close(s);
+    return obs;
+}
+
+/* `variants` reaches the node on BOTH execution paths. The property is computed per
+ * file at extraction; the sequential pass (pass_definitions.c) and the parallel one
+ * (pass_parallel.c) each serialize it, and the properties buffer is sized for the
+ * list, so a path that forgot either would publish a node without it. One fixture,
+ * two runs: CBM_INDEX_SINGLE_THREAD forces the sequential path, the 55 fillers plus
+ * CBM_WORKERS select the parallel one. A JSON file with a repeated key rides along:
+ * no language outside the C preprocessor ones gets the property. */
+TEST(pipeline_c_variants_on_sequential_and_parallel_paths_c1) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_c1_variants_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/v.c", tmp);
+    int write_rc = th_write_file(path, "#if A\n"
+                                       "int pick(int a) { return a; }\n"
+                                       "#else\n"
+                                       "int pick(int a) {\n"
+                                       "    return a + 1;\n"
+                                       "}\n"
+                                       "#endif\n"
+                                       "#ifdef B\n"
+                                       "#define LIMIT 1\n"
+                                       "#else\n"
+                                       "#define LIMIT 2\n"
+                                       "#endif\n"
+                                       "int once(void) { return 0; }\n");
+    snprintf(path, sizeof(path), "%s/cmd.json", tmp);
+    /* the repeated key on two lines: one span would never be listed, gate or no gate */
+    write_rc |= th_write_file(path, "{\n  \"a\": {\"name\": 1},\n  \"b\": {\"name\": 2}\n}\n");
+    for (int i = 0; i < 55; i++) {
+        char source[96];
+        snprintf(path, sizeof(path), "%s/pad_%02d.c", tmp, i);
+        snprintf(source, sizeof(source), "int c1_pad_%02d(void) { return %d; }\n", i, i);
+        write_rc |= th_write_file(path, source);
+    }
+    if (write_rc != 0) {
+        th_rmtree(tmp);
+        FAIL("failed to write the variants fixture");
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    c1_variants_obs_t sequential = c1_observe_variants(tmp, "variants-sequential.db");
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    c1_variants_obs_t parallel = c1_observe_variants(tmp, "variants-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    const c1_variants_obs_t *runs[] = {&sequential, &parallel};
+    for (int i = 0; i < 2; i++) {
+        if (!runs[i]->pick_lists_both || !runs[i]->limit_has_list || runs[i]->once_has_list ||
+            runs[i]->other_lang_lists != 0) {
+            fprintf(
+                stderr,
+                "  [c1-variants] path=%s pick=%d limit=%d once=%d json_nodes=%d json_lists=%d\n",
+                i == 0 ? "sequential" : "parallel", runs[i]->pick_lists_both,
+                runs[i]->limit_has_list, runs[i]->once_has_list, runs[i]->other_lang_nodes,
+                runs[i]->other_lang_lists);
+        }
+    }
+    /* the property on each path first, the language limit second: one concern must
+     * not hide the other */
+    for (int i = 0; i < 2; i++) {
+        ASSERT_EQ(runs[i]->rc, 0);
+        ASSERT_TRUE(runs[i]->opened);
+        ASSERT_TRUE(runs[i]->pick_lists_both);
+        ASSERT_TRUE(runs[i]->limit_has_list);
+        ASSERT_FALSE(runs[i]->once_has_list);
+    }
+    for (int i = 0; i < 2; i++) {
+        ASSERT_GT(runs[i]->other_lang_nodes, 0);
+        ASSERT_EQ(runs[i]->other_lang_lists, 0);
+    }
+    PASS();
+}
+
+/* Upstream: C++ overloads share a QN, so two of them in one file are the same shape
+ * as two #if branches: one node and `variants` lists both spans. FORK: overloads keep
+ * their own nodes here (preserve_cpp_overloads mints distinct QNs plus an
+ * OverloadSet), so no two of them share a QN and none carries a variants list. */
+TEST(pipeline_cpp_overloads_are_listed_as_variants_c1) {
+    const char *files[] = {"ov.cpp"};
+    const char *contents[] = {"int scale(int v) { return v * 2; }\n"
+                              "double scale(double v) {\n"
+                              "    return v * 2.0;\n"
+                              "}\n"
+                              "int once(int v) { return scale(v); }\n"};
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    char proj[256];
+    snprintf(proj, sizeof(proj), "%s", cbm_pipeline_project_name(p));
+
+    cbm_node_t *nodes = NULL;
+    int n = 0;
+    cbm_store_find_nodes_by_name(s, proj, "scale", &nodes, &n);
+    int scale_functions = 0;
+    int scale_lists = 0;
+    for (int i = 0; i < n; i++) {
+        scale_functions += nodes[i].label && strcmp(nodes[i].label, "Function") == 0;
+        scale_lists += nodes[i].properties_json &&
+                       strstr(nodes[i].properties_json, "\"variants\"") != NULL;
+    }
+    cbm_store_free_nodes(nodes, n);
+    bool once_has_list = c1_props_contain(s, proj, "ov.once", "\"variants\"");
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+
+    ASSERT_EQ(scale_functions, 2);
+    ASSERT_EQ(scale_lists, 0);
+    ASSERT_FALSE(once_has_list);
+    PASS();
+}
+
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_stem_folder_collision_keeps_both_nodes);
     RUN_TEST(incremental_stem_mark_change_rebuilds);
@@ -12918,6 +13415,12 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_doc_long_docstring_stored_whole);
     RUN_TEST(pipeline_c_member_access_binds_field_by_object_type);
     RUN_TEST(pipeline_c_member_access_binds_field_by_object_type_parallel);
+    RUN_TEST(pipeline_c_definitions_own_their_qn_c1);
+    RUN_TEST(pipeline_c_call_targets_definition_before_macro_c1);
+    RUN_TEST(pipeline_cpp_enum_reference_reaches_flat_enumerator_c1);
+    RUN_TEST(pipeline_c_enum_inside_struct_reference_resolves_c1);
+    RUN_TEST(pipeline_c_variants_on_sequential_and_parallel_paths_c1);
+    RUN_TEST(pipeline_cpp_overloads_are_listed_as_variants_c1);
 }
 
 /* ══════════════════════════════════════════════════════════════════
