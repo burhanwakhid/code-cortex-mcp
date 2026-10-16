@@ -334,6 +334,44 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node(const cbm_gbuf
     return match;
 }
 
+/* Rust (#2053): true when the Rust LSP positively resolved a call to a
+ * registered symbol that lives OUTSIDE the project — a std/core/alloc seed
+ * method (`root.join()` on `root: &Path` -> std.path.Path.join) or a seeded
+ * crate API. Such a row has no graph node, and the callers then fell back to
+ * the textual registry, which bound the call to whatever project method
+ * shares the leaf name (EvidenceTier::join, unique_name).
+ *
+ * The evidence is the strategy plus the QN's namespace. The listed strategies
+ * emit the QN of a function the LSP registry actually holds; project defs are
+ * registered under their project-prefixed QNs, so a registered QN outside the
+ * project prefix is an embedded seed by construction. A project-prefixed QN
+ * that merely failed the gbuf lookup is NOT external and keeps the #1085
+ * registry fallback. Rust-only: suppressors stay per-language. */
+static inline bool cbm_pipeline_rust_external_target(CBMLanguage lang, const char *strategy,
+                                                     const char *callee_qn,
+                                                     const char *project_name) {
+    if (lang != CBM_LANG_RUST || !strategy || !callee_qn || !callee_qn[0] || !project_name ||
+        !project_name[0]) {
+        return false;
+    }
+    static const char *const registered_target_strategies[] = {
+        "lsp_method_dispatch", "lsp_trait_dispatch", "lsp_deref_dispatch", "lsp_bound_dispatch",
+        "lsp_direct",          "lsp_ufcs",           "lsp_constructor",
+    };
+    bool registered_target = false;
+    for (const char *s : registered_target_strategies) {
+        if (strcmp(strategy, s) == 0) {
+            registered_target = true;
+            break;
+        }
+    }
+    if (!registered_target) {
+        return false;
+    }
+    size_t proj_len = strlen(project_name);
+    return !(strncmp(callee_qn, project_name, proj_len) == 0 && callee_qn[proj_len] == '.');
+}
+
 #ifdef __cplusplus
 }
 #endif

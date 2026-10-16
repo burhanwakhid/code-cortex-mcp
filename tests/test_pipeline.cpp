@@ -8743,6 +8743,94 @@ TEST(pipeline_go_rw_usage_never_cross_into_c_parallel) {
     PASS();
 }
 
+/* #2053 Rust std-receiver probes (sequential and parallel twins). The Rust LSP
+ * types `root: &Path` and dispatches `root.join(..)` to std's Path::join — a
+ * symbol with no graph node. Before the fix the pipeline then fell back to the
+ * textual registry, which bound the call to the only project method named
+ * `join` (EvidenceTier::join, unique_name). The call-expression receiver
+ * (`root.to_path_buf().join(..)`) needs to_path_buf's return type and
+ * PathBuf's Deref to Path. POSITIVE tripwires: the typed project call keeps
+ * its LSP edge, and a closure-parameter receiver the LSP cannot type still
+ * reaches the registry. `m.get(k)` on a std HashMap guards the parallel route
+ * fallback, which must not turn the skipped call into a self-call. */
+static const char *const k_rust_std_recv_names[] = {"Cargo.toml", "src/lib.rs"};
+static const char *const k_rust_std_recv_bodies[] = {
+    "[package]\nname = \"stdrecv\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    "use std::collections::HashMap;\n"
+    "use std::path::{Path, PathBuf};\n"
+    "\n"
+    "pub struct EvidenceTier(pub u8);\n"
+    "impl EvidenceTier {\n"
+    "    pub fn join(&self, other: &EvidenceTier) -> EvidenceTier {\n"
+    "        EvidenceTier(self.0.max(other.0))\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "pub struct Gauge(pub u8);\n"
+    "impl Gauge {\n"
+    "    pub fn recalibrate_gauge(&self) -> u8 {\n"
+    "        self.0\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "pub fn real_caller() -> EvidenceTier {\n"
+    "    EvidenceTier(1).join(&EvidenceTier(2))\n"
+    "}\n"
+    "\n"
+    "pub fn stdlib_receiver(root: &Path) -> PathBuf {\n"
+    "    root.join(\"subdir\")\n"
+    "}\n"
+    "\n"
+    "pub fn call_expr_receiver(root: &Path) -> PathBuf {\n"
+    "    root.to_path_buf().join(\"nested\")\n"
+    "}\n"
+    "\n"
+    "pub fn untyped_receiver(gauges: &[Gauge]) -> u8 {\n"
+    "    gauges.iter().map(|g| g.recalibrate_gauge()).sum()\n"
+    "}\n"
+    "\n"
+    "pub fn std_map_lookup(m: &HashMap<String, u8>, k: &str) -> Option<u8> {\n"
+    "    m.get(k).copied()\n"
+    "}\n"};
+
+/* 0 = no std call bound to a project method, controls kept. */
+static int rust_std_receiver_probe(int pad) {
+    char db[512];
+    cbm_pipeline_t *p = index_fixture_with_padding(k_rust_std_recv_names, k_rust_std_recv_bodies,
+                                                   2, pad, db, sizeof(db));
+    if (!p) {
+        teardown_lang_repo();
+        return -9;
+    }
+    cbm_store_t *s = cbm_store_open_path(db);
+    const char *proj = cbm_pipeline_project_name(p);
+    int rc = -8;
+    if (s) {
+        int bad = named_edge_count(s, proj, "CALLS", "stdlib_receiver", "join") +
+                  named_edge_count(s, proj, "CALLS", "call_expr_receiver", "join");
+        int self = named_edge_count(s, proj, "CALLS", "std_map_lookup", "std_map_lookup");
+        int typed = named_edge_count(s, proj, "CALLS", "real_caller", "join");
+        int untyped = named_edge_count(s, proj, "CALLS", "untyped_receiver", "recalibrate_gauge");
+        printf("  rust std receiver probe pad=%d: bad=%d self=%d typed=%d untyped=%d\n", pad, bad,
+               self, typed, untyped);
+        rc = bad != 0 ? -1 : self != 0 ? -2 : typed != 1 ? -3 : untyped != 1 ? -4 : 0;
+        cbm_store_close(s);
+    }
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    return rc;
+}
+
+TEST(pipeline_rust_std_receiver_never_binds_project_method) {
+    ASSERT_EQ(rust_std_receiver_probe(0), 0);
+    PASS();
+}
+
+TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel) {
+    ASSERT_EQ(rust_std_receiver_probe(52), 0);
+    PASS();
+}
+
 /* SQL DDL becomes first-class Table/View nodes wired into FROM/JOIN lineage,
  * while the shared name registry must NOT leak those relations into other
  * languages' textual resolution: a Python call or identifier sharing the table's
@@ -9960,6 +10048,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cross_language_suffix_match_winner_is_dropped_issue725);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
+    RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method);
+    RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
