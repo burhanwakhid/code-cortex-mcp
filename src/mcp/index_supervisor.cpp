@@ -203,6 +203,69 @@ static char *slurp_file(const char *path) {
     return buf;
 }
 
+enum {
+    WORKER_LOG_TAIL_BYTES = 64 * 1024, /* last-phase scan window: bounded, never the whole log */
+    WORKER_LOG_LINE_CAP = 1024,
+    WORKER_LOG_EVENT_CAP = 128,
+};
+
+/* Copy the event name of one structured log line ("level=... msg=<event> ..."
+ * or {"level":...,"event":"<event>",...}) into out. False for any other line
+ * (plain stderr text, a truncated fragment). */
+static bool worker_log_line_event(const char *line, char *out, size_t out_size) {
+    static const char text_key[] = " msg=";
+    static const char json_key[] = "\"event\":\"";
+    const char *start = NULL;
+    char stop = ' ';
+    if (strncmp(line, "level=", strlen("level=")) == 0) {
+        const char *msg = strstr(line, text_key);
+        start = msg ? msg + strlen(text_key) : NULL;
+    } else if (strncmp(line, "{\"level\":", strlen("{\"level\":")) == 0) {
+        const char *event = strstr(line, json_key);
+        start = event ? event + strlen(json_key) : NULL;
+        stop = '"';
+    }
+    if (!start) {
+        return false;
+    }
+    size_t length = 0;
+    while (start[length] && start[length] != stop && start[length] != '\n' &&
+           start[length] != '\r') {
+        length++;
+    }
+    if (length == 0 || length >= out_size) {
+        return false;
+    }
+    memcpy(out, start, length);
+    out[length] = '\0';
+    return true;
+}
+
+/* Upstream #1300: the last structured event the worker logged before it
+ * exited — the phase it reached. Scans only the log's final
+ * WORKER_LOG_TAIL_BYTES. */
+static void worker_log_last_phase(const char *log_path, char *out, size_t out_size) {
+    (void)snprintf(out, out_size, "%s", "unknown");
+    FILE *log = cbm_fopen(log_path, "rb");
+    if (!log) {
+        return;
+    }
+    if (fseek(log, 0, SEEK_END) == 0) {
+        long size = ftell(log);
+        long from = size > WORKER_LOG_TAIL_BYTES ? size - WORKER_LOG_TAIL_BYTES : 0;
+        if (size >= 0 && fseek(log, from, SEEK_SET) == 0) {
+            char line[WORKER_LOG_LINE_CAP];
+            char event[WORKER_LOG_EVENT_CAP];
+            while (fgets(line, sizeof(line), log)) {
+                if (worker_log_line_event(line, event, sizeof(event))) {
+                    (void)snprintf(out, out_size, "%s", event);
+                }
+            }
+        }
+    }
+    (void)fclose(log);
+}
+
 static bool write_file(const char *path, const char *contents) {
     FILE *f = cbm_fopen(path, "wb");
     if (!f) {
@@ -258,6 +321,9 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     result->exit_code = -1;
     result->term_signal = 0;
     result->response = NULL;
+    result->response_missing = false;
+    result->last_phase[0] = '\0';
+    result->worker_log[0] = '\0';
 
     char self[1024] = {0};
     if (!cbm_resolve_self_exe_path(NULL, self, sizeof(self)) || !self[0]) {
@@ -343,6 +409,17 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     result->term_signal = r.term_signal;
     if (r.outcome == CBM_PROC_CLEAN) {
         result->response = slurp_file(resp_path);
+        if (result->response && result->response[0] == '\0') {
+            /* An empty response file is a worker that never wrote its result;
+             * reading it as "" made that a successful run (upstream #1300). */
+            free(result->response);
+            result->response = NULL;
+        }
+        if (!result->response) {
+            result->response_missing = true;
+            worker_log_last_phase(log_path, result->last_phase, sizeof(result->last_phase));
+            (void)snprintf(result->worker_log, sizeof(result->worker_log), "%s", log_path);
+        }
     }
     remove_response_files(resp_path);
 
@@ -369,7 +446,9 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     } else if (r.outcome == CBM_PROC_CLEAN && result->response) {
         cbm_log_info("index.supervisor.profile_log", "log", log_path);
     } else if (r.outcome == CBM_PROC_CLEAN) {
-        cbm_log_warn("index.supervisor.missing_response", "log", log_path);
+        /* #1300: keep and name the log — it is the only record of the run. */
+        cbm_log_error("index.supervisor.no_response", "exit_code", exit_buf, "last_phase",
+                      result->last_phase, "log", log_path);
     } else {
         cbm_log_warn("index.supervisor.worker_failed", "outcome", cbm_proc_outcome_str(r.outcome),
                      "exit_code", exit_buf, "log", log_path);
@@ -383,6 +462,9 @@ int cbm_tool_spawn_worker(const char *tool_name, const char *args_json,
     result->exit_code = -1;
     result->term_signal = 0;
     result->response = NULL;
+    result->response_missing = false;
+    result->last_phase[0] = '\0';
+    result->worker_log[0] = '\0';
 
     if (!cbm_tool_worker_name_safe(tool_name)) {
         cbm_log_warn("tool.supervisor.invalid_name");

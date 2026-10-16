@@ -1514,6 +1514,59 @@ TEST(tool_underscore_projects_visible_in_cache_scans) {
     PASS();
 }
 
+
+/* Upstream 7acb5eac (#1300): a worker that exits 0 without writing its
+ * response — no file, or an empty one. Reading the empty file as "" made the
+ * run a SUCCESS with an empty response. It must be a named failure: no
+ * response, the worker log retained, and the last phase the log recorded
+ * (incremental.edge_snapshot, not the plain stderr line after it). */
+TEST(index_supervisor_clean_exit_without_response_is_named_failure_issue1300) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-index-silent-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? strdup(old_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    const char *modes[] = {"silent-exit", "empty-response"};
+    const char *phases[] = {"incremental.edge_snapshot", "pass.timing"};
+    bool ok[2] = {false, false};
+    bool failure_named[2] = {false, false};
+    for (int m = 0; m < 2; m++) {
+        char args[128];
+        snprintf(args, sizeof(args), "{\"__cbm_test_worker\":\"%s\"}", modes[m]);
+        cbm_index_worker_result_t r;
+        int rc = cbm_index_spawn_worker(args, false, NULL, NULL, 60000, &r);
+        bool log_retained = r.worker_log[0] && cbm_file_size(r.worker_log) > 0;
+        ok[m] = rc == 0 && r.outcome == CBM_PROC_CLEAN && r.exit_code == 0 && !r.response &&
+                r.response_missing && strcmp(r.last_phase, phases[m]) == 0 && log_retained;
+        if (!ok[m]) {
+            fprintf(stderr, "  #1300 %s: rc=%d outcome=%d response=%p missing=%d phase=%s log=%s\n",
+                    modes[m], rc, (int)r.outcome, (void *)r.response, (int)r.response_missing,
+                    r.last_phase, r.worker_log);
+        }
+        char *failure = cbm_mcp_index_worker_no_response_failure(args, &r);
+        failure_named[m] = failure && strstr(failure, "no_response") &&
+                           strstr(failure, phases[m]) && strstr(failure, "\"isError\":true");
+        free(failure);
+        if (r.worker_log[0]) {
+            (void)cbm_unlink(r.worker_log);
+        }
+        cbm_index_worker_result_free(&r);
+    }
+    if (saved_cache) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+        free(saved_cache);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(cache);
+    ASSERT_TRUE(ok[0]);
+    ASSERT_TRUE(ok[1]);
+    ASSERT_TRUE(failure_named[0]);
+    ASSERT_TRUE(failure_named[1]);
+    PASS();
+}
+
 TEST(tool_manage_adr_no_project) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -6793,6 +6846,7 @@ SUITE(mcp) {
     RUN_TEST(detect_changes_explicit_base_is_used_as_given_issue1357);
     RUN_TEST(detect_changes_unresolvable_default_names_tried_ref_issue1357);
     RUN_TEST(tool_underscore_projects_visible_in_cache_scans);
+    RUN_TEST(index_supervisor_clean_exit_without_response_is_named_failure_issue1300);
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
     RUN_TEST(tool_manage_adr_unified_backend_issue256);

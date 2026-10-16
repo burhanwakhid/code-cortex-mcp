@@ -15,6 +15,7 @@ int tf_skip_count = 0;
 #include "mcp/mcp.h"               /* cbm_mcp_handle_tool — act as a real worker */
 #include "pipeline/pipeline.h"
 #include "foundation/constants.h"
+#include "foundation/log.h" /* cbm_log_info — #1300 silent-exit worker probe */
 #include <stdio.h>
 #include <stdlib.h>
 #include "foundation/compat.h" /* cbm_mkdtemp / cbm_setenv / cbm_mkdir — HOME isolation (all platforms) */
@@ -64,6 +65,25 @@ static int tf_maybe_run_index_worker(int argc, char **argv) {
     const char *response_out = argv[6];
 
     cbm_index_set_worker_role(true, response_out);
+    if (strstr(args_json, "\"__cbm_test_worker\":\"silent-exit\"")) {
+        /* Upstream #1300: reach a phase, then exit 0 without writing the
+         * response. The trailing plain-text line must not be mistaken for a
+         * phase. */
+        cbm_log_info("incremental.edge_snapshot", "captured", "3");
+        (void)fprintf(stderr, "async worker silent-exit probe\n");
+        fflush(NULL);
+        _Exit(0);
+    }
+    if (strstr(args_json, "\"__cbm_test_worker\":\"empty-response\"")) {
+        /* #1300: an EMPTY response file used to read back as "" = success. */
+        FILE *empty = fopen(response_out, "wb");
+        if (empty) {
+            (void)fclose(empty);
+        }
+        cbm_log_info("pass.timing", "pass", "definitions");
+        fflush(NULL);
+        _Exit(0);
+    }
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     if (!srv) {
         return 1;

@@ -6820,6 +6820,39 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
     return mcp_text_result_take_owned(json, true);
 }
 
+/* Upstream #1300: the explicit error for a worker that exited cleanly without
+ * writing a response (worker_result->response_missing). Names the retained
+ * worker log and the last phase it reached. */
+char *cbm_mcp_index_worker_no_response_failure(const char *args,
+                                               const cbm_index_worker_result_t *worker_result) {
+    const char *phase =
+        worker_result && worker_result->last_phase[0] ? worker_result->last_phase : "unknown";
+    const char *log =
+        worker_result && worker_result->worker_log[0] ? worker_result->worker_log : "unavailable";
+    char *repo_path = args ? cbm_mcp_get_string_arg(args, "repo_path") : NULL;
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "error");
+    yyjson_mut_obj_add_str(doc, root, "outcome", "missing_response");
+    yyjson_mut_obj_add_str(doc, root, "reason", "no_response");
+    yyjson_mut_obj_add_strcpy(doc, root, "last_phase", phase);
+    yyjson_mut_obj_add_strcpy(doc, root, "worker_log", log);
+    char hint[CBM_SZ_2K];
+    (void)snprintf(hint, sizeof(hint),
+                   "Indexing worker exited cleanly (exit 0) without writing a response; the "
+                   "index was not published. Last phase reached: %s. Inspect the worker log: %s",
+                   phase, log);
+    yyjson_mut_obj_add_strcpy(doc, root, "hint", hint);
+    if (repo_path) {
+        yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
+    }
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    free(repo_path);
+    return mcp_text_result_take_owned(json, true);
+}
+
 /* Drop the cached store so the next query reopens whatever the worker wrote (each
  * worker is a fresh process that deletes + recreates the .db). NULL-safe: the
  * background watcher path (main.c) has no MCP server / cached store — the child
@@ -7020,9 +7053,13 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
          * not fall back to an unbounded in-process run. */
         char *resp = wr.response; /* transfer ownership to caller (may be NULL) */
         wr.response = NULL;
+        if (!resp) {
+            /* #1300: a clean exit without a response is a named failure. */
+            resp = cbm_mcp_index_worker_no_response_failure(args, &wr);
+        }
         cbm_index_worker_result_free(&wr);
         supervisor_invalidate_store(srv);
-        return resp ? resp : build_worker_failure_response(args, CBM_PROC_CLEAN);
+        return resp;
     }
 
     /* Crash / hang / nonzero exit → skip-and-continue recovery. Re-run the
@@ -7080,6 +7117,13 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
             wr2.response = NULL;
             cbm_index_worker_result_free(&wr2);
             break; /* good files indexed; quarantined files reported as crash/hang */
+        }
+        if (wr2.outcome == CBM_PROC_CLEAN && wr2.response_missing) {
+            /* #1300: a recovery run that exits cleanly without a response is
+             * reported as such, not as a generic failed recovery. */
+            resp = cbm_mcp_index_worker_no_response_failure(args, &wr2);
+            cbm_index_worker_result_free(&wr2);
+            break;
         }
         if (wr2.outcome == CBM_PROC_CRASH || wr2.outcome == CBM_PROC_HANG ||
             wr2.outcome == CBM_PROC_EXIT_NONZERO) {

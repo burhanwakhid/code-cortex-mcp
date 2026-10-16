@@ -76,6 +76,13 @@ typedef struct {
     int exit_code;              /* worker exit code (-1 if signalled) */
     int term_signal;            /* POSIX terminating signal, else 0 */
     char *response;             /* worker's result string on CLEAN exit (caller frees); else NULL */
+    /* Upstream #1300: the worker exited CLEAN but wrote no response (no file,
+     * or an empty one). A contained failure, never a success: the worker log
+     * is retained and named here, and last_phase is the last structured event
+     * it recorded ("unknown" when it holds none). */
+    bool response_missing;
+    char last_phase[128];
+    char worker_log[1024];
 } cbm_index_worker_result_t;
 
 /* Spawn `<self> cli --index-worker index_repository <args_json> --response-out <tmp>`,

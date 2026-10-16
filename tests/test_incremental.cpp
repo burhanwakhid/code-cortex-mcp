@@ -414,6 +414,65 @@ TEST(incr_modify_file) {
     PASS();
 }
 
+
+static char g_purge_log[8192];
+static int g_purge_progress_lines;
+
+static void purge_log_sink(const char *line) {
+    if (!line || !strstr(line, "msg=incremental.purge")) {
+        return;
+    }
+    if (strstr(line, "msg=incremental.purge.progress")) {
+        g_purge_progress_lines++;
+    }
+    size_t used = strlen(g_purge_log);
+    (void)snprintf(g_purge_log + used, sizeof(g_purge_log) - used, "%s\n", line);
+}
+
+/* Upstream 7acb5eac (#1300): the per-file purge logged nothing until it
+ * finished, so a stall there left no trace of where the run was. It now
+ * announces its counts and reports bounded progress — counts only, at most
+ * 20 progress lines however many files, ending at files_done == files_total. */
+TEST(incr_purge_reports_bounded_progress_issue1300) {
+    char *resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    /* More than 20 changed files, so one line per file would break the bound. */
+    reformat_files("fastapi", 30);
+    reformat_files("tests", 30);
+    reformat_files("docs_src", 30);
+
+    CBMLogLevel saved_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    g_purge_log[0] = '\0';
+    g_purge_progress_lines = 0;
+    cbm_log_set_sink(purge_log_sink);
+    resp = index_repo();
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(saved_level);
+    ASSERT(resp != NULL);
+    ASSERT(strstr(resp, "indexed") != NULL);
+    free(resp);
+
+    const char *start = strstr(g_purge_log, "msg=incremental.purge.start");
+    ASSERT(start != NULL);
+    const char *changed_at = strstr(start, "changed=");
+    const char *deleted_at = strstr(start, "deleted=");
+    ASSERT(changed_at != NULL && deleted_at != NULL);
+    int changed = atoi(changed_at + strlen("changed="));
+    int deleted = atoi(deleted_at + strlen("deleted="));
+    int total = changed + deleted;
+    ASSERT_GT(total, 20); /* enough files that one line per file would exceed the bound */
+    ASSERT_GT(g_purge_progress_lines, 0);
+    ASSERT(g_purge_progress_lines <= 21);
+    ASSERT(g_purge_progress_lines < total); /* never one line per file */
+    char last[64];
+    (void)snprintf(last, sizeof(last), "files_done=%d files_total=%d", total, total);
+    ASSERT(strstr(g_purge_log, last) != NULL);
+    ASSERT(strstr(g_purge_log, "msg=incremental.purge elapsed_ms=") != NULL);
+    PASS();
+}
+
 TEST(incr_formatter_run) {
     /* Baseline */
     char *resp = index_repo();
@@ -2890,6 +2949,7 @@ SUITE(incremental) {
     /* Phase 3: Incremental deltas */
     RUN_TEST(incr_modify_file);
     RUN_TEST(incr_formatter_run);
+    RUN_TEST(incr_purge_reports_bounded_progress_issue1300);
     RUN_TEST(incr_add_file);
     RUN_TEST(incr_delete_file);
     RUN_TEST(incr_simultaneous_changes);

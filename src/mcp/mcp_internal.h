@@ -12,6 +12,7 @@
 #include "mcp/mcp.h"
 #include "pipeline/pipeline.h" /* cbm_changed_hunk_t */
 #include "store/store.h"       /* cbm_node_t */
+#include "mcp/index_supervisor.h" /* cbm_index_worker_result_t */
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,6 +52,12 @@ bool cbm_mcp_auto_index_within_file_limit(const char *root_path, int file_limit,
 /* CBM_INDEX_MAX_RESTARTS as the supervised index resolves it: 100 by default
  * and for an unreadable value, 0 means no restarts. Exposed for tests. */
 int cbm_index_restart_cap_for_testing(void);
+
+/* Upstream #1300: the explicit error response for a worker that exited cleanly
+ * without writing a response (worker_result->response_missing). Names the
+ * retained worker log and the last phase it reached; caller frees. */
+char *cbm_mcp_index_worker_no_response_failure(const char *args,
+                                               const cbm_index_worker_result_t *worker_result);
 
 #ifdef __cplusplus
 }
