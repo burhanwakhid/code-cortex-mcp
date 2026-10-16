@@ -1391,6 +1391,87 @@ TEST(registry_python_scope_keeps_import_precedence_and_raw_scoring) {
     PASS();
 }
 
+TEST(call_onto_field_follows_language_and_shape) {
+    /* A call the registry resolved onto a Field node. */
+    /* Another language: only the spelling connects them. */
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_BASH, "command", "Field", "src/probe.h"),
+              CBM_FIELD_CALL_DROP);
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_PYTHON, "sorted", "Field", "src/pool.c"),
+              CBM_FIELD_CALL_DROP);
+    /* A bare C call is never a struct member. */
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_C, "socket", "Field", "tests/t.c"),
+              CBM_FIELD_CALL_DROP);
+    /* A C member call is decided by its object's type, in a .c or a .h. */
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_C, "cb.close", "Field", "src/cb.h"),
+              CBM_FIELD_CALL_BY_OWNER);
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_C, "w->svc->app.cancel", "Field", "src/a.c"),
+              CBM_FIELD_CALL_BY_OWNER);
+    /* C++ reaches its own members bare, so a bare call keeps its resolution;
+     * a member call is typed like C's (`text.size()` is not some struct's
+     * `size` member). */
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_CPP, "handler", "Field", "src/a.h"),
+              CBM_FIELD_CALL_KEEP);
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_CPP, "text.size", "Field", "src/a.h"),
+              CBM_FIELD_CALL_BY_OWNER);
+    /* The same language as the Field keeps its resolution too. */
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_GO, "s.fn", "Field", "pkg/s.go"),
+              CBM_FIELD_CALL_KEEP);
+    /* Not a Field target: not this rule's business. */
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_BASH, "main", "Function", "src/main.c"),
+              CBM_FIELD_CALL_KEEP);
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_C, "socket", NULL, "tests/t.c"),
+              CBM_FIELD_CALL_KEEP);
+    PASS();
+}
+
+TEST(c_member_access_binds_by_owner_only) {
+    /* The member half of a C `a.b` / `a->b` means nothing without the type of
+     * `a`: it binds through the C LSP's field-owner rows and never through a
+     * bare-name lookup. The selector shape arrives as is_member_access. */
+    ASSERT_TRUE(cbm_c_member_binds_by_owner(true, true));
+    /* A bare C identifier keeps the ordinary resolution. */
+    ASSERT_FALSE(cbm_c_member_binds_by_owner(true, false));
+    /* Other languages keep theirs: a C++ or Objective-C method body reaches its
+     * own members without a selector, and Go has its own rule above. */
+    ASSERT_FALSE(cbm_c_member_binds_by_owner(false, true));
+    ASSERT_FALSE(cbm_c_member_binds_by_owner(false, false));
+    PASS();
+}
+
+
+TEST(unique_field_qn_needs_exactly_one_field_of_that_name) {
+    /* What an untyped C member access may still bind: a name exactly one
+     * Field carries. Two Fields would be a choice; a function or variable of
+     * the same name is not a candidate for a member at all. */
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "only_here", "proj.a.Alpha.only_here", "Field");
+    cbm_registry_add(r, "count", "proj.a.Alpha.count", "Field");
+    cbm_registry_add(r, "count", "proj.b.Beta.count", "Field");
+    cbm_registry_add(r, "close", "proj.cb.Callbacks.close", "Field");
+    cbm_registry_add(r, "close", "proj.io.close", "Function");
+    cbm_registry_add(r, "lonely_fn", "proj.io.lonely_fn", "Function");
+
+    const char *only = cbm_registry_unique_field_qn(r, "only_here");
+    ASSERT_NOT_NULL(only);
+    ASSERT_STR_EQ(only, "proj.a.Alpha.only_here");
+    /* Two fields share the name: no pick. */
+    ASSERT_NULL(cbm_registry_unique_field_qn(r, "count"));
+    /* One field and one function share the name: the function is not a
+     * candidate for a member, so the field is still the only one. */
+    const char *member = cbm_registry_unique_field_qn(r, "close");
+    ASSERT_NOT_NULL(member);
+    ASSERT_STR_EQ(member, "proj.cb.Callbacks.close");
+    /* Unique, but not a field. */
+    ASSERT_NULL(cbm_registry_unique_field_qn(r, "lonely_fn"));
+    /* Unknown name and degenerate input. */
+    ASSERT_NULL(cbm_registry_unique_field_qn(r, "absent"));
+    ASSERT_NULL(cbm_registry_unique_field_qn(r, NULL));
+    ASSERT_NULL(cbm_registry_unique_field_qn(NULL, "count"));
+    cbm_registry_free(r);
+    PASS();
+}
+
 
 SUITE(registry) {
     RUN_TEST(python_symbol_scope_len_preserves_file_identity);
@@ -1475,4 +1556,7 @@ SUITE(registry) {
     RUN_TEST(fuzzy_resolve_confidence_distance);
     RUN_TEST(fuzzy_penalty_unreachable_import);
     RUN_TEST(fuzzy_no_import_map_passthrough);
+    RUN_TEST(call_onto_field_follows_language_and_shape);
+    RUN_TEST(unique_field_qn_needs_exactly_one_field_of_that_name);
+    RUN_TEST(c_member_access_binds_by_owner_only);
 }

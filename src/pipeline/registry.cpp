@@ -1655,6 +1655,77 @@ bool cbm_suppress_ref_edge(CBMLanguage lang, bool is_member_access, const cbm_gb
            cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, is_member_access, target->label);
 }
 
+cbm_field_call_policy_t cbm_call_onto_field_policy(CBMLanguage caller_lang, const char *callee_text,
+                                                   const char *target_label,
+                                                   const char *target_file_path) {
+    /* The short-name registry holds Field nodes, so a call spelled like some
+     * struct member can resolve onto that Field. Three shapes are decided here:
+     *   - a caller in another language: nothing but the spelling connects a
+     *     Bash `command` or a Python `sorted()` to a C struct member (the
+     *     #1928 reference rule, with its C/C++ family exemption);
+     *   - a bare C call (`socket(...)`, a function-pointer parameter
+     *     `want(x)`): a bare C name is never a struct member;
+     *   - a C or C++ member call (`cb.close(ctx)`, `text.size()`): the type of
+     *     the object decides which struct's member is called, never the
+     *     member name alone. The C LSP publishes owners in both modes.
+     * A bare C++ call keeps its resolution (a method body reaches its own
+     * members without a selector), and so does every other language. */
+    if (!target_label || strcmp(target_label, "Field") != 0) {
+        return CBM_FIELD_CALL_KEEP;
+    }
+    if (cbm_suppress_cross_language_ref(caller_lang, target_file_path)) {
+        return CBM_FIELD_CALL_DROP;
+    }
+    if (caller_lang != CBM_LANG_C && caller_lang != CBM_LANG_CPP) {
+        return CBM_FIELD_CALL_KEEP;
+    }
+    if (callee_text && (strchr(callee_text, '.') || strstr(callee_text, "->"))) {
+        return CBM_FIELD_CALL_BY_OWNER;
+    }
+    return caller_lang == CBM_LANG_C ? CBM_FIELD_CALL_DROP : CBM_FIELD_CALL_KEEP;
+}
+
+bool cbm_c_member_binds_by_owner(bool is_c, bool is_member_access) {
+    /* The member half of `a.b` / `a->b` is not a name in any C scope: only the
+     * type of `a` gives `b` a meaning. Handing the bare `b` to the short-name
+     * registry bound whichever Field (or function, or variable) was called
+     * `b`. Such a reference binds through the C LSP's field-owner rows; an
+     * object the LSP could not type binds only a member name that is unique
+     * in the project (cbm_registry_unique_field_qn), never one of several.
+     *
+     * C-gated like the Go rule above: a C++ or Objective-C method body
+     * reaches its own members without a selector, and their member accesses
+     * keep the existing resolution until their LSPs publish owners too. */
+    return is_c && is_member_access;
+}
+
+const char *cbm_registry_unique_field_qn(const cbm_registry_t *r, const char *member_name) {
+    /* A member name that exactly one Field in the whole project carries names
+     * that Field without any choice being made. This is what an untyped C
+     * member access may still bind: the defect in bare-name member resolution
+     * was the arbitrary pick among SEVERAL same-named members. Only Fields are
+     * candidates -- a function or variable of the same name can never be what
+     * `a.b` means -- and two of them bind nothing. */
+    const char **qns = NULL;
+    int count = 0;
+    if (!r || !member_name || cbm_registry_find_by_name(r, member_name, &qns, &count) != 0 ||
+        !qns) {
+        return NULL;
+    }
+    const char *only = NULL;
+    for (int i = 0; i < count; i++) {
+        const char *label = qns[i] ? cbm_registry_label_of(r, qns[i]) : NULL;
+        if (!label || strcmp(label, "Field") != 0) {
+            continue;
+        }
+        if (only && strcmp(only, qns[i]) != 0) {
+            return NULL;
+        }
+        only = qns[i];
+    }
+    return only;
+}
+
 bool cbm_suppress_call_target(CBMLanguage lang, const cbm_gbuf_node_t *target,
                               const char *strategy) {
     return cbm_suppress_cross_language_suffix_match(lang, target->file_path, strategy) ||

@@ -6,6 +6,7 @@
 #include "type_registry.h"
 #include "../cbm.h"
 #include "go_lsp.h" // for CBMLSPDef, CBMResolvedCallArray
+#include "lsp_neg_memo.h" // CBMNegMemo: the emitted field-reference set
 
 // CLSPContext holds state for C/C++ expression type evaluation within a file.
 
@@ -65,8 +66,18 @@ typedef struct {
     int neg_memo_cap;   // power-of-two; 0 until first insert
     int neg_memo_count; // live entries (grow by rehash at 70% load)
 
+    // Field references already emitted for this file, keyed by (enclosing
+    // function, owner type, field). The function -> Field edge needs one row
+    // per pair; a row per occurrence would cost a record for every member
+    // access in the corpus. Arena-backed (dies with ctx->arena).
+    CBMNegMemo field_ref_seen;
+
     // Output
     CBMResolvedCallArray *resolved_calls;
+    // C member access `a.b` / `a->b`: one row per (caller, owner field), the
+    // callee_qn naming the Field `b` of the type of `a`. Kept apart from
+    // resolved_calls so no call join ever sees them. NULL = do not emit.
+    CBMResolvedCallArray *field_refs;
 
     // Function pointer targets: var_name -> target function QN
     const char **fp_var_names;
@@ -176,7 +187,8 @@ CBMLSPStatus cbm_run_c_lsp_cross_status(CBMArena *arena, const char *source, int
                                         int def_count, const char **include_paths,
                                         const char **include_ns_qns, int include_count,
                                         TSTree *cached_tree, // NULL = parse internally
-                                        CBMResolvedCallArray *out);
+                                        CBMResolvedCallArray *out,
+                                        CBMResolvedCallArray *field_out); // NULL = none
 
 bool cbm_run_c_lsp_cross(CBMArena *arena, const char *source, int source_len, const char *module_qn,
                          bool cpp_mode, CBMLSPDef *defs, int def_count, const char **include_paths,
@@ -196,7 +208,8 @@ CBMLSPStatus cbm_run_c_lsp_cross_with_registry_status(
     CBMTypeRegistry *reg, // pre-built, finalized, READ-ONLY
     const char **include_paths, const char **include_ns_qns, int include_count,
     TSTree *cached_tree, // NULL = parse internally
-    CBMResolvedCallArray *out);
+    CBMResolvedCallArray *out,
+    CBMResolvedCallArray *field_out); // NULL = none
 
 bool cbm_run_c_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
                                        const char *module_qn, bool cpp_mode,

@@ -282,6 +282,28 @@ typedef struct {
 bool cbm_suppress_ref_edge(CBMLanguage lang, bool is_member_access, const cbm_gbuf_node_t *target,
                            cbm_lang_memo_t *memo);
 
+/* What to do with a call whose registry resolution landed on a Field node.
+ * Pure; unit-tested in test_registry.cpp. */
+typedef enum {
+    CBM_FIELD_CALL_KEEP = 0, /* not a Field target, or a language this rule leaves alone */
+    CBM_FIELD_CALL_DROP,     /* a Field can never be this call's target */
+    CBM_FIELD_CALL_BY_OWNER, /* C/C++ member call: the object's type names the Field */
+} cbm_field_call_policy_t;
+cbm_field_call_policy_t cbm_call_onto_field_policy(CBMLanguage caller_lang, const char *callee_text,
+                                                   const char *target_label,
+                                                   const char *target_file_path);
+
+/* True when a reference is the member half of a C `a.b` / `a->b`. Such a
+ * reference binds through the C LSP's field-owner rows (the type of `a`); with
+ * no typed owner it binds only cbm_registry_unique_field_qn(). C only. Pure;
+ * unit-tested in test_registry.cpp. */
+bool cbm_c_member_binds_by_owner(bool is_c, bool is_member_access);
+
+/* The QN of the Field `member_name` names when exactly one Field in the
+ * registry carries that name (symbols of other labels are not candidates for
+ * a member); NULL when none or several do. */
+const char *cbm_registry_unique_field_qn(const cbm_registry_t *r, const char *member_name);
+
 /* One guard for a resolved CALLS target: true when a suffix_match edge crosses
  * a language boundary (cbm_suppress_cross_language_suffix_match) or a textual
  * Go match binds a Field (cbm_go_suppress_textual_field_call). Shared by

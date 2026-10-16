@@ -2995,6 +2995,108 @@ static const CBMType* c_lookup_field_type(CLSPContext* ctx, const char* type_qn,
     return NULL;
 }
 
+// True when qn is `prefix` followed by a '.' segment boundary.
+static bool c_qn_in_module(const char* qn, const char* prefix) {
+    size_t plen = prefix ? strlen(prefix) : 0;
+    return plen > 0 && strncmp(qn, prefix, plen) == 0 && qn[plen] == '.';
+}
+
+// The registered type a member access is made on: as written, then
+// module-qualified, then by short name -- a C use site names `struct Alpha`
+// while the struct is registered under the header that declares it.
+//
+// A short name several modules declare is taken from this module, else from a
+// directly included header, else only when it is the single candidate. Two
+// same-named structs with no evidence between them resolve to NOTHING: binding
+// a field of the wrong struct is the defect this lookup exists to remove.
+// FORK: the C++ include-visibility map is consulted first, as in
+// c_lookup_field_type; an ambiguous or blocked binding names no owner.
+static const CBMRegisteredType* c_resolve_field_owner_type(CLSPContext* ctx, const char* type_qn) {
+    if (const auto* visible = c_visible_qualified_type(ctx, type_qn)) {
+        if (!visible->alias_of) return nullptr;
+        type_qn = visible->alias_of;
+    }
+    const CBMRegisteredType* rt = cbm_registry_lookup_type(ctx->registry, type_qn);
+    if (!rt && ctx->module_qn) {
+        char sbuf[1024];
+        const char* prefixed = c_build_module_prefixed(ctx, type_qn, sbuf, sizeof(sbuf));
+        if (!prefixed)
+            prefixed = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, type_qn);
+        if (prefixed) rt = cbm_registry_lookup_type(ctx->registry, prefixed);
+    }
+    if (rt || !ctx->registry)
+        return rt;
+
+    const char* dot = strrchr(type_qn, '.');
+    const char* shortn = dot ? dot + 1 : type_qn;
+    size_t slen = strlen(shortn);
+    const CBMRegisteredType* included = NULL;
+    const CBMRegisteredType* only = NULL;
+    bool included_ambiguous = false;
+    bool only_ambiguous = false;
+    CBMTypeShortIter it;
+    cbm_registry_types_by_short_name(ctx->registry, shortn, &it);
+    int i;
+    while ((i = cbm_type_short_iter_next(&it)) >= 0) {
+        const CBMRegisteredType* cand = &it.reg->types[i];
+        const char* q = cand->qualified_name;
+        if (!q || strstr(q, ".__cpp_visible."))
+            continue;
+        size_t qlen = strlen(q);
+        if (qlen <= slen + 1 || q[qlen - slen - 1] != '.' || strcmp(q + qlen - slen, shortn) != 0)
+            continue;
+        if (c_qn_in_module(q, ctx->module_qn))
+            return cand;
+        if (only && strcmp(only->qualified_name, q) != 0)
+            only_ambiguous = true;
+        only = cand;
+        for (int inc = 0; inc < ctx->include_count; inc++) {
+            if (!c_qn_in_module(q, ctx->include_ns_qns[inc]))
+                continue;
+            if (included && strcmp(included->qualified_name, q) != 0)
+                included_ambiguous = true;
+            included = cand;
+            break;
+        }
+    }
+    if (included)
+        return included_ambiguous ? NULL : included;
+    return only_ambiguous ? NULL : only;
+}
+
+// The registered type that DECLARES field_name, reached from type_qn through
+// aliases and base classes as c_lookup_field_type walks them. A field whose
+// type text did not parse still has an owner, so only the name decides.
+static const CBMRegisteredType* c_lookup_field_owner(CLSPContext* ctx, const char* type_qn,
+                                                     const char* field_name, int depth) {
+    if (!type_qn || !field_name || depth > 5)
+        return NULL;
+
+    const CBMRegisteredType* rt = c_resolve_field_owner_type(ctx, type_qn);
+    if (!rt)
+        return NULL;
+
+    if (rt->alias_of)
+        return c_lookup_field_owner(ctx, rt->alias_of, field_name, depth + 1);
+
+    if (rt->field_names) {
+        for (int i = 0; rt->field_names[i]; i++) {
+            if (strcmp(rt->field_names[i], field_name) == 0)
+                return rt;
+        }
+    }
+
+    if (rt->embedded_types) {
+        for (int i = 0; rt->embedded_types[i]; i++) {
+            const CBMRegisteredType* owner =
+                c_lookup_field_owner(ctx, rt->embedded_types[i], field_name, depth + 1);
+            if (owner)
+                return owner;
+        }
+    }
+    return NULL;
+}
+
 // ============================================================================
 // c_process_statement: bind variables from statements
 // ============================================================================
@@ -3675,6 +3777,90 @@ static void c_emit_unresolved_call(CLSPContext* ctx, const char* expr_text, cons
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
 }
 
+// FNV-1a over (caller, type, field) with 0xff separators (cbm_negmemo_key
+// shape); never 0, the set's empty-slot sentinel.
+static uint64_t c_field_ref_hash(const char* caller_qn, const char* type_qn,
+                                 const char* field_name) {
+    const char* parts[] = {caller_qn, type_qn, field_name};
+    uint64_t h = 1469598103934665603ULL;
+    for (int part = 0; part < 3; part++) {
+        for (const unsigned char* p = (const unsigned char*)parts[part]; *p; p++) {
+            h ^= (uint64_t)*p;
+            h *= 1099511628211ULL;
+        }
+        h ^= (uint64_t)0xffu;
+        h *= 1099511628211ULL;
+    }
+    return h ? h : 1ULL;
+}
+
+/* `a.b` / `a->b`: only the type of `a` says WHICH struct's `b` is meant. The
+ * usage and read/write resolvers see the member name alone, and a bare-name
+ * lookup of `b` returns whichever Field happens to be called `b`. Publish the
+ * owner here so they bind the member through its object's type.
+ *
+ * One row per (enclosing function, object type, field): the pipeline edge is
+ * function -> Field, so repeating the row for every occurrence would add a
+ * record per member access in the corpus and no edge. An object whose type is
+ * unknown, or (in C) whose type declares no such field, publishes nothing.
+ *
+ * FORK: the rows go to their own array (ctx->field_refs, result->field_refs),
+ * not into resolved_calls, so no call-join, coverage proof or cross-LSP
+ * eligibility count ever sees them. */
+static void c_emit_field_reference(CLSPContext* ctx, TSNode node) {
+    if (!ctx->field_refs || !ctx->enclosing_func_qn)
+        return;
+    TSNode arg_node = ts_node_child_by_field_name(node, "argument", 8);
+    TSNode field_node = ts_node_child_by_field_name(node, "field", 5);
+    if (ts_node_is_null(arg_node) || ts_node_is_null(field_node) ||
+        strcmp(ts_node_type(field_node), "field_identifier") != 0)
+        return;
+    char* field_name = c_node_text(ctx, field_node);
+    if (!field_name || !field_name[0])
+        return;
+
+    const CBMType* obj_type = c_eval_expr_type(ctx, arg_node);
+    if (cbm_type_is_unknown(obj_type))
+        return;
+    bool is_arrow = false;
+    uint32_t nc = ts_node_child_count(node);
+    for (uint32_t i = 0; i < nc && !is_arrow; i++) {
+        TSNode child = ts_node_child(node, i);
+        is_arrow = !ts_node_is_named(child) && strcmp(ts_node_type(child), "->") == 0;
+    }
+    const char* type_qn = type_to_qn(c_simplify_type(ctx, obj_type, is_arrow));
+    if (!type_qn)
+        return;
+
+    /* Decided once per (function, type, field), hit or miss: the owner lookup
+     * below formats a module-qualified name on its way. */
+    uint64_t key = c_field_ref_hash(ctx->enclosing_func_qn, type_qn, field_name);
+    if (cbm_negmemo_contains(&ctx->field_ref_seen, key))
+        return;
+    cbm_negmemo_insert(&ctx->field_ref_seen, ctx->arena, key);
+
+    const CBMRegisteredType* owner = c_lookup_field_owner(ctx, type_qn, field_name, 0);
+    if (!owner && ctx->cpp_mode) {
+        /* C++: an object of a KNOWN type that declares no such field
+         * (`text.size()` on a std::string) is evidence that no project Field
+         * is meant. Publish the type anyway: the row names no node, so the
+         * resolvers bind nothing instead of falling back to the member name.
+         * C keeps the fallback, since a C aggregate's nested anonymous members
+         * are not all registered on it. */
+        owner = c_resolve_field_owner_type(ctx, type_qn);
+    }
+    if (!owner || !owner->qualified_name)
+        return;
+
+    CBMResolvedCall resolved = {};
+    resolved.caller_qn = ctx->enclosing_func_qn;
+    resolved.callee_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", owner->qualified_name, field_name);
+    resolved.strategy = "lsp_field_access";
+    resolved.confidence = 0.95f;
+    if (resolved.callee_qn)
+        cbm_resolvedcall_push(ctx->field_refs, ctx->arena, resolved);
+}
+
 // ============================================================================
 // resolve_calls_in_node: walk AST and resolve calls
 // ============================================================================
@@ -3706,6 +3892,11 @@ static void c_resolve_calls_in_node_inner(CLSPContext* ctx, TSNode node) {
 
     // Process statements for scope building
     c_process_statement(ctx, node);
+
+    // --- Member access: publish which type owns the field ---
+    if (ctx->field_refs && strcmp(kind, "field_expression") == 0) {
+        c_emit_field_reference(ctx, node);
+    }
 
     // --- Resolve call expressions ---
     if (strcmp(kind, "call_expression") == 0) {
@@ -5614,6 +5805,7 @@ void cbm_run_c_lsp(CBMArena* arena, CBMFileResult* result,
     c_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, cpp_mode, &result->resolved_calls);
     ctx.local_result = result;
     c_memo_test_stage(&ctx, "raw");
+    ctx.field_refs = &result->field_refs;
 
     c_lsp_process_file(&ctx, root);
     if (ctx.eval_failure) cbm_c_lsp_record_failure(result, ctx.eval_failure);
@@ -5675,21 +5867,27 @@ static void c_register_lsp_defs(CBMArena* arena, CBMTypeRegistry* reg,
                 }
             }
 
-            // Field defs
+            // Field defs. Sized from the list itself: a fixed cap here would
+            // silently drop the later fields of a large struct, and with them
+            // every member-access edge onto those fields.
             if (d->field_defs) {
+                int fcap = 1;
+                for (const char* c = d->field_defs; *c; c++) {
+                    if (*c == '|') fcap++;
+                }
+                const char** fnarr = (const char**)cbm_arena_alloc(arena, (fcap + 1) * sizeof(const char*));
+                const CBMType** ftarr = (const CBMType**)cbm_arena_alloc(arena, (fcap + 1) * sizeof(const CBMType*));
                 const char* fsrc = d->field_defs;
-                const char* fnames[64];
-                const CBMType* ftypes[64];
                 int fcount = 0;
-                while (*fsrc && fcount < 63) {
+                while (fnarr && ftarr && *fsrc && fcount < fcap) {
                     const char* sep = strchr(fsrc, '|');
                     const char* end = sep ? sep : fsrc + strlen(fsrc);
                     char* pair = cbm_arena_strndup(arena, fsrc, end - fsrc);
-                    char* colon = strchr(pair, ':');
+                    char* colon = pair ? strchr(pair, ':') : NULL;
                     if (colon) {
                         *colon = '\0';
-                        fnames[fcount] = pair;
-                        ftypes[fcount] = c_parse_return_type_text(arena, colon + 1,
+                        fnarr[fcount] = pair;
+                        ftarr[fcount] = c_parse_return_type_text(arena, colon + 1,
                             d->def_module_qn ? d->def_module_qn : module_qn);
                         fcount++;
                     }
@@ -5697,9 +5895,6 @@ static void c_register_lsp_defs(CBMArena* arena, CBMTypeRegistry* reg,
                     fsrc = sep + 1;
                 }
                 if (fcount > 0) {
-                    const char** fnarr = (const char**)cbm_arena_alloc(arena, (fcount + 1) * sizeof(const char*));
-                    const CBMType** ftarr = (const CBMType**)cbm_arena_alloc(arena, (fcount + 1) * sizeof(const CBMType*));
-                    for (int j = 0; j < fcount; j++) { fnarr[j] = fnames[j]; ftarr[j] = ftypes[j]; }
                     fnarr[fcount] = NULL;
                     ftarr[fcount] = NULL;
                     rt.field_names = fnarr;
@@ -5802,8 +5997,8 @@ bool cbm_run_c_lsp_cross_with_registry(
     CBMResolvedCallArray* out) {
     return cbm_run_c_lsp_cross_with_registry_status(arena, source, source_len, module_qn,
                                                     cpp_mode, reg, include_paths, include_ns_qns,
-                                                    include_count, cached_tree,
-                                                    out) == CBM_LSP_COMPLETE;
+                                                    include_count, cached_tree, out,
+                                                    NULL) == CBM_LSP_COMPLETE;
 }
 
 CBMLSPStatus cbm_run_c_lsp_cross_with_registry_status(
@@ -5814,7 +6009,8 @@ CBMLSPStatus cbm_run_c_lsp_cross_with_registry_status(
     CBMTypeRegistry* reg,
     const char** include_paths, const char** include_ns_qns, int include_count,
     TSTree* cached_tree,
-    CBMResolvedCallArray* out) {
+    CBMResolvedCallArray* out,
+    CBMResolvedCallArray* field_out) {
     if (!source || source_len == 0 || !out || !reg) return CBM_LSP_COMPLETE;
 
     TSParser* parser = NULL;
@@ -5834,6 +6030,7 @@ CBMLSPStatus cbm_run_c_lsp_cross_with_registry_status(
 
     CLSPContext ctx;
     c_lsp_init(&ctx, arena, source, source_len, reg, module_qn, cpp_mode, out);
+    ctx.field_refs = field_out;
     ctx.registry_shared = true; /* Tier-2 shared registry: read-only, see flag doc */
     for (int i = 0; i < include_count; i++) {
         c_lsp_add_include(&ctx, include_paths[i], include_ns_qns[i]);
@@ -5858,7 +6055,7 @@ bool cbm_run_c_lsp_cross(
     CBMResolvedCallArray* out) {
     return cbm_run_c_lsp_cross_status(arena, source, source_len, module_qn, cpp_mode, defs,
                                       def_count, include_paths, include_ns_qns, include_count,
-                                      cached_tree, out) == CBM_LSP_COMPLETE;
+                                      cached_tree, out, NULL) == CBM_LSP_COMPLETE;
 }
 
 CBMLSPStatus cbm_run_c_lsp_cross_status(
@@ -5869,7 +6066,8 @@ CBMLSPStatus cbm_run_c_lsp_cross_status(
     CBMLSPDef* defs, int def_count,
     const char** include_paths, const char** include_ns_qns, int include_count,
     TSTree* cached_tree,
-    CBMResolvedCallArray* out) {
+    CBMResolvedCallArray* out,
+    CBMResolvedCallArray* field_out) {
 
     if (!source || source_len == 0 || !out) return CBM_LSP_COMPLETE;
 
@@ -5909,6 +6107,7 @@ CBMLSPStatus cbm_run_c_lsp_cross_status(
     // Initialize context and run
     CLSPContext ctx;
     c_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, cpp_mode, out);
+    ctx.field_refs = field_out;
 
     // Add include mappings
     for (int i = 0; i < include_count; i++) {

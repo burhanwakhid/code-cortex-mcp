@@ -1174,6 +1174,8 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
     cbm_arena_init(&scratch);
     CBMResolvedCallArray out;
     memset(&out, 0, sizeof(out));
+    CBMResolvedCallArray field_out; /* C member-access owners (C LSP only) */
+    memset(&field_out, 0, sizeof(field_out));
 
     switch (lang) {
     case CBM_LANG_GO:
@@ -1190,7 +1192,7 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
          * fall back to its own #include scan. */
         CBMLSPStatus status =
             cbm_run_c_lsp_cross_status(&scratch, source, source_len, module_qn, cpp_mode, defs,
-                                       def_count, NULL, NULL, 0, tree, &out);
+                                       def_count, NULL, NULL, 0, tree, &out, &field_out);
         if (status != CBM_LSP_COMPLETE)
             cbm_c_lsp_record_failure(r, status);
         break;
@@ -1234,6 +1236,7 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
     }
 
     pxc_append_results(&r->arena, &r->resolved_calls, &out);
+    pxc_append_results(&r->arena, &r->field_refs, &field_out);
     cbm_arena_destroy(&scratch);
 }
 
@@ -1392,7 +1395,8 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
         case CBM_LANG_CUDA: {
             CBMLSPStatus status = cbm_run_c_lsp_cross_with_registry_status(
                 &result->arena, source, source_len, def_module, (lang != CBM_LANG_C), prebuilt,
-                imp_keys, imp_vals, imp_count, result->cached_tree, &result->resolved_calls);
+                imp_keys, imp_vals, imp_count, result->cached_tree, &result->resolved_calls,
+                &result->field_refs);
             if (status != CBM_LSP_COMPLETE)
                 cbm_c_lsp_record_failure(result, status);
             // Snapshot-backed workers load the original call records after

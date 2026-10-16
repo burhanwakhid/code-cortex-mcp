@@ -10463,6 +10463,53 @@ TEST(extract_c_fname_macro_definitions_stay_distinct_issue1957) {
 }
 
 
+/* `typedef struct { … } Name;` is the dominant C spelling of a type: the
+ * aggregate itself is anonymous and the typedef's declarator names it. Without
+ * that name the struct had no Class node and none of its members a Field node
+ * (37 of the 38 structs in internal/cbm/cbm.h), so a member access could only
+ * bind some OTHER struct's same-named field. */
+TEST(extract_c_anonymous_typedef_aggregate_is_named_by_its_typedef) {
+    CBMFileResult *r = extract("typedef struct {\n"
+                               "    int count;\n"
+                               "    const char *label;\n"
+                               "} Tally;\n"
+                               "\n"
+                               "typedef union {\n"
+                               "    int as_int;\n"
+                               "    float as_float;\n"
+                               "} Slot;\n"
+                               "\n"
+                               "typedef enum { SHADE_RED, SHADE_GREEN } Shade;\n"
+                               "\n"
+                               "typedef struct Named {\n"
+                               "    int id;\n"
+                               "} Named;\n"
+                               "\n"
+                               "typedef struct {\n"
+                               "    int raw;\n"
+                               "} *TallyRef;\n",
+                               CBM_LANG_C, "t", "tally.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* RED before the fix: none of the three anonymous aggregates has a def. */
+    ASSERT_TRUE(has_def(r, "Class", "Tally"));
+    ASSERT_TRUE(m946_has_def_qn(r, "t.tally.Tally.count"));
+    ASSERT_TRUE(m946_has_def_qn(r, "t.tally.Tally.label"));
+    ASSERT_TRUE(has_def(r, "Class", "Slot"));
+    ASSERT_TRUE(m946_has_def_qn(r, "t.tally.Slot.as_int"));
+    ASSERT_TRUE(m946_has_def_qn(r, "t.tally.Slot.as_float"));
+    ASSERT_TRUE(has_def_any(r, "Shade"));
+    /* A struct that names itself keeps exactly one def, under its own name. */
+    ASSERT_EQ(m946_count_defs(r, "Class", "Named"), 1);
+    ASSERT_TRUE(m946_has_def_qn(r, "t.tally.Named.id"));
+    /* A pointer typedef names a pointer type, not the aggregate: no Class. */
+    ASSERT_FALSE(has_def(r, "Class", "TallyRef"));
+    ASSERT_FALSE(has_def(r, "Field", "raw"));
+    cbm_free_result(r);
+    PASS();
+}
+
+
 SUITE(extraction) {
     /* Initialize extraction library */
     cbm_init();
@@ -10930,4 +10977,5 @@ SUITE(extraction) {
     RUN_TEST(extract_cpp_macro_wrapped_declarator_names_def_issue946);
     RUN_TEST(extract_c_macro_wrapped_declarator_controls_issue946);
     RUN_TEST(extract_c_fname_macro_definitions_stay_distinct_issue1957);
+    RUN_TEST(extract_c_anonymous_typedef_aggregate_is_named_by_its_typedef);
 }

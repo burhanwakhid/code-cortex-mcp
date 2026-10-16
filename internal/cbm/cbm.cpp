@@ -2929,6 +2929,7 @@ static void lsp_scratch_reclaim(CBMFileResult *result, CBMArena *dst, const CBMA
     RELOC_ARRAY_BLOCK(&result->defs, dst, scratch);
     RELOC_ARRAY_BLOCK(&result->calls, dst, scratch);
     RELOC_ARRAY_BLOCK(&result->resolved_calls, dst, scratch);
+    RELOC_ARRAY_BLOCK(&result->field_refs, dst, scratch);
 
     for (int i = defs_before; i < result->defs.count; i++) {
         reloc_definition(dst, scratch, &result->defs.items[i]);
@@ -2938,6 +2939,11 @@ static void lsp_scratch_reclaim(CBMFileResult *result, CBMArena *dst, const CBMA
     }
     for (int i = resolved_before; i < result->resolved_calls.count; i++) {
         reloc_resolved_call(dst, scratch, &result->resolved_calls.items[i]);
+    }
+    /* Field-owner rows (C LSP): reloc_str leaves a string that is not in
+     * the scratch alone, so rows from an earlier pass are untouched. */
+    for (int i = 0; i < result->field_refs.count; i++) {
+        reloc_resolved_call(dst, scratch, &result->field_refs.items[i]);
     }
 }
 

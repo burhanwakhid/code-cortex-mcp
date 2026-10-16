@@ -527,6 +527,11 @@ typedef struct {
     CBMTypeAssignArray type_assigns;
     CBMImplTraitArray impl_traits;       // Rust: impl Trait for Struct pairs
     CBMResolvedCallArray resolved_calls; // LSP-resolved calls (high confidence)
+    /* C member access `a.b` / `a->b` typed by the C LSP: one row per
+     * (enclosing function, owner field), callee_qn = the Field. The usage and
+     * read/write resolvers bind a member through these rows; no call join
+     * reads them. */
+    CBMResolvedCallArray field_refs;
     CBMStringRefArray string_refs;       // URL/config string literals from AST
     CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
     CBMChannelArray channels;            // Socket.IO / EventEmitter pub/sub participation

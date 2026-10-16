@@ -823,6 +823,35 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     if (!target_node || source_node->id == target_node->id) {
         return 0;
     }
+    /* A call that resolved onto a struct Field: refused across languages and
+     * for a bare C call; a C/C++ member call takes the Field its object's type
+     * names instead of the one the member name happened to find, and with an
+     * untyped object only a member name the project holds exactly once.
+     * Twin of pass_parallel.cpp resolve_file_calls. */
+    switch (cbm_call_onto_field_policy(lang, call->callee_name, target_node->label,
+                                       target_node->file_path)) {
+    case CBM_FIELD_CALL_DROP:
+        return 0;
+    case CBM_FIELD_CALL_BY_OWNER: {
+        bool typed = false;
+        target_node =
+            cbm_pipeline_c_member_call_field(&result->field_refs, NULL, ctx->gbuf, ctx->project_name,
+                                             call->enclosing_func_qn, call->callee_name, &typed);
+        if (!target_node && !typed) {
+            const char *only = cbm_registry_unique_field_qn(
+                ctx->registry, cbm_lsp_bare_segment(call->callee_name));
+            target_node = only ? cbm_gbuf_find_by_qn(ctx->gbuf, only) : NULL;
+        }
+        if (!target_node || source_node->id == target_node->id) {
+            return 0;
+        }
+        res.qualified_name = target_node->qualified_name;
+        res.strategy = typed ? "lsp_field_access" : "unique_name";
+        break;
+    }
+    case CBM_FIELD_CALL_KEEP:
+        break;
+    }
     /* #725: suffix_match is language-agnostic and will attach a Python
      * Store.commit() call to a JS function named commit (or a Bash main to a
      * Python main); a textual Go call match never binds a struct Field node. */

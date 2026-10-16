@@ -12237,6 +12237,288 @@ TEST(pipeline_doc_long_docstring_stored_whole) {
 }
 
 
+/* Nodes named `name` with this label in `path` (-1 on a store error). */
+static int fixture_node_count(cbm_store_t *store, const char *project, const char *path,
+                              const char *name, const char *label) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_name(store, project, name, &nodes, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int found = 0;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].file_path && nodes[i].label && strcmp(nodes[i].file_path, path) == 0 &&
+            strcmp(nodes[i].label, label) == 0) {
+            found++;
+        }
+    }
+    if (nodes) {
+        cbm_store_free_nodes(nodes, count);
+    }
+    return found;
+}
+
+/* True when a node named src_name has an edge of edge_type to the Field
+ * `field` OWNED BY `owner` (qualified name ends in ".owner.field"). The
+ * name-only cross_file_edge_exists cannot tell two same-named fields apart,
+ * which is exactly what the C member-access probes below must do. */
+static bool field_edge_exists(cbm_store_t *s, const char *project, const char *src_name,
+                              const char *owner, const char *field, const char *edge_type) {
+    char suffix[256];
+    snprintf(suffix, sizeof(suffix), ".%s.%s", owner, field);
+    size_t suffix_len = strlen(suffix);
+    cbm_node_t *srcs = NULL;
+    cbm_node_t *tgts = NULL;
+    int sc = 0;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, project, src_name, &srcs, &sc);
+    cbm_store_find_nodes_by_name(s, project, field, &tgts, &tc);
+    bool found = false;
+    for (int i = 0; i < sc && !found; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, srcs[i].id, edge_type, &edges, &ec);
+        for (int j = 0; j < ec && !found; j++) {
+            for (int k = 0; k < tc && !found; k++) {
+                const char *qn = tgts[k].qualified_name;
+                size_t qn_len = qn ? strlen(qn) : 0;
+                found = edges[j].target_id == tgts[k].id && tgts[k].label &&
+                        strcmp(tgts[k].label, "Field") == 0 && qn_len >= suffix_len &&
+                        strcmp(qn + qn_len - suffix_len, suffix) == 0;
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (srcs) {
+        cbm_store_free_nodes(srcs, sc);
+    }
+    if (tgts) {
+        cbm_store_free_nodes(tgts, tc);
+    }
+    return found;
+}
+
+/* Number of edges of edge_type that END on the Field `field` owned by `owner`,
+ * whatever their source: the call probes below must hold for a caller in any
+ * language, including a shell script whose source node has no stable name. */
+static int field_inbound_edge_count(cbm_store_t *s, const char *project, const char *owner,
+                                    const char *field, const char *edge_type) {
+    char suffix[256];
+    snprintf(suffix, sizeof(suffix), ".%s.%s", owner, field);
+    size_t suffix_len = strlen(suffix);
+    cbm_node_t *tgts = NULL;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, project, field, &tgts, &tc);
+    int total = 0;
+    for (int k = 0; k < tc; k++) {
+        const char *qn = tgts[k].qualified_name;
+        size_t qn_len = qn ? strlen(qn) : 0;
+        if (!tgts[k].label || strcmp(tgts[k].label, "Field") != 0 || qn_len < suffix_len ||
+            strcmp(qn + qn_len - suffix_len, suffix) != 0) {
+            continue;
+        }
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_target_type(s, tgts[k].id, edge_type, &edges, &ec);
+        total += ec;
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (tgts) {
+        cbm_store_free_nodes(tgts, tc);
+    }
+    return total;
+}
+
+/* Fixture for the C member-access probes: two structs share the field name
+ * `count`, and each function touches exactly one of them. A bare-name lookup
+ * of `count` can only pick one Field for both functions; only the type of the
+ * object expression says which struct is meant. `use_opaque` reaches `count`
+ * through a type the project never defines, so no Field may be bound at all;
+ * `beta_only` through that same untyped object is the one Field of that name
+ * in the project, so nothing has to be picked and it binds.
+ *
+ * Calls follow the same rule. The structs carry a function-pointer member
+ * `notify` (declared through a typedef: a member spelled `void (*notify)(int)`
+ * has no Field node today, a separate extraction gap). `use_remote` calls
+ * Beta's `notify` from a file that declares its own struct with a `notify`
+ * member -- the candidate a bare-name lookup prefers, being in the same
+ * module. `call_param` calls a PARAMETER named like the field `alpha_only`,
+ * and `tool.sh` runs a command of that name: neither calls a struct member.
+ *
+ * FORK: this fork records no USAGE for the member half of a C `a.b` read
+ * (extract_usages.cpp keeps field_identifier references for Go and Rust only),
+ * so the read probes assert only that no member read binds a wrong Field, and
+ * the typed and unique-name binds are proven on WRITES: `use_opaque` also
+ * writes both members through its untyped object. */
+static void write_c_member_field_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "alpha.h",
+                    "#ifndef ALPHA_H\n"
+                    "#define ALPHA_H\n"
+                    "typedef void (*alpha_notify_fn)(int);\n"
+                    "struct Alpha {\n"
+                    "    int count;\n"
+                    "    int alpha_only;\n"
+                    "    alpha_notify_fn notify;\n"
+                    "};\n"
+                    "#endif\n");
+    write_temp_file(tmp, "beta.h",
+                    "#ifndef BETA_H\n"
+                    "#define BETA_H\n"
+                    "typedef void (*beta_notify_fn)(int);\n"
+                    "typedef struct {\n"
+                    "    int count;\n"
+                    "    int beta_only;\n"
+                    "    beta_notify_fn notify;\n"
+                    "} Beta;\n"
+                    "#endif\n");
+    write_temp_file(tmp, "use_alpha.c",
+                    "#include \"alpha.h\"\n"
+                    "\n"
+                    "int use_alpha(struct Alpha *a) {\n"
+                    "    a->count = 1;\n"
+                    "    return a->count + a->alpha_only;\n"
+                    "}\n"
+                    "\n"
+                    "int call_param(int (*alpha_only)(void)) {\n"
+                    "    return alpha_only();\n"
+                    "}\n");
+    write_temp_file(tmp, "mix.c",
+                    "#include \"beta.h\"\n"
+                    "\n"
+                    "typedef void (*local_notify_fn)(int);\n"
+                    "struct Local {\n"
+                    "    local_notify_fn notify;\n"
+                    "};\n"
+                    "\n"
+                    "void use_remote(Beta b) {\n"
+                    "    b.notify(3);\n"
+                    "}\n");
+    write_temp_file(tmp, "tool.sh",
+                    "#!/bin/sh\n"
+                    "alpha_only --check\n");
+    write_temp_file(tmp, "use_beta.c",
+                    "#include \"beta.h\"\n"
+                    "\n"
+                    "int use_beta(Beta b) {\n"
+                    "    b.count = 2;\n"
+                    "    return b.count + b.beta_only;\n"
+                    "}\n");
+    write_temp_file(tmp, "use_opaque.c",
+                    "struct Opaque;\n"
+                    "\n"
+                    "int use_opaque(struct Opaque *o) {\n"
+                    "    o->count = 0;\n"
+                    "    o->beta_only = 1;\n"
+                    "    return o->count + o->beta_only;\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.c", i);
+        snprintf(body, sizeof(body), "int filler%d(void) { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+/* Shared assertions for the sequential and the parallel twin. */
+static int assert_c_member_fields_bind_by_type(cbm_store_t *s, const char *project) {
+    /* The probe means nothing unless both same-named fields exist. */
+    ASSERT_GTE(fixture_node_count(s, project, "alpha.h", "count", "Field"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "beta.h", "count", "Field"), 1);
+    /* Reproduce-first: RED while `count` resolves by bare name — both
+     * functions then bind the SAME Field, so one of each pair is wrong. */
+    ASSERT_FALSE(field_edge_exists(s, project, "use_alpha", "Beta", "count", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "use_beta", "Alpha", "count", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "use_alpha", "Alpha", "count", "WRITES"));
+    ASSERT_FALSE(field_edge_exists(s, project, "use_alpha", "Beta", "count", "WRITES"));
+    ASSERT_TRUE(field_edge_exists(s, project, "use_beta", "Beta", "count", "WRITES"));
+    ASSERT_FALSE(field_edge_exists(s, project, "use_beta", "Alpha", "count", "WRITES"));
+    /* An object whose type the project never defines binds no Field by a
+     * name several structs share... */
+    ASSERT_FALSE(field_edge_exists(s, project, "use_opaque", "Alpha", "count", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "use_opaque", "Beta", "count", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "use_opaque", "Alpha", "count", "WRITES"));
+    ASSERT_FALSE(field_edge_exists(s, project, "use_opaque", "Beta", "count", "WRITES"));
+    /* ...and still binds a member name the project holds exactly once. */
+    ASSERT_TRUE(field_edge_exists(s, project, "use_opaque", "Beta", "beta_only", "WRITES"));
+    /* A call through a function-pointer member lands on the member of its
+     * object's type, not on the same-named member its own file declares. */
+    ASSERT_GTE(fixture_node_count(s, project, "mix.c", "notify", "Field"), 1);
+    ASSERT_TRUE(field_edge_exists(s, project, "use_remote", "Beta", "notify", "CALLS"));
+    ASSERT_FALSE(field_edge_exists(s, project, "use_remote", "Local", "notify", "CALLS"));
+    /* A bare C call of a parameter named `alpha_only` and a shell command of
+     * that name are not calls of the struct member, however unique the name. */
+    ASSERT_EQ(field_inbound_edge_count(s, project, "Alpha", "alpha_only", "CALLS"), 0);
+    return 0;
+}
+
+TEST(pipeline_c_member_access_binds_field_by_object_type) {
+    /* `x.f` / `x->f` handed only the member name `f` to the short-name
+     * registry, which returned whichever Field was called `f`: 9,150 USAGE
+     * and 2,810 WRITES edges onto Fields on this repository, 3,976 of the
+     * USAGE edges onto a name several structs share. Sequential-path twin. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_c_field_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_c_member_field_fixture(tmp, 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/c_field.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    int rc = assert_c_member_fields_bind_by_type(s, project);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    if (rc != 0) {
+        return rc;
+    }
+    PASS();
+}
+
+TEST(pipeline_c_member_access_binds_field_by_object_type_parallel) {
+    /* Parallel twin: resolve_file_usages / resolve_file_rw are independent
+     * resolvers and must take the same typed join (#1928's lesson). */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_c_fieldp_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_c_member_field_fixture(tmp, 52);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/c_fieldp.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    int rc = assert_c_member_fields_bind_by_type(s, project);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    if (rc != 0) {
+        return rc;
+    }
+    PASS();
+}
+
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_stem_folder_collision_keeps_both_nodes);
     RUN_TEST(incremental_stem_mark_change_rebuilds);
@@ -12634,6 +12916,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_doc_go_package_comment_on_file_node);
     RUN_TEST(pipeline_doc_rust_inner_doc_on_file_node);
     RUN_TEST(pipeline_doc_long_docstring_stored_whole);
+    RUN_TEST(pipeline_c_member_access_binds_field_by_object_type);
+    RUN_TEST(pipeline_c_member_access_binds_field_by_object_type_parallel);
 }
 
 /* ══════════════════════════════════════════════════════════════════
