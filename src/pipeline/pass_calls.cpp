@@ -539,11 +539,104 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
     return src;
 }
 
+/* Per-file LSP join index, the sequential twin of resolve_file_calls'
+ * lsp_idx (pass_parallel.cpp): "caller_qn|leaf" -> best resolution, built
+ * once per file. Without it every call scanned every resolved row, which is
+ * O(calls x resolved) per file -- 32,000 calls in one generated function
+ * cost minutes once the #1527 port stopped truncating the LSP output. */
+static void seq_lsp_idx_free_key(const char *key, void *value, void *ud) {
+    (void)value;
+    (void)ud;
+    free((char *)key);
+}
+
+static void seq_lsp_idx_put(CBMHashTable *idx, const char *caller_qn, const char *name,
+                            const CBMResolvedCall *rc_e) {
+    if (!name || !name[0]) {
+        return;
+    }
+    char key[CBM_SZ_1K];
+    int kn = cbm_pipeline_lsp_key(key, sizeof(key), caller_qn, name, rc_e->source_byte);
+    if (kn <= 0 || kn >= (int)sizeof(key)) {
+        return;
+    }
+    const auto *existing = (const CBMResolvedCall *)cbm_ht_get(idx, key);
+    if (!existing) {
+        char *kdup = strdup(key);
+        if (kdup) {
+            cbm_ht_set(idx, kdup, (void *)rc_e);
+        }
+    } else if (rc_e->confidence > existing->confidence) {
+        const char *skey = cbm_ht_get_key(idx, key);
+        if (skey) {
+            cbm_ht_set(idx, skey, (void *)rc_e);
+        }
+    }
+}
+
+static CBMHashTable *seq_lsp_idx_build(const CBMFileResult *result) {
+    if (result->calls.count <= 0 || result->resolved_calls.count <= 0) {
+        return NULL;
+    }
+    CBMHashTable *idx = cbm_ht_create((uint32_t)result->resolved_calls.count * 4u + 16u);
+    if (!idx) {
+        return NULL;
+    }
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc_e = &result->resolved_calls.items[i];
+        if (!rc_e->caller_qn || !rc_e->callee_qn || rc_e->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+            continue;
+        }
+        const char *short_name = cbm_lsp_bare_segment(rc_e->callee_qn);
+        seq_lsp_idx_put(idx, rc_e->caller_qn, short_name, rc_e);
+        if (rc_e->reason && cbm_lsp_strategy_matches_on_reason(rc_e->strategy)) {
+            const char *reason_leaf = cbm_lsp_bare_segment(rc_e->reason);
+            if (reason_leaf && strcmp(reason_leaf, short_name) != 0) {
+                seq_lsp_idx_put(idx, rc_e->caller_qn, reason_leaf, rc_e);
+            }
+        }
+    }
+    return idx;
+}
+
+static void seq_lsp_idx_free(CBMHashTable *idx) {
+    if (idx) {
+        cbm_ht_foreach(idx, seq_lsp_idx_free_key, NULL);
+        cbm_ht_free(idx);
+    }
+}
+
+/* Same lookup as the parallel driver: the index is authoritative for a
+ * fitting key unless JVM tail matching is allowed; otherwise scan. */
+static const CBMResolvedCall *seq_lsp_lookup(const CBMHashTable *idx,
+                                             const CBMResolvedCallArray *lsp_calls,
+                                             const CBMCall *call, bool allow_tail) {
+    if (idx && call->enclosing_func_qn) {
+        const char *call_leaf = cbm_pipeline_call_callee_leaf(call->callee_name);
+        char key[CBM_SZ_1K];
+        int kn = call_leaf ? cbm_pipeline_lsp_key(key, sizeof(key), call->enclosing_func_qn,
+                                                  call_leaf, call->source_byte)
+                           : -1;
+        if (kn > 0 && kn < (int)sizeof(key)) {
+            const auto *hit = (const CBMResolvedCall *)cbm_ht_get(idx, key);
+            if (!hit && call->source_byte) {
+                cbm_pipeline_lsp_key(key, sizeof(key), call->enclosing_func_qn, call_leaf, 0);
+                hit = (const CBMResolvedCall *)cbm_ht_get(idx, key);
+            }
+            if (hit || !allow_tail) {
+                return hit;
+            }
+        }
+    }
+    return cbm_pipeline_find_lsp_resolution(lsp_calls, call, allow_tail);
+}
+
 /* Resolve one call and emit the appropriate edge. Returns 1 if resolved, 0 if not. */
 static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBMFileResult *result,
-                               const CBMResolvedCallArray *lsp_calls, const char *rel,
-                               const char *module_qn, const char **imp_keys, const char **imp_vals,
-                               int imp_count, CBMLanguage lang, const CBMImportArray *imports) {
+                               const CBMResolvedCallArray *lsp_calls, const CBMHashTable *lsp_idx,
+                               const char *rel, const char *module_qn, const char **imp_keys,
+                               const char **imp_vals, int imp_count, CBMLanguage lang,
+                               const CBMImportArray *imports) {
     const cbm_gbuf_node_t *source_node = calls_find_source(ctx, rel, call->enclosing_func_qn);
     if (!source_node) {
         return 0;
@@ -552,7 +645,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     /* LSP-resolved calls take precedence over registry-textual matching.
      * Unique-tail fallbacks are JVM-only (see cbm_pipeline_lsp_allow_tail_match). */
     bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
-    const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution(lsp_calls, call, allow_tail);
+    const CBMResolvedCall *lsp = seq_lsp_lookup(lsp_idx, lsp_calls, call, allow_tail);
     if (lsp) {
         const cbm_gbuf_node_t *target_node =
             cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name, lsp->callee_qn, allow_tail);
@@ -817,20 +910,22 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
                                                       pc_module_is_dir(files[i].language));
 
         /* Resolve each call */
+        CBMHashTable *lsp_idx = seq_lsp_idx_build(result);
         for (int c = 0; c < result->calls.count; c++) {
             CBMCall *call = &result->calls.items[c];
             if (!call->callee_name) {
                 continue;
             }
             total_calls++;
-            if (resolve_single_call(ctx, call, result, &result->resolved_calls, rel, module_qn,
-                                    imp_keys, imp_vals, imp_count, files[i].language,
+            if (resolve_single_call(ctx, call, result, &result->resolved_calls, lsp_idx, rel,
+                                    module_qn, imp_keys, imp_vals, imp_count, files[i].language,
                                     &result->imports)) {
                 resolved++;
             } else {
                 unresolved++;
             }
         }
+        seq_lsp_idx_free(lsp_idx);
 
         free(module_qn);
         free_import_map(imp_keys, imp_vals, imp_count);
