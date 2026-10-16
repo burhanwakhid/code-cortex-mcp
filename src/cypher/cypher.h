@@ -346,6 +346,12 @@ void cbm_query_free(cbm_query_t *q);
  * check; a negative value restores the default budget. */
 void cbm_cypher_test_set_deadline_ms(int64_t budget_ms);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Override only the deadline clock on this thread; NULL restores real time. */
+typedef uint64_t (*cbm_cypher_test_clock_fn)(void);
+void cbm_cypher_test_set_deadline_clock(cbm_cypher_test_clock_fn clock_fn);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
