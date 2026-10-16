@@ -3298,9 +3298,8 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
         if (include_connected && sr->node.id > 0) {
             enrich_connected(doc, item, store, sr->node.id, relationship);
         }
-        yyjson_doc *pdoc =
-            enrich_node_properties_ex(doc, item, sr->node.properties_json, !include_metrics,
-                                      MCP_SEARCH_DOCSTRING_CAP);
+        yyjson_doc *pdoc = enrich_node_properties_ex(doc, item, sr->node.properties_json,
+                                                     !include_metrics, MCP_SEARCH_DOCSTRING_CAP);
         if (pdoc && pdocs) {
             pdocs[pdoc_count++] = pdoc;
         }
