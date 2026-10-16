@@ -1805,11 +1805,11 @@ TEST(store_search_anchored_name_matches_plain_scan) {
         cbm_search_params_t p = {.project = "p",
                                  .label = cases[c].label,
                                  .name_pattern = cases[c].pattern,
-                                 .case_sensitive = cases[c].case_sensitive,
+                                 .min_degree = -1,
+                                 .max_degree = -1,
                                  .limit = cases[c].limit,
                                  .offset = cases[c].offset,
-                                 .min_degree = -1,
-                                 .max_degree = -1};
+                                 .case_sensitive = cases[c].case_sensitive};
         int rc_fast = 0;
         int rc_plain = 0;
         int before = ranged;
