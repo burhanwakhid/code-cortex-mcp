@@ -5,7 +5,11 @@
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
 #include "foundation/compat.h" // CBM_TLS
-#include <stdlib.h>            // calloc/free for the symbol-set cache
+#include "foundation/log.h"    // cbm_log_error -- walker stack allocation failure
+#include <limits.h>            // INT_MAX
+#include <stdint.h>            // SIZE_MAX
+#include <stdio.h>             // snprintf
+#include <stdlib.h>            // calloc/free for the symbol-set cache, walker stacks
 #include <string.h>
 
 const char *cbm_overload_at(const CBMFileResult *result, uint32_t offset) {
@@ -575,10 +579,54 @@ bool cbm_has_ancestor_kind(TSNode node, const char *kind, int max_depth) {
     return false;
 }
 
-// Recursive branching count
-#define BRANCHING_STACK_CAP 4096
+bool cbm_walk_stack_reserve(void **items, int *cap, int need, size_t elem_size,
+                            const void *inline_buf, const char *walker) {
+    if (need <= *cap) {
+        return true;
+    }
+    size_t new_cap = (size_t)*cap;
+    while (new_cap < (size_t)need) {
+        new_cap *= 2;
+    }
+    void *grown = nullptr;
+    if (new_cap <= (size_t)INT_MAX && new_cap <= SIZE_MAX / elem_size) {
+        if (*items == inline_buf) {
+            grown = malloc(new_cap * elem_size);
+            if (grown) {
+                memcpy(grown, inline_buf, (size_t)*cap * elem_size);
+            }
+        } else {
+            grown = realloc(*items, new_cap * elem_size);
+        }
+    }
+    if (!grown) {
+        char pending[24];
+        snprintf(pending, sizeof(pending), "%d", need);
+        cbm_log_error("extract.walk_stack_alloc_failed", "walker", walker, "pending", pending);
+        return false;
+    }
+    *items = grown;
+    *cap = (int)new_cap;
+    return true;
+}
+
+void cbm_walk_stack_release(void *items, const void *inline_buf) {
+    if (items != inline_buf) {
+        free(items);
+    }
+}
+
+// On-stack first chunk of the walker stacks (replaces a fixed 4096-frame cap
+// that silently dropped a wide body's FIRST children). Normal functions never
+// leave it; only a pending set this large (a very wide or deep body) spills to
+// the heap.
+enum { WALK_STACK_INLINE = 512 };
+
+// Iterative branching count (pre-order; no cap on the pending set).
 static int count_branching_iter(TSNode root, const char **types) {
-    TSNode stack[BRANCHING_STACK_CAP];
+    TSNode inline_stack[WALK_STACK_INLINE];
+    TSNode *stack = inline_stack;
+    int cap = WALK_STACK_INLINE;
     int top = 0;
     int count = 0;
     stack[top++] = root;
@@ -592,10 +640,17 @@ static int count_branching_iter(TSNode root, const char **types) {
             }
         }
         uint32_t n = ts_node_child_count(node);
-        for (int i = (int)n - SKIP_ONE; i >= 0 && top < BRANCHING_STACK_CAP; i--) {
+        if (top + (int)n > cap &&
+            !cbm_walk_stack_reserve((void **)&stack, &cap, top + (int)n, sizeof(TSNode),
+                                    inline_stack, "count_branching")) {
+            count = CBM_WALK_METRIC_UNAVAILABLE;
+            break;
+        }
+        for (int i = (int)n - SKIP_ONE; i >= 0; i--) {
             stack[top++] = ts_node_child(node, (uint32_t)i);
         }
     }
+    cbm_walk_stack_release(stack, inline_stack);
     return count;
 }
 
@@ -668,7 +723,9 @@ void cbm_compute_complexity(TSNode node, const char **branching_types, cbm_compl
         int ldepth;
         int adepth;
     };
-    struct cx_frame stack[BRANCHING_STACK_CAP];
+    struct cx_frame inline_stack[WALK_STACK_INLINE];
+    struct cx_frame *stack = inline_stack;
+    int cap = WALK_STACK_INLINE;
     int top = 0;
     stack[top].node = node;
     stack[top].bdepth = 0;
@@ -715,7 +772,17 @@ void cbm_compute_complexity(TSNode node, const char **branching_types, cbm_compl
             child_l = d;
         }
         uint32_t n = ts_node_child_count(f.node);
-        for (int i = (int)n - SKIP_ONE; i >= 0 && top < BRANCHING_STACK_CAP; i--) {
+        if (top + (int)n > cap &&
+            !cbm_walk_stack_reserve((void **)&stack, &cap, top + (int)n, sizeof(struct cx_frame),
+                                    inline_stack, "compute_complexity")) {
+            out->cyclomatic = CBM_WALK_METRIC_UNAVAILABLE;
+            out->cognitive = CBM_WALK_METRIC_UNAVAILABLE;
+            out->loop_count = CBM_WALK_METRIC_UNAVAILABLE;
+            out->loop_depth = CBM_WALK_METRIC_UNAVAILABLE;
+            out->max_access_depth = CBM_WALK_METRIC_UNAVAILABLE;
+            break;
+        }
+        for (int i = (int)n - SKIP_ONE; i >= 0; i--) {
             stack[top].node = ts_node_child(f.node, (uint32_t)i);
             stack[top].bdepth = child_b;
             stack[top].ldepth = child_l;
@@ -723,6 +790,7 @@ void cbm_compute_complexity(TSNode node, const char **branching_types, cbm_compl
             top++;
         }
     }
+    cbm_walk_stack_release(stack, inline_stack);
 }
 
 // --- Enclosing function detection ---

@@ -4,14 +4,15 @@
 #include "lang_specs.h"
 #include "foundation/constants.h"
 #include "foundation/platform.h" // safe_realloc (frees old on failure)
-#include "foundation/log.h"      // cbm_log_warn
+#include "foundation/log.h"      // cbm_log_warn, cbm_log_error
 #include "foundation/sha256.h"
 #include "foundation/str_util.h" // cbm_str_ends_with
 #include "extract_node_stack.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
-#include <stdint.h>          // uint32_t
+#include <limits.h>          // INT_MAX
+#include <stdint.h>          // uint32_t, SIZE_MAX
 #include <stdio.h>           // snprintf
 #include <stdlib.h>          // getenv, atoi
 #include <string.h>
@@ -92,10 +93,18 @@ static bool try_append_ident(const char *source, uint32_t s, int len, uint32_t *
 }
 
 /* Walk AST body, collect unique identifier text as space-separated string.
- * Returns arena-allocated string or NULL. */
+ * Contract: the first BT_MAX_IDENTS unique identifiers in pre-order (source
+ * order), bounded by BT_BUF bytes. The ident/byte caps ARE the sampling
+ * contract; the pending stack is not -- BT_STACK is only the on-stack first
+ * chunk and spills to the heap, because a full fixed stack dropped a wide
+ * body's FIRST children and sampled a mid-body window instead.
+ * Returns arena-allocated string, or NULL when there are no identifiers or the
+ * stack could not be grown (logged; no truncated sample is ever returned). */
 static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
     enum { BT_STACK = 512, BT_BUF = 2048, BT_MAX_IDENTS = 128, BT_SEEN = 256, BT_SEEN_MASK = 255 };
-    TSNode bt_stack[BT_STACK];
+    TSNode bt_inline[BT_STACK];
+    TSNode *bt_stack = bt_inline;
+    int bt_cap = BT_STACK;
     int bt_top = 0;
     bt_stack[bt_top++] = body;
     char bt_buf[BT_BUF];
@@ -119,11 +128,18 @@ static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
                 }
             }
         } else {
-            for (int i = (int)nc - SKIP_ONE; i >= 0 && bt_top < BT_STACK; i--) {
+            if (bt_top + (int)nc > bt_cap &&
+                !cbm_walk_stack_reserve((void **)&bt_stack, &bt_cap, bt_top + (int)nc,
+                                        sizeof(TSNode), bt_inline, "body_ident_tokens")) {
+                bt_pos = 0; /* sentinel: no sample rather than a truncated one */
+                break;
+            }
+            for (int i = (int)nc - SKIP_ONE; i >= 0; i--) {
                 bt_stack[bt_top++] = ts_node_child(nd, (uint32_t)i);
             }
         }
     }
+    cbm_walk_stack_release(bt_stack, bt_inline);
     if (bt_pos > 0) {
         bt_buf[bt_pos] = '\0';
         return cbm_arena_strdup(ctx->arena, bt_buf);
@@ -6531,32 +6547,180 @@ typedef struct {
     const char *enclosing_class_qn; // saved context for class nesting
 } walk_defs_frame_t;
 
-#define CBM_WALK_DEFS_STACK_CAP 4096
+/* Pending walk_defs frames. This used to be a fixed 4096-frame array on the C
+ * stack (~96 KB) whose `top < 4096` push guards SILENTLY DROPPED every
+ * definition past the cap: children are pushed last-to-first, so a file with
+ * more than 4096 top-level nodes lost its FIRST definitions. No work cap may
+ * decide graph content, so the stack has no ceiling: it starts in a small
+ * inline buffer (the common case never allocates) and doubles on the heap on
+ * demand. Only an allocation failure stops the walk, and that is loud: logged
+ * at error level and reported as a per-file extract error (has_error), never a
+ * silent partial file (upstream 77ab4bea). */
+enum { WD_STACK_INLINE = 256 };
+
+typedef struct {
+    walk_defs_frame_t *data; // inline_buf, or a heap buffer once grown
+    int top;
+    int cap;
+    bool failed;      // growth failed: pending frames dropped, walk drains
+    bool cursor_live; // `cursor` has been created and must be deleted
+    const char *path; // for the error log on allocation failure (may be NULL)
+    /* One cursor reused for every child enumeration of the walk:
+     * ts_node_child(node, i) is O(i), so the old per-index reverse loop was
+     * O(N^2) on a root with N top-level nodes. */
+    TSTreeCursor cursor;
+    walk_defs_frame_t inline_buf[WD_STACK_INLINE];
+} wd_stack_t;
+
+static void wd_init(wd_stack_t *s, const char *path) {
+    s->data = s->inline_buf;
+    s->top = 0;
+    s->cap = WD_STACK_INLINE;
+    s->failed = false;
+    s->cursor_live = false;
+    s->path = path;
+}
+
+static void wd_release(wd_stack_t *s) {
+    if (s->data != s->inline_buf) {
+        free(s->data);
+    }
+    if (s->cursor_live) {
+        ts_tree_cursor_delete(&s->cursor);
+    }
+    s->data = s->inline_buf;
+    s->cap = WD_STACK_INLINE;
+    s->top = 0;
+    s->cursor_live = false;
+}
+
+/* Double the stack. Returns false, after logging, when the doubled size is not
+ * representable or cannot be allocated; the old buffer stays intact so
+ * wd_release can still free it. */
+static bool wd_grow(wd_stack_t *s) {
+    walk_defs_frame_t *nd = NULL;
+    if (s->cap <= INT_MAX / 2 && (size_t)s->cap * 2 <= SIZE_MAX / sizeof(walk_defs_frame_t)) {
+        int ncap = s->cap * 2;
+        size_t bytes = (size_t)ncap * sizeof(walk_defs_frame_t);
+        if (s->data == s->inline_buf) {
+            nd = (walk_defs_frame_t *)malloc(bytes);
+            if (nd) {
+                memcpy(nd, s->data, (size_t)s->top * sizeof(walk_defs_frame_t));
+            }
+        } else {
+            nd = (walk_defs_frame_t *)realloc(s->data, bytes);
+        }
+        if (nd) {
+            s->data = nd;
+            s->cap = ncap;
+            return true;
+        }
+    }
+    char pending[24];
+    snprintf(pending, sizeof(pending), "%d", s->top);
+    cbm_log_error("extract.walk_stack_alloc_failed", "walker", "walk_defs", "pending", pending,
+                  "path", s->path ? s->path : "");
+    return false;
+}
+
+static inline void wd_push(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
+    if (s->top >= s->cap) {
+        if (s->failed) {
+            return;
+        }
+        if (!wd_grow(s)) {
+            /* Drop every pending frame so the walk drains and exits; walk_defs
+             * then marks the file's result as an extract error. */
+            s->failed = true;
+            s->top = 0;
+            s->cap = 0; // every later push lands here and is refused
+            return;
+        }
+    }
+    s->data[s->top++] = (walk_defs_frame_t){node, enclosing_qn};
+}
+
+static inline void wd_reverse(walk_defs_frame_t *a, int lo, int hi) {
+    while (lo < hi) {
+        walk_defs_frame_t t = a[lo];
+        a[lo++] = a[hi];
+        a[hi--] = t;
+    }
+}
+
+static void wd_cursor_reset(wd_stack_t *s, TSNode node) {
+    if (s->cursor_live) {
+        ts_tree_cursor_reset(&s->cursor, node);
+    } else {
+        s->cursor = ts_tree_cursor_new(node);
+        s->cursor_live = true;
+    }
+}
+
+/* Push every child of `node` so they POP in source order -- the same result as
+ * `for (i = count - 1; i >= 0; i--) push(ts_node_child(node, i))`, in one
+ * linear cursor pass. */
+static void wd_push_children_reverse(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
+    uint32_t cc = ts_node_child_count(node);
+    if (cc == 0) {
+        return;
+    }
+    if (cc <= 2) { // trivially cheap indexed access; skips the cursor reset
+        for (int i = (int)cc - SKIP_CHAR; i >= 0; i--) {
+            wd_push(s, ts_node_child(node, (uint32_t)i), enclosing_qn);
+        }
+        return;
+    }
+    int base = s->top;
+    wd_cursor_reset(s, node);
+    if (ts_tree_cursor_goto_first_child(&s->cursor)) {
+        do {
+            wd_push(s, ts_tree_cursor_current_node(&s->cursor), enclosing_qn);
+        } while (ts_tree_cursor_goto_next_sibling(&s->cursor));
+    }
+    if (s->failed) {
+        return;
+    }
+    wd_reverse(s->data, base, s->top - 1);
+}
 
 // Push nested class nodes from a class body container onto the defs stack.
 // Iteratively walks into wrapper nodes (field_declaration, template_declaration).
-static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, walk_defs_frame_t *stack,
-                                    int *top, const char *enclosing_qn, const CBMExtractCtx *ctx) {
+// Children are enumerated with a linear cursor pass and each stack's freshly
+// pushed segment is reversed, which pops them in the same order as the old
+// per-index reverse loop without its O(N^2) ts_node_child cost on wide bodies.
+static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, wd_stack_t *s,
+                                    const char *enclosing_qn, const CBMExtractCtx *ctx) {
     TSNodeStack nc_stack;
     ts_nstack_init(&nc_stack, ctx, NESTED_CLASS_STACK_CAP);
     ts_nstack_push(&nc_stack, body);
 
     while (nc_stack.count > 0) {
         TSNode cur = ts_nstack_pop(&nc_stack);
-        uint32_t nc = ts_node_child_count(cur);
-        for (int i = (int)nc - SKIP_CHAR; i >= 0; i--) {
-            TSNode child = ts_node_child(cur, (uint32_t)i);
-            if (cbm_kind_in_set(child, spec->class_node_types)) {
-                if (*top < CBM_WALK_DEFS_STACK_CAP) {
-                    stack[(*top)++] = (walk_defs_frame_t){child, enclosing_qn};
+        int wd_base = s->top;
+        int nc_base = nc_stack.count;
+        wd_cursor_reset(s, cur);
+        if (ts_tree_cursor_goto_first_child(&s->cursor)) {
+            do {
+                TSNode child = ts_tree_cursor_current_node(&s->cursor);
+                if (cbm_kind_in_set(child, spec->class_node_types)) {
+                    wd_push(s, child, enclosing_qn);
+                } else {
+                    const char *ck = ts_node_type(child);
+                    if (strcmp(ck, "field_declaration") == 0 ||
+                        strcmp(ck, "template_declaration") == 0 || strcmp(ck, "declaration") == 0) {
+                        ts_nstack_push(&nc_stack, child);
+                    }
                 }
-            } else {
-                const char *ck = ts_node_type(child);
-                if (strcmp(ck, "field_declaration") == 0 ||
-                    strcmp(ck, "template_declaration") == 0 || strcmp(ck, "declaration") == 0) {
-                    ts_nstack_push(&nc_stack, child);
-                }
-            }
+            } while (ts_tree_cursor_goto_next_sibling(&s->cursor));
+        }
+        if (!s->failed) {
+            wd_reverse(s->data, wd_base, s->top - 1);
+        }
+        for (int lo = nc_base, hi = nc_stack.count - 1; lo < hi; lo++, hi--) {
+            TSNode t = nc_stack.items[lo];
+            nc_stack.items[lo] = nc_stack.items[hi];
+            nc_stack.items[hi] = t;
         }
     }
 }
@@ -6675,29 +6839,28 @@ static bool is_dart_unnamed_extension(const CBMExtractCtx *ctx, TSNode node) {
 /* Walk an unnamed Dart extension's members as file-level functions. A member is
  * `method_signature > function_signature`; the wrapper carries no name of its
  * own, so push the inner function_signature (which does) for the generic walk. */
-static void push_dart_unnamed_extension_members(TSNode node, walk_defs_frame_t *stack, int *top,
+static void push_dart_unnamed_extension_members(TSNode node, wd_stack_t *s,
                                                 const char *enclosing_qn) {
     TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
     if (ts_node_is_null(body)) {
         return;
     }
     uint32_t nc = ts_node_named_child_count(body);
-    for (int i = (int)nc - 1; i >= 0 && *top < CBM_WALK_DEFS_STACK_CAP; i--) {
+    for (int i = (int)nc - 1; i >= 0; i--) {
         TSNode child = ts_node_named_child(body, (uint32_t)i);
         if (strcmp(ts_node_type(child), "method_signature") == 0) {
             TSNode sig = cbm_find_child_by_kind(child, "function_signature");
             if (!ts_node_is_null(sig)) {
-                stack[(*top)++] = (walk_defs_frame_t){sig, enclosing_qn};
+                wd_push(s, sig, enclosing_qn);
             }
             continue;
         }
-        stack[(*top)++] = (walk_defs_frame_t){child, enclosing_qn};
+        wd_push(s, child, enclosing_qn);
     }
 }
 
-static void push_class_body_children(TSNode node, const CBMLangSpec *spec, walk_defs_frame_t *stack,
-                                     int *top, const char *new_enclosing,
-                                     const CBMExtractCtx *ctx) {
+static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_stack_t *s,
+                                     const char *new_enclosing, const CBMExtractCtx *ctx) {
     uint32_t nc = ts_node_child_count(node);
     for (uint32_t ci = 0; ci < nc; ci++) {
         TSNode child = ts_node_child(node, ci);
@@ -6715,14 +6878,12 @@ static void push_class_body_children(TSNode node, const CBMLangSpec *spec, walk_
             // (a second node, and for JAX-RS a second, un-prefixed Route).
             // Upstream fixed the same omission in 87a0e3f7.
             (strcmp(ck, "template_body") == 0 && spec->language == CBM_LANG_SCALA)) {
-            push_nested_class_nodes(child, spec, stack, top, new_enclosing, ctx);
+            push_nested_class_nodes(child, spec, s, new_enclosing, ctx);
             return;
         }
     }
     // No body found — push all children directly
-    for (int ci = (int)nc - SKIP_CHAR; ci >= 0 && *top < CBM_WALK_DEFS_STACK_CAP; ci--) {
-        stack[(*top)++] = (walk_defs_frame_t){ts_node_child(node, (uint32_t)ci), new_enclosing};
-    }
+    wd_push_children_reverse(s, node, new_enclosing);
 }
 
 // Helm / Go template named-template definition: {{ define "chart.fullname" }} ...
@@ -7046,12 +7207,12 @@ static void recover_kotlin_error_classes(CBMExtractCtx *ctx, TSNode err_node) {
 
 static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, int depth_unused) {
     (void)depth_unused;
-    walk_defs_frame_t stack[CBM_WALK_DEFS_STACK_CAP];
-    int top = 0;
-    stack[top++] = (walk_defs_frame_t){root, ctx->enclosing_class_qn};
+    wd_stack_t s;
+    wd_init(&s, ctx->rel_path);
+    wd_push(&s, root, ctx->enclosing_class_qn);
 
-    while (top > 0) {
-        walk_defs_frame_t frame = stack[--top];
+    while (s.top > 0) {
+        walk_defs_frame_t frame = s.data[--s.top];
         TSNode node = frame.node;
         ctx->enclosing_class_qn = frame.enclosing_class_qn;
         const char *kind = ts_node_type(node);
@@ -7105,11 +7266,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             (strcmp(kind, "export_item") == 0 || strcmp(kind, "import_item") == 0) &&
             ts_node_is_null(
                 find_first_descendant_by_kind(node, "func_type", CBM_DESCENDANT_MAX_DEPTH))) {
-            uint32_t cc = ts_node_child_count(node);
-            for (int i = (int)cc - SKIP_CHAR; i >= 0 && top < CBM_WALK_DEFS_STACK_CAP; i--) {
-                stack[top++] =
-                    (walk_defs_frame_t){ts_node_child(node, (uint32_t)i), frame.enclosing_class_qn};
-            }
+            wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
             continue;
         }
 
@@ -7120,10 +7277,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
          * the scope node itself. */
         if (is_namespace_scope_kind(ctx->language, kind, node)) {
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
-            uint32_t nsc = ts_node_child_count(node);
-            for (int i = (int)nsc - SKIP_CHAR; i >= 0 && top < CBM_WALK_DEFS_STACK_CAP; i--) {
-                stack[top++] = (walk_defs_frame_t){ts_node_child(node, (uint32_t)i), new_enclosing};
-            }
+            wd_push_children_reverse(&s, node, new_enclosing);
             continue;
         }
 
@@ -7173,22 +7327,23 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         }
 
         if (is_dart_unnamed_extension(ctx, node)) {
-            push_dart_unnamed_extension_members(node, stack, &top, frame.enclosing_class_qn);
+            push_dart_unnamed_extension_members(node, &s, frame.enclosing_class_qn);
             continue;
         }
 
         if (cbm_kind_in_set(node, spec->class_node_types)) {
             extract_class_def(ctx, node, spec);
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
-            push_class_body_children(node, spec, stack, &top, new_enclosing, ctx);
+            push_class_body_children(node, spec, &s, new_enclosing, ctx);
             continue;
         }
 
-        uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_CHAR; i >= 0 && top < CBM_WALK_DEFS_STACK_CAP; i--) {
-            stack[top++] =
-                (walk_defs_frame_t){ts_node_child(node, (uint32_t)i), frame.enclosing_class_qn};
-        }
+        wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
+    }
+    wd_release(&s);
+    if (s.failed && ctx->result) {
+        ctx->result->has_error = true;
+        ctx->result->error_msg = "definitions walk: stack allocation failed";
     }
 }
 

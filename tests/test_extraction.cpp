@@ -14,6 +14,8 @@
 #include "../src/pipeline/pass_lsp_cross.h"
 #include "../src/pipeline/pipeline.h"
 #include "test_helpers.h"
+#include "helpers.h"    /* cbm_count_branching (walker stack cap) */
+#include "lang_specs.h" /* cbm_lang_spec, cbm_ts_language */
 #include <sqlite3.h>
 #include <cctype>
 #include <cstdio>
@@ -5566,6 +5568,157 @@ TEST(complexity_access_depth_and_params) {
     PASS();
 }
 
+/* The definitions walk kept its pending frames in a fixed 4096-frame array and
+ * stopped pushing once it was full. Children are pushed last-to-first, so a
+ * file wider than the cap lost its FIRST top-level definitions (upstream
+ * 77ab4bea). The stack now grows without a ceiling. */
+enum { WIDE_DEFS = 5000 };
+
+TEST(walk_defs_wide_file_extracts_every_definition) {
+    size_t cap = (size_t)WIDE_DEFS * 40 + 64;
+    char *src = (char *)malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = 0;
+    for (int i = 0; i < WIDE_DEFS; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos, "int wd%d(void) { return %d; }\n", i, i);
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_C, "t", "wide_defs.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    for (int i = 0; i < WIDE_DEFS; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "wd%d", i);
+        ASSERT_NOT_NULL(find_def(r, name));
+    }
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
+/* Same property through a class body: more than 4096 nested classes inside a
+ * C++ namespace-less struct body go through push_nested_class_nodes, and more
+ * than 4096 methods through the class-body path. Every one must survive. */
+TEST(walk_defs_wide_class_body_keeps_every_nested_class) {
+    enum { N = 4500 };
+    size_t cap = (size_t)N * 48 + 64;
+    char *src = (char *)malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = (size_t)snprintf(src, cap, "struct Outer {\n");
+    for (int i = 0; i < N; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos, "  struct In%d { int v; };\n", i);
+    }
+    snprintf(src + pos, cap - pos, "};\n");
+    CBMFileResult *r = extract(src, CBM_LANG_CPP, "t", "wide_nested.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(find_def(r, "In0"));
+    ASSERT_NOT_NULL(find_def(r, "In2000"));
+    ASSERT_NOT_NULL(find_def(r, (std::string("In") + std::to_string(N - 1)).c_str()));
+    int found = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *n = r->defs.items[i].name;
+        if (n && n[0] == 'I' && n[1] == 'n' && isdigit((unsigned char)n[2])) {
+            found++;
+        }
+    }
+    ASSERT_EQ(found, N);
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
+/* ── Walker stacks must never cap graph content ──────────────────────
+ *
+ * The complexity walkers and the body-token sampler used fixed-size pending
+ * stacks (4096 / 512 nodes) and silently stopped pushing children once full.
+ * Children are pushed last-to-first, so a wide body lost its FIRST statements:
+ * a function with 5000 top-level branches under-reported its cyclomatic count,
+ * and the token sampler started mid-body (upstream 7707c9d7). */
+enum { WIDE_STMTS = 5000, WIDE_CALLS = 600, BODY_TOKEN_PREFIX = 100 };
+
+/* C function `wide` whose body holds `n` top-level statements alternating
+ * `if (x) g();` and `while (x) g();`. Caller frees. */
+static char *build_wide_branch_fn(int n) {
+    size_t cap = (size_t)n * 24 + 64;
+    char *src = (char *)malloc(cap);
+    if (!src)
+        return NULL;
+    size_t pos = (size_t)snprintf(src, cap, "void g(void);\nvoid wide(int x) {\n");
+    for (int i = 0; i < n; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos, "%s",
+                                (i % 2 == 0) ? "if (x) g();\n" : "while (x) g();\n");
+    }
+    snprintf(src + pos, cap - pos, "}\n");
+    return src;
+}
+
+TEST(complexity_wide_body_exceeds_old_stack_cap) {
+    char *src = build_wide_branch_fn(WIDE_STMTS);
+    ASSERT_NOT_NULL(src);
+    CBMFileResult *r = extract(src, CBM_LANG_C, "t", "wide.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "wide");
+    ASSERT_NOT_NULL(d);
+    /* every if/while is one branching node at nesting depth 0 */
+    ASSERT_EQ(d->complexity, WIDE_STMTS);
+    ASSERT_EQ(d->cognitive, WIDE_STMTS);
+    ASSERT_EQ(d->loop_count, WIDE_STMTS / 2);
+    ASSERT_EQ(d->loop_depth, 1);
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
+TEST(count_branching_wide_body_exceeds_old_stack_cap) {
+    char *src = build_wide_branch_fn(WIDE_STMTS);
+    ASSERT_NOT_NULL(src);
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_C)));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+    ASSERT_NOT_NULL(tree);
+    int n = cbm_count_branching(ts_tree_root_node(tree),
+                                cbm_lang_spec(CBM_LANG_C)->branching_node_types);
+    ASSERT_EQ(n, WIDE_STMTS);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    free(src);
+    PASS();
+}
+
+/* The body-token sampler's contract is "the first BODY_TOKEN_CAP unique
+ * identifiers in source order". A body with 600 distinct calls must sample
+ * from f0 on, not a window starting mid-body (the capped stack began at f91).
+ * Only the source-order prefix f0..f99 is asserted: the sampler's dedupe key
+ * also merges a few later names, a separate property this test does not pin. */
+TEST(body_tokens_wide_body_samples_from_the_start) {
+    size_t cap = (size_t)WIDE_CALLS * 16 + 64;
+    char *src = (char *)malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = (size_t)snprintf(src, cap, "void wide_calls(void) {\n");
+    for (int i = 0; i < WIDE_CALLS; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos, "f%d();\n", i);
+    }
+    snprintf(src + pos, cap - pos, "}\n");
+    char expect[BODY_TOKEN_PREFIX * 8];
+    size_t ep = 0;
+    for (int i = 0; i < BODY_TOKEN_PREFIX; i++) {
+        ep += (size_t)snprintf(expect + ep, sizeof(expect) - ep, "f%d ", i);
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_C, "t", "wide_calls.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "wide_calls");
+    ASSERT_NOT_NULL(d);
+    ASSERT_NOT_NULL(d->body_tokens);
+    ASSERT_GTE(strlen(d->body_tokens), ep);
+    ASSERT_MEM_EQ(d->body_tokens, expect, ep);
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
 /* A macro parse error elsewhere in a C++ header must not rename existing
  * inline methods when the preprocessed definition-recovery pass runs. */
 TEST(extract_cpp_recovery_preserves_inline_call_identities) {
@@ -9134,6 +9287,11 @@ SUITE(extraction) {
     RUN_TEST(complexity_recursion_in_loop_unguarded);
     RUN_TEST(complexity_guarded_recursion);
     RUN_TEST(complexity_access_depth_and_params);
+    RUN_TEST(walk_defs_wide_file_extracts_every_definition);
+    RUN_TEST(walk_defs_wide_class_body_keeps_every_nested_class);
+    RUN_TEST(complexity_wide_body_exceeds_old_stack_cap);
+    RUN_TEST(count_branching_wide_body_exceeds_old_stack_cap);
+    RUN_TEST(body_tokens_wide_body_samples_from_the_start);
     RUN_TEST(extract_c_prototypes_are_declarations);
     RUN_TEST(extract_declaration_keys_match_definitions);
     RUN_TEST(extract_declaration_keys_preserve_scope_and_overloads);
