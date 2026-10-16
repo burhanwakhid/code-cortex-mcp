@@ -3535,10 +3535,39 @@ static char *cbm_first_branch_projection(const char *src, int len) {
  * them; the gate keeps the extra parse to ~1% of kernel C bytes (sampled). */
 enum { CBM_PROJ_MIN_ERROR_LINES = 20 };
 
-/* Adopt from the projection only what the raw pass lost: a Function/Method
- * def that overlaps a raw ERROR region, whose QN no def already holds, whose
- * name is on its first raw line, and whose span has definition syntax (the
- * #961 gates). Everything else the projected walk produced is discarded. */
+/* What the projection rescue adopts: a Function/Method def that overlaps a
+ * raw ERROR region, whose QN no def already holds, whose name is on its first
+ * raw line, and whose span has definition syntax (the #961 gates). */
+typedef struct {
+    CBMHashTable *held; /* QNs already defined (raw pass + adopted so far) */
+    const cbm_error_regions_t *regs;
+    const char *raw_source;
+    int raw_len;
+} cbm_rescue_gate_t;
+
+static bool cbm_rescue_adopts(const cbm_rescue_gate_t *g, const CBMDefinition *d) {
+    if (!d->name || !d->qualified_name || !cbm_def_label_is_callable(d->label) ||
+        cbm_ht_has(g->held, d->qualified_name)) {
+        return false;
+    }
+    bool overlaps = false;
+    for (int r = 0; r < g->regs->count && !overlaps; r++) {
+        overlaps = d->start_line <= g->regs->ends[r] && d->end_line >= g->regs->starts[r];
+    }
+    return overlaps && cbm_line_contains(g->raw_source, g->raw_len, d->start_line, d->name) &&
+           cbm_span_contains_callable_def(g->raw_source, g->raw_len, d->start_line, d->end_line,
+                                          d->name);
+}
+
+/* The projected walk's function filter: a def the rescue would discard is not
+ * worth its docstring, complexity and fingerprint. `held` only grows after
+ * the walk, so a def passed here is checked again below. */
+static bool cbm_rescue_keep_func_def(void *arg, const CBMDefinition *d) {
+    return cbm_rescue_adopts((const cbm_rescue_gate_t *)arg, d);
+}
+
+/* Adopt from the projection only what the raw pass lost (cbm_rescue_adopts).
+ * Everything else the projected walk produced is discarded. */
 static void cbm_rescue_defs_from_projection(CBMExtractCtx *raw_ctx, const TSLanguage *ts_lang) {
     CBMFileResult *result = raw_ctx->result;
     if (!ts_node_has_error(raw_ctx->root)) {
@@ -3600,23 +3629,15 @@ static void cbm_rescue_defs_from_projection(CBMExtractCtx *raw_ctx, const TSLang
             .module_qn = result->module_qn,
             .root = ts_tree_root_node(tree),
         };
+        cbm_rescue_gate_t gate = {held, &regs, raw_ctx->source, raw_ctx->source_len};
+        pctx.keep_func_def = cbm_rescue_keep_func_def;
+        pctx.keep_func_def_arg = &gate;
         int before = result->defs.count;
         cbm_extract_definitions_without_module(&pctx);
         int w = before;
         for (int i = before; i < result->defs.count; i++) {
             CBMDefinition *d = &result->defs.items[i];
-            bool adopt = d->name && d->qualified_name && cbm_def_label_is_callable(d->label) &&
-                         !cbm_ht_has(held, d->qualified_name);
-            bool overlaps = false;
-            for (int r = 0; adopt && r < regs.count && !overlaps; r++) {
-                overlaps = d->start_line <= regs.ends[r] && d->end_line >= regs.starts[r];
-            }
-            adopt =
-                adopt && overlaps &&
-                cbm_line_contains(raw_ctx->source, raw_ctx->source_len, d->start_line, d->name) &&
-                cbm_span_contains_callable_def(raw_ctx->source, raw_ctx->source_len, d->start_line,
-                                               d->end_line, d->name);
-            if (adopt) {
+            if (cbm_rescue_adopts(&gate, d)) {
                 result->defs.items[w++] = *d;
                 cbm_ht_set(held, result->defs.items[w - 1].qualified_name,
                            &result->defs.items[w - 1]);

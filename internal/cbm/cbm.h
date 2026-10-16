@@ -695,6 +695,13 @@ typedef struct {
      * out of budget, and the deepest tree level it reached. */
     uint32_t walk_nodes_visited;
     uint32_t walk_max_depth;
+    /* Pre-filter for a walk whose output is mostly thrown away (the C
+     * projection rescue in cbm.cpp keeps only what the raw pass lost). A
+     * function the filter rejects is dropped before its docstring, complexity
+     * and fingerprint are computed. It may only reject a def the caller would
+     * discard anyway. NULL = keep every def. */
+    bool (*keep_func_def)(void *arg, const CBMDefinition *def);
+    void *keep_func_def_arg;
 } CBMExtractCtx;
 
 // --- Public API ---

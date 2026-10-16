@@ -5049,6 +5049,11 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // downgraded by this.
     def.is_test = def.is_test || ctx->result->is_test_file;
 
+    /* The caller discards this def: skip the costly fields below. */
+    if (ctx->keep_func_def && !ctx->keep_func_def(ctx->keep_func_def_arg, &def)) {
+        return;
+    }
+
     // Docstring
     def.docstring = extract_docstring(ctx, node, name);
 
