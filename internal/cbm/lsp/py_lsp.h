@@ -61,6 +61,12 @@ typedef struct {
     // caller QNs.
     const char *enclosing_func_qn;
     const char *enclosing_class_qn;
+    // Active class execution (upstream 78aea85b): nested class bodies skip
+    // this class frame. Local classes have no extracted graph QN, so
+    // class_body_qn stays NULL for them.
+    CBMScope *class_body_outer_scope;
+    const char *class_body_qn;
+    bool class_body_in_comprehension; // retain enclosing comprehension bindings
     const char *module_qn;      // Python symbol scope (package __init__ omitted)
     const char *file_module_qn; // raw file identity (Module caller QN)
 
