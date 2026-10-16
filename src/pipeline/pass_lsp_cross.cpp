@@ -284,13 +284,29 @@ static bool pxc_lang_resolves_base_qns(CBMLanguage lang) {
  * (every inherited member of the wrong base becomes a callable target).
  * Returns NULL for stdlib / third-party / unknown bases, which then keep their
  * raw spelling and the pre-existing behaviour. */
-static const char *pxc_resolve_base_qn(const cbm_registry_t *reg, const char *raw,
-                                       const char *module_qn, const char **imp_keys,
-                                       const char **imp_vals, int imp_count) {
-    if (!reg || !raw || !raw[0]) {
+/* One file's base-resolution scope: the registry + import map pass_semantic
+ * uses, plus the facts the external-base gate reads. NULL (the surface-probe
+ * path) keeps every base at its raw spelling. */
+typedef struct {
+    const cbm_registry_t *reg;
+    const char **imp_keys;
+    const char **imp_vals;
+    int imp_count;
+    const CBMImportArray *imports;
+    const cbm_gbuf_t *gbuf;
+    const char *project_name;
+    const char *rel;
+    CBMLanguage lang;
+} pxc_base_scope_t;
+
+static const char *pxc_resolve_base_qn(const pxc_base_scope_t *bs, const char *raw,
+                                       const char *module_qn) {
+    if (!bs || !bs->reg || !raw || !raw[0]) {
         return NULL;
     }
-    cbm_resolution_t res = cbm_registry_resolve(reg, raw, module_qn, imp_keys, imp_vals, imp_count);
+    const cbm_registry_t *reg = bs->reg;
+    cbm_resolution_t res =
+        cbm_registry_resolve(reg, raw, module_qn, bs->imp_keys, bs->imp_vals, bs->imp_count);
     if (!res.qualified_name || !res.qualified_name[0]) {
         return NULL;
     }
@@ -300,14 +316,20 @@ static const char *pxc_resolve_base_qn(const cbm_registry_t *reg, const char *ra
     if (!cbm_label_is_type_like(cbm_registry_label_of(reg, res.qualified_name))) {
         return NULL;
     }
+    /* `unittest.TestCase` under an external `import unittest` survives the
+     * weak-strategy veto through the same-module suffix fallback; the shared
+     * external-base gate keeps it at its source spelling. */
+    if (cbm_python_external_base_contradicts(bs->lang, bs->imports, raw, res.qualified_name,
+                                             bs->gbuf, bs->project_name, bs->rel)) {
+        return NULL;
+    }
     return res.qualified_name;
 }
 
 /* pxc_join_pipe over base_classes, substituting each resolved QN for its
  * source spelling. Unresolved entries pass through verbatim. */
 static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
-                                     const cbm_registry_t *reg, const char *module_qn,
-                                     const char **imp_keys, const char **imp_vals, int imp_count) {
+                                     const pxc_base_scope_t *bs, const char *module_qn) {
     if (!bases || !bases[0]) {
         return NULL;
     }
@@ -321,8 +343,7 @@ static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
         return pxc_join_pipe(arena, bases);
     }
     for (int i = 0; i < count; i++) {
-        const char *qn =
-            pxc_resolve_base_qn(reg, bases[i], module_qn, imp_keys, imp_vals, imp_count);
+        const char *qn = pxc_resolve_base_qn(bs, bases[i], module_qn);
         resolved[i] = qn ? qn : bases[i];
     }
     resolved[count] = NULL;
@@ -405,11 +426,10 @@ typedef struct {
 } pxc_py_field_t;
 
 static void pxc_fold_py_field_types(CBMArena *arena, const CBMFileResult *result, CBMLSPDef *defs,
-                                    int start, int end, const cbm_registry_t *reg,
-                                    const char *module_qn, const char **imp_keys,
-                                    const char **imp_vals, int imp_count) {
+                                    int start, int end, const pxc_base_scope_t *bs,
+                                    const char *module_qn) {
     int nf = result ? result->field_types.count : 0;
-    if (!arena || nf == 0 || !defs || start >= end || !reg) {
+    if (!arena || nf == 0 || !defs || start >= end || !bs || !bs->reg) {
         return;
     }
     CBMHashTable *by_qn = cbm_ht_create((uint32_t)(end - start));
@@ -434,8 +454,7 @@ static void pxc_fold_py_field_types(CBMArena *arena, const CBMFileResult *result
         fields[f].type_qn = NULL;
         CBMLSPDef *owner = ft->class_qn ? (CBMLSPDef *)cbm_ht_get(by_qn, ft->class_qn) : NULL;
         const char *name = owner ? pxc_py_annotation_type_name(arena, ft->type_text) : NULL;
-        const char *qn =
-            name ? pxc_resolve_base_qn(reg, name, module_qn, imp_keys, imp_vals, imp_count) : NULL;
+        const char *qn = name ? pxc_resolve_base_qn(bs, name, module_qn) : NULL;
         if (!qn || !ft->field_name || !ft->field_name[0]) {
             continue;
         }
@@ -473,8 +492,7 @@ static void pxc_fold_py_field_types(CBMArena *arena, const CBMFileResult *result
  * `reg` resolves Python/TS base-class spellings to project QNs (see above). */
 static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const char *module_qn,
                              const char *namespace_name, CBMLanguage lang, CBMLSPDef *dst,
-                             const cbm_registry_t *reg, const char **imp_keys,
-                             const char **imp_vals, int imp_count) {
+                             const pxc_base_scope_t *bs) {
     const char *label = pxc_map_label(src->label);
     if (!label && src->label && strcmp(src->label, "Declaration") == 0 &&
         (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA))
@@ -500,9 +518,8 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     dst->return_types = src->return_type;
     if (lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA)
         dst->parameter_types = src->param_types;
-    dst->embedded_types = (reg && pxc_lang_resolves_base_qns(lang))
-                              ? pxc_join_base_qns(arena, src->base_classes, reg, module_qn,
-                                                  imp_keys, imp_vals, imp_count)
+    dst->embedded_types = (bs && bs->reg && pxc_lang_resolves_base_qns(lang))
+                              ? pxc_join_base_qns(arena, src->base_classes, bs, module_qn)
                               : pxc_join_pipe(arena, src->base_classes);
     dst->lang = lang;
     dst->cpp_declaration_key = src->declaration_key;
@@ -866,32 +883,34 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMFileResult
          * resolved base QNs, only when the caller supplied a pipeline context
          * with a registry (NULL keeps the raw spelling), and only when some def
          * in the file has a base class -- the map feeds nothing else. */
-        const cbm_registry_t *base_reg = NULL;
-        const char **imp_keys = NULL;
-        const char **imp_vals = NULL;
-        int imp_count = 0;
+        pxc_base_scope_t bs = {};
+        bs.imports = &cache[fi]->imports;
+        bs.project_name = project_name;
+        bs.rel = files[fi].rel_path;
+        bs.lang = files[fi].language;
         if (ctx && ctx->registry && ctx->gbuf && pxc_lang_resolves_base_qns(files[fi].language)) {
-            base_reg = ctx->registry;
+            bs.reg = ctx->registry;
+            bs.gbuf = ctx->gbuf;
             if (pxc_file_has_base_classes(cache[fi]) ||
                 (files[fi].language == CBM_LANG_PYTHON && cache[fi]->field_types.count > 0)) {
-                pxc_build_import_map(ctx->gbuf, project_name, files[fi].rel_path, &imp_keys,
-                                     &imp_vals, &imp_count);
+                pxc_build_import_map(ctx->gbuf, project_name, files[fi].rel_path, &bs.imp_keys,
+                                     &bs.imp_vals, &bs.imp_count);
             }
         }
         int first_def = idx;
         for (int di = 0; di < cache[fi]->defs.count; di++) {
             if (pxc_build_lsp_def(&cache[fi]->arena, &cache[fi]->defs.items[di], def_modules[fi],
-                                  namespace_name, files[fi].language, &defs[idx], base_reg,
-                                  imp_keys, imp_vals, imp_count) == 0) {
+                                  namespace_name, files[fi].language, &defs[idx],
+                                  bs.reg ? &bs : NULL) == 0) {
                 def_files.push_back(fi);
                 idx++;
             }
         }
         if (files[fi].language == CBM_LANG_PYTHON) {
-            pxc_fold_py_field_types(&cache[fi]->arena, cache[fi], defs, first_def, idx, base_reg,
-                                    def_modules[fi], imp_keys, imp_vals, imp_count);
+            pxc_fold_py_field_types(&cache[fi]->arena, cache[fi], defs, first_def, idx, &bs,
+                                    def_modules[fi]);
         }
-        pxc_free_import_map(imp_keys, imp_vals, imp_count); /* NULL-safe */
+        pxc_free_import_map(bs.imp_keys, bs.imp_vals, bs.imp_count); /* NULL-safe */
         /* Go too: struct fields are extracted as flat "Field" defs that
          * pxc_map_label drops, so without this fold every Go struct registers
          * with zero fields and field chains (h.svc.Handle()) never resolve.
