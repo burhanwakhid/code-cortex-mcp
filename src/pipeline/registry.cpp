@@ -213,8 +213,11 @@ static int callable_rank(const cbm_registry_t *r, const char *qn) {
      * rocksdb 145 INHERITS and ~9k class USAGE edges to constructors. It
      * ranks below every other definition, the QN order cannot pick it over
      * its own type either in line or out of line, and a real same-named
-     * function (`BytewiseComparator()`) still wins. */
-    if ((callable || strcmp(label, "OverloadSet") == 0 || strcmp(label, "Declaration") == 0) &&
+     * function (`BytewiseComparator()`) still wins. A constructor is a Method
+     * (or its Declaration / OverloadSet): a free Function named after its
+     * module (`parse` in parse.c, QN `parse.parse`) is not one. */
+    if ((strcmp(label, "Method") == 0 || strcmp(label, "OverloadSet") == 0 ||
+         strcmp(label, "Declaration") == 0) &&
         constructor_qn(qn)) {
         return REG_RANK_CONSTRUCTOR;
     }
@@ -228,6 +231,36 @@ static int callable_rank(const cbm_registry_t *r, const char *qn) {
  * directory is an ordinary name. */
 static bool csharp_reference_stub(const cbm_registry_t *r, const char *qn) {
     return r && r->csharp_ref_stubs && cbm_ht_get(r->csharp_ref_stubs, qn) != NULL;
+}
+
+/* The reference-assembly layout itself: src/libraries/<Asm>/ref/<file>.cs,
+ * where <Asm> is a dotted assembly name and the file's first segment is one
+ * of its segments (`System.Runtime.ref.System.Runtime...`,
+ * `System.Linq.Parallel.ref.System.Linq...`). A source folder or namespace
+ * that is merely called `ref` (`app.ref.Helpers`) repeats nothing and is not
+ * a stub. Only the CSHARP_REF_ASM_SEGMENTS segments before `ref` are asked. */
+enum { CSHARP_REF_ASM_SEGMENTS = 4 };
+
+static bool csharp_reference_assembly_qn(const char *qn) {
+    static const char marker[] = ".ref.";
+    const size_t marker_len = sizeof(marker) - SKIP_ONE;
+    for (const char *hit = strstr(qn, marker); hit; hit = strstr(hit + SKIP_ONE, marker)) {
+        const char *next = hit + marker_len;
+        size_t next_len = strcspn(next, ".");
+        const char *end = hit;
+        for (int k = 0; k < CSHARP_REF_ASM_SEGMENTS && end > qn; k++) {
+            const char *seg = end;
+            while (seg > qn && seg[-1] != '.') {
+                seg--;
+            }
+            if ((size_t)(end - seg) == next_len && next_len > 0 &&
+                strncmp(seg, next, next_len) == 0) {
+                return true;
+            }
+            end = seg > qn ? seg - SKIP_ONE : qn;
+        }
+    }
+    return false;
 }
 
 /* Total order among candidates that tie on candidate_score. Bucket position
@@ -867,7 +900,7 @@ void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qual
     }
     cbm_da_push(arr, (char *)owned_qn);
 
-    if (lang == CBM_LANG_CSHARP && strstr(owned_qn, ".ref.") != NULL) {
+    if (lang == CBM_LANG_CSHARP && csharp_reference_assembly_qn(owned_qn)) {
         if (!r->csharp_ref_stubs) {
             r->csharp_ref_stubs = cbm_ht_create(REG_INIT_CAP);
         }

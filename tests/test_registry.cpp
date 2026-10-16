@@ -1021,6 +1021,24 @@ TEST(registry_tie_prefers_csharp_implementation_over_ref_stub) {
     PASS();
 }
 
+/* Only a Method is a constructor: a C function named after its file
+ * (`parse` in parse.c, QN `...parse.parse`) keeps its callable rank, and a C#
+ * folder merely named `ref` is not a reference assembly. */
+TEST(registry_tie_same_stem_function_and_plain_ref_folder) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "parse", "proj.c.parse.parse", "Function");
+    cbm_registry_add(r, "parse", "proj.a.parse", "Class");
+    cbm_registry_add_lang(r, "Run", "proj.app.ref.Helpers.Run", "Method", CBM_LANG_CSHARP);
+    cbm_registry_add_lang(r, "Run", "proj.app.src.Helpers.Run", "Method", CBM_LANG_CSHARP);
+    cbm_resolution_t fn = cbm_registry_resolve(r, "parse", "proj.z.main", NULL, NULL, 0);
+    cbm_resolution_t run = cbm_registry_resolve(r, "Run", "proj.z.Main", NULL, NULL, 0);
+    ASSERT_STR_EQ(fn.qualified_name, "proj.c.parse.parse");
+    /* No stub among them: the plain QN order decides ("ref" < "src"). */
+    ASSERT_STR_EQ(run.qualified_name, "proj.app.ref.Helpers.Run");
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(python_builtin_member_table_matches_builtin_type_methods) {
     /* Ends and middle of the sorted table, so a mis-sorted insert shows up. */
     ASSERT_TRUE(cbm_python_is_builtin_member("add"));
@@ -1634,6 +1652,7 @@ SUITE(registry) {
     RUN_TEST(registry_tie_prefers_callable_over_property);
     RUN_TEST(registry_tie_ignores_nesting_depth);
     RUN_TEST(registry_tie_prefers_class_over_its_constructor);
+    RUN_TEST(registry_tie_same_stem_function_and_plain_ref_folder);
     RUN_TEST(registry_tie_prefers_csharp_implementation_over_ref_stub);
     RUN_TEST(python_builtin_member_table_matches_builtin_type_methods);
     RUN_TEST(weak_member_unique_name_exempt_is_python_self_rooted_unique_and_specific_only);
