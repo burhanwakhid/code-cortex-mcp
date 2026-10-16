@@ -6663,6 +6663,38 @@ static bool ruby_is_class_body_method(TSNode node) {
     return !ts_node_is_null(body) && ts_node_eq(body, parent);
 }
 
+/* Dart `extension on T { ... }` has no name: there is no container def to hang
+ * its members on, and extract_class_def would bail before extract_class_methods,
+ * dropping every member (#1457). */
+static bool is_dart_unnamed_extension(const CBMExtractCtx *ctx, TSNode node) {
+    return ctx->language == CBM_LANG_DART &&
+           strcmp(ts_node_type(node), "extension_declaration") == 0 &&
+           ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("name")));
+}
+
+/* Walk an unnamed Dart extension's members as file-level functions. A member is
+ * `method_signature > function_signature`; the wrapper carries no name of its
+ * own, so push the inner function_signature (which does) for the generic walk. */
+static void push_dart_unnamed_extension_members(TSNode node, walk_defs_frame_t *stack, int *top,
+                                                const char *enclosing_qn) {
+    TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    uint32_t nc = ts_node_named_child_count(body);
+    for (int i = (int)nc - 1; i >= 0 && *top < CBM_WALK_DEFS_STACK_CAP; i--) {
+        TSNode child = ts_node_named_child(body, (uint32_t)i);
+        if (strcmp(ts_node_type(child), "method_signature") == 0) {
+            TSNode sig = cbm_find_child_by_kind(child, "function_signature");
+            if (!ts_node_is_null(sig)) {
+                stack[(*top)++] = (walk_defs_frame_t){sig, enclosing_qn};
+            }
+            continue;
+        }
+        stack[(*top)++] = (walk_defs_frame_t){child, enclosing_qn};
+    }
+}
+
 static void push_class_body_children(TSNode node, const CBMLangSpec *spec, walk_defs_frame_t *stack,
                                      int *top, const char *new_enclosing,
                                      const CBMExtractCtx *ctx) {
@@ -7137,6 +7169,11 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
 
         if (ctx->language == CBM_LANG_RUST && strcmp(kind, "impl_item") == 0) {
             extract_rust_impl(ctx, node, spec);
+            continue;
+        }
+
+        if (is_dart_unnamed_extension(ctx, node)) {
+            push_dart_unnamed_extension_members(node, stack, &top, frame.enclosing_class_qn);
             continue;
         }
 
