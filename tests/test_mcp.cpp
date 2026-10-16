@@ -7411,6 +7411,38 @@ TEST(search_code_scan_in_process_threads_keep_list_order) {
     PASS();
 #endif
 }
+
+/* A matching line longer than the 2 KiB record reader is cut to what that
+ * reader holds: one record of at most 2046 bytes plus its newline, starting
+ * with the line's own text, and no stray tail. */
+TEST(search_code_scan_in_process_caps_long_records) {
+#ifdef _WIN32
+    SKIP_PLATFORM("Windows keeps the Select-String scan");
+#else
+    scan_fixture_t fx;
+    ASSERT_TRUE(scan_fixture_open(&fx));
+    std::string line = "needle_long_line ";
+    line += std::string(100000, 'q');
+    line += " tail:7:needle_long_line\n";
+    ASSERT_TRUE(scan_fixture_add(&fx, "min.js", line.data(), line.size()));
+    ASSERT_TRUE(scan_fixture_list(&fx, NULL));
+    char *got = scan_fixture_run(&fx, "needle_long_line", false, NULL, 500);
+    ASSERT_NOT_NULL(got);
+    size_t got_len = strlen(got);
+    std::string prefix = std::string(fx.files[0]) + ":1:needle_long_line qqq";
+    bool starts = strncmp(got, prefix.c_str(), prefix.size()) == 0;
+    int records = 0;
+    for (const char *p = got; *p; p++) {
+        records += *p == '\n';
+    }
+    free(got);
+    th_rmtree(fx.dir);
+    ASSERT_TRUE(starts);
+    ASSERT_EQ(records, 1);
+    ASSERT_TRUE(got_len <= (size_t)CBM_SZ_2K - 1);
+    PASS();
+#endif
+}
 #endif
 
 
@@ -8164,6 +8196,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_scan_in_process_binary_and_crlf);
     RUN_TEST(search_code_scan_in_process_limits_globs_and_literals);
     RUN_TEST(search_code_scan_in_process_threads_keep_list_order);
+    RUN_TEST(search_code_scan_in_process_caps_long_records);
 #endif
     RUN_TEST(search_code_context_window_is_bounded);
     RUN_TEST(search_code_context_extreme_values_answer_normally);

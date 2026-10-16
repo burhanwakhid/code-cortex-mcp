@@ -9579,13 +9579,22 @@ static void search_scan_locale_leave(search_scan_locale_t *l) {
 }
 
 /* Append one `grep -Hn` record. */
+/* collect_grep_matches reads records through a CBM_SZ_2K fgets buffer, so it
+ * never sees past a record's first CBM_SZ_2K - 1 bytes (the rest of a longer
+ * line came back as stray partial records). A record is cut to what that
+ * buffer holds, which keeps a scan of minified one-line files from holding
+ * whole lines -- up to the file cap each -- until the join. */
+enum { SEARCH_SCAN_RECORD_MAX = CBM_SZ_2K - PAIR_LEN }; /* room for '\n' and NUL */
+
 static void search_scan_emit(std::string &out, const char *path, size_t line_number,
                              const char *line, size_t line_length) {
     char number[CBM_SZ_32];
     int n = snprintf(number, sizeof(number), ":%zu:", line_number);
+    size_t header = strlen(path) + (n > 0 ? (size_t)n : 0);
+    size_t room = header < (size_t)SEARCH_SCAN_RECORD_MAX ? SEARCH_SCAN_RECORD_MAX - header : 0;
     out.append(path);
     out.append(number, n > 0 ? (size_t)n : 0);
-    out.append(line, line_length);
+    out.append(line, line_length < room ? line_length : room);
     out.push_back('\n');
 }
 

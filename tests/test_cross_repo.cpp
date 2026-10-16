@@ -614,6 +614,18 @@ TEST(cross_repo_absolute_remote_url_skips_caller_local_floor) {
         cross_repo_exec(&fixture, "mono-v4",
                         "UPDATE edges SET properties = '{\"url_path\":"
                         "\"http://127.0.0.2/api/users\",\"method\":\"GET\"}' "
+                        "WHERE type = 'HTTP_CALLS';") &&
+        cross_repo_seed_http_pair(&fixture, "mono-v6x", "pay-v6x", "/api/users", "mono") &&
+        cross_repo_seed_local_handler(&fixture, "mono-v6x", "mono") &&
+        cross_repo_exec(&fixture, "mono-v6x",
+                        "UPDATE edges SET properties = '{\"url_path\":"
+                        "\"http://[0:0:0:0:0:0:0:1]/api/users\",\"method\":\"GET\"}' "
+                        "WHERE type = 'HTTP_CALLS';") &&
+        cross_repo_seed_http_pair(&fixture, "mono-v6r", "pay-v6r", "/api/users", "mono") &&
+        cross_repo_seed_local_handler(&fixture, "mono-v6r", "mono") &&
+        cross_repo_exec(&fixture, "mono-v6r",
+                        "UPDATE edges SET properties = '{\"url_path\":"
+                        "\"http://[2001:db8::1]/api/users\",\"method\":\"GET\"}' "
                         "WHERE type = 'HTTP_CALLS';");
     if (!setup) {
         cross_repo_fixture_end(&fixture);
@@ -631,6 +643,10 @@ TEST(cross_repo_absolute_remote_url_skips_caller_local_floor) {
     const char *v4_target = "pay-v4";
     cbm_cross_repo_result_t v4 = cbm_cross_repo_match("mono-v4", &v4_target, 1);
     int v4_edges = cross_repo_count_edges(&fixture, "mono-v4", "CROSS_HTTP_CALLS");
+    const char *v6x_target = "pay-v6x";
+    cbm_cross_repo_result_t v6x = cbm_cross_repo_match("mono-v6x", &v6x_target, 1);
+    const char *v6r_target = "pay-v6r";
+    cbm_cross_repo_result_t v6r = cbm_cross_repo_match("mono-v6r", &v6r_target, 1);
     cross_repo_fixture_end(&fixture);
 
     ASSERT_FALSE(remote.failed);
@@ -645,6 +661,8 @@ TEST(cross_repo_absolute_remote_url_skips_caller_local_floor) {
     ASSERT_FALSE(v4.failed);
     ASSERT_EQ(v4.http_edges, 0); /* all of 127.0.0.0/8 is loopback */
     ASSERT_EQ(v4_edges, 0);
+    ASSERT_EQ(v6x.http_edges, 0); /* expanded ::1 */
+    ASSERT_EQ(v6r.http_edges, 1); /* a real IPv6 host ending in 1 is remote */
     PASS();
 }
 

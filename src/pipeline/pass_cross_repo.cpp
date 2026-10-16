@@ -42,8 +42,9 @@ enum {
     CR_COL_4 = 4,
     CR_SCHEME_SKIP = 3,          /* strlen("://") */
     CR_IPV4_LOOPBACK_PREFIX = 4, /* strlen("127.") */
-    CR_ROUTE_PREFIX_LEN = 9,     /* strlen("__route__") */
-    CR_ANY_LEN = 3,              /* strlen("ANY") */
+    CR_IPV6_MAX_GROUPS = 8,
+    CR_ROUTE_PREFIX_LEN = 9, /* strlen("__route__") */
+    CR_ANY_LEN = 3,          /* strlen("ANY") */
 };
 
 #define CR_MS_PER_SEC 1000.0
@@ -178,6 +179,41 @@ static const char *cr_url_path(const char *url) {
     return path_start ? path_start : "/";
 }
 
+/* True when the IPv6 literal s[0..len) (brackets and any %zone stripped) is
+ * ::1 in any spelling: zero groups, at most one "::", last group 1. */
+static bool cr_ipv6_is_loopback(const char *s, size_t len) {
+    const char *zone = (const char *)memchr(s, '%', len);
+    if (zone) {
+        len = (size_t)(zone - s);
+    }
+    const char *last = s + len;
+    while (last > s && last[-1] != ':') {
+        last--;
+    }
+    if (last == s) {
+        return false; /* no colon: not an IPv6 literal */
+    }
+    size_t last_len = (size_t)(s + len - last);
+    size_t zeros = strspn(last, "0");
+    if (last_len == 0 || zeros != last_len - SKIP_ONE || last[last_len - SKIP_ONE] != '1') {
+        return false;
+    }
+    int groups = 1;
+    int double_colons = 0;
+    for (const char *p = s; p < last; p++) {
+        if (*p == ':') {
+            groups++;
+            if (p + SKIP_ONE < s + len && p[SKIP_ONE] == ':') {
+                double_colons++;
+            }
+        } else if (*p != '0') {
+            return false;
+        }
+    }
+    return double_colons <= SKIP_ONE && groups <= CR_IPV6_MAX_GROUPS + SKIP_ONE &&
+           (double_colons == SKIP_ONE || groups == CR_IPV6_MAX_GROUPS);
+}
+
 /* True when url names a host other than this machine: "scheme://host/..."
  * with a host that is not localhost or a loopback address. Such a call goes
  * to another service even when the caller serves the same path itself, so
@@ -198,7 +234,10 @@ static bool cr_url_names_remote_host(const char *url) {
     if (len == 0) {
         return false;
     }
-    static const char *const loopback[] = {"localhost", "0.0.0.0", "[::1]"};
+    if (close && cr_ipv6_is_loopback(host + SKIP_ONE, len - PAIR_LEN)) {
+        return false;
+    }
+    static const char *const loopback[] = {"localhost", "0.0.0.0"};
     for (const char *name : loopback) {
         if (strlen(name) == len && strncasecmp(host, name, len) == 0) {
             return false;
