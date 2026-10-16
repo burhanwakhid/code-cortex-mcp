@@ -5627,6 +5627,101 @@ TEST(walk_defs_wide_class_body_keeps_every_nested_class) {
     PASS();
 }
 
+/* ── #2176: binary `.res` resources must not hang the indexer ──────────
+ * tree-sitter lexes an unparseable stretch by retrying at every byte with
+ * every external token marked valid. The ReScript scanner then ran its
+ * template-string loop from each byte to the next '`', '$', '\\' or NUL — to
+ * the end of the file when there is none — and threw the result away: O(n^2)
+ * per file, all inside lexing where the parse budget's progress callback never
+ * runs. Work is counted as the bytes the lexer pulls through a chunked
+ * TSInput: a pure function of (grammar, input), independent of speed. */
+enum { RES_LEX_CHUNK = 64, RES_LEX_BASE_BYTES = 4096 };
+
+typedef struct {
+    const char *src;
+    uint32_t len;
+    uint64_t bytes_pulled;
+} ResLexInput;
+
+static const char *res_lex_read(void *payload, uint32_t byte_index, TSPoint position,
+                                uint32_t *bytes_read) {
+    (void)position;
+    ResLexInput *in = (ResLexInput *)payload;
+    if (byte_index >= in->len) {
+        *bytes_read = 0;
+        return "";
+    }
+    uint32_t n = in->len - byte_index;
+    if (n > RES_LEX_CHUNK) {
+        n = RES_LEX_CHUNK;
+    }
+    in->bytes_pulled += n;
+    *bytes_read = n;
+    return in->src + byte_index;
+}
+
+/* Bytes pulled while parsing `len` copies of `fill` as ReScript; 0 on failure. */
+static uint64_t rescript_lex_work(unsigned char fill, uint32_t len) {
+    char *src = (char *)malloc(len);
+    TSParser *parser = ts_parser_new();
+    uint64_t work = 0;
+    if (src && parser && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_RESCRIPT))) {
+        memset(src, fill, len);
+        ResLexInput in = {src, len, 0};
+        TSInput input = {&in, res_lex_read, TSInputEncodingUTF8, NULL};
+        TSTree *tree = ts_parser_parse(parser, NULL, input);
+        if (tree) {
+            work = in.bytes_pulled;
+            ts_tree_delete(tree);
+        }
+    }
+    if (parser) {
+        ts_parser_delete(parser);
+    }
+    free(src);
+    return work;
+}
+
+TEST(rescript_error_recovery_lexing_is_linear) {
+    /* 0xFF: the reporter's binary bytes (invalid UTF-8). '~': plain ASCII text
+     * that ReScript cannot parse either — the defect is not binary-only. */
+    static const unsigned char fills[] = {0xFF, '~'};
+    for (size_t i = 0; i < sizeof(fills); i++) {
+        uint64_t base = rescript_lex_work(fills[i], RES_LEX_BASE_BYTES);
+        uint64_t doubled = rescript_lex_work(fills[i], 2 * RES_LEX_BASE_BYTES);
+        ASSERT_GTE(base, (uint64_t)RES_LEX_BASE_BYTES); /* non-vacuous */
+        double r = (double)doubled / (double)base;
+        printf("    fill 0x%02x: lexer bytes %llu -> %llu  ratio %.2f (linear ~2, quadratic ~4)\n",
+               fills[i], (unsigned long long)base, (unsigned long long)doubled, r);
+        ASSERT_TRUE(r >= 1.5 && r <= 2.6);
+    }
+    PASS();
+}
+
+/* The upstream hang's other half (#2176) was a per-leaf ts_node_parent climb
+ * in the ReScript `let` binding classifier. The fork has no such classifier:
+ * ReScript identifiers are not usage reference nodes here, and the usage walk
+ * takes each node's parent off its ancestor chain. The test below pins the
+ * end-to-end property instead. */
+/* A 1 MB run of non-NUL binary bytes parsed as ReScript must finish (the
+ * discovery sniff only rejects files with a NUL in their first 4 KB). */
+TEST(extract_rescript_binary_blob_finishes) {
+    enum { BLOB = 1 << 20 };
+    std::string src(BLOB, '\0');
+    uint32_t x = 2463534242u;
+    for (size_t i = 0; i < src.size(); i++) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        unsigned char c = (unsigned char)(x & 0xFF);
+        src[i] = (char)(c ? c : 0xFF);
+    }
+    CBMFileResult *r = extract(src.c_str(), CBM_LANG_RESCRIPT, "t", "blob.res");
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Walker stacks must never cap graph content ──────────────────────
  *
  * The complexity walkers and the body-token sampler used fixed-size pending
@@ -9292,6 +9387,8 @@ SUITE(extraction) {
     RUN_TEST(complexity_wide_body_exceeds_old_stack_cap);
     RUN_TEST(count_branching_wide_body_exceeds_old_stack_cap);
     RUN_TEST(body_tokens_wide_body_samples_from_the_start);
+    RUN_TEST(rescript_error_recovery_lexing_is_linear);
+    RUN_TEST(extract_rescript_binary_blob_finishes);
     RUN_TEST(extract_c_prototypes_are_declarations);
     RUN_TEST(extract_declaration_keys_match_definitions);
     RUN_TEST(extract_declaration_keys_preserve_scope_and_overloads);

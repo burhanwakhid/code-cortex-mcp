@@ -1101,6 +1101,35 @@ TEST(lang_frm_form_stays_form) {
     PASS();
 }
 
+/* #2176: a Godot binary resource shares the .res extension with ReScript.
+ * Parsed as ReScript it produced an error tree that never finished indexing;
+ * binary content is not ReScript source and must not be indexed as such. */
+TEST(lang_res_binary_resource_unsupported) {
+    static const unsigned char godot_head[] = {'R',  'S',  'R',  'C',  0x00, 0x00, 0x00, 0x00,
+                                               0x04, 0x00, 0x00, 0x00, 'A',  'r',  'r',  'a',
+                                               'y',  'M',  'e',  's',  'h',  0x00, 0xff, 0x80};
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_godot.res", cbm_tmpdir());
+    FILE *f = fopen(path, "wb");
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(fwrite(godot_head, 1, sizeof(godot_head), f), sizeof(godot_head));
+    fclose(f);
+    ASSERT_EQ(cbm_disambiguate_res(path), CBM_LANG_COUNT);
+    remove(path);
+    PASS();
+}
+
+TEST(lang_res_rescript_stays_rescript) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_rescript.res", cbm_tmpdir());
+    ASSERT_EQ(th_write_file(path, "let greet = name => `Hello ${name}`\n"
+                                  "module M = {\n  let x = 1\n}\n"), 0);
+    ASSERT_EQ(cbm_disambiguate_res(path), CBM_LANG_RESCRIPT);
+    remove(path);
+    ASSERT_EQ(cbm_disambiguate_res("/tmp/nonexistent_file_12345.res"), CBM_LANG_RESCRIPT);
+    PASS();
+}
+
 SUITE(language) {
     /* Extension: Tier 1 programming */
     RUN_TEST(lang_ext_go);
@@ -1258,6 +1287,8 @@ SUITE(language) {
     RUN_TEST(lang_cls_apex_stays_apex);
     RUN_TEST(lang_frm_vb6_form_unsupported);
     RUN_TEST(lang_frm_form_stays_form);
+    RUN_TEST(lang_res_binary_resource_unsupported);
+    RUN_TEST(lang_res_rescript_stays_rescript);
 
     /* Go test ports */
     /* New languages */

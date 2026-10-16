@@ -707,6 +707,10 @@ static CBMLanguage detect_file_language(const char *entry_name, const char *abs_
     if (dot && strcmp(dot, ".frm") == 0) {
         lang = cbm_disambiguate_frm(abs_path);
     }
+    /* Special: .res is also a binary Godot / Windows resource (#2176) */
+    if (dot && strcmp(dot, ".res") == 0) {
+        lang = cbm_disambiguate_res(abs_path);
+    }
     if (lang == CBM_LANG_COUNT) {
         return CBM_LANG_COUNT;
     }
