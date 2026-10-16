@@ -744,6 +744,100 @@ TEST(ei_py_external_import_never_binds_project_symbol) {
     PASS();
 }
 
+/* The fastapi shape: pyproject.toml names the distribution after the package
+ * it ships (`[project] name = "pkg"`, package dir pkg/ or src/pkg/). The
+ * pkgmap entry for that name made every absolute self-import
+ * (`from pkg.responses import X`) unresolvable as a module, so the #2127
+ * gate read the project's own imports as EXTERNAL: a re-exported name
+ * (`pkg.responses` re-exports `pkg.sse.EventSourceResponse`) lost its IMPORTS
+ * edge and, with it, the import_map CALLS edge and the LSP-typed method call
+ * of every use. The internal import keeps its leaf-name fallback, ranked: a
+ * hit that spells the module chain (`from pkg import Query` ->
+ * pkg.param_functions.Query, not docs.graphql.Query) wins, and a module
+ * segment never binds a method (`from pkg.openapi.constants import
+ * REF_TEMPLATE` is no `FastAPI.openapi`). `pad` > MIN_FILES_FOR_PARALLEL(50)
+ * runs the parallel resolver. */
+static int ei_py_pyproject_self_import_case(int pad, bool src_layout) {
+    enum { EI_PYPROJ_FIXED = 11, EI_PYPROJ_MAX = EI_PYPROJ_FIXED + 64 };
+    static char names[EI_PYPROJ_MAX][48];
+    EILangFile f[EI_PYPROJ_MAX];
+    const char *root = src_layout ? "src/" : "";
+    static const char *const rels[] = {"pkg/__init__.py",         "pkg/sse.py",
+                                       "pkg/responses.py",        "pkg/applications.py",
+                                       "pkg/openapi/__init__.py", "pkg/openapi/constants.py",
+                                       "pkg/param_functions.py"};
+    static const char *const bodies[] = {
+        "from .param_functions import Query as Query  # noqa\n",
+        "class EventSourceResponse:\n    def render(self):\n        return 1\n",
+        "from pkg.sse import EventSourceResponse as EventSourceResponse  # noqa\n",
+        "class FastAPI:\n    def openapi(self):\n        return 1\n",
+        "",
+        "REF_TEMPLATE = \"#/components/schemas/{model}\"\n",
+        "def Query(default=None):\n    return default\n"};
+    int n = 0;
+    f[n++] = EILangFile{"pyproject.toml", "[project]\nname = \"pkg\"\n"};
+    for (int i = 0; i < (int)(sizeof(rels) / sizeof(rels[0])); i++) {
+        snprintf(names[n], sizeof(names[n]), "%s%s", root, rels[i]);
+        f[n] = EILangFile{names[n], bodies[i]};
+        n++;
+    }
+    f[n++] =
+        EILangFile{"docs/graphql_app.py", "class Query:\n    def user(self):\n        return 1\n"};
+    f[n++] = EILangFile{"tests/test_sse.py", "from pkg import Query\n"
+                                             "from pkg.responses import EventSourceResponse\n"
+                                             "from pkg.openapi.constants import REF_TEMPLATE\n\n\n"
+                                             "def test_stream(q=Query()):\n"
+                                             "    response = EventSourceResponse()\n"
+                                             "    response.render()\n"
+                                             "    return response, REF_TEMPLATE\n"};
+    for (int i = 0; i < pad && n < EI_PYPROJ_MAX; i++) {
+        snprintf(names[n], sizeof(names[n]), "pad/mod_%02d.py", i);
+        f[n] = EILangFile{names[n], "def filler():\n    return 0\n"};
+        n++;
+    }
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, n);
+    int reexport_imports =
+        store ? ei_inbound_edges_on(store, lp.project, "EventSourceResponse", "Class", "IMPORTS")
+              : -1;
+    int reexport_calls =
+        store ? ei_inbound_edges_on(store, lp.project, "EventSourceResponse", "Class", "CALLS")
+              : -1;
+    int method_calls =
+        store ? ei_inbound_edges_on(store, lp.project, "render", "Method", "CALLS") : -1;
+    int query_imports =
+        store ? ei_inbound_edges_on(store, lp.project, "Query", "Function", "IMPORTS") : -1;
+    int wrong_query =
+        store ? ei_inbound_edges_on(store, lp.project, "Query", "Class", "IMPORTS") : -1;
+    int segment_imports =
+        store ? ei_inbound_edges_on(store, lp.project, "openapi", "Method", "IMPORTS") : -1;
+    /* pkg/responses.py and tests/test_sse.py both import EventSourceResponse. */
+    int ok = reexport_imports >= 2 && reexport_calls >= 1 && method_calls >= 1 &&
+             query_imports >= 1 && wrong_query == 0 && segment_imports == 0;
+    if (!ok) {
+        fprintf(stderr,
+                "  [pyproject self-import pad=%d src=%d] EventSourceResponse IMPORTS=%d "
+                "(want >=2) CALLS=%d render CALLS=%d pkg Query IMPORTS=%d (want >=1 each); "
+                "docs Query IMPORTS=%d FastAPI.openapi IMPORTS=%d (want 0/0)\n",
+                pad, src_layout ? 1 : 0, reexport_imports, reexport_calls, method_calls,
+                query_imports, wrong_query, segment_imports);
+    }
+    ei_cleanup(&lp, store);
+    return ok;
+}
+
+TEST(ei_py_pyproject_named_package_self_imports_stay_internal) {
+    int flat_seq = ei_py_pyproject_self_import_case(0, false);
+    int flat_par = ei_py_pyproject_self_import_case(60, false);
+    int src_seq = ei_py_pyproject_self_import_case(0, true);
+    int src_par = ei_py_pyproject_self_import_case(60, true);
+    ASSERT_TRUE(flat_seq);
+    ASSERT_TRUE(flat_par);
+    ASSERT_TRUE(src_seq);
+    ASSERT_TRUE(src_par);
+    PASS();
+}
+
 /* Base-class helper: INHERITS edges out of the (single) Class named `src`
  * (return value), and how many land on a node whose QN ends with
  * `want_qn_suffix` (*to_want); -1 when the class is missing. */
@@ -2008,6 +2102,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_go_two_consumers_same_package);
     RUN_TEST(ei_go_import_never_binds_symbol);
     RUN_TEST(ei_py_external_import_never_binds_project_symbol);
+    RUN_TEST(ei_py_pyproject_named_package_self_imports_stay_internal);
     RUN_TEST(ei_py_external_base_never_inherits_project_class);
     RUN_TEST(ei_js_parent_relative_asset_import);
     RUN_TEST(ei_cpp_dot_relative_include_targets_header_file);

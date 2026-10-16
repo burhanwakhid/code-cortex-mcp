@@ -1390,6 +1390,70 @@ static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path
     return NULL;
 }
 
+/* Python pyproject entries (parse_pyproject_toml) map the distribution name to
+ * its package's `__init__` module, the src/ layout registered first, so the
+ * map always holds `<proj>.src.<name>.__init__`. Neither generic resolver
+ * handles that value: the exact lookup names a module a flat layout does not
+ * have, and the dot-prefix resolver treats the QN as a directory path and
+ * yields `<proj>.<proj>.src...`. For a repository whose pyproject name is its
+ * own package (fastapi, flask, requests) cbm_pipeline_resolve_module then
+ * resolves none of the absolute self-imports, and the #2127 external-import
+ * gate read every one of them as a stdlib/third-party import. Returns heap
+ * QN, or NULL when module_path is not under a Python entry. The default
+ * resolution wins when it names a node (flat layout); otherwise the entry's
+ * package directory replaces the name, resolved by the default convention
+ * (src/ layout). Only the in-project test uses it: Strategy 1 keeps its
+ * existing answer, because a corrected `from pkg import X` lands on the
+ * package Folder, which carries no re-exported X (the leaf-name fallback
+ * reaches `pkg.mod.X` and the cross-file LSP types through it). */
+static char *resolve_python_pkg_entry(const cbm_pipeline_ctx_t *ctx, CBMHashTable *pkgmap,
+                                      const char *module_path) {
+    static const char init_suffix[] = ".__init__";
+    char buf[PKGMAP_PATH_BUF];
+    snprintf(buf, sizeof(buf), "%s", module_path);
+    const char *entry_qn = NULL;
+    const char *rest = NULL;
+    const char *full_end = buf + strlen(buf);
+    for (const char *end = full_end;;) {
+        const char *v = (const char *)cbm_ht_get(pkgmap, buf);
+        if (v && ends_with(v, init_suffix)) {
+            entry_qn = v;
+            rest = end != full_end ? module_path + (end - buf) + SKIP_ONE : NULL;
+            break;
+        }
+        char *dot = strrchr(buf, '.');
+        if (!dot) {
+            break;
+        }
+        *dot = '\0';
+        end = dot;
+    }
+    if (!entry_qn) {
+        return NULL;
+    }
+    char *fallback = cbm_pipeline_fqn_module(ctx->project_name, module_path);
+    if (fallback && ctx->gbuf && cbm_gbuf_find_by_qn(ctx->gbuf, fallback)) {
+        return fallback;
+    }
+    free(fallback);
+    if (!rest) {
+        return strdup(entry_qn);
+    }
+    /* `<proj>.src.<name>.__init__` -> package path `src.<name>`, then the
+     * import's remaining segments under it. */
+    size_t proj_len = strlen(ctx->project_name);
+    size_t qn_len = strlen(entry_qn);
+    if (strncmp(entry_qn, ctx->project_name, proj_len) != 0 || entry_qn[proj_len] != '.' ||
+        qn_len < proj_len + SKIP_ONE + sizeof(init_suffix) - SKIP_ONE) {
+        return strdup(entry_qn);
+    }
+    const char *pkg_dir = entry_qn + proj_len + SKIP_ONE;
+    int pkg_dir_len = (int)(qn_len - proj_len - SKIP_ONE - (sizeof(init_suffix) - SKIP_ONE));
+    char path[PKGMAP_PATH_BUF];
+    snprintf(path, sizeof(path), "%.*s.%s", pkg_dir_len, pkg_dir, rest);
+    return cbm_pipeline_fqn_module(ctx->project_name, path);
+}
+
 char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
                                   const char *module_path) {
     if (!ctx || !module_path) {
@@ -1742,6 +1806,14 @@ static bool python_import_module_in_project(const cbm_pipeline_ctx_t *ctx, const
     char *qn = cbm_pipeline_resolve_module(ctx, source_rel, part);
     bool found = qn && cbm_gbuf_find_by_qn(ctx->gbuf, qn) != NULL;
     free(qn);
+    CBMHashTable *pkgmap = found ? NULL : cbm_pipeline_get_pkgmap();
+    if (pkgmap) {
+        /* A package named by the project's own pyproject (see
+         * resolve_python_pkg_entry) is in the project. */
+        char *py_qn = resolve_python_pkg_entry(ctx, pkgmap, part);
+        found = py_qn && cbm_gbuf_find_by_qn(ctx->gbuf, py_qn) != NULL;
+        free(py_qn);
+    }
     return found;
 }
 
@@ -1776,6 +1848,25 @@ static bool python_external_hit_rejected(const CBMImport *imp, const char *name,
     }
     bool names_module = enclosing_segment || python_is_plain_module_import(imp);
     return names_module && strcmp(hit->label, "Module") != 0 && strcmp(hit->label, "File") != 0;
+}
+
+/* Strategy 3 rank of a symbol hit for a Python import of a PROJECT module:
+ * 0 = rejected, 1 = admissible, 2 = preferred. A segment that names a module
+ * (an enclosing segment, or any segment of a plain `import a.b`) can only be
+ * a Module/File/Folder -- `from pkg.openapi.constants import REF_TEMPLATE` is
+ * no `FastAPI.openapi` method. Among the rest a hit that spells the import's
+ * module chain (`from pkg import Query` -> pkg.param_functions.Query, not a
+ * docs example's `Query` class) wins; a hit that does not is still kept,
+ * because a project module may re-export a name defined elsewhere
+ * (`from pkg.responses import X`, X defined in pkg.sse). */
+static int python_internal_hit_rank(const CBMImport *imp, const char *name, bool enclosing_segment,
+                                    const cbm_gbuf_node_t *hit) {
+    bool names_module = enclosing_segment || python_is_plain_module_import(imp);
+    if (names_module && strcmp(hit->label, "Module") != 0 && strcmp(hit->label, "File") != 0 &&
+        strcmp(hit->label, "Folder") != 0) {
+        return 0;
+    }
+    return cbm_python_import_path_matches_qn(imp->module_path, name, hit->qualified_name) ? 2 : 1;
 }
 
 /* #1934: whether the name-guess import fallbacks -- Strategy 1b (sibling file,
@@ -2262,9 +2353,9 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
         }
         /* #2127: a Python import whose module is not in the project (stdlib /
          * third party) may only fall back to a hit that spells its chain. */
+        const bool py_import = symbol_fallback_allowed && src_lang == CBM_LANG_PYTHON;
         const bool py_external =
-            symbol_fallback_allowed && src_lang == CBM_LANG_PYTHON &&
-            !python_import_module_in_project(ctx, source_rel, imp->module_path);
+            py_import && !python_import_module_in_project(ctx, source_rel, imp->module_path);
         for (int ci = 0; symbol_fallback_allowed && ci < ncands; ci++) {
             const cbm_gbuf_node_t **hits = NULL;
             int n = 0;
@@ -2277,6 +2368,7 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
                  * rippled into the importing file's reachability set and
                  * flipped its CALLS attributions too. */
                 const cbm_gbuf_node_t *best = NULL;
+                int best_rank = 0;
                 for (int i = 0; i < n; i++) {
                     const cbm_gbuf_node_t *cand = hits[i];
                     if (!cand || (php_only && !node_in_php_file(cand)) ||
@@ -2290,9 +2382,17 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
                     if (py_external && python_external_hit_rejected(imp, cands[ci], ci > 0, cand)) {
                         continue; /* #2127: not the external module's symbol */
                     }
-                    if (!best || (cand->qualified_name && best->qualified_name &&
-                                  strcmp(cand->qualified_name, best->qualified_name) < 0)) {
+                    int rank = py_import && !py_external
+                                   ? python_internal_hit_rank(imp, cands[ci], ci > 0, cand)
+                                   : 1;
+                    if (rank == 0) {
+                        continue;
+                    }
+                    if (!best || rank > best_rank ||
+                        (rank == best_rank && cand->qualified_name && best->qualified_name &&
+                         strcmp(cand->qualified_name, best->qualified_name) < 0)) {
                         best = cand;
+                        best_rank = rank;
                     }
                 }
                 if (best) {
