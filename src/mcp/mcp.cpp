@@ -60,7 +60,10 @@ enum {
 
 #include <algorithm>
 #include <cctype>
+#include <condition_variable>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -9458,6 +9461,96 @@ static bool search_scan_read_file(const char *path, std::vector<char> &buffer, s
 
 /* Scan the NUL-separated file list into `grep -Hn` records. False when the
  * list cannot be read (the caller then runs grep). */
+/* Files are scanned by up to SEARCH_SCAN_THREADS threads, each with its own
+ * compiled patterns (glibc serializes regexec on a shared regex_t) and read
+ * buffer. Files are handed out in list order and their records are joined in
+ * list order, so the output is the sequential scan's. The scan stops once the
+ * files finished in list order hold max_records records; a thread runs at most
+ * SEARCH_SCAN_WINDOW files ahead of that prefix, which bounds the records held
+ * for files that may not be needed. */
+enum {
+    SEARCH_SCAN_THREADS = 4,
+    SEARCH_SCAN_PARALLEL_MIN_FILES = 32, /* fewer files: one thread */
+    SEARCH_SCAN_WINDOW = 64,
+};
+
+struct search_scan_shared_t {
+    const std::vector<const char *> *paths;
+    const char *pattern;
+    bool use_regex;
+    int max_records;
+    std::vector<std::string> outputs; /* per file, in list order */
+    std::vector<int> counts;          /* records per file; -1 = not finished */
+    std::mutex lock;
+    std::condition_variable advanced;
+    size_t next = 0;      /* next file to hand out */
+    size_t committed = 0; /* files [0, committed) are finished */
+    int committed_records = 0;
+    bool stop = false;
+};
+
+static void search_scan_worker(search_scan_shared_t *sh) {
+    search_scan_patterns_t patterns;
+    if (!search_scan_patterns_parse(&patterns, sh->pattern, sh->use_regex)) {
+        return; /* checked by the caller first: cannot happen */
+    }
+    std::vector<char> buffer;
+    const std::vector<const char *> &paths = *sh->paths;
+    for (;;) {
+        size_t i = 0;
+        int budget = 0;
+        {
+            std::unique_lock<std::mutex> guard(sh->lock);
+            sh->advanced.wait(guard, [sh] {
+                return sh->stop || sh->next >= sh->outputs.size() ||
+                       sh->next < sh->committed + (size_t)SEARCH_SCAN_WINDOW;
+            });
+            if (sh->stop || sh->next >= sh->outputs.size()) {
+                break;
+            }
+            i = sh->next++;
+            budget = sh->max_records - sh->committed_records;
+        }
+        int left = budget;
+        size_t length = 0;
+        if (budget > 0 && search_scan_read_file(paths[i], buffer, &length)) {
+            search_scan_buffer(sh->outputs[i], &patterns, sh->use_regex, paths[i], buffer.data(),
+                               length, &left);
+        }
+        std::lock_guard<std::mutex> guard(sh->lock);
+        sh->counts[i] = budget - left;
+        while (sh->committed < sh->counts.size() && sh->counts[sh->committed] >= 0) {
+            sh->committed_records += sh->counts[sh->committed];
+            sh->committed++;
+        }
+        if (sh->committed_records >= sh->max_records) {
+            sh->stop = true;
+        }
+        sh->advanced.notify_all();
+    }
+    search_scan_patterns_free(&patterns);
+}
+
+/* Join the per-file records in list order, up to max_records records. */
+static void search_scan_join(search_scan_shared_t *sh, std::string &out) {
+    int budget = sh->max_records;
+    for (size_t i = 0; i < sh->committed && budget > 0; i++) {
+        const std::string &records = sh->outputs[i];
+        if (sh->counts[i] <= budget) {
+            out.append(records);
+            budget -= sh->counts[i];
+            continue;
+        }
+        /* Every record ends in the one '\n' a line cannot otherwise hold. */
+        size_t cut = 0;
+        for (int r = 0; r < budget; r++) {
+            cut = records.find('\n', cut) + SKIP_ONE;
+        }
+        out.append(records, 0, cut);
+        budget = 0;
+    }
+}
+
 static bool search_scan_in_process(const char *filelist_path, const char *pattern, bool use_regex,
                                    const char *file_pattern, int max_records, std::string &out) {
     std::vector<char> list;
@@ -9465,30 +9558,52 @@ static bool search_scan_in_process(const char *filelist_path, const char *patter
     if (!search_scan_read_file(filelist_path, list, &list_length)) {
         return false;
     }
-    search_scan_patterns_t patterns;
-    if (!search_scan_patterns_parse(&patterns, pattern, use_regex)) {
-        return true; /* grep -E rejected the pattern: no records */
-    }
-    std::vector<char> buffer;
-    int budget = max_records;
-    size_t pos = 0;
-    while (pos < list_length && budget > 0) {
+    std::vector<const char *> paths;
+    for (size_t pos = 0; pos < list_length;) {
         const char *end = (const char *)memchr(list.data() + pos, '\0', list_length - pos);
         size_t record_end = end ? (size_t)(end - list.data()) : list_length;
         list[record_end] = '\0';
         const char *path = list.data() + pos;
-        bool listed = record_end > pos;
+        if (record_end > pos &&
+            (!file_pattern || search_scan_include_matches(file_pattern, path))) {
+            paths.push_back(path);
+        }
         pos = record_end + SKIP_ONE;
-        if (!listed || (file_pattern && !search_scan_include_matches(file_pattern, path))) {
-            continue;
-        }
-        size_t length = 0;
-        if (!search_scan_read_file(path, buffer, &length)) {
-            continue;
-        }
-        search_scan_buffer(out, &patterns, use_regex, path, buffer.data(), length, &budget);
     }
-    search_scan_patterns_free(&patterns);
+    search_scan_patterns_t patterns;
+    if (!search_scan_patterns_parse(&patterns, pattern, use_regex)) {
+        return true; /* grep -E rejected the pattern: no records */
+    }
+    if (max_records <= 0 || paths.empty()) {
+        search_scan_patterns_free(&patterns);
+        return true;
+    }
+    search_scan_shared_t sh;
+    sh.paths = &paths;
+    sh.pattern = pattern;
+    sh.use_regex = use_regex;
+    sh.max_records = max_records;
+    sh.outputs.resize(paths.size());
+    sh.counts.assign(paths.size(), CBM_NOT_FOUND);
+    int threads = paths.size() >= (size_t)SEARCH_SCAN_PARALLEL_MIN_FILES ? SEARCH_SCAN_THREADS : 1;
+    int nprocs = cbm_nprocs();
+    if (nprocs > 0 && threads > nprocs) {
+        threads = nprocs;
+    }
+    search_scan_patterns_free(&patterns); /* each worker compiles its own */
+    std::vector<std::thread> helpers;
+    for (int t = SKIP_ONE; t < threads; t++) {
+        try {
+            helpers.emplace_back(search_scan_worker, &sh);
+        } catch (...) {
+            break; /* no thread: the calling thread scans the rest */
+        }
+    }
+    search_scan_worker(&sh);
+    for (std::thread &helper : helpers) {
+        helper.join();
+    }
+    search_scan_join(&sh, out);
     return true;
 }
 

@@ -7077,6 +7077,69 @@ TEST(search_code_scan_in_process_limits_globs_and_literals) {
 #endif
 }
 
+/* Enough files for the threaded scan: the records still come in list order,
+ * file by file, and the record budget cuts them exactly where a sequential
+ * scan would, including inside a file. */
+TEST(search_code_scan_in_process_threads_keep_list_order) {
+#ifdef _WIN32
+    SKIP_PLATFORM("Windows keeps the Select-String scan");
+#else
+    enum { FILES = 120, LINES = 3 };
+    char *dir = th_mktempdir("cbm_scan_par");
+    ASSERT_NOT_NULL(dir);
+    char list[600];
+    snprintf(list, sizeof(list), "%s/list", dir);
+    FILE *lf = fopen(list, "wb");
+    ASSERT_NOT_NULL(lf);
+    std::string want_all;
+    for (int i = 0; i < FILES; i++) {
+        /* Uneven sizes so the threads finish out of order. */
+        char path[700];
+        snprintf(path, sizeof(path), "%s/f%03d.c", dir, (i * 37) % FILES);
+        FILE *fp = fopen(path, "wb");
+        ASSERT_NOT_NULL(fp);
+        for (int pad = 0; pad < ((i * 7919) % 13) * 200; pad++) {
+            fputs("filler line without the word\n", fp);
+        }
+        int base = ((i * 7919) % 13) * 200;
+        for (int l = 0; l < LINES; l++) {
+            fprintf(fp, "alpha %d %d\n", i, l);
+            char rec[800];
+            snprintf(rec, sizeof(rec), "%s:%d:alpha %d %d\n", path, base + l + 1, i, l);
+            want_all += rec;
+        }
+        fclose(fp);
+        fputs(path, lf);
+        fputc('\0', lf);
+    }
+    fclose(lf);
+    char *got = cbm_mcp_search_scan_for_test(list, "alpha", false, NULL, FILES * LINES + 10);
+    ASSERT_NOT_NULL(got);
+    ASSERT_TRUE(want_all == got);
+    free(got);
+    /* A budget that ends inside the 17th file. */
+    int budget = 16 * LINES + 2;
+    size_t cut = 0;
+    for (int r = 0; r < budget; r++) {
+        cut = want_all.find('\n', cut) + 1;
+    }
+    got = cbm_mcp_search_scan_for_test(list, "alpha", false, NULL, budget);
+    ASSERT_NOT_NULL(got);
+    ASSERT_TRUE(want_all.substr(0, cut) == got);
+    free(got);
+    got = cbm_mcp_search_scan_for_test(list, "alpha [0-9]+ 2$", true, NULL, 500);
+    ASSERT_NOT_NULL(got);
+    int lines = 0;
+    for (const char *p = got; *p; p++) {
+        lines += *p == '\n';
+    }
+    ASSERT_EQ(lines, FILES);
+    free(got);
+    th_rmtree(dir);
+    PASS();
+#endif
+}
+
 
 SUITE(mcp) {
     RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
@@ -7313,4 +7376,5 @@ SUITE(mcp) {
     RUN_TEST(search_code_scan_in_process_writes_grep_records);
     RUN_TEST(search_code_scan_in_process_binary_and_crlf);
     RUN_TEST(search_code_scan_in_process_limits_globs_and_literals);
+    RUN_TEST(search_code_scan_in_process_threads_keep_list_order);
 }
