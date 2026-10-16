@@ -689,8 +689,8 @@ static const tool_def_t TOOLS[] = {
      "\"depth\":{\"type\":\"integer\",\"default\":2,\"description\":\"Max traversal hops from the "
      "changed symbols.\"},\"limit\":{\"type\":\"integer\",\"default\":200,\"description\":"
      "\"Max impacted_symbols rows (nearest hops first); the module rollup stays complete.\"},"
-     "\"base_branch\":{\"type\":"
-     "\"string\",\"default\":\"main\"},\"since\":{\"type\":\"string\",\"description\":"
+     "\"base_branch\":{\"type\":\"string\",\"description\":\"Default: origin/HEAD, else "
+     "main, else master, else the upstream.\"},\"since\":{\"type\":\"string\",\"description\":"
      "\"Git ref or tag to compare from (e.g. HEAD~5, v0.5.0). Diffs <ref>...HEAD.\"}},"
      "\"required\":"
      "[\"project\"]}"},
@@ -9345,6 +9345,133 @@ static void detect_module_of(const char *file, char *out, size_t outsz) {
     out[len] = '\0';
 }
 
+#ifdef _WIN32
+#define DETECT_GIT_Q "\""
+#define DETECT_GIT_NULL "2>NUL"
+#else
+#define DETECT_GIT_Q "'"
+#define DETECT_GIT_NULL "2>/dev/null"
+#endif
+
+/* Run one git query (scrubbed git environment) and return its first output
+ * line without the line ending. *complete reports whether a whole,
+ * newline-terminated line was read. False when the command cannot run or
+ * exits non-zero. */
+static bool detect_git_line(const char *command, char *out, size_t out_size, bool *complete) {
+    out[0] = '\0';
+    *complete = false;
+    FILE *fp = cbm_popen_git(command);
+    if (!fp) {
+        return false;
+    }
+    bool read = fgets(out, (int)out_size, fp) != NULL;
+    /* Drain so the child never blocks on a full pipe before cbm_pclose. */
+    char drain[CBM_SZ_256];
+    while (fgets(drain, sizeof(drain), fp)) {}
+    int status = cbm_pclose(fp);
+    size_t length = read ? strlen(out) : 0;
+    *complete = length > 0 && out[length - 1] == '\n';
+    while (length > 0 && (out[length - 1] == '\n' || out[length - 1] == '\r')) {
+        out[--length] = '\0';
+    }
+    if (status != 0) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+/* First output line of a git query, only when it is a non-empty value that
+ * can be spliced back into the later git commands safely. */
+static bool detect_git_first_line(const char *command, char *out, size_t out_size) {
+    bool complete = false;
+    bool ok = detect_git_line(command, out, out_size, &complete) && complete && out[0] &&
+              out[0] != '-' && cbm_validate_shell_arg(out);
+    if (!ok) {
+        out[0] = '\0';
+    }
+    return ok;
+}
+
+/* Upstream #1357: without base_branch, diff against the repository's default
+ * branch rather than a literal "main" that trunk/master/develop repositories
+ * do not have. Order: origin/HEAD (what the clone calls the default), a local
+ * main, a local master, then the current branch's upstream. main and master
+ * come before the upstream on purpose: a pushed feature branch tracks its own
+ * remote twin, and diffing against that would silently shrink the impact
+ * analysis to unpushed commits. Nothing resolves -> false, out = "main", and
+ * the caller reports that ref as the one it tried. */
+static bool detect_default_base(const char *root_path, char *out, size_t out_size) {
+    char command[CBM_SZ_2K];
+    char line[CBM_SZ_1K];
+    snprintf(command, sizeof(command),
+             "git -C " DETECT_GIT_Q "%s" DETECT_GIT_Q
+             " symbolic-ref -q --short refs/remotes/origin/HEAD " DETECT_GIT_NULL,
+             root_path);
+    if (detect_git_first_line(command, line, sizeof(line))) {
+        snprintf(out, out_size, "%s", line);
+        return true;
+    }
+    static const char *const local_defaults[] = {"main", "master"};
+    for (const char *candidate : local_defaults) {
+        snprintf(command, sizeof(command),
+                 "git -C " DETECT_GIT_Q "%s" DETECT_GIT_Q " rev-parse -q --verify " DETECT_GIT_Q
+                 "refs/heads/%s^{commit}" DETECT_GIT_Q " " DETECT_GIT_NULL,
+                 root_path, candidate);
+        if (detect_git_first_line(command, line, sizeof(line))) {
+            snprintf(out, out_size, "%s", candidate);
+            return true;
+        }
+    }
+    snprintf(command, sizeof(command),
+             "git -C " DETECT_GIT_Q "%s" DETECT_GIT_Q
+             " rev-parse -q --abbrev-ref --symbolic-full-name " DETECT_GIT_Q
+             "@{upstream}" DETECT_GIT_Q " " DETECT_GIT_NULL,
+             root_path);
+    if (detect_git_first_line(command, line, sizeof(line))) {
+        snprintf(out, out_size, "%s", line);
+        return true;
+    }
+    snprintf(out, out_size, "%s", "main");
+    return false;
+}
+
+/* Upstream #1951: the project root may be a SUBDIRECTORY of the Git worktree.
+ * `git diff --name-only` and `git status --porcelain` report paths relative to
+ * the Git ROOT, graph file_paths are relative to the project root. Fills
+ * `prefix` with the project's position inside the worktree as
+ * `rev-parse --show-prefix` prints it ("" at the root, else "dir/"). Any
+ * failure (not a repository, malformed answer) leaves it "", which is the
+ * pre-fix behaviour. */
+static void detect_git_prefix(const char *root_path, char *prefix, size_t prefix_size) {
+    prefix[0] = '\0';
+    char command[CBM_SZ_2K];
+    snprintf(command, sizeof(command),
+             "git -C " DETECT_GIT_Q "%s" DETECT_GIT_Q " rev-parse --show-prefix " DETECT_GIT_NULL,
+             root_path);
+    bool complete = false;
+    if (!detect_git_line(command, prefix, prefix_size, &complete) || !complete) {
+        prefix[0] = '\0';
+        return;
+    }
+    size_t length = strlen(prefix);
+    if (length > 0 && prefix[length - 1] != '/') {
+        prefix[0] = '\0';
+    }
+}
+#undef DETECT_GIT_Q
+#undef DETECT_GIT_NULL
+
+/* Git-root path -> project-relative tail, or NULL for a path outside the
+ * project (it has no graph nodes). */
+static const char *detect_project_relative_path(const char *git_path, const char *prefix) {
+    size_t prefix_length = strlen(prefix);
+    if (strncmp(git_path, prefix, prefix_length) != 0) {
+        return NULL;
+    }
+    return git_path + prefix_length;
+}
+
 static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg_or_cwd(srv, args, true);
     char *base_branch = cbm_mcp_get_string_arg(args, "base_branch");
@@ -9368,16 +9495,16 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     }
     free(since); /* no-op after the swap (since is NULL); frees it otherwise */
 
-    if (!base_branch) {
-        base_branch = heap_strdup("main");
-    }
+    /* No base given: resolved from the repository once the project root is
+     * known (upstream #1357). An explicit base_branch/since is used as given. */
+    bool base_defaulted = base_branch == NULL;
 
     /* Reject shell metacharacters, and a leading '-', in the user-supplied
      * branch name. base_branch is spliced into `git diff --name-only
      * "<base>"...HEAD`; a value starting with '-' would be read by git as an
      * option rather than a ref (e.g. `--output=<path>` writes the diff to an
      * arbitrary file). A real git ref never begins with '-'. */
-    if (!cbm_validate_shell_arg(base_branch) || base_branch[0] == '-') {
+    if (base_branch && (!cbm_validate_shell_arg(base_branch) || base_branch[0] == '-')) {
         free(project);
         free(base_branch);
         free(scope);
@@ -9402,6 +9529,23 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         free(scope);
         return cbm_mcp_text_result("project path contains invalid characters", true);
     }
+
+    /* The default base is looked up only once root_path is known to be safe
+     * to splice into the git command line. */
+    bool default_base_found = true;
+    if (base_defaulted) {
+        char default_base[CBM_SZ_1K];
+        default_base_found = detect_default_base(root_path, default_base, sizeof(default_base));
+        base_branch = heap_strdup(default_base);
+        if (!base_branch) {
+            free(root_path);
+            free(project);
+            free(scope);
+            return cbm_mcp_text_result("out of memory", true);
+        }
+    }
+    char git_prefix[CBM_SZ_4K];
+    detect_git_prefix(root_path, git_prefix, sizeof(git_prefix));
 
     /* Get changed files via git (-C avoids cd + quoting issues on Windows).
      * Three sources are merged:
@@ -9490,20 +9634,22 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
      * index combined with insertions earlier in the file shifts the node lines
      * relative to the hunks and can mis-scope. The failure is bounded by
      * detect_collect_seeds' zero-overlap fallback: a file whose definitions all
-     * miss reverts to whole-file seeding rather than dropping out. */
+     * miss reverts to whole-file seeding rather than dropping out.
+     * --relative keeps hunk paths in the same project-relative coordinates as
+     * `files` when the project root is a repository subdirectory (#1951). */
     cbm_changed_hunk_t *hunks = NULL;
     int hunk_count = 0;
     if (want_symbols) {
         char hunk_cmd[CBM_SZ_2K];
 #ifdef _WIN32
         snprintf(hunk_cmd, sizeof(hunk_cmd),
-                 "git -C \"%s\" diff --unified=0 \"%s\"...HEAD 2>NUL & "
-                 "git -C \"%s\" diff --unified=0 2>NUL",
+                 "git -C \"%s\" diff --relative --unified=0 \"%s\"...HEAD 2>NUL & "
+                 "git -C \"%s\" diff --relative --unified=0 2>NUL",
                  root_path, base_branch, root_path);
 #else
         snprintf(hunk_cmd, sizeof(hunk_cmd),
-                 "{ git -C '%s' diff --unified=0 '%s'...HEAD 2>/dev/null; "
-                 "git -C '%s' diff --unified=0 2>/dev/null; }",
+                 "{ git -C '%s' diff --relative --unified=0 '%s'...HEAD 2>/dev/null; "
+                 "git -C '%s' diff --relative --unified=0 2>/dev/null; }",
                  root_path, base_branch, root_path);
 #endif
         FILE *hfp = cbm_popen_git(hunk_cmd);
@@ -9586,7 +9732,10 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
                 path_line = arrow + ARROW_LEN;
             }
         }
-        if (path_line[0] == '\0') {
+        /* Git-root coordinates -> project-relative ones (#1951); a change
+         * outside the project has no graph nodes and is left out. */
+        path_line = (char *)detect_project_relative_path(path_line, git_prefix);
+        if (!path_line || path_line[0] == '\0') {
             continue;
         }
 
@@ -9653,14 +9802,33 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 
     bool is_error = false;
     if (git_status != 0 && file_count == 0) {
-        char hint_buf[CBM_SZ_256];
-        snprintf(hint_buf, sizeof(hint_buf),
-                 "git diff exited with status %d. Check that branch '%s' exists.", git_status,
-                 base_branch);
+        /* Name the ref that was tried: with the implicit default, callers
+         * otherwise had to guess which base was meant (#1357). */
+        char hint_buf[CBM_SZ_2K];
+        if (!base_defaulted) {
+            snprintf(hint_buf, sizeof(hint_buf),
+                     "git diff exited with status %d. Check that branch '%s' exists.", git_status,
+                     base_branch);
+        } else if (!default_base_found) {
+            snprintf(hint_buf, sizeof(hint_buf),
+                     "git diff exited with status %d. No default base found (tried origin/HEAD, "
+                     "main, master and the upstream; fell back to '%s'); pass base_branch.",
+                     git_status, base_branch);
+        } else {
+            snprintf(hint_buf, sizeof(hint_buf),
+                     "git diff exited with status %d against the default base '%s'; pass "
+                     "base_branch.",
+                     git_status, base_branch);
+        }
         yyjson_mut_obj_add_strcpy(doc, root_obj, "hint", hint_buf);
         is_error = true;
     }
 
+    if (!is_error && base_defaulted && !default_base_found) {
+        yyjson_mut_obj_add_str(doc, root_obj, "hint",
+                               "No default base found (tried origin/HEAD, main, master and the "
+                               "upstream); fell back to 'main'. Pass base_branch.");
+    }
     yyjson_mut_obj_add_strcpy(doc, root_obj, "base", base_branch);
     if (merge_base[0]) {
         yyjson_mut_obj_add_strcpy(doc, root_obj, "merge_base", merge_base);

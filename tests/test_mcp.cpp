@@ -1147,6 +1147,278 @@ TEST(detect_changes_zero_overlap_falls_back_issue1363) {
     PASS();
 }
 
+/* Shared by the #1951 and #1357 fixtures: one git command line in `repo` with
+ * identity and signing pinned so the machine's global config never matters. */
+static int dc_git(const char *repo, const char *args) {
+    char cmd[CBM_SZ_4K];
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" -c user.name=cbm-test -c user.email=cbm-test@example.invalid "
+             "-c commit.gpgsign=false %s",
+             repo, args);
+    return system(cmd);
+}
+
+/* Upstream #1951: the indexed project root is a SUBDIRECTORY of a normal Git
+ * repository. Git reports changed paths relative to the Git root
+ * ("game/src/math.c"), graph file_paths are relative to the project root
+ * ("src/math.c"). detect_changes must translate Git-root paths into the
+ * project's coordinates (diff, hunk and status records alike) and leave
+ * changes outside the project out, or the seed lookup finds nothing. */
+TEST(detect_changes_subdirectory_project_translates_git_root_paths_issue1951) {
+    char *tmp = th_mktempdir("cbm-detect-subdir");
+    ASSERT_NOT_NULL(tmp);
+    char repo[CBM_SZ_1K];
+    snprintf(repo, sizeof(repo), "%s", tmp);
+    char cache[CBM_SZ_1K];
+    snprintf(cache, sizeof(cache), "%s/cache", repo);
+    ASSERT_EQ(th_mkdir_p(cache), 0);
+    char project_root[CBM_SZ_1K];
+    snprintf(project_root, sizeof(project_root), "%s/game", repo);
+    char math_source[CBM_SZ_1K];
+    snprintf(math_source, sizeof(math_source), "%s/src/math.c", project_root);
+    ASSERT_EQ(th_write_file(math_source, "int add_one(int x) { return x + 1; }\n"
+                                         "int untouched(void) { return 0; }\n"),
+              0);
+    char use_source[CBM_SZ_1K];
+    snprintf(use_source, sizeof(use_source), "%s/src/use.c", project_root);
+    ASSERT_EQ(
+        th_write_file(use_source, "int add_one(int x);\nint use_it(void) { return add_one(4); }\n"),
+        0);
+    char outside_source[CBM_SZ_1K];
+    snprintf(outside_source, sizeof(outside_source), "%s/outside.c", repo);
+    ASSERT_EQ(th_write_file(outside_source, "int outside(void) { return 0; }\n"), 0);
+    if (dc_git(repo, "init -q") != 0 || dc_git(repo, "add game outside.c") != 0 ||
+        dc_git(repo, "commit -q -m fixture") != 0) {
+        th_rmtree(repo);
+        FAIL("git fixture setup failed");
+    }
+
+    /* Worktree edits: a tracked change inside the project (diff + hunk path),
+     * an untracked file inside it (status path) and a change outside it. */
+    ASSERT_EQ(th_write_file(math_source, "int add_one(int x) { return x + 2; }\n"
+                                         "int untouched(void) { return 0; }\n"),
+              0);
+    char fresh_source[CBM_SZ_1K];
+    snprintf(fresh_source, sizeof(fresh_source), "%s/src/fresh.c", project_root);
+    ASSERT_EQ(th_write_file(fresh_source, "int fresh(void) { return 1; }\n"), 0);
+    ASSERT_EQ(th_write_file(outside_source, "int outside(void) { return 1; }\n"), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "detect-subdir-project";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, project_root), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    cbm_node_t seed = {};
+    seed.project = project;
+    seed.label = "Function";
+    seed.name = "add_one";
+    seed.qualified_name = "fixture.src.math.add_one";
+    seed.file_path = "src/math.c";
+    seed.start_line = 1;
+    seed.end_line = 1;
+    int64_t seed_id = cbm_store_upsert_node(store, &seed);
+    ASSERT_GT(seed_id, 0);
+    /* Same file, untouched line: only hunk scoping (project-relative hunk
+     * paths) keeps it out of the seeds; whole-file fallback would add it. */
+    cbm_node_t untouched = seed;
+    untouched.name = "untouched";
+    untouched.qualified_name = "fixture.src.math.untouched";
+    untouched.start_line = 2;
+    untouched.end_line = 2;
+    ASSERT_GT(cbm_store_upsert_node(store, &untouched), 0);
+    cbm_node_t caller = seed;
+    caller.name = "use_it";
+    caller.qualified_name = "fixture.src.use.use_it";
+    caller.file_path = "src/use.c";
+    caller.start_line = 2;
+    caller.end_line = 2;
+    int64_t caller_id = cbm_store_upsert_node(store, &caller);
+    ASSERT_GT(caller_id, 0);
+    cbm_edge_t edge = {};
+    edge.project = project;
+    edge.source_id = caller_id;
+    edge.target_id = seed_id;
+    edge.type = "CALLS";
+    ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+
+    char *response = cbm_mcp_handle_tool(srv, "detect_changes",
+                                         "{\"project\":\"detect-subdir-project\",\"base_branch\":"
+                                         "\"HEAD\",\"scope\":\"impact\",\"depth\":2}");
+    char *inner = extract_text_content(response);
+    yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *changed_files = root ? yyjson_obj_get(root, "changed_files") : NULL;
+    yyjson_val *first_path = changed_files ? yyjson_arr_get(changed_files, 0) : NULL;
+    yyjson_val *second_path = changed_files ? yyjson_arr_get(changed_files, 1) : NULL;
+    yyjson_val *impacted = root ? yyjson_obj_get(root, "impacted_symbols") : NULL;
+    yyjson_val *first_impact = impacted ? yyjson_arr_get(impacted, 0) : NULL;
+    /* The fork does not order changed_files; accept either order. */
+    const char *first = first_path ? yyjson_get_str(first_path) : NULL;
+    const char *second = second_path ? yyjson_get_str(second_path) : NULL;
+    bool project_relative_paths =
+        root && yyjson_get_int(yyjson_obj_get(root, "changed_count")) == 2 && first && second &&
+        ((strcmp(first, "src/fresh.c") == 0 && strcmp(second, "src/math.c") == 0) ||
+         (strcmp(first, "src/math.c") == 0 && strcmp(second, "src/fresh.c") == 0));
+    bool seed_found = root && yyjson_get_int(yyjson_obj_get(root, "seed_count")) == 1;
+    const char *impact_qn =
+        first_impact ? yyjson_get_str(yyjson_obj_get(first_impact, "qualified_name")) : NULL;
+    bool impact_found = impact_qn && strcmp(impact_qn, "fixture.src.use.use_it") == 0;
+    if (!project_relative_paths || !seed_found || !impact_found) {
+        fprintf(stderr, "  issue1951 response: %s\n", inner ? inner : "(null)");
+    }
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(repo);
+
+    ASSERT_TRUE(project_relative_paths);
+    ASSERT_TRUE(seed_found);
+    ASSERT_TRUE(impact_found);
+    PASS();
+}
+
+/* Upstream #1357: detect_changes without base_branch must diff against the
+ * repository's default branch, not a literal "main". Each fixture is a real
+ * git repository: a base commit on the default branch, then a feature branch
+ * with one committed file, so the correct base yields exactly that file. */
+typedef struct {
+    char base[CBM_SZ_256];
+    char hint[CBM_SZ_1K];
+    bool feature_listed;
+} detect_default_base_probe_t;
+
+static bool detect_default_base_run(const char *default_branch, bool set_origin_head,
+                                    const char *base_arg, detect_default_base_probe_t *probe) {
+    memset(probe, 0, sizeof(*probe));
+    char *tmp = th_mktempdir("cbm-detect-default");
+    if (!tmp) {
+        return false;
+    }
+    char repo[CBM_SZ_1K];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    char cache[CBM_SZ_1K];
+    snprintf(cache, sizeof(cache), "%s/cache", tmp);
+    char base_file[CBM_SZ_1K];
+    char feature_file[CBM_SZ_1K];
+    snprintf(base_file, sizeof(base_file), "%s/base.c", repo);
+    snprintf(feature_file, sizeof(feature_file), "%s/feature.c", repo);
+    char args[CBM_SZ_1K];
+    bool ok = th_mkdir_p(repo) == 0 && th_mkdir_p(cache) == 0 && dc_git(repo, "init -q") == 0;
+    snprintf(args, sizeof(args), "symbolic-ref HEAD refs/heads/%s", default_branch);
+    ok = ok && dc_git(repo, args) == 0 && th_write_file(base_file, "int base_value = 1;\n") == 0 &&
+         dc_git(repo, "add base.c") == 0 && dc_git(repo, "commit -q -m base") == 0;
+    if (ok && set_origin_head) {
+        snprintf(args, sizeof(args), "update-ref refs/remotes/origin/%s HEAD", default_branch);
+        ok = dc_git(repo, args) == 0;
+        snprintf(args, sizeof(args), "symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/%s",
+                 default_branch);
+        ok = ok && dc_git(repo, args) == 0;
+    }
+    ok = ok && dc_git(repo, "checkout -q -b feature") == 0 &&
+         th_write_file(feature_file, "int feature_value = 2;\n") == 0 &&
+         dc_git(repo, "add feature.c") == 0 && dc_git(repo, "commit -q -m feature") == 0;
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ok = ok && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    cbm_mcp_server_t *srv = ok ? cbm_mcp_server_new(NULL) : NULL;
+    cbm_store_t *store = srv ? cbm_mcp_server_store(srv) : NULL;
+    const char *project = "detect-default-base-project";
+    ok = store && cbm_store_upsert_project(store, project, repo) == CBM_STORE_OK;
+    if (base_arg) {
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"base_branch\":\"%s\",\"scope\":\"files\"}", project,
+                 base_arg);
+    } else {
+        snprintf(args, sizeof(args), "{\"project\":\"%s\",\"scope\":\"files\"}", project);
+    }
+    if (ok) {
+        cbm_mcp_server_set_project(srv, project);
+    }
+    char *response = ok ? cbm_mcp_handle_tool(srv, "detect_changes", args) : NULL;
+    char *inner = response ? extract_text_content(response) : NULL;
+    yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    const char *base = root ? yyjson_get_str(yyjson_obj_get(root, "base")) : NULL;
+    if (base) {
+        snprintf(probe->base, sizeof(probe->base), "%s", base);
+    }
+    const char *hint = root ? yyjson_get_str(yyjson_obj_get(root, "hint")) : NULL;
+    if (hint) {
+        snprintf(probe->hint, sizeof(probe->hint), "%s", hint);
+    }
+    yyjson_val *changed = root ? yyjson_obj_get(root, "changed_files") : NULL;
+    size_t index;
+    size_t count;
+    yyjson_val *entry;
+    yyjson_arr_foreach(changed, index, count, entry) {
+        if (yyjson_is_str(entry) && strcmp(yyjson_get_str(entry), "feature.c") == 0) {
+            probe->feature_listed = true;
+        }
+    }
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    if (srv) {
+        cbm_mcp_server_free(srv);
+    }
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(tmp);
+    return ok;
+}
+
+TEST(detect_changes_default_base_follows_origin_head_issue1357) {
+    detect_default_base_probe_t probe;
+    ASSERT_TRUE(detect_default_base_run("trunk", true, NULL, &probe));
+    ASSERT_STR_EQ(probe.base, "origin/trunk");
+    ASSERT_TRUE(probe.feature_listed);
+    PASS();
+}
+
+TEST(detect_changes_default_base_falls_back_to_master_issue1357) {
+    detect_default_base_probe_t probe;
+    ASSERT_TRUE(detect_default_base_run("master", false, NULL, &probe));
+    ASSERT_STR_EQ(probe.base, "master");
+    ASSERT_TRUE(probe.feature_listed);
+    PASS();
+}
+
+TEST(detect_changes_explicit_base_is_used_as_given_issue1357) {
+    detect_default_base_probe_t probe;
+    ASSERT_TRUE(detect_default_base_run("trunk", true, "trunk", &probe));
+    ASSERT_STR_EQ(probe.base, "trunk");
+    ASSERT_TRUE(probe.feature_listed);
+    PASS();
+}
+
+TEST(detect_changes_unresolvable_default_names_tried_ref_issue1357) {
+    detect_default_base_probe_t probe;
+    ASSERT_TRUE(detect_default_base_run("develop", false, NULL, &probe));
+    ASSERT_STR_EQ(probe.base, "main");
+    ASSERT_NOT_NULL(strstr(probe.hint, "origin/HEAD"));
+    ASSERT_NOT_NULL(strstr(probe.hint, "'main'"));
+    PASS();
+}
+
 static bool uscore_make_db(const char *cache, const char *file, const char *project,
                            const char *fn) {
     char dbpath[CBM_SZ_1K];
@@ -6497,6 +6769,11 @@ SUITE(mcp) {
     RUN_TEST(detect_changes_node_in_hunks_overlap_issue1363);
     RUN_TEST(detect_changes_seeds_only_touched_symbol_issue1363);
     RUN_TEST(detect_changes_zero_overlap_falls_back_issue1363);
+    RUN_TEST(detect_changes_subdirectory_project_translates_git_root_paths_issue1951);
+    RUN_TEST(detect_changes_default_base_follows_origin_head_issue1357);
+    RUN_TEST(detect_changes_default_base_falls_back_to_master_issue1357);
+    RUN_TEST(detect_changes_explicit_base_is_used_as_given_issue1357);
+    RUN_TEST(detect_changes_unresolvable_default_names_tried_ref_issue1357);
     RUN_TEST(tool_underscore_projects_visible_in_cache_scans);
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
