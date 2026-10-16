@@ -9250,6 +9250,19 @@ struct search_scan_patterns_t {
 
 enum { SEARCH_SCAN_MIN_REQUIRED = 3 }; /* shorter literals filter too little */
 
+/* Bytes in the UTF-8 sequence starting at s: 1 for ASCII or a malformed
+ * lead, else 2-4 when that many continuation bytes follow. */
+static size_t search_scan_utf8_seq_len(const char *s) {
+    unsigned char lead = (unsigned char)s[0];
+    size_t len = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+    for (size_t i = 1; i < len; i++) {
+        if (((unsigned char)s[i] & 0xC0) != 0x80) {
+            return 1;
+        }
+    }
+    return len;
+}
+
 /* The longest run of plain characters that every match of the ERE `re` must
  * contain, or "" when none is certain. Conservative by construction: any
  * construct it does not fully understand ends the current run, and a top-level
@@ -9330,15 +9343,21 @@ static std::string search_scan_required_literal(const char *re) {
             p++;
             continue;
         }
+        /* A literal is one character: under a UTF-8 locale a quantifier binds
+         * a whole multi-byte sequence, so `fooé*bar` must not require é's
+         * lead byte. Taking the sequence as a unit is also safe under a byte
+         * locale, where it only makes the required run shorter. */
         bool literal = false;
-        char lit = 0;
+        size_t lit_at = 0;
+        size_t lit_len = SKIP_ONE;
         size_t width = SKIP_ONE;
         if (c == '\\') {
             unsigned char e = (unsigned char)p[SKIP_ONE];
             if (e && !isalnum(e) && e != '<' && e != '>' && e != '`' && e != '\'') {
                 literal = true;
-                lit = (char)e;
-                width = PAIR_LEN;
+                lit_at = SKIP_ONE;
+                lit_len = search_scan_utf8_seq_len(p + SKIP_ONE);
+                width = SKIP_ONE + lit_len;
             } else if (!e) {
                 return std::string();
             } else {
@@ -9347,7 +9366,8 @@ static std::string search_scan_required_literal(const char *re) {
         } else if (c != '.' && c != '^' && c != '$' && c != '*' && c != '+' && c != '?' &&
                    c != '{' && c != '}') {
             literal = true;
-            lit = c;
+            lit_len = search_scan_utf8_seq_len(p);
+            width = lit_len;
         }
         char next = p[width];
         bool quantified = next == '*' || next == '+' || next == '?' || next == '{';
@@ -9355,11 +9375,11 @@ static std::string search_scan_required_literal(const char *re) {
             flush();
         } else if (quantified) {
             if (next == '+') {
-                run.push_back(lit);
+                run.append(p + lit_at, lit_len);
             }
             flush();
         } else {
-            run.push_back(lit);
+            run.append(p + lit_at, lit_len);
         }
         p += width;
     }

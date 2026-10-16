@@ -7443,6 +7443,61 @@ TEST(search_code_scan_in_process_caps_long_records) {
     PASS();
 #endif
 }
+
+/* The required-literal prefilter takes a multi-byte character as one unit:
+ * under a UTF-8 locale `fooé*bar` matches "foobar", so é's lead byte must not
+ * be required. Skipped where the host has no UTF-8 locale. */
+TEST(search_code_scan_in_process_utf8_quantifier_prefilter) {
+#ifdef _WIN32
+    SKIP_PLATFORM("Windows keeps the Select-String scan");
+#else
+    const char *utf8_names[] = {"C.UTF-8", "en_US.UTF-8", "C.utf8", "en_US.utf8"};
+    const char *utf8 = NULL;
+    for (const char *name : utf8_names) {
+        locale_t probe = newlocale(LC_ALL_MASK, name, (locale_t)0);
+        if (probe) {
+            freelocale(probe);
+            utf8 = name;
+            break;
+        }
+    }
+    if (!utf8) {
+        SKIP_PLATFORM("no UTF-8 locale on this host");
+    }
+    const char *lc_all = getenv("LC_ALL");
+    char *saved_lc_all = lc_all ? strdup(lc_all) : NULL;
+    ASSERT_EQ(setenv("LC_ALL", utf8, 1), 0);
+    scan_fixture_t fx;
+    ASSERT_TRUE(scan_fixture_open(&fx));
+    static const char text[] = "foobar\nfoo\xc3\xa9" "bar\nfoo\xc3\xa9\xc3\xa9" "bar\nfoo bar\n";
+    ASSERT_TRUE(scan_fixture_add(&fx, "u.txt", text, sizeof(text) - 1));
+    ASSERT_TRUE(scan_fixture_list(&fx, NULL));
+    char *star = scan_fixture_run(&fx, "foo\xc3\xa9*bar", true, NULL, 500);
+    char *plus = scan_fixture_run(&fx, "foo\xc3\xa9+bar", true, NULL, 500);
+    int star_records = 0;
+    int plus_records = 0;
+    for (const char *p = star ? star : ""; *p; p++) {
+        star_records += *p == '\n';
+    }
+    for (const char *p = plus ? plus : ""; *p; p++) {
+        plus_records += *p == '\n';
+    }
+    bool star_has_plain = star && strstr(star, ":1:foobar\n");
+    free(star);
+    free(plus);
+    th_rmtree(fx.dir);
+    if (saved_lc_all) {
+        setenv("LC_ALL", saved_lc_all, 1);
+        free(saved_lc_all);
+    } else {
+        unsetenv("LC_ALL");
+    }
+    ASSERT_TRUE(star_has_plain);
+    ASSERT_EQ(star_records, 3);
+    ASSERT_EQ(plus_records, 2);
+    PASS();
+#endif
+}
 #endif
 
 
@@ -8197,6 +8252,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_scan_in_process_limits_globs_and_literals);
     RUN_TEST(search_code_scan_in_process_threads_keep_list_order);
     RUN_TEST(search_code_scan_in_process_caps_long_records);
+    RUN_TEST(search_code_scan_in_process_utf8_quantifier_prefilter);
 #endif
     RUN_TEST(search_code_context_window_is_bounded);
     RUN_TEST(search_code_context_extreme_values_answer_normally);
