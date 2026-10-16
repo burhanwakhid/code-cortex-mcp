@@ -11,6 +11,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <store/store.h>
+#include "sqlite3.h" /* vendored/sqlite3: read pragmas back on the store's own handle */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -245,6 +246,65 @@ TEST(store_read_batch_snapshot_renews) {
     PASS();
 }
 
+/* #1419: effective pragmas per store role, read on the handle itself —
+ * synchronous is per-connection and never persisted, so an external sqlite3
+ * shell reports its own default (FULL), not what the indexer runs with. */
+static int role_pragma_int(cbm_store_t *s, const char *sql) {
+    sqlite3_stmt *stmt = NULL;
+    int value = -1;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s), sql, -1, &stmt, NULL) == SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW) {
+        value = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return value;
+}
+
+TEST(store_role_pragmas_issue1419) {
+    enum {
+        SYNC_OFF = 0,
+        SYNC_NORMAL = 1,
+        /* 64 MiB = 1024 of the 64 KiB pages every index is written with. */
+        WRITE_CACHE_KIB = -65536,
+        SQLITE_DEFAULT_CACHE_KIB = -2000,
+    };
+    char tmp_path[256];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/cbm_test_roles_%d.db", cbm_tmpdir(), (int)getpid());
+    unlink(tmp_path);
+
+    /* Read-write role: WAL at NORMAL, with a page cache that holds more than a
+     * few 64 KiB pages. */
+    cbm_store_t *s = cbm_store_open_path(tmp_path);
+    ASSERT(s != NULL);
+    ASSERT_EQ(role_pragma_int(s, "PRAGMA synchronous;"), SYNC_NORMAL);
+    ASSERT_EQ(role_pragma_int(s, "PRAGMA cache_size;"), WRITE_CACHE_KIB);
+    /* Bulk role: sync off for the write burst, then back to the read-write
+     * settings rather than SQLite's defaults. */
+    ASSERT_EQ(cbm_store_begin_bulk(s), CBM_STORE_OK);
+    ASSERT_EQ(role_pragma_int(s, "PRAGMA synchronous;"), SYNC_OFF);
+    ASSERT_EQ(role_pragma_int(s, "PRAGMA cache_size;"), WRITE_CACHE_KIB);
+    ASSERT_EQ(cbm_store_end_bulk(s), CBM_STORE_OK);
+    ASSERT_EQ(role_pragma_int(s, "PRAGMA synchronous;"), SYNC_NORMAL);
+    ASSERT_EQ(role_pragma_int(s, "PRAGMA cache_size;"), WRITE_CACHE_KIB);
+    cbm_store_close(s);
+
+    /* Query role: read-only, keeps SQLite's small default cache (MCP read
+     * tools open one per project, so it stays cheap). */
+    cbm_store_t *q = cbm_store_open_path_query(tmp_path);
+    ASSERT(q != NULL);
+    ASSERT_EQ(role_pragma_int(q, "PRAGMA cache_size;"), SQLITE_DEFAULT_CACHE_KIB);
+    cbm_store_close(q);
+
+    unlink(tmp_path);
+    char tmp_wal[300];
+    char tmp_shm[300];
+    snprintf(tmp_wal, sizeof(tmp_wal), "%s-wal", tmp_path);
+    snprintf(tmp_shm, sizeof(tmp_shm), "%s-shm", tmp_path);
+    unlink(tmp_wal);
+    unlink(tmp_shm);
+    PASS();
+}
+
 SUITE(store_pragmas) {
     RUN_TEST(corrupt_page_scan_returns_error_not_truncation);
     RUN_TEST(mmap_size_default_when_unset);
@@ -255,4 +315,5 @@ SUITE(store_pragmas) {
     RUN_TEST(mmap_size_partial_garbage_falls_back_to_default);
     RUN_TEST(store_open_with_mmap_disabled);
     RUN_TEST(store_read_batch_snapshot_renews);
+    RUN_TEST(store_role_pragmas_issue1419);
 }

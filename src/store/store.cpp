@@ -533,6 +533,16 @@ int64_t cbm_store_resolve_mmap_size(void) {
     return (int64_t)parsed;
 }
 
+/* #1419: page cache for read-write on-disk connections, in SQLite's negative
+ * KiB form. sqlite_writer.cpp gives every index 64 KiB pages, so SQLite's
+ * default 2000 KiB holds only ~31 of them, while an incremental update dirties
+ * pages across the node and edge tables and all of their indexes. The
+ * transaction then spills dirty pages into the WAL and rewrites them over and
+ * over (upstream: 5.2 GiB of WAL writes for a one-line change on a 294 MB
+ * django index). 64 MiB = 1024 pages, the budget bulk mode already used; the
+ * cache only grows as pages are touched. Query connections keep the default. */
+static const char ST_WRITE_CACHE_SQL[] = "PRAGMA cache_size = -65536;";
+
 /* Configure connection pragmas.
  *   in_memory  — :memory: DB (synchronous OFF, no journal file).
  *   read_only  — query-only connection opened SQLITE_OPEN_READONLY. Runs
@@ -579,6 +589,10 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory, bool read_only) {
          * May fail with SQLITE_BUSY if another process holds a lock. */
         (void)sqlite3_exec(s->db, "PRAGMA wal_checkpoint(PASSIVE)", NULL, NULL, NULL);
         rc = exec_sql(s, "PRAGMA synchronous = NORMAL;");
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+        rc = exec_sql(s, ST_WRITE_CACHE_SQL);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
@@ -1314,7 +1328,7 @@ int cbm_store_begin_bulk(cbm_store_t *s) {
     if (rc != CBM_STORE_OK) {
         return rc;
     }
-    return exec_sql(s, "PRAGMA cache_size = -65536;"); /* CBM_SZ_64 MB */
+    return exec_sql(s, ST_WRITE_CACHE_SQL);
 }
 
 int cbm_store_end_bulk(cbm_store_t *s) {
@@ -1322,7 +1336,8 @@ int cbm_store_end_bulk(cbm_store_t *s) {
     if (rc != CBM_STORE_OK) {
         return rc;
     }
-    return exec_sql(s, "PRAGMA cache_size = -2000;"); /* default ~2 MB */
+    /* Back to the read-write cache, not SQLite's 2000 KiB default (#1419). */
+    return exec_sql(s, ST_WRITE_CACHE_SQL);
 }
 
 int cbm_store_drop_indexes(cbm_store_t *s) {

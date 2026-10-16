@@ -305,7 +305,8 @@ void cbm_store_read_batch_expire_for_test(cbm_store_t *s);
  * WAL journal mode is preserved throughout for crash safety. */
 int cbm_store_begin_bulk(cbm_store_t *s);
 
-/* Restore normal pragmas (synchronous=NORMAL, default cache) after bulk writes. */
+/* Restore normal pragmas (synchronous=NORMAL, the 64 MiB read-write cache)
+ * after bulk writes. */
 int cbm_store_end_bulk(cbm_store_t *s);
 
 /* Drop user indexes for faster bulk inserts. */
