@@ -2576,7 +2576,7 @@ void cbm_run_go_lsp_cross(
         parser = ts_parser_new();
         if (!parser) return;
         ts_parser_set_language(parser, tree_sitter_go());
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, TSParseOptions{});
         owns_tree = true;
         if (!tree) { ts_parser_delete(parser); return; }
     }
@@ -2932,7 +2932,7 @@ void cbm_run_go_lsp_cross_with_registry(
         parser = ts_parser_new();
         if (!parser) return;
         ts_parser_set_language(parser, tree_sitter_go());
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, TSParseOptions{});
         owns_tree = true;
         if (!tree) { ts_parser_delete(parser); return; }
     }

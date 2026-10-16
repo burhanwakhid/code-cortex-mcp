@@ -7317,14 +7317,214 @@ TEST(extract_missing_final_newline_across_grammars_issue1610) {
 }
 
 /* The guard is deliberately narrow. A WIDTH-BEARING failure at EOF really does
- * lose the construct, so it must still be reported: this Makefile's last recipe
- * line is genuinely dropped, unlike an absent newline. */
+ * lose the construct, so it must still be reported. The construct here is
+ * broken whether or not the line is terminated, so neither the zero-width rule
+ * nor the virtual final newline (#2078) may excuse it.
+ *
+ * This guard used a Makefile whose final recipe line lacks its newline, which
+ * really did drop the recipe from the tree. Since #2078 the parser sees that
+ * line terminated and the recipe parses, so there is no loss left to report --
+ * see extract_makefile_unterminated_recipe_is_parsed_issue2078. */
 TEST(extract_width_bearing_error_at_eof_still_flagged_issue1610) {
-    const char *src = "all:\n\techo hi"; /* no trailing newline; recipe is lost */
-    CBMFileResult *r = extract(src, CBM_LANG_MAKEFILE, "t", "Makefile");
+    const char *src = "def ok():\n    return 1\nx = (1,"; /* unclosed at EOF */
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "t", "eof.py");
     ASSERT_NOT_NULL(r);
     ASSERT_TRUE(r->parse_incomplete);
     cbm_free_result(r);
+    PASS();
+}
+
+/* #2078: the recipe the old #1610 guard lost is now parsed -- the file is not
+ * flagged, with or without a trailing blank. */
+TEST(extract_makefile_unterminated_recipe_is_parsed_issue2078) {
+    const char *cases[] = {"all:\n\techo hi", "all:\n\techo hi "};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = extract(cases[i], CBM_LANG_MAKEFILE, "t", "Makefile");
+        ASSERT_NOT_NULL(r);
+        bool flagged = r->parse_incomplete;
+        cbm_free_result(r);
+        if (flagged) {
+            FAIL("an unterminated final recipe line must parse like a terminated one");
+        }
+    }
+    PASS();
+}
+
+/* #2078: every file is parsed as if it ended with a newline. An opening code
+ * fence, an ATX heading or a bare list marker as the final bytes of a markdown
+ * file left a WIDTH-BEARING ERROR, and a file that is only "```" came back as a
+ * whole-file error. cbm now feeds the parser one virtual "\n" past EOF when the
+ * last byte is not already a newline, then clamps the tree back to the real
+ * length, so no consumer sees a byte, a line or a range that is not in the
+ * file. */
+TEST(extract_markdown_unterminated_last_line_is_clean_issue2078) {
+    const char *cases[] = {"text\n```", "```", "# Top", "- "};
+    int flagged = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = extract(cases[i], CBM_LANG_MARKDOWN, "t", "doc.md");
+        ASSERT_NOT_NULL(r);
+        if (r->parse_incomplete || r->parse_unusable) {
+            fprintf(stderr, "  case %zu flagged: partial=%d unusable=%d ranges=%s\n", i,
+                    r->parse_incomplete, r->parse_unusable,
+                    r->error_ranges ? r->error_ranges : "(none)");
+            flagged++;
+        }
+        cbm_free_result(r);
+    }
+    if (flagged) {
+        FAIL("a markdown file must not be flagged only because its last line is unterminated");
+    }
+    PASS();
+}
+
+/* Controls: the same bytes WITH the newline were already clean and stay so. */
+TEST(extract_markdown_terminated_last_line_controls_unchanged_issue2078) {
+    const char *cases[] = {"text\n```\n", "```\n", "# Top\n", "- \n"};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = extract(cases[i], CBM_LANG_MARKDOWN, "t", "doc.md");
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->parse_incomplete);
+        ASSERT_FALSE(r->parse_unusable);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* Everything extraction reports, as one string, so two results compare
+ * byte-for-byte: defs (every text field and range), calls, imports and the
+ * coverage verdict. The Module def spans the whole file and is compared on its
+ * own. */
+static std::string nl2078_dump(const CBMFileResult *r) {
+    std::string out;
+    auto str = [&](const char *tag, const char *v) {
+        out += ' ';
+        out += tag;
+        out += '=';
+        out += v ? v : "~";
+    };
+    auto num = [&](const char *tag, long v) {
+        out += ' ';
+        out += tag;
+        out += '=';
+        out += std::to_string(v);
+    };
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && strcmp(d->label, "Module") == 0) {
+            continue;
+        }
+        str("\nD", d->qualified_name);
+        str("name", d->name);
+        str("label", d->label);
+        num("start", d->start_line);
+        num("end", d->end_line);
+        num("lines", d->lines);
+        num("cx", d->complexity);
+        num("params", d->param_count);
+        str("sig", d->signature);
+        str("ret", d->return_type);
+        str("doc", d->docstring);
+        str("prof", d->structural_profile);
+        str("tok", d->body_tokens);
+    }
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        str("\nC", c->callee_name);
+        str("in", c->enclosing_func_qn);
+        num("line", c->start_line);
+        num("byte", (long)c->source_byte);
+        num("args", c->arg_count);
+    }
+    for (int i = 0; i < r->imports.count; i++) {
+        str("\nI", r->imports.items[i].local_name);
+        str("path", r->imports.items[i].module_path);
+    }
+    str("\nP", r->error_ranges);
+    num("partial", r->parse_incomplete);
+    num("unusable", r->parse_unusable);
+    return out;
+}
+
+/* GUARD: for code grammars a trailing newline is insignificant, so a file
+ * without one must extract identically to the same file with one -- every
+ * def, range, text field and call site. The virtual newline may never show up
+ * as phantom content or a phantom line. */
+TEST(extract_code_without_final_newline_extracts_identically_issue2078) {
+    struct NlCase {
+        const char *src; /* no trailing newline */
+        CBMLanguage lang;
+        const char *path;
+    };
+    static const NlCase cases[] = {
+        {"#include <stdio.h>\n\nstatic int beta(int x) {\n    return x + 1;\n}\n\n"
+         "void alpha(void) { printf(\"a\"); beta(2); }",
+         CBM_LANG_C, "a.c"},
+        {"import os\n\n\nclass K:\n    def m(self, a):\n        return os.path.join(a)\n\n\n"
+         "def f(x):\n    \"\"\"doc\"\"\"\n    return K().m(x)",
+         CBM_LANG_PYTHON, "a.py"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        std::string terminated = std::string(cases[i].src) + "\n";
+        CBMFileResult *bare = extract(cases[i].src, cases[i].lang, "t", cases[i].path);
+        CBMFileResult *term = extract(terminated.c_str(), cases[i].lang, "t", cases[i].path);
+        ASSERT_NOT_NULL(bare);
+        ASSERT_NOT_NULL(term);
+        std::string a = nl2078_dump(bare);
+        std::string b = nl2078_dump(term);
+        cbm_free_result(bare);
+        cbm_free_result(term);
+        if (a != b) {
+            fprintf(stderr, "  %s differs:\n--- without final newline%s\n--- with%s\n",
+                    cases[i].path, a.c_str(), b.c_str());
+            FAIL("extraction must not depend on whether the last line is terminated");
+        }
+    }
+    PASS();
+}
+
+/* GUARD against phantom content: a heading on an unterminated last line is a
+ * one-line file. No def may end past line 1 and no text may carry the virtual
+ * newline. Before #2078 the heading was silently dropped. */
+TEST(extract_virtual_newline_adds_no_phantom_line_or_text_issue2078) {
+    CBMFileResult *r = extract("# Top", CBM_LANG_MARKDOWN, "t", "top.md");
+    ASSERT_NOT_NULL(r);
+    bool found = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        found = found || (d->name && strcmp(d->name, "Top") == 0);
+        if (d->end_line > 1 || d->start_line > 1) {
+            fprintf(stderr, "  def %s spans %u-%u\n", d->name ? d->name : "?", d->start_line,
+                    d->end_line);
+            cbm_free_result(r);
+            FAIL("no def may reach past the last real line");
+        }
+        if ((d->name && strchr(d->name, '\n')) || (d->signature && strchr(d->signature, '\n'))) {
+            cbm_free_result(r);
+            FAIL("no extracted text may contain the virtual newline");
+        }
+    }
+    cbm_free_result(r);
+    if (!found) {
+        FAIL("the heading on an unterminated last line must be extracted as a Section");
+    }
+    PASS();
+}
+
+/* GUARD: the empty file and a file that is exactly "\n" get no virtual
+ * newline (nothing is unterminated) and stay clean. */
+TEST(extract_empty_and_newline_only_files_unchanged_issue2078) {
+    const char *srcs[] = {"", "\n"};
+    CBMLanguage langs[] = {CBM_LANG_MARKDOWN, CBM_LANG_PYTHON, CBM_LANG_C};
+    const char *paths[] = {"e.md", "e.py", "e.c"};
+    for (size_t si = 0; si < 2; si++) {
+        for (size_t l = 0; l < 3; l++) {
+            CBMFileResult *r = extract(srcs[si], langs[l], "t", paths[l]);
+            ASSERT_NOT_NULL(r);
+            ASSERT_FALSE(r->parse_incomplete);
+            ASSERT_FALSE(r->parse_unusable);
+            cbm_free_result(r);
+        }
+    }
     PASS();
 }
 
@@ -7395,7 +7595,8 @@ TEST(extract_real_errors_still_flagged_with_trailing_blank_issue1746) {
     ASSERT_TRUE(r->parse_incomplete);
     ASSERT_NOT_NULL(r->error_ranges);
     cbm_free_result(r);
-    r = extract("all:\n\techo hi ", CBM_LANG_MAKEFILE, "t", "Makefile");
+    /* Formerly the unterminated Makefile recipe, which #2078 now parses. */
+    r = extract("def ok():\n    return 1\nx = (1, ", CBM_LANG_PYTHON, "t", "eof.py");
     ASSERT_NOT_NULL(r);
     ASSERT_TRUE(r->parse_incomplete);
     cbm_free_result(r);
@@ -10385,6 +10586,12 @@ SUITE(extraction) {
     RUN_TEST(extract_final_newline_present_still_clean_issue1610);
     RUN_TEST(extract_missing_final_newline_across_grammars_issue1610);
     RUN_TEST(extract_width_bearing_error_at_eof_still_flagged_issue1610);
+    RUN_TEST(extract_makefile_unterminated_recipe_is_parsed_issue2078);
+    RUN_TEST(extract_markdown_unterminated_last_line_is_clean_issue2078);
+    RUN_TEST(extract_markdown_terminated_last_line_controls_unchanged_issue2078);
+    RUN_TEST(extract_code_without_final_newline_extracts_identically_issue2078);
+    RUN_TEST(extract_virtual_newline_adds_no_phantom_line_or_text_issue2078);
+    RUN_TEST(extract_empty_and_newline_only_files_unchanged_issue2078);
     RUN_TEST(extract_dockerfile_trailing_blank_at_eof_not_flagged_issue1746);
     RUN_TEST(extract_dockerfile_trailing_blank_controls_clean_issue1746);
     RUN_TEST(extract_real_errors_still_flagged_with_trailing_blank_issue1746);

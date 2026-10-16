@@ -3747,7 +3747,7 @@ void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result
             return;
         }
         ts_parser_set_language(parser, tree_sitter_java());
-        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, TSParseOptions{});
         ts_parser_delete(parser);
         owns_tree = true;
     }
@@ -3797,7 +3797,7 @@ void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
     if (!tree) {
         TSParser *parser = ts_parser_new();
         ts_parser_set_language(parser, tree_sitter_java());
-        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, TSParseOptions{});
         ts_parser_delete(parser);
         owns_tree = true;
     }

@@ -512,6 +512,8 @@ void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch) {
 typedef struct {
     const char *string;
     uint32_t length;
+    /* #2078: serve one "\n" at offset `length` -- see cbm_parse_source. */
+    bool virtual_newline;
 } CBMStringInput;
 
 static const char *cbm_string_read(void *payload, uint32_t byte, TSPoint point,
@@ -519,11 +521,68 @@ static const char *cbm_string_read(void *payload, uint32_t byte, TSPoint point,
     (void)point;
     CBMStringInput *self = (CBMStringInput *)payload;
     if (byte >= self->length) {
+        if (self->virtual_newline && byte == self->length) {
+            *bytes_read = 1;
+            return "\n";
+        }
         *bytes_read = 0;
         return "";
     }
     *bytes_read = self->length - byte;
     return self->string + byte;
+}
+
+/* Where the parser stands after reading all `len` real bytes. */
+static TSPoint cbm_source_end_point(const char *source, uint32_t len) {
+    TSPoint end = {0, 0};
+    const char *p = source;
+    const char *stop = source + len;
+    const char *nl;
+    while (p < stop && (nl = (const char *)memchr(p, '\n', (size_t)(stop - p))) != NULL) {
+        end.row++;
+        p = nl + 1;
+    }
+    end.column = (uint32_t)(stop - p);
+    return end;
+}
+
+/* #2078: parse every file as if its last line were terminated.
+ *
+ * Many grammars treat the line terminator as part of the construct it ends --
+ * a markdown fence, heading or list marker, a Makefile recipe, a Dockerfile
+ * instruction. A file whose last byte is not "\n" leaves that construct
+ * unterminated: at best a zero-width MISSING token (#1610/#1746 excuse those at
+ * EOF), at worst a WIDTH-BEARING error that costs the whole last line or, for a
+ * one-line file, the whole file, and sometimes a silent loss (an unterminated
+ * markdown heading produced no Section and no flag). The same bytes plus one
+ * "\n" parse clean, so the absent newline is supplied instead of excused.
+ *
+ * The parser reads one virtual "\n" past EOF; afterwards a single tree edit
+ * deletes it again. tree-sitter's own edit arithmetic then clamps every node
+ * that reached into the virtual byte back to the real end -- byte offsets AND
+ * row/column points -- so every consumer (def line ranges, node text, call
+ * byte spans, parse-coverage ranges, the retained tree the LSP passes reuse)
+ * sees only real bytes and real lines; nothing downstream needs to know. The
+ * caller's buffer is never copied or written.
+ *
+ * A file that is empty or already ends in "\n" is parsed exactly as before. */
+TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_len,
+                         TSParseOptions opts) {
+    CBMStringInput input = {source, source_len, source_len > 0 && source[source_len - 1] != '\n'};
+    TSInput ts_input = {&input, cbm_string_read, TSInputEncodingUTF8, NULL};
+    TSTree *tree = ts_parser_parse_with_options(parser, NULL, ts_input, opts);
+    if (tree && input.virtual_newline) {
+        TSPoint end = cbm_source_end_point(source, source_len);
+        TSInputEdit drop_virtual_newline = {};
+        drop_virtual_newline.start_byte = source_len;
+        drop_virtual_newline.old_end_byte = source_len + 1;
+        drop_virtual_newline.new_end_byte = source_len;
+        drop_virtual_newline.start_point = end;
+        drop_virtual_newline.old_end_point = {end.row + 1, 0};
+        drop_virtual_newline.new_end_point = end;
+        ts_tree_edit(tree, &drop_virtual_newline);
+    }
+    return tree;
 }
 
 // --- Parse timeout callback ---
@@ -3154,14 +3213,7 @@ static CBMFileResult *extract_file_impl_body(const char *source, int source_len,
         }
     }
 
-    // Build string input + timeout options for parse_with_options
-    CBMStringInput str_input = {parse_source, (uint32_t)source_len};
-    TSInput ts_input = {
-        &str_input,
-        cbm_string_read,
-        TSInputEncodingUTF8,
-        NULL,
-    };
+    // Timeout options for parse_with_options
 
     TSParseOptions opts = {0};
     CBMParseBudget budget = {0, 0, 0}; // cppcheck-suppress unreadVariable
@@ -3189,7 +3241,7 @@ static CBMFileResult *extract_file_impl_body(const char *source, int source_len,
 #endif
     }
 
-    TSTree *tree = ts_parser_parse_with_options(parser, NULL, ts_input, opts);
+    TSTree *tree = cbm_parse_source(parser, parse_source, (uint32_t)source_len, opts);
     free(sql_blanked);
     uint64_t t1 = now_ns();
 
@@ -3432,7 +3484,7 @@ static CBMFileResult *extract_file_impl_body(const char *source, int source_len,
             TSParser *pp_parser = get_thread_parser(ts_lang, language);
             if (pp_parser) {
                 ts_parser_reset(pp_parser);
-                CBMStringInput pp_input = {expanded, (uint32_t)expanded_len};
+                CBMStringInput pp_input = {expanded, (uint32_t)expanded_len, false};
                 TSInput pp_ts_input = {
                     &pp_input,
                     cbm_string_read,

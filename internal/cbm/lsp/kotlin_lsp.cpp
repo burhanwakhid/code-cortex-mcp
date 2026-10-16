@@ -4324,7 +4324,7 @@ void cbm_run_kotlin_lsp_cross(CBMArena *arena, const char *source, int source_le
             return;
         }
         ts_parser_set_language(parser, tree_sitter_kotlin());
-        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, TSParseOptions{});
         ts_parser_delete(parser);
         owns_tree = true;
     }

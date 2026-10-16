@@ -4026,7 +4026,7 @@ CBMLSPStatus cbm_run_py_lsp_cross_status(
         parser = ts_parser_new();
         if (!parser) return CBM_LSP_COMPLETE;
         ts_parser_set_language(parser, tree_sitter_python());
-        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, TSParseOptions{});
         owns_tree = true;
         if (!tree) { ts_parser_delete(parser); return CBM_LSP_COMPLETE; }
     }
@@ -4133,7 +4133,7 @@ CBMLSPStatus cbm_run_py_lsp_cross_with_registry_status(
         parser = ts_parser_new();
         if (!parser) return CBM_LSP_COMPLETE;
         ts_parser_set_language(parser, tree_sitter_python());
-        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, TSParseOptions{});
         owns_tree = true;
         if (!tree) { ts_parser_delete(parser); return CBM_LSP_COMPLETE; }
     }

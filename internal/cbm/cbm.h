@@ -717,6 +717,14 @@ const char *cbm_index_quarantine_phase(const char *rel_path);
 void cbm_index_mark_start(const char *rel_path);
 void cbm_index_mark_done(const char *rel_path);
 
+/* Parse one whole file as if its last line ended with "\n" (#2078). The
+ * parser sees the source plus one virtual newline when the last byte is not
+ * already one; the returned tree is then clamped back to `source_len`, so no
+ * node range, point or text reaches past the real bytes. Every whole-file parse
+ * goes through here, so a retained tree and a fallback re-parse agree. */
+TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_len,
+                         TSParseOptions opts);
+
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.
 // Arena bytes cbm_extract_file attributed to each of its stages, summed over
