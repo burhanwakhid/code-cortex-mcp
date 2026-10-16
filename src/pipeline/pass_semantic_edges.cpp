@@ -324,29 +324,9 @@ static const char *file_ext(const char *path) {
     return dot ? dot : "";
 }
 
-/* Extract a JSON string value by key (simple strstr-based, no full parse). */
+/* Extract a JSON string value by key, escapes honoured (cbm_sem_json_str). */
 static const char *json_str_value(const char *json, const char *key, char *buf, int bufsize) {
-    if (!json || !key) {
-        return NULL;
-    }
-    char search[CBM_SZ_64];
-    snprintf(search, sizeof(search), "\"%s\":\"", key);
-    const char *start = strstr(json, search);
-    if (!start) {
-        return NULL;
-    }
-    start += strlen(search);
-    const char *end = strchr(start, '"');
-    if (!end) {
-        return NULL;
-    }
-    int len = (int)(end - start);
-    if (len >= bufsize) {
-        len = bufsize - SKIP_ONE;
-    }
-    memcpy(buf, start, (size_t)len);
-    buf[len] = '\0';
-    return buf;
+    return cbm_sem_json_str(json, key, buf, bufsize);
 }
 
 /* Extract a JSON array of strings by key. Returns count. */
@@ -722,21 +702,15 @@ static void vec_build_worker(int worker_id, void *ctx_ptr) {
         int tc = vc->token_counts[f];
         char **tokens = &vc->all_tokens[vc->offsets[f]];
 
-        /* TF-IDF weights */
+        /* One corpus lookup per token: its index serves the RI sum (by
+         * index) and then, in place, becomes the TF-IDF terms. */
         int *indices = (int *)malloc((size_t)tc * sizeof(int));
         float *weights = (float *)malloc((size_t)tc * sizeof(float));
-        int tfidf_len = 0;
-        for (int t = 0; t < tc; t++) {
-            float idf = cbm_sem_corpus_idf(vc->corpus, tokens[t]);
-            if (idf > 0.0F) {
-                indices[tfidf_len] = t;
-                weights[tfidf_len] = idf;
-                tfidf_len++;
+        if (indices) {
+            for (int t = 0; t < tc; t++) {
+                indices[t] = cbm_sem_corpus_token_index(vc->corpus, tokens[t]);
             }
         }
-        vc->funcs[f].tfidf_indices = indices;
-        vc->funcs[f].tfidf_weights = weights;
-        vc->funcs[f].tfidf_len = tfidf_len;
 
         /* RI vector: sum of enriched token vectors weighted by IDF. Built in a
          * LOCAL dense buffer; only the quantized code is retained per func
@@ -744,12 +718,30 @@ static void vec_build_worker(int worker_id, void *ctx_ptr) {
         cbm_sem_vec_t ri_dense;
         memset(&ri_dense, 0, sizeof(cbm_sem_vec_t));
         for (int t = 0; t < tc; t++) {
-            const cbm_sem_vec_t *ri = cbm_sem_corpus_ri_vec(vc->corpus, tokens[t]);
-            if (ri) {
-                float idf = cbm_sem_corpus_idf(vc->corpus, tokens[t]);
-                cbm_sem_vec_add_scaled(&ri_dense, ri, idf);
+            const cbm_sem_vec_t *ri = NULL;
+            float idf = 0.0F;
+            if (indices) {
+                if (indices[t] < 0 || !cbm_sem_corpus_token_at(vc->corpus, indices[t], &ri, &idf)) {
+                    continue;
+                }
+            } else {
+                ri = cbm_sem_corpus_ri_vec(vc->corpus, tokens[t]);
+                if (!ri) {
+                    continue;
+                }
+                idf = cbm_sem_corpus_idf(vc->corpus, tokens[t]);
             }
+            cbm_sem_vec_add_scaled(&ri_dense, ri, idf);
         }
+
+        /* TF-IDF terms, keyed by corpus token (cbm_sem_tfidf_terms). */
+        int tfidf_len = indices && weights
+                            ? cbm_sem_tfidf_terms(vc->corpus, tokens, indices, tc, indices, weights)
+                            : 0;
+        vc->funcs[f].tfidf_indices = indices;
+        vc->funcs[f].tfidf_weights = weights;
+        vc->funcs[f].tfidf_len = tfidf_len;
+
         cbm_sem_normalize(&ri_dense);
         cbm_rsq_encode(ri_dense.v, &vc->funcs[f].ri_code);
 
@@ -895,18 +887,15 @@ static int score_collect_candidates(score_ctx_t *sc, int i, int *seen, int *cand
 }
 
 /* Score one candidate pair (i, j) and push a deferred edge if the score
- * passes the threshold. Emission here is DELIBERATELY budget-free on the
- * j side: the per-node edge budget used to be enforced with shared atomic
- * counters, so which pairs consumed a node's budget depended on worker
- * scheduling and the emitted edge SET varied between identical runs.
- * Budgets are now applied deterministically in phase6b after a canonical
- * sort; `local_emitted` bounds this i's fan-out so the deferred total
- * keeps the same func_count × max_edges worst case as before. */
-static void score_try_emit(score_ctx_t *sc, int i, int j, deferred_edge_buf_t *my_buf,
-                           int *local_emitted) {
-    if (*local_emitted >= sc->cfg.max_edges) {
-        return;
-    }
+ * passes the threshold. ADMISSION (the per-node max_edges budget) is
+ * deliberately NOT decided here. Shared atomic counters made the emitted
+ * edge SET depend on worker scheduling; a per-i cap on the first max_edges
+ * pairs above the threshold (discovery order) kept a function's FIRST
+ * partners, not its best (upstream ad25b0b6: the pairs first-come admitted
+ * over budget were 0 of 17 judged related). Every above-threshold pair is
+ * deferred (at most SEM_MAX_CANDIDATES per function) and phase6b admits
+ * best-first, sequentially, in canonical order. */
+static void score_try_emit(score_ctx_t *sc, int i, int j, deferred_edge_buf_t *my_buf) {
     if (strcmp(sc->funcs[i].file_ext, sc->funcs[j].file_ext) != 0) {
         return;
     }
@@ -917,7 +906,6 @@ static void score_try_emit(score_ctx_t *sc, int i, int j, deferred_edge_buf_t *m
     bool same_file = sc->funcs[i].file_path && sc->funcs[j].file_path &&
                      strcmp(sc->funcs[i].file_path, sc->funcs[j].file_path) == 0;
     deferred_buf_push(my_buf, sc->funcs[i].node_id, sc->funcs[j].node_id, i, j, score, same_file);
-    (*local_emitted)++;
 }
 
 static void score_worker(int worker_id, void *ctx_ptr) {
@@ -935,9 +923,8 @@ static void score_worker(int worker_id, void *ctx_ptr) {
         }
         int candidates[SEM_MAX_CANDIDATES];
         int cand_count = score_collect_candidates(sc, i, seen, candidates, SEM_MAX_CANDIDATES);
-        int local_emitted = 0;
         for (int c = 0; c < cand_count; c++) {
-            score_try_emit(sc, i, candidates[c], my_buf, &local_emitted);
+            score_try_emit(sc, i, candidates[c], my_buf);
         }
     }
 }
@@ -1099,16 +1086,13 @@ static void phase5c_build_lsh_buckets(const uint64_t *signatures, int func_count
     }
 }
 
-/* Canonical order for deferred edges: best score first, ties by function
- * indices. Which worker found an edge (and in what order) varies run to
- * run; this sort makes the budget cut and the gbuf insert order depend on
- * the edges themselves only. */
+/* Canonical order for deferred pairs: by function indices. Which worker
+ * found a pair (and in what order) varies run to run; funcs[] is sorted by
+ * content, so this order (and the admission ties it settles) depends on the
+ * pairs themselves only. */
 static int deferred_edge_cmp(const void *a, const void *b) {
     const deferred_edge_t *ea = (const deferred_edge_t *)a;
     const deferred_edge_t *eb = (const deferred_edge_t *)b;
-    if (ea->score != eb->score) {
-        return ea->score > eb->score ? -1 : 1;
-    }
     if (ea->fi != eb->fi) {
         return ea->fi < eb->fi ? -1 : 1;
     }
@@ -1118,45 +1102,71 @@ static int deferred_edge_cmp(const void *a, const void *b) {
     return 0;
 }
 
-/* Phase 6b: apply the per-node edge budget deterministically, then serialize
- * the surviving deferred edges into the graph buffer (sequential because
- * gbuf isn't thread-safe). Highest-scoring edges win a node's budget. */
+/* Phase 6b: admit pairs best-first under the per-node edge budget
+ * (cbm_sem_admit_best_first: descending score, ties in canonical order),
+ * then serialize the admitted ones into the graph buffer in canonical order
+ * (sequential because gbuf isn't thread-safe). Every edge carries "p", the
+ * calibrated probability for its score AS STORED (three decimals). */
 static int phase6b_merge_edges(cbm_gbuf_t *gbuf, deferred_edge_buf_t *worker_bufs, int worker_count,
                                int func_count, int max_edges) {
     int total_deferred = 0;
     for (int w = 0; w < worker_count; w++) {
         total_deferred += worker_bufs[w].count;
     }
-    deferred_edge_t *all =
-        (deferred_edge_t *)malloc((size_t)(total_deferred + SKIP_ONE) * sizeof(deferred_edge_t));
-    int *node_budget = (int *)calloc((size_t)(func_count + SKIP_ONE), sizeof(int));
+    size_t slots = (size_t)total_deferred + SKIP_ONE;
+    deferred_edge_t *all = (deferred_edge_t *)malloc(slots * sizeof(deferred_edge_t));
+    int *node_budget = (int *)calloc((size_t)func_count + SKIP_ONE, sizeof(int));
+    float *scores = (float *)malloc(slots * sizeof(float));
+    int *fa = (int *)malloc(slots * sizeof(int));
+    int *fb = (int *)malloc(slots * sizeof(int));
+    bool *admitted = (bool *)malloc(slots * sizeof(bool));
     int all_count = 0;
-    if (all && node_budget) {
+    bool ranked = all && node_budget && scores && fa && fb && admitted;
+    if (ranked) {
         for (int w = 0; w < worker_count; w++) {
             for (int e = 0; e < worker_bufs[w].count; e++) {
                 all[all_count++] = worker_bufs[w].edges[e];
             }
         }
         qsort(all, (size_t)all_count, sizeof(deferred_edge_t), deferred_edge_cmp);
+        for (int e = 0; e < all_count; e++) {
+            scores[e] = all[e].score;
+            fa[e] = all[e].fi;
+            fb[e] = all[e].fj;
+        }
+        ranked = cbm_sem_admit_best_first(scores, fa, fb, NULL, all_count, max_edges, node_budget,
+                                          admitted);
+    }
+    if (!ranked && total_deferred > 0) {
+        cbm_log_warn("semantic_edges.admission", "reason", "out_of_memory", "pairs",
+                     itoa_log(total_deferred));
     }
 
     int total_edges = 0;
-    for (int e = 0; e < all_count; e++) {
-        deferred_edge_t *de = &all[e];
-        if (node_budget[de->fi] >= max_edges || node_budget[de->fj] >= max_edges) {
+    for (int e = 0; ranked && e < all_count; e++) {
+        if (!admitted[e]) {
             continue;
         }
-        node_budget[de->fi]++;
-        node_budget[de->fj]++;
+        const deferred_edge_t *de = &all[e];
+        /* p from the score as stored, so one shown score carries one p. */
+        char score_text[CBM_SZ_32];
+        snprintf(score_text, sizeof(score_text), "%.3f", (double)de->score);
         char props[PROPS_BUF];
-        snprintf(props, sizeof(props), "{\"score\":%.3f,\"same_file\":%s}", de->score,
-                 de->same_file ? "true" : "false");
+        snprintf(props, sizeof(props), "{\"score\":%s,\"same_file\":%s,\"p\":%.2f}", score_text,
+                 de->same_file ? "true" : "false",
+                 (double)cbm_sem_calibrated_p(strtof(score_text, NULL)));
         cbm_gbuf_insert_edge(gbuf, de->source_id, de->target_id, "SEMANTICALLY_RELATED", props);
         total_edges++;
     }
+    cbm_log_info("pass.semantic.admission", "pairs", itoa_log(all_count), "admitted",
+                 itoa_log(total_edges));
 
     free(all);
     free(node_budget);
+    free(scores);
+    free(fa);
+    free(fb);
+    free(admitted);
     for (int w = 0; w < worker_count; w++) {
         deferred_buf_free(&worker_bufs[w]);
     }

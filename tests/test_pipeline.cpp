@@ -11,6 +11,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
+#include "semantic/semantic.h"
 #include "foundation/subprocess.h"
 #include "foundation/constants.h"
 #include "foundation/log.h" // cbm_log_set_sink — incremental-route observation
@@ -9410,6 +9411,237 @@ TEST(pipeline_semantic_batched_matches_unbatched) {
     PASS();
 }
 
+/* ── Semantic engine: TF-IDF terms and the combined score ─────────
+ * (upstream tests/test_semantic.c; this fork has no semantic suite file, so
+ * they ride with the pipeline's semantic-pass tests.) */
+
+static int sem_terms_of(const cbm_sem_corpus_t *c, char **tokens, int n, cbm_sem_func_t *f,
+                        int *indices, float *weights) {
+    memset(f, 0, sizeof(*f));
+    f->tfidf_indices = indices;
+    f->tfidf_weights = weights;
+    f->tfidf_len = cbm_sem_tfidf_terms(c, tokens, NULL, n, indices, weights);
+    return f->tfidf_len;
+}
+
+/* Two functions share a TF-IDF term only when they share the word. Until
+ * 2026-10 the term key was the token's POSITION: any two functions of equal
+ * length matched on every term, so the signal measured length (a held-out
+ * judged sample: admitted-edge precision 0.713 -> 0.742 with the fix). */
+TEST(sem_tfidf_terms_compare_vocabulary_not_positions) {
+    cbm_sem_corpus_t *c = cbm_sem_corpus_new();
+    ASSERT_NOT_NULL(c);
+    static const char *parse_c[] = {"parse", "header", "value"};
+    static const char *render_c[] = {"render", "widget", "frame"};
+    static const char *reparse_c[] = {"value", "parse", "header", "parse", "absent"};
+    static const char *other_c[] = {"queue", "drain"};
+    cbm_sem_corpus_add_doc(c, parse_c, 3);
+    cbm_sem_corpus_add_doc(c, render_c, 3);
+    cbm_sem_corpus_add_doc(c, reparse_c, 4); /* "absent" stays out */
+    cbm_sem_corpus_add_doc(c, other_c, 2);
+    cbm_sem_corpus_finalize(c);
+    char **parse = const_cast<char **>(parse_c);
+    char **render = const_cast<char **>(render_c);
+    char **reparse = const_cast<char **>(reparse_c);
+
+    cbm_sem_func_t fa;
+    cbm_sem_func_t fb;
+    cbm_sem_func_t fc;
+    int ia[3];
+    int ib[3];
+    int ic[5];
+    float wa[3];
+    float wb[3];
+    float wc[5];
+    ASSERT_EQ(sem_terms_of(c, parse, 3, &fa, ia, wa), 3);
+    ASSERT_EQ(sem_terms_of(c, render, 3, &fb, ib, wb), 3);
+    /* A repeated word is one term, its weight twice the idf; an unknown word
+     * is no term; terms ascend by token index. */
+    ASSERT_EQ(sem_terms_of(c, reparse, 5, &fc, ic, wc), 3);
+    ASSERT_TRUE(ic[0] < ic[1] && ic[1] < ic[2]);
+    int parse_idx = cbm_sem_corpus_token_index(c, "parse");
+    ASSERT_TRUE(parse_idx >= 0);
+    ASSERT_EQ(cbm_sem_corpus_token_index(c, "absent"), -1);
+    int at_parse = ic[0] == parse_idx ? 0 : ic[1] == parse_idx ? 1 : 2;
+    ASSERT_EQ(ic[at_parse], parse_idx);
+    ASSERT_FLOAT_EQ(wc[at_parse], 2.0F * cbm_sem_corpus_idf(c, "parse"), 1e-6);
+    ASSERT_FLOAT_EQ(cbm_sem_corpus_idf_at(c, parse_idx), cbm_sem_corpus_idf(c, "parse"), 0.0);
+
+    cbm_sem_signals_t s;
+    cbm_sem_signal_values(&fa, &fb, &s);
+    ASSERT_FLOAT_EQ(s.tfidf, 0.0F, 1e-6); /* same length, no shared word */
+    cbm_sem_signal_values(&fa, &fc, &s);
+    ASSERT_TRUE(s.tfidf > 0.9F); /* the same words, other order and length */
+    cbm_sem_corpus_free(c);
+    PASS();
+}
+
+/* cbm_sem_combine is the weighted sum of the signals, times the proximity
+ * multiplier, clamped to [0, 1]; a SIMILAR_TO near copy scores 0. And
+ * cbm_sem_combined_score is exactly that, applied to cbm_sem_signal_values. */
+TEST(sem_combine_weighs_signals) {
+    cbm_sem_config_t cfg = cbm_sem_get_config();
+    cbm_sem_signals_t s = {};
+    s.tfidf = 0.5F;
+    s.ri = 0.25F;
+    s.proximity = 1.0F;
+    ASSERT_FLOAT_EQ(cbm_sem_combine(&s, &cfg), cfg.w_tfidf * 0.5F + cfg.w_ri * 0.25F, 1e-6);
+    s.proximity = 1.10F;
+    ASSERT_FLOAT_EQ(cbm_sem_combine(&s, &cfg), (cfg.w_tfidf * 0.5F + cfg.w_ri * 0.25F) * 1.10F,
+                    1e-6);
+    cbm_sem_signals_t all = {};
+    all.tfidf = all.ri = all.minhash = all.api = all.type = all.decorator = all.struct_profile =
+        1.0F;
+    all.proximity = 1.10F;
+    ASSERT_FLOAT_EQ(cbm_sem_combine(&all, &cfg), 1.0F, 0.0); /* clamped */
+    all.near_copy = true;
+    ASSERT_FLOAT_EQ(cbm_sem_combine(&all, &cfg), 0.0F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_combine(NULL, &cfg), 0.0F, 0.0);
+
+    cbm_sem_corpus_t *c = cbm_sem_corpus_new();
+    ASSERT_NOT_NULL(c);
+    static const char *one_c[] = {"open", "socket", "port"};
+    static const char *two_c[] = {"open", "socket", "host", "retry"};
+    cbm_sem_corpus_add_doc(c, one_c, 3);
+    cbm_sem_corpus_add_doc(c, two_c, 4);
+    cbm_sem_corpus_finalize(c);
+    cbm_sem_func_t fa;
+    cbm_sem_func_t fb;
+    int ia[3];
+    int ib[4];
+    float wa[3];
+    float wb[4];
+    sem_terms_of(c, const_cast<char **>(one_c), 3, &fa, ia, wa);
+    sem_terms_of(c, const_cast<char **>(two_c), 4, &fb, ib, wb);
+    fa.file_path = "net/dial.go";
+    fb.file_path = "net/listen.go";
+    cbm_sem_signals_t v;
+    cbm_sem_signal_values(&fa, &fb, &v);
+    ASSERT_FLOAT_EQ(cbm_sem_combined_score(&fa, &fb, &cfg), cbm_sem_combine(&v, &cfg), 0.0);
+    cbm_sem_corpus_free(c);
+    PASS();
+}
+
+/* Over budget, a function keeps its BEST partners, not its first ones (a
+ * held-out judged sample: the pairs first-come admitted over budget were 0 of
+ * 17 related). Equal scores keep the canonical order; an ineligible pair is
+ * never admitted and takes no budget. */
+TEST(sem_admit_best_first_keeps_the_best) {
+    /* function 0 has four partners in canonical order, budget 2 */
+    const float scores[] = {0.80F, 0.90F, 0.95F, 0.99F, 0.90F};
+    const int fa[] = {0, 0, 0, 0, 5};
+    const int fb[] = {1, 2, 3, 4, 6};
+    const bool eligible[] = {true, true, true, false, true};
+    int counts[7] = {0};
+    bool admitted[5];
+    ASSERT_TRUE(cbm_sem_admit_best_first(scores, fa, fb, eligible, 5, 2, counts, admitted));
+    ASSERT_FALSE(admitted[0]); /* first-come would have kept 0.80 */
+    ASSERT_TRUE(admitted[1]);
+    ASSERT_TRUE(admitted[2]);
+    ASSERT_FALSE(admitted[3]); /* the best score, but not eligible */
+    ASSERT_TRUE(admitted[4]);
+    ASSERT_EQ(counts[0], 2);
+    ASSERT_EQ(counts[4], 0);
+
+    /* ties: the earlier pair in canonical order wins the last slot */
+    const float tied[] = {0.85F, 0.85F};
+    const int ta[] = {0, 0};
+    const int tb[] = {1, 2};
+    int tcounts[3] = {0};
+    bool tadmitted[2];
+    ASSERT_TRUE(cbm_sem_admit_best_first(tied, ta, tb, NULL, 2, 1, tcounts, tadmitted));
+    ASSERT_TRUE(tadmitted[0]);
+    ASSERT_FALSE(tadmitted[1]);
+    PASS();
+}
+
+/* p by the stored (three-decimal) score: the judged bands, monotone. */
+TEST(sem_calibrated_p_bands) {
+    ASSERT_FLOAT_EQ(cbm_sem_calibrated_p(0.750F), 0.626F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_calibrated_p(0.772F), 0.626F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_calibrated_p(0.773F), 0.760F, 0.0);
+    /* the cut sits at the stored precision (0.773), not the raw quartile:
+     * a stored "0.773" and a stored "0.772" never share a band */
+    ASSERT_FLOAT_EQ(cbm_sem_calibrated_p(0.7729F), 0.626F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_calibrated_p(0.838F), 0.760F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_calibrated_p(1.000F), 0.760F, 0.0);
+    float last = 0.0F;
+    for (int milli = 750; milli <= 1000; milli++) {
+        float p = cbm_sem_calibrated_p((float)milli / 1000.0F);
+        ASSERT_TRUE(p >= last);
+        last = p;
+    }
+    PASS();
+}
+
+/* Every SEMANTICALLY_RELATED edge carries "p": the calibrated probability for
+ * its score AS STORED (three decimals), so one shown score has one p. */
+TEST(pipeline_semantic_edges_carry_p) {
+    ThSavedEnv saved_thresh("CBM_SEMANTIC_THRESHOLD");
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_semp_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    std::string repo = std::string(tmp) + "/repo";
+    static const char *const subjects[] = {"User", "Server", "Client", "Cache", "Queue", "Mail"};
+    for (size_t i = 0; i < sizeof(subjects) / sizeof(subjects[0]); i++) {
+        write_sem_family(repo, subjects[i]);
+    }
+    std::string db = std::string(tmp) + "/p.db";
+    cbm_setenv("CBM_SEMANTIC_THRESHOLD", "0.3", 1); /* admits the near-duplicates */
+    cbm_pipeline_t *p = cbm_pipeline_new(repo.c_str(), db.c_str(), CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    cbm_unsetenv("CBM_SEMANTIC_THRESHOLD");
+    cbm_pipeline_free(p);
+    ASSERT_EQ(rc, 0);
+
+    cbm_store_t *s = cbm_store_open_path(db.c_str());
+    ASSERT_NOT_NULL(s);
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(s),
+                                 "SELECT properties FROM edges WHERE type = 'SEMANTICALLY_RELATED'",
+                                 -1, &st, NULL),
+              SQLITE_OK);
+    int edges = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *props = (const char *)sqlite3_column_text(st, 0);
+        ASSERT_NOT_NULL(props);
+        yyjson_doc *doc = yyjson_read(props, strlen(props), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *score = yyjson_obj_get(yyjson_doc_get_root(doc), "score");
+        yyjson_val *pv = yyjson_obj_get(yyjson_doc_get_root(doc), "p");
+        ASSERT_TRUE(score && yyjson_is_num(score));
+        ASSERT_TRUE(pv && yyjson_is_num(pv));
+        double want = cbm_sem_calibrated_p((float)yyjson_get_num(score));
+        ASSERT_FLOAT_EQ(yyjson_get_num(pv), want, 0.006);
+        yyjson_doc_free(doc);
+        edges++;
+    }
+    sqlite3_finalize(st);
+    cbm_store_close(s);
+    ASSERT_GT(edges, 0);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* A properties string holding a quote is read whole, and escapes are not
+ * glued to the next word (until 2026-10 the read stopped at the first quote
+ * and kept "\n" raw, so "\nreturn" became the token "nreturn"). */
+TEST(sem_json_str_honours_escapes) {
+    static const char json[] =
+        "{\"docstring\":\"Say \\\"hi\\\" to\\nthe user \\u00e9 now\",\"bt\":\"x\"}";
+    char buf[64];
+    ASSERT_NOT_NULL(cbm_sem_json_str(json, "docstring", buf, sizeof(buf)));
+    ASSERT_STR_EQ(buf, "Say \"hi\" to the user   now");
+    ASSERT_NOT_NULL(cbm_sem_json_str(json, "bt", buf, sizeof(buf)));
+    ASSERT_STR_EQ(buf, "x");
+    ASSERT_NULL(cbm_sem_json_str(json, "absent", buf, sizeof(buf)));
+    char small[6];
+    ASSERT_NOT_NULL(cbm_sem_json_str(json, "docstring", small, sizeof(small)));
+    ASSERT_STR_EQ(small, "Say \""); /* cut at the buffer, still terminated */
+    PASS();
+}
+
 SUITE(pipeline) {
 #ifdef _WIN32
     RUN_TEST(pipeline_lease_windows_ambiguous_missing_and_replaced_names);
@@ -9738,6 +9970,12 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
     RUN_TEST(pipeline_semantic_batched_matches_unbatched);
+    RUN_TEST(sem_tfidf_terms_compare_vocabulary_not_positions);
+    RUN_TEST(sem_combine_weighs_signals);
+    RUN_TEST(sem_admit_best_first_keeps_the_best);
+    RUN_TEST(sem_calibrated_p_bands);
+    RUN_TEST(sem_json_str_honours_escapes);
+    RUN_TEST(pipeline_semantic_edges_carry_p);
     RUN_TEST(pipeline_go_cross_package_field_chain_resolves);
     RUN_TEST(pipeline_go_cross_package_field_chain_resolves_parallel);
     RUN_TEST(pipeline_go_textual_call_never_binds_field);

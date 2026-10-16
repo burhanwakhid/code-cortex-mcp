@@ -57,9 +57,10 @@ enum { CBM_SEM_WINDOW = 5 };
 enum { CBM_SEM_MAX_OCCUR = 512 };
 
 /* Default score threshold for SEMANTICALLY_RELATED edge emission.
- * 0.75 balances recall with precision: validated ~95% precision on
- * Linux kernel (0.80 = 100% but only 90 edges, 0.70 = 2047 edges
- * but ~80% precision). */
+ * 0.75 balances recall with precision. The old "~95% precision on the Linux
+ * kernel" claim did not hold: upstream's blind judged samples from held-out
+ * repositories (2026-10) put admitted-edge precision near 0.72, and no
+ * threshold reaches 0.90. Each edge carries its calibrated "p" instead. */
 #define CBM_SEM_EDGE_THRESHOLD 0.75
 
 /* Maximum SEMANTICALLY_RELATED edges per node. */
@@ -178,6 +179,12 @@ void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus);
 /* Get IDF weight for a token. Returns 0.0 for unknown tokens. */
 float cbm_sem_corpus_idf(const cbm_sem_corpus_t *corpus, const char *token);
 
+/* Corpus index of a token, or -1 when the corpus does not know it. */
+int cbm_sem_corpus_token_index(const cbm_sem_corpus_t *corpus, const char *token);
+
+/* IDF weight of the token at a corpus index (0.0 when out of range). */
+float cbm_sem_corpus_idf_at(const cbm_sem_corpus_t *corpus, int index);
+
 /* Get the enriched Random Indexing vector for a token (after co-occurrence). */
 const cbm_sem_vec_t *cbm_sem_corpus_ri_vec(const cbm_sem_corpus_t *corpus, const char *token);
 
@@ -195,11 +202,65 @@ const char *cbm_sem_corpus_token_at(const cbm_sem_corpus_t *corpus, int index,
 /* Free corpus. */
 void cbm_sem_corpus_free(cbm_sem_corpus_t *corpus);
 
+/* The TF-IDF terms of one function: one entry per distinct corpus token whose
+ * idf is above 0, weighted term frequency x idf, in ascending token-index
+ * order (the order the TF-IDF cosine merges on). `token_index[t]` is the
+ * corpus index of tokens[t] (-1 when unknown); NULL looks each token up by
+ * name. `indices` and `weights` hold at least `count` entries; `indices` may
+ * be `token_index` itself (entry t is read before any write reaches it).
+ * Returns the number of terms written. */
+int cbm_sem_tfidf_terms(const cbm_sem_corpus_t *corpus, char *const *tokens, const int *token_index,
+                        int count, int *indices, float *weights);
+
 /* ── Combined scoring ────────────────────────────────────────────── */
 
 /* Compute combined similarity score between two functions. */
 float cbm_sem_combined_score(const cbm_sem_func_t *a, const cbm_sem_func_t *b,
                              const cbm_sem_config_t *cfg);
+
+/* The signal values cbm_sem_combined_score weighs, for measuring them one by
+ * one: each similarity in [0, 1] (minhash 0 when either side has none),
+ * proximity a multiplier in [1.0, 1.10]. `near_copy`: the pair is a SIMILAR_TO
+ * copy, which the combined score sets to 0. */
+typedef struct {
+    float tfidf;
+    float ri;
+    float minhash;
+    float api;
+    float type;
+    float decorator;
+    float struct_profile;
+    float proximity;
+    bool near_copy;
+} cbm_sem_signals_t;
+
+void cbm_sem_signal_values(const cbm_sem_func_t *a, const cbm_sem_func_t *b,
+                           cbm_sem_signals_t *out);
+
+/* cbm_sem_combined_score from the signal values (the same arithmetic). */
+float cbm_sem_combine(const cbm_sem_signals_t *s, const cbm_sem_config_t *cfg);
+
+/* Best-first admission under a per-function edge budget. Pair k joins
+ * functions fa[k] and fb[k] with scores[k]; pairs are taken by descending
+ * score, ties in ascending k (the caller's canonical order), and pair k is
+ * admitted when eligible[k] (NULL: every pair) and both functions have fewer
+ * than max_edges admitted pairs. counts holds one zeroed slot per function and
+ * is updated. Returns false (nothing admitted) when the order cannot be
+ * allocated. */
+bool cbm_sem_admit_best_first(const float *scores, const int *fa, const int *fb,
+                              const bool *eligible, int n, int max_edges, int *counts,
+                              bool *admitted);
+
+/* The string value of "key" in a properties JSON object, unescaped into buf
+ * (cut at bufsize - 1); NULL when the key is absent. Escapes are honoured:
+ * \" \\ \/ keep their character, \n \t \r \b \f and \uXXXX become a space (a
+ * separator for the tokenizer), so a value holding a quote is read whole. */
+const char *cbm_sem_json_str(const char *json, const char *key, char *buf, int bufsize);
+
+/* The probability that an admitted SEMANTICALLY_RELATED pair is related, by
+ * its score as stored (three decimals): the judged precision of blind-judged
+ * held-out samples (the edge property "p"). */
+float cbm_sem_calibrated_p(float score);
 
 /* Module proximity multiplier based on file paths. */
 float cbm_sem_proximity(const char *path_a, const char *path_b);
