@@ -365,7 +365,7 @@ void cbm_registry_import_map_cache_end(void) {
  * eliminated. */
 typedef struct {
     cbm_resolution_t res;
-    size_t scope_len; /* raw and Python-scoped requests may share one file cache */
+    size_t scope_len;  /* raw and Python-scoped requests may share one file cache */
     bool skip_members; /* a C call and a C reference to the same name share it */
 } resolve_cache_entry_t;
 
@@ -1351,14 +1351,13 @@ static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const c
      * cache key only needs callee_name (plus the effective scope and the member choice). */
     resolve_cache_entry_t *cached =
         _resolve_cache ? (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name) : NULL;
-    if (cached && cached->scope_len == scope_len &&
-        cached->skip_members == skip_members) {
+    if (cached && cached->scope_len == scope_len && cached->skip_members == skip_members) {
         return cached->res;
     }
 
-    cbm_resolution_t res = registry_resolve_chain(r, callee_name, module_qn, import_map_keys,
-                                                  import_map_vals, import_map_count, scope_len,
-                                                  skip_members);
+    cbm_resolution_t res =
+        registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                               import_map_count, scope_len, skip_members);
 
     /* Data relations (Table/View) are LINEAGE-ONLY registry members. Common
      * table names (users, orders, config) collide with code identifiers in
@@ -1439,8 +1438,7 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
      * would poison one variant with the other's semantics. A SQL file holds few
      * distinct relation refs, so the chain walk stays cheap. */
     return registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                  import_map_count, module_qn ? strlen(module_qn) : 0,
-                                  false);
+                                  import_map_count, module_qn ? strlen(module_qn) : 0, false);
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */

@@ -252,12 +252,12 @@ template <class A> void fields(A &a, CBMResolvedCall &v) {
 template <class A> void fields(A &a, CBMFileResult &v) {
     auto &[arena, defs, overloads, overload_count, calls, deferred_cpp_operator_count,
            pending_cpp_operator_count, cpp_operator_tracker, imports, usages, throws, rw, type_refs,
-           env_accesses, type_assigns, impl_traits, resolved_calls, field_refs, string_refs, infra_bindings,
-           channels, field_types, module_qn, namespace_name, php_vendor_names, php_vendor_qns,
-           php_vendor_count, exports, constants, global_vars, macros, module_doc, has_error, error_msg,
-           parse_incomplete, parse_unusable, error_ranges, error_region_count, is_test_file,
-           imports_count, cached_tree, lsp_skipped, walk_truncated, lsp_skip_reason, tree_nodes,
-           walk_nodes_visited, cached_lang, source, source_len] = v;
+           env_accesses, type_assigns, impl_traits, resolved_calls, field_refs, string_refs,
+           infra_bindings, channels, field_types, module_qn, namespace_name, php_vendor_names,
+           php_vendor_qns, php_vendor_count, exports, constants, global_vars, macros, module_doc,
+           has_error, error_msg, parse_incomplete, parse_unusable, error_ranges, error_region_count,
+           is_test_file, imports_count, cached_tree, lsp_skipped, walk_truncated, lsp_skip_reason,
+           tree_nodes, walk_nodes_visited, cached_lang, source, source_len] = v;
     /* PHP vendor evidence (#1186) is recorded after extraction, on the retained
      * summary, and copied onto the loaded record by the resolve worker: never
      * part of the snapshot. */

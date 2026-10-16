@@ -712,7 +712,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     cbm_resolution_t res = {0};
     if (!rust_external && !php_vendor_call) {
         res = cbm_registry_resolve_call_lang(ctx->registry, call->callee_name, module_qn, imp_keys,
-                                        imp_vals, imp_count, lang);
+                                             imp_vals, imp_count, lang);
     }
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         /* Resolution is empty when the callee belongs to an EXTERNAL client
@@ -834,9 +834,9 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         return 0;
     case CBM_FIELD_CALL_BY_OWNER: {
         bool typed = false;
-        target_node =
-            cbm_pipeline_c_member_call_field(&result->field_refs, NULL, ctx->gbuf, ctx->project_name,
-                                             call->enclosing_func_qn, call->callee_name, &typed);
+        target_node = cbm_pipeline_c_member_call_field(&result->field_refs, NULL, ctx->gbuf,
+                                                       ctx->project_name, call->enclosing_func_qn,
+                                                       call->callee_name, &typed);
         if (!target_node && !typed) {
             const char *only = cbm_registry_unique_field_qn(
                 ctx->registry, cbm_lsp_bare_segment(call->callee_name));
