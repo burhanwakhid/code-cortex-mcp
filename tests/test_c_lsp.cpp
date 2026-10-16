@@ -968,6 +968,23 @@ TEST(clsp_nocrash_structured_binding_excess_names) {
     PASS();
 }
 
+/* #1743 (upstream test): the decltype() form of the same excess-names read. */
+TEST(clsp_structured_binding_more_names_than_fields) {
+    CBMFileResult *r = extract_cpp("struct A { int x, y; };\n"
+                                   "const auto &[acr0, acr1, acr2] = A();\n"
+                                   "using ConstFloatRef = decltype(acr2);\n"
+                                   "void test() {\n"
+                                   "    auto [b0, b1, b2, b3] = A();\n"
+                                   "    using T = decltype(b3);\n"
+                                   "    for (auto [c0, c1, c2, c3] : (A *)0) {\n"
+                                   "        using U = decltype(c3);\n"
+                                   "    }\n"
+                                   "}\n");
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(clsp_nocrash_nested_namespace) {
     CBMFileResult *r = extract_cpp("\n"
                                    "namespace a {\n"
@@ -15770,6 +15787,7 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_nocrash_issue312_default_template_auto_param);
     RUN_TEST(clsp_nocrash_lambda);
     RUN_TEST(clsp_nocrash_structured_binding_excess_names);
+    RUN_TEST(clsp_structured_binding_more_names_than_fields);
     RUN_TEST(clsp_nocrash_nested_namespace);
     RUN_TEST(clsp_nocrash_empty_source);
     RUN_TEST(clsp_nocrash_complex_class);
