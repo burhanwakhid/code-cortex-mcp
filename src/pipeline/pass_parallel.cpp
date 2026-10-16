@@ -2678,7 +2678,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                (cbm_pipeline_php_vendor_call(result, call) ||
                                 (lsp && !lsp_target && cbm_pipeline_lsp_external_receiver(lsp)));
         if ((!res.qualified_name || !res.qualified_name[0]) && !rust_external && !php_vendor_call) {
-            res = cbm_registry_resolve_lang(rc->registry, call->callee_name, module_qn, imp_keys,
+            res = cbm_registry_resolve_call_lang(rc->registry, call->callee_name, module_qn, imp_keys,
                                             imp_vals, imp_count, lang);
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_resolve, extract_now_ns() - _rc_t0,

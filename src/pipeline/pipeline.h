@@ -331,6 +331,14 @@ cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *
                                            const char **import_map_vals, int import_map_count,
                                            CBMLanguage lang);
 
+/* The CALLS variant: as cbm_registry_resolve_lang, except that a bare C call (no
+ * `.` / `->`) does not consider Field or Method nodes, which it can never
+ * call. Shares the per-file cache, keyed on that choice too. */
+cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
+                                                const char *module_qn, const char **import_map_keys,
+                                                const char **import_map_vals, int import_map_count,
+                                                CBMLanguage lang);
+
 /* Per-file memoization cache for is_import_reachable. Thread-local —
  * each resolve worker owns its own cache. Call _begin at the start
  * of resolve_file_calls (or any per-file resolve loop) and _end at
