@@ -6328,6 +6328,19 @@ static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
     free(targets);
     yyjson_doc_free(jdoc);
 
+    if (result.failed) {
+        free(project);
+        return cbm_mcp_text_result(
+            result.no_targets
+                ? "cross-repo-intelligence resolved zero target projects: no indexed project "
+                  "other than the source matched target_projects. Index the other service first "
+                  "(run list_projects to see what is indexed); existing cross-repo edges were "
+                  "left unchanged."
+                : "cross-repo source or target project is missing, invalid, or not indexed; "
+                  "existing cross-repo edges were left unchanged.",
+            true);
+    }
+
     int total = result.http_edges + result.async_edges + result.channel_edges + result.grpc_edges +
                 result.graphql_edges + result.trpc_edges;
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);

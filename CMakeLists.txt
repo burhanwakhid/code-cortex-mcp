@@ -438,6 +438,7 @@ set(CBM_TEST_SRCS
     tests/test_graph_buffer.cpp
     tests/test_registry.cpp tests/test_pipeline.cpp tests/test_fqn.cpp
     tests/test_path_alias.cpp tests/test_configlink.cpp tests/test_infrascan.cpp
+    tests/test_cross_repo.cpp
     tests/test_worker_pool.cpp tests/test_parallel.cpp
     tests/test_watcher.cpp
     # vendored format suites

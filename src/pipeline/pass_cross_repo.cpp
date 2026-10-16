@@ -25,13 +25,15 @@
 #include <string.h>
 #include <time.h>
 
+#include <string>
+#include <vector>
+
 /* ── Constants ───────────────────────────────────────────────────── */
 
 enum {
     CR_PATH_BUF = 1024,
     CR_QN_BUF = 512,
     CR_PROPS_BUF = 2048,
-    CR_MAX_EDGES = 4096,
     CR_DB_EXT_LEN = 3, /* strlen(".db") */
     CR_INIT_CAP = 32,
     CR_COL_3 = 3,
@@ -295,6 +297,24 @@ static bool cr_path_matches_template(const char *concrete, const char *templ) {
     return *c == '\0' && *t == '\0';
 }
 
+/* Split a "__route__<METHOD>__<path>" QN into method and path. Returns false
+ * for any other QN shape. */
+static bool cr_split_route_qn(const char *qn, const char **method, size_t *mlen,
+                              const char **path) {
+    if (!qn || strncmp(qn, "__route__", CR_ROUTE_PREFIX_LEN) != 0) {
+        return false;
+    }
+    const char *rest = qn + CR_ROUTE_PREFIX_LEN;
+    const char *sep = strstr(rest, "__");
+    if (!sep) {
+        return false;
+    }
+    *method = rest;
+    *mlen = (size_t)(sep - rest);
+    *path = sep + PAIR_LEN;
+    return true;
+}
+
 /* Fallback for when the exact route-QN lookup misses: a concrete client path
  * ("/v2/orders/123") never exact-matches a templated route QN
  * ("__route__GET__/v2/orders/{}"). Enumerate the target store's Route nodes
@@ -302,9 +322,9 @@ static bool cr_path_matches_template(const char *concrete, const char *templ) {
  * the route QN into out_qn and return the handler id; returns 0 on no match.
  *
  * COST: this scans every Route node of the target project once per unmatched
- * HTTP_CALLS edge — O(calls × routes) per project pair. Acceptable while both
- * factors stay small (calls are capped at CR_MAX_EDGES and it only runs for
- * edges the exact lookup missed); revisit with a prepared template index if
+ * HTTP_CALLS edge — O(calls × routes) per project pair. It only runs for edges
+ * the exact lookup missed; no row count stops a scan (a cap used to decide
+ * which calls were matched at all); revisit with a prepared template index if
  * cross-repo matching ever shows up in profiles. (#523) */
 static int64_t find_route_handler_fuzzy(cbm_store_t *target_store, const char *concrete_path,
                                         const char *method, char *out_qn, size_t out_qn_sz,
@@ -322,17 +342,12 @@ static int64_t find_route_handler_fuzzy(cbm_store_t *target_store, const char *c
     int64_t found = 0;
     while (sqlite3_step(s) == SQLITE_ROW) {
         const char *qn = (const char *)sqlite3_column_text(s, 0);
-        if (!qn || strncmp(qn, "__route__", CR_ROUTE_PREFIX_LEN) != 0) {
+        const char *rest = NULL;
+        const char *rpath = NULL;
+        size_t mlen = 0;
+        if (!cr_split_route_qn(qn, &rest, &mlen, &rpath)) {
             continue;
         }
-        /* Split "__route__<METHOD>__<path>" */
-        const char *rest = qn + CR_ROUTE_PREFIX_LEN;
-        const char *sep = strstr(rest, "__");
-        if (!sep) {
-            continue;
-        }
-        size_t mlen = (size_t)(sep - rest);
-        const char *rpath = sep + PAIR_LEN;
         /* Method gate: the route's method must equal the caller's, or be ANY.
          * A missing caller method matches any route method. */
         if (method && method[0]) {
@@ -406,12 +421,77 @@ static void emit_cross_route_bidirectional(cbm_store_t *src_store, const char *s
     insert_cross_edge(tgt_store, tgt_project, handler_id, tgt_route_id, edge_type, rev);
 }
 
+/* The caller project's own handled routes: every Route node with a HANDLES
+ * edge, loaded once per match_http_routes call so the caller-local floor
+ * below costs one query per project pair instead of one Route scan per call.
+ * find_route_handler only ever answers for a Route with a HANDLES edge, so
+ * this set holds exactly the routes the target-side resolver could return. */
+struct cr_local_routes {
+    std::vector<int64_t> ids;
+    std::vector<std::string> qns;
+};
+
+static void cr_load_local_routes(struct sqlite3 *db, const char *project, cr_local_routes *out) {
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(db,
+                           "SELECT DISTINCT r.id, r.qualified_name FROM nodes r "
+                           "JOIN edges e ON e.target_id = r.id AND e.type = 'HANDLES' "
+                           "WHERE r.project = ?1 AND r.label = 'Route'",
+                           CBM_NOT_FOUND, &s, NULL) != SQLITE_OK) {
+        return;
+    }
+    sqlite3_bind_text(s, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        const char *qn = (const char *)sqlite3_column_text(s, SKIP_ONE);
+        out->ids.push_back(sqlite3_column_int64(s, 0));
+        out->qns.emplace_back(qn ? qn : "");
+    }
+    sqlite3_finalize(s);
+}
+
+/* Caller-local floor (upstream #1459): a call the caller's own project serves
+ * is an in-project call; another project exposing the same path is no
+ * evidence of a cross-service call. "Served" is a HANDLES edge on the Route
+ * node the HTTP_CALLS points at, or the same exact-method / ANY / template
+ * resolution the target lookup uses, applied to the caller's own routes: a
+ * method-less fetch() points at the ANY node while the local handler sits on
+ * the GET node. */
+static bool call_served_locally(const cr_local_routes *local, int64_t route_id, const char *method,
+                                const char *curl) {
+    for (int64_t id : local->ids) {
+        if (id == route_id) {
+            return true;
+        }
+    }
+    for (const std::string &qn : local->qns) {
+        const char *rmethod = NULL;
+        const char *rpath = NULL;
+        size_t mlen = 0;
+        if (!cr_split_route_qn(qn.c_str(), &rmethod, &mlen, &rpath)) {
+            continue;
+        }
+        if (method && method[0]) {
+            bool same_method = (strncmp(rmethod, method, mlen) == 0 && method[mlen] == '\0');
+            bool route_any = (mlen == CR_ANY_LEN && strncmp(rmethod, "ANY", CR_ANY_LEN) == 0);
+            if (!same_method && !route_any) {
+                continue;
+            }
+        }
+        if (strcmp(rpath, curl) == 0 || cr_path_matches_template(curl, rpath)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int match_http_routes(cbm_store_t *src_store, const char *src_project,
                              cbm_store_t *tgt_store, const char *tgt_project) {
     struct sqlite3 *src_db = cbm_store_get_db(src_store);
     if (!src_db) {
         return 0;
     }
+    cr_local_routes local;
+    cr_load_local_routes(src_db, src_project, &local);
 
     /* Find all HTTP_CALLS edges in source project */
     sqlite3_stmt *s = NULL;
@@ -424,7 +504,7 @@ static int match_http_routes(cbm_store_t *src_store, const char *src_project,
     sqlite3_bind_text(s, SKIP_ONE, src_project, CBM_NOT_FOUND, SQLITE_STATIC);
 
     int count = 0;
-    while (sqlite3_step(s) == SQLITE_ROW && count < CR_MAX_EDGES) {
+    while (sqlite3_step(s) == SQLITE_ROW) {
         int64_t caller_id = sqlite3_column_int64(s, 0);
         int64_t route_id = sqlite3_column_int64(s, SKIP_ONE);
         const char *props = (const char *)sqlite3_column_text(s, PAIR_LEN);
@@ -443,6 +523,9 @@ static int match_http_routes(cbm_store_t *src_store, const char *src_project,
         char route_qn[CR_QN_BUF];
         char cpath[CBM_SZ_256];
         const char *curl = cbm_route_canon_path(cr_url_path(url_path), cpath, sizeof(cpath));
+        if (call_served_locally(&local, route_id, method, curl)) {
+            continue;
+        }
         snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method[0] ? method : "ANY", curl);
 
         char handler_name[CBM_SZ_256] = {0};
@@ -497,7 +580,7 @@ static int match_async_routes(cbm_store_t *src_store, const char *src_project,
     sqlite3_bind_text(s, SKIP_ONE, src_project, CBM_NOT_FOUND, SQLITE_STATIC);
 
     int count = 0;
-    while (sqlite3_step(s) == SQLITE_ROW && count < CR_MAX_EDGES) {
+    while (sqlite3_step(s) == SQLITE_ROW) {
         int64_t caller_id = sqlite3_column_int64(s, 0);
         int64_t route_id = sqlite3_column_int64(s, SKIP_ONE);
         const char *props = (const char *)sqlite3_column_text(s, PAIR_LEN);
@@ -607,7 +690,7 @@ static int match_channels(cbm_store_t *src_store, const char *src_project, cbm_s
     sqlite3_bind_text(s, SKIP_ONE, src_project, CBM_NOT_FOUND, SQLITE_STATIC);
 
     int count = 0;
-    while (sqlite3_step(s) == SQLITE_ROW && count < CR_MAX_EDGES) {
+    while (sqlite3_step(s) == SQLITE_ROW) {
         const char *channel_name = (const char *)sqlite3_column_text(s, SKIP_ONE);
         const char *channel_qn = (const char *)sqlite3_column_text(s, PAIR_LEN);
         if (!channel_name || !channel_qn) {
@@ -676,7 +759,7 @@ static int match_typed_routes(cbm_store_t *src_store, const char *src_project,
     sqlite3_bind_text(s, SKIP_ONE, src_project, CBM_NOT_FOUND, SQLITE_STATIC);
 
     int count = 0;
-    while (sqlite3_step(s) == SQLITE_ROW && count < CR_MAX_EDGES) {
+    while (sqlite3_step(s) == SQLITE_ROW) {
         int64_t caller_id = sqlite3_column_int64(s, 0);
         int64_t route_id = sqlite3_column_int64(s, SKIP_ONE);
         const char *props = (const char *)sqlite3_column_text(s, PAIR_LEN);
@@ -757,6 +840,31 @@ static int collect_all_projects(char ***out) {
     return count;
 }
 
+/* True when `project` is a usable cross-repo input: its store exists, holds
+ * that exact project, and carries the schema the read-write open requires.
+ * The probe is read-only, so it never creates a ghost .db for a missing
+ * project and leaves a pre-#768 store untouched for its reindex. */
+static bool cr_project_usable(const char *project) {
+    char path[CR_PATH_BUF];
+    cr_db_path(project, path, sizeof(path));
+    cbm_store_t *store = cbm_store_open_path_query(path);
+    if (!store) {
+        return false;
+    }
+    cbm_project_t proj = {};
+    bool usable = cbm_store_get_project(store, project, &proj) == CBM_STORE_OK;
+    if (usable) {
+        cbm_project_free_fields(&proj);
+    }
+    if (usable && !cbm_store_edges_schema_current(store)) {
+        cbm_log_warn("cross_repo.project_unusable", "project", project, "reason",
+                     "pre_768_schema_reindex_required");
+        usable = false;
+    }
+    cbm_store_close(store);
+    return usable;
+}
+
 static void free_project_list(char **projects, int count) {
     for (int i = 0; i < count; i++) {
         free(projects[i]);
@@ -772,23 +880,23 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    /* Open source project store (read-write) */
-    char src_path[CR_PATH_BUF];
-    cr_db_path(project, src_path, sizeof(src_path));
-    cbm_store_t *src_store = cbm_store_open_path(src_path);
-    if (!src_store) {
+    if (!project || (target_count > 0 && !target_projects)) {
+        result.failed = true;
         return result;
     }
-
-    /* Clean existing CROSS_* edges for this project */
-    delete_cross_edges(src_store, project);
+    if (!cr_project_usable(project)) {
+        result.failed = true;
+        return result;
+    }
 
     /* Resolve target projects */
     char **resolved = NULL;
     int resolved_count = 0;
     bool own_list = false;
+    bool wildcard =
+        target_count == SKIP_ONE && target_projects[0] && strcmp(target_projects[0], "*") == 0;
 
-    if (target_count == SKIP_ONE && strcmp(target_projects[0], "*") == 0) {
+    if (wildcard) {
         resolved_count = collect_all_projects(&resolved);
         own_list = true;
     } else {
@@ -796,13 +904,57 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
         resolved_count = target_count;
     }
 
-    /* Match against each target */
+    /* Validate every target before any write. A named target that is missing,
+     * holds another project, or carries a pre-#768 schema fails the run here,
+     * before the source's existing CROSS_* edges are deleted (upstream #2133).
+     * A wildcard skips such a store instead: it is not a usable target, and
+     * one legacy index in the cache must not decide the whole run. */
+    std::vector<const char *> targets;
     for (int i = 0; i < resolved_count; i++) {
         const char *tgt = resolved[i];
+        if (!tgt) {
+            result.failed = true;
+            break;
+        }
         if (strcmp(tgt, project) == 0) {
             continue; /* skip self */
         }
+        if (!cr_project_usable(tgt)) {
+            if (wildcard) {
+                continue;
+            }
+            result.failed = true;
+            break;
+        }
+        targets.push_back(tgt);
+    }
+    /* Nothing but the source itself to match against (a self-only list, or
+     * ["*"] in a cache holding only the source). Reporting that as success
+     * with projects_scanned:0 is indistinguishable from "these services share
+     * no routes", and the source's CROSS_* edges would be wiped below with
+     * nothing to rebuild them. Fail before any write (upstream #1133). */
+    if (!result.failed && targets.empty()) {
+        result.failed = true;
+        result.no_targets = true;
+    }
 
+    /* Open source project store (read-write) */
+    char src_path[CR_PATH_BUF];
+    cr_db_path(project, src_path, sizeof(src_path));
+    cbm_store_t *src_store = result.failed ? NULL : cbm_store_open_path(src_path);
+    if (!src_store) {
+        result.failed = true;
+        if (own_list) {
+            free_project_list(resolved, resolved_count);
+        }
+        return result;
+    }
+
+    /* Clean existing CROSS_* edges for this project */
+    delete_cross_edges(src_store, project);
+
+    /* Match against each validated target */
+    for (const char *tgt : targets) {
         char tgt_path[CR_PATH_BUF];
         cr_db_path(tgt, tgt_path, sizeof(tgt_path));
 

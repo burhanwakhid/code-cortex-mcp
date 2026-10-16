@@ -221,6 +221,7 @@ extern void suite_store_bulk(void);
 extern void suite_store_pragmas(void);
 extern void suite_store_checkpoint(void);
 extern void suite_configlink(void);
+extern void suite_cross_repo(void);
 extern void suite_infrascan(void);
 extern void suite_cli(void);
 extern void suite_system_info(void);
@@ -388,6 +389,7 @@ int main(int argc, char **argv) {
 
     /* Config link */
     RUN_SUITE(configlink);
+    RUN_SUITE(cross_repo);
 
     /* Infrastructure scanning */
     RUN_SUITE(infrascan);
