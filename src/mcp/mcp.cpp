@@ -7380,24 +7380,7 @@ static bool wait_for_pipeline_lock(int timeout_ms) {
     return false;
 }
 
-static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
-    /* Supervisor gate: run the index in a crash/hang-isolating worker subprocess
-     * unless this process IS the worker or the kill switch (CBM_INDEX_SUPERVISOR=0)
-     * is set. A production supervisor failure returns an error; it never falls
-     * through to an unbounded in-process run. */
-    if (cbm_index_supervisor_should_wrap()) {
-        if (!wait_for_pipeline_lock(MCP_INDEX_LOCK_WAIT_MS)) {
-            return cbm_mcp_text_result(
-                "{\"status\":\"error\",\"error\":\"indexing is already active after waiting "
-                "5 seconds\",\"hint\":\"Call index_status for the target project, then retry "
-                "index_repository.\"}",
-                true);
-        }
-        char *supervised = index_run_supervised(srv, args);
-        cbm_pipeline_unlock();
-        return supervised;
-    }
-
+static char *index_repository_in_process(cbm_mcp_server_t *srv, const char *args) {
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *name_override = cbm_mcp_get_string_arg(args, "name");
@@ -7580,6 +7563,35 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     free(repo_path);
 
     return mcp_text_result_take_owned(json, rc != 0);
+}
+
+static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
+    /* Cross-repo matching extracts nothing: it reads and writes existing
+     * project DBs. Run it in-process (under the pipeline lock), ahead of the
+     * supervisor, so its own error result (zero targets, a missing target)
+     * reaches the caller instead of a generic "worker exited nonzero". */
+    char *mode_peek = cbm_mcp_get_string_arg(args, "mode");
+    bool cross_repo = mode_peek && strcmp(mode_peek, "cross-repo-intelligence") == 0;
+    free(mode_peek);
+
+    /* Supervisor gate: run the index in a crash/hang-isolating worker subprocess
+     * unless this process IS the worker or the kill switch (CBM_INDEX_SUPERVISOR=0)
+     * is set. A production supervisor failure returns an error; it never falls
+     * through to an unbounded in-process run. */
+    if (cbm_index_supervisor_should_wrap()) {
+        if (!wait_for_pipeline_lock(MCP_INDEX_LOCK_WAIT_MS)) {
+            return cbm_mcp_text_result(
+                "{\"status\":\"error\",\"error\":\"indexing is already active after waiting "
+                "5 seconds\",\"hint\":\"Call index_status for the target project, then retry "
+                "index_repository.\"}",
+                true);
+        }
+        char *result =
+            cross_repo ? index_repository_in_process(srv, args) : index_run_supervised(srv, args);
+        cbm_pipeline_unlock();
+        return result;
+    }
+    return index_repository_in_process(srv, args);
 }
 
 /* ── get_code_snippet ─────────────────────────────────────────── */
