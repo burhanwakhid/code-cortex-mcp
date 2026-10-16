@@ -914,13 +914,32 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         }
     }
 
+    const int local_count = dst_calls->count;
     for (int j = 0; j < src_out->count; j++) {
         const CBMResolvedCall *src = &src_out->items[j];
         if (!src->caller_qn || !src->callee_qn)
             continue;
         char *k = cbm_arena_sprintf(&keys, "%s\x1f%s", src->caller_qn, src->callee_qn);
-        if (k && cbm_ht_has(seen, k))
+        if (k && cbm_ht_has(seen, k)) {
+            /* #1186: PHP vendor evidence exists only in the cross-file pass.
+             * The per-file pass saw the same call as a below-floor
+             * `*_unindexed` row (or a typed row on a seeded vendor class), so
+             * the first-wins dedup would drop the proof. Rewrite the local
+             * records in place instead; one record per local occurrence. */
+            if (src->strategy && strcmp(src->strategy, "php_external_receiver") == 0) {
+                for (int i = 0; i < local_count; i++) {
+                    CBMResolvedCall *rc = &dst_calls->items[i];
+                    if (rc->caller_qn && rc->callee_qn &&
+                        strcmp(rc->caller_qn, src->caller_qn) == 0 &&
+                        strcmp(rc->callee_qn, src->callee_qn) == 0) {
+                        rc->strategy = cbm_arena_strdup(dst_arena, src->strategy);
+                        rc->confidence = src->confidence;
+                        rc->reason = NULL;
+                    }
+                }
+            }
             continue;
+        }
         if (k) {
             cbm_ht_set(seen, k, (void *)(uintptr_t)1);
         }
@@ -1028,8 +1047,10 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
                              imp_qns, imp_count, tree, &out);
         break;
     case CBM_LANG_PHP:
-        cbm_run_php_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
-                              imp_qns, imp_count, tree, &out);
+        /* #1186: the IMPORTS writer recorded the file's vendor `use` targets. */
+        cbm_run_php_lsp_cross_ex(&scratch, source, source_len, module_qn, defs, def_count,
+                                 imp_names, imp_qns, imp_count, tree, &out, r->php_vendor_qns,
+                                 r->php_vendor_count);
         break;
     case CBM_LANG_JAVA:
         cbm_run_java_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,

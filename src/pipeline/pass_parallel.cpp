@@ -1493,6 +1493,9 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
 
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
+        /* #1186 vendor evidence for the resolve workers. MUST match
+         * pass_definitions.cpp. */
+        cbm_pipeline_php_classify_imports(ctx, result, rel, namespace_map);
         create_channel_edges(ctx, result, rel);
         create_env_configures(ctx, result, rel);
     }
@@ -2560,7 +2563,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * pass_calls.cpp; the service fallbacks below still see the call. */
         bool rust_external = lsp && cbm_pipeline_rust_external_target(
                                         lang, lsp->strategy, lsp->callee_qn, rc->project_name);
-        if ((!res.qualified_name || !res.qualified_name[0]) && !rust_external) {
+        /* #1186: a PHP call on a vendor type takes the LSP result or no
+         * target. Mirrors pass_calls.cpp. */
+        bool php_vendor_call = lang == CBM_LANG_PHP &&
+                               (cbm_pipeline_php_vendor_call(result, call) ||
+                                (lsp && !lsp_target && cbm_pipeline_lsp_external_receiver(lsp)));
+        if ((!res.qualified_name || !res.qualified_name[0]) && !rust_external && !php_vendor_call) {
             res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
                                        imp_vals, imp_count);
         }
@@ -2607,14 +2615,19 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * is dropped. Detect it on the callee_name FIRST so the HTTP_CALLS/
          * ASYNC_CALLS edge is emitted regardless (target is a synthesized route
          * node, not the unindexed library). Mirrors pass_calls.c. (#523) */
-        cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
+        /* A PHP call on a proven vendor class is classified by that class
+         * (#1186): it skipped the registry above, so the route-verb fallback
+         * would otherwise mint a route registration for
+         * `GuzzleClient::get('/x')`. MUST match pass_calls.cpp. */
+        cbm_svc_kind_t csvc;
+        const char *svc_name = cbm_pipeline_service_name(call, lsp_target ? NULL : lsp, &csvc);
         if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
             const char *cu = call->first_string_arg;
             bool chas_url = cu && cu[0] != '\0' &&
                             (cu[0] == '/' || strstr(cu, "://") != NULL ||
                              (csvc == CBM_SVC_ASYNC && strlen(cu) > PP_ESC_SPACE));
             if (chas_url) {
-                cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
+                cbm_resolution_t svc_res = {.qualified_name = svc_name,
                                             .strategy = "service_pattern",
                                             .confidence = PP_HALF_CONF};
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &svc_res,
@@ -2633,10 +2646,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                  * HashMap) reaches this branch only because its registry
                  * fallback was skipped. Without a route path the plain-CALLS
                  * fall-through would bind source -> source, a fabricated
-                 * self-call, so it keeps only the route/service edges. */
+                 * self-call, so it keeps only the route/service edges. A PHP
+                 * vendor call (`$r->get('id')` on a vendor Request, #1186)
+                 * skipped its registry fallback the same way. */
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count, rust_external);
+                                  imp_count, rust_external || php_vendor_call);
             } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
                 /* Native `fetch()` (#856): only the global API once resolution
                  * has failed to find a local/imported `fetch`. Call the low-level
@@ -2740,6 +2755,11 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
          * the default variant, whose central relation veto keeps same-named
          * code identifiers out of the lineage layer.
          * MUST mirror the sequential twin in pass_usages.cpp exactly. */
+        /* #1186: a PHP name imported from a vendor namespace is not the
+         * same-named project symbol. Mirrors pass_usages.cpp. */
+        if (lang == CBM_LANG_PHP && cbm_pipeline_php_vendor_ref(result, usage->ref_name)) {
+            continue;
+        }
         cbm_resolution_t res =
             (lang == CBM_LANG_SQL)
                 ? cbm_registry_resolve_lineage(rc->registry, usage->ref_name, module_qn, imp_keys,
@@ -2841,12 +2861,19 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
 
 /* Resolve base_classes → INHERITS edges for one definition. */
 static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
-                                 const CBMDefinition *def, const cbm_gbuf_node_t *node,
-                                 const char *mq, const char **ik, const char **iv, int ic) {
+                                 const CBMFileResult *result, const CBMDefinition *def,
+                                 const cbm_gbuf_node_t *node, const char *mq, const char **ik,
+                                 const char **iv, int ic) {
     if (!def->base_classes) {
         return;
     }
     for (int b = 0; def->base_classes[b]; b++) {
+        /* #1186: `extends Request` with `use Saloon\Http\Request` names the
+         * vendor class, never a same-named project class. Mirrors
+         * pass_semantic.cpp. */
+        if (cbm_pipeline_php_vendor_ref(result, def->base_classes[b])) {
+            continue;
+        }
         const char *bqn = resolve_as_class(rc->registry, def->base_classes[b], mq, ik, iv, ic);
         if (!bqn) {
             continue;
@@ -2939,7 +2966,7 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!node) {
             continue;
         }
-        resolve_def_inherits(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_def_inherits(rc, ws, result, def, node, module_qn, imp_keys, imp_vals, imp_count);
         resolve_def_decorators(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count);
     }
     for (int t = 0; t < result->impl_traits.count; t++) {
@@ -3091,6 +3118,11 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
             // collect_all_defs can infer a JVM namespace in the retained summary.
             // Preserve that update when resolving the original stored record.
             stored_result.get()->namespace_name = result->namespace_name;
+            // The registry phase records PHP vendor evidence (#1186) on the
+            // retained summary; its arena outlives the resolve.
+            stored_result.get()->php_vendor_names = result->php_vendor_names;
+            stored_result.get()->php_vendor_qns = result->php_vendor_qns;
+            stored_result.get()->php_vendor_count = result->php_vendor_count;
             result = stored_result.get();
         }
         atomic_fetch_add_explicit(&rc->total_files_visited, 1, memory_order_relaxed);

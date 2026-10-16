@@ -248,10 +248,19 @@ template <class A> void fields(A &a, CBMFileResult &v) {
     auto &[arena, defs, overloads, overload_count, calls, deferred_cpp_operator_count,
            pending_cpp_operator_count, cpp_operator_tracker, imports, usages, throws, rw, type_refs,
            env_accesses, type_assigns, impl_traits, resolved_calls, string_refs, infra_bindings,
-           channels, module_qn, namespace_name, exports, constants, global_vars, macros, has_error,
-           error_msg, parse_incomplete, parse_unusable, error_ranges, error_region_count,
-           is_test_file, imports_count, cached_tree, lsp_skipped, walk_truncated, lsp_skip_reason,
-           tree_nodes, walk_nodes_visited, cached_lang, source, source_len] = v;
+           channels, module_qn, namespace_name, php_vendor_names, php_vendor_qns, php_vendor_count,
+           exports, constants, global_vars, macros, has_error, error_msg, parse_incomplete,
+           parse_unusable, error_ranges, error_region_count, is_test_file, imports_count,
+           cached_tree, lsp_skipped, walk_truncated, lsp_skip_reason, tree_nodes,
+           walk_nodes_visited, cached_lang, source, source_len] = v;
+    /* PHP vendor evidence (#1186) is recorded after extraction, on the retained
+     * summary, and copied onto the loaded record by the resolve worker: never
+     * part of the snapshot. */
+    if constexpr (std::is_same_v<A, Reader>) {
+        php_vendor_names = nullptr;
+        php_vendor_qns = nullptr;
+        php_vendor_count = 0;
+    }
     a(deferred_cpp_operator_count, pending_cpp_operator_count, module_qn, namespace_name, exports,
       constants, global_vars, macros, has_error, error_msg, parse_incomplete, parse_unusable,
       error_ranges, error_region_count, is_test_file, imports_count, lsp_skipped, walk_truncated,

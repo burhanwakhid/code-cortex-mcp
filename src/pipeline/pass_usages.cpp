@@ -229,6 +229,12 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             continue;
         }
 
+        /* #1186: a PHP name imported from a vendor namespace is not the
+         * same-named project symbol. Mirrors pass_parallel.cpp. */
+        if (lang == CBM_LANG_PHP && cbm_pipeline_php_vendor_ref(result, usage->ref_name)) {
+            continue;
+        }
+
         /* SQL usages are FROM/JOIN LINEAGE refs and may bind Table/View targets
          * (cbm_registry_resolve_lineage); every other language resolves through
          * the default variant, whose central relation veto keeps same-named

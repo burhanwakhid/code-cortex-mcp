@@ -134,6 +134,13 @@ typedef struct {
      * use-after-free first observable on the real-repo corpus tier. */
     char **seq_cross_def_modules;
     int seq_cross_def_module_count;
+
+    /* True when the namespace map is built from a SUBSET of the project's
+     * files (incremental runs index only the changed files). Such a map
+     * cannot prove that a PHP namespace is undeclared, so PHP `use` imports
+     * keep the generic (PHP-only) strategies and no vendor evidence is
+     * recorded (#1186). */
+    bool namespace_map_partial;
 } cbm_pipeline_ctx_t;
 
 static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,
@@ -191,6 +198,18 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
  * when it is unique — so an ambiguous name never mis-attributes the method. */
 const cbm_gbuf_node_t *cbm_pipeline_resolve_method_parent(const cbm_gbuf_t *gb,
                                                           const char *parent_qn);
+
+/* PHP vendor evidence (#1186). On a run whose namespace map covers every
+ * project file, cbm_pipeline_php_classify_imports records on `result` the
+ * `use` imports whose namespace no project file declares — names outside the
+ * project (Illuminate\, Spatie\, ...). Both IMPORTS writers call it; the
+ * resolve passes then keep such names out of every name-only fallback. The
+ * arrays live in result->arena; NULL means no evidence. */
+void cbm_pipeline_php_classify_imports(const cbm_pipeline_ctx_t *ctx, CBMFileResult *result,
+                                       const char *rel, CBMHashTable *namespace_map);
+bool cbm_pipeline_php_vendor_name(const CBMFileResult *result, const char *name);
+bool cbm_pipeline_php_vendor_call(const CBMFileResult *result, const CBMCall *call);
+bool cbm_pipeline_php_vendor_ref(const CBMFileResult *result, const char *name);
 
 /* Build a namespace → File-node-QN map from a set of extraction results.
  * Each result that declared a namespace/package contributes one entry keyed by

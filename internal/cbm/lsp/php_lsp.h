@@ -38,6 +38,13 @@ typedef struct {
     int use_count;
     int use_cap;
 
+    /* Cross-file mode: dotted targets of the file's `use` declarations that
+     * the pipeline proved to lie outside the project (vendor / undeclared
+     * namespaces, #1186). A type named through one never matches a project
+     * type by short name. Borrowed; NULL / 0 outside the pipeline. */
+    const char **external_use_qns;
+    int external_use_count;
+
     /* Current function/method/class context. */
     const char *enclosing_func_qn;
     const char *enclosing_class_qn;  /* NULL outside class body */
@@ -115,6 +122,15 @@ void cbm_run_php_lsp_cross(CBMArena *arena, const char *source, int source_len,
                            const char **import_names, const char **import_qns, int import_count,
                            TSTree *cached_tree, /* NULL = parse internally */
                            CBMResolvedCallArray *out);
+
+/* Cross-file resolve with the pipeline's vendor evidence (#1186):
+ * `external_qns` are the dotted targets of the file's `use` imports that no
+ * project file declares. Calls on such a type carry php_external_receiver. */
+void cbm_run_php_lsp_cross_ex(CBMArena *arena, const char *source, int source_len,
+                              const char *module_qn, CBMLSPDef *defs, int def_count,
+                              const char **import_names, const char **import_qns, int import_count,
+                              TSTree *cached_tree, CBMResolvedCallArray *out,
+                              const char **external_qns, int external_count);
 
 /* --- Batch cross-file LSP --- */
 

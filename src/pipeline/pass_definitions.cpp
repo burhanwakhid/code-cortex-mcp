@@ -734,6 +734,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             }
             total_imports +=
                 create_import_edges_for_file(ctx, result, files[i].rel_path, namespace_map);
+            /* #1186 vendor evidence for the resolve passes. MUST match
+             * cbm_build_registry_from_cache (pass_parallel.cpp). */
+            cbm_pipeline_php_classify_imports(ctx, result, files[i].rel_path, namespace_map);
             create_channel_edges_for_file(ctx, result, files[i].rel_path);
             create_env_configures_for_file(ctx, result, files[i].rel_path);
         }

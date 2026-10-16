@@ -254,10 +254,26 @@ const char *php_resolve_class_name(PHPLSPContext *ctx, const char *name) {
  * Step 4 is critical for PHP because the unified extractor builds QNs from
  * file paths but `use App\\Models\\User` produces an "App.Models.User" key.
  * Without short-name fallback, every cross-file class resolution would miss. */
+/* True when `qn` is, or lies under, the target of a `use` the pipeline proved
+ * to be outside the project (cross-file mode only, #1186). */
+static bool php_external_qn(const PHPLSPContext *ctx, const char *qn) {
+    for (int i = 0; qn && i < ctx->external_use_count; i++) {
+        const char *ext = ctx->external_use_qns[i];
+        if (!ext) continue;
+        size_t n = strlen(ext);
+        if (strncmp(qn, ext, n) == 0 && (qn[n] == '\0' || qn[n] == '.')) return true;
+    }
+    return false;
+}
+
 static const CBMRegisteredType *lookup_type_with_project(PHPLSPContext *ctx, const char *qn) {
     if (!qn) return NULL;
     const CBMRegisteredType *t = cbm_registry_lookup_type(ctx->registry, qn);
     if (t) return t;
+    /* A QN named through a vendor `use` stops after the exact lookup:
+     * `Illuminate.Http.Request` is not the project's App.Http.Requests.Request
+     * (#1186). */
+    if (php_external_qn(ctx, qn)) return NULL;
 
     if (ctx->module_qn && ctx->module_qn[0]) {
         const char *combo = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, qn);
@@ -1156,6 +1172,31 @@ static void emit_resolved(PHPLSPContext *ctx, const char *callee_qn, const char 
     emit_resolved_reason(ctx, callee_qn, strategy, confidence, NULL);
 }
 
+/* The method of a class the index does not hold. When the class came from a
+ * vendor `use` (cross-file mode), the row is emitted above the pipeline's
+ * confidence floor as php_external_receiver: the receiver is PROVEN to be a
+ * type outside the project, so no name-only fallback may bind the call to a
+ * same-named project method (#1186). Otherwise the existing low-confidence
+ * `unindexed_strategy` row. */
+static void emit_external_or_unindexed(PHPLSPContext *ctx, const char *class_qn,
+                                       const char *method_name, const char *unindexed_strategy) {
+    const char *target = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name);
+    if (php_external_qn(ctx, class_qn)) {
+        emit_resolved(ctx, target, "php_external_receiver", 0.95f);
+        return;
+    }
+    emit_resolved(ctx, target, unindexed_strategy, 0.55f);
+}
+
+/* A method the registry DOES hold on a class reached through a vendor `use`
+ * (a seeded library type such as GuzzleHttp.Client) is just as far outside
+ * the project: the graph has no node for it either, so its row carries the
+ * same php_external_receiver proof (#1186). */
+static const char *php_receiver_strategy(const PHPLSPContext *ctx, const char *class_qn,
+                                         const char *strategy) {
+    return php_external_qn(ctx, class_qn) ? "php_external_receiver" : strategy;
+}
+
 static void emit_unresolved(PHPLSPContext *ctx, const char *expr_text, const char *reason) {
     if (!ctx->resolved_calls || !ctx->enclosing_func_qn) return;
     CBMResolvedCall rc = {};
@@ -1405,7 +1446,8 @@ static void resolve_member_call(PHPLSPContext *ctx, TSNode call) {
         const char *strategy = (f->receiver_type && strcmp(f->receiver_type, class_qn) == 0)
                                    ? "php_method_typed"
                                    : "php_method_inherited";
-        emit_resolved(ctx, f->qualified_name, strategy, 0.95f);
+        emit_resolved(ctx, f->qualified_name, php_receiver_strategy(ctx, class_qn, strategy),
+                      0.95f);
         return;
     }
     /* Receiver known but method missing — magic __call? The call dispatches to
@@ -1423,9 +1465,7 @@ static void resolve_member_call(PHPLSPContext *ctx, TSNode call) {
      * at "<class_qn>.<method>" so the pipeline bridge can BLOCK the unified
      * extractor's likely-incorrect short-name fallback. The bridge filters
      * unknown targets and yields no edge — better than a wrong edge. */
-    emit_resolved(ctx,
-                  cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name),
-                  "php_method_typed_unindexed", 0.55f);
+    emit_external_or_unindexed(ctx, class_qn, method_name, "php_method_typed_unindexed");
 }
 
 static void resolve_static_call(PHPLSPContext *ctx, TSNode call) {
@@ -1448,6 +1488,7 @@ static void resolve_static_call(PHPLSPContext *ctx, TSNode call) {
                 strategy = "php_self_static";
             } else {
                 class_qn = php_resolve_class_name(ctx, cls);
+                strategy = php_receiver_strategy(ctx, class_qn, strategy);
             }
         }
     }
@@ -1468,9 +1509,7 @@ static void resolve_static_call(PHPLSPContext *ctx, TSNode call) {
     /* Class resolved (e.g., from a `use` clause), method unknown — emit
      * synthetic resolved call so the pipeline bridge can suppress the
      * unified extractor's name-fallback misroute. */
-    emit_resolved(ctx,
-                  cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name),
-                  "php_static_unindexed", 0.55f);
+    emit_external_or_unindexed(ctx, class_qn, method_name, "php_static_unindexed");
 }
 
 /* ── type narrowing ─────────────────────────────────────────────────
@@ -3915,6 +3954,15 @@ void cbm_run_php_lsp_cross(
     const char **import_names, const char **import_qns, int import_count,
     TSTree *cached_tree,
     CBMResolvedCallArray *out) {
+    cbm_run_php_lsp_cross_ex(arena, source, source_len, module_qn, defs, def_count, import_names,
+                             import_qns, import_count, cached_tree, out, NULL, 0);
+}
+
+void cbm_run_php_lsp_cross_ex(CBMArena *arena, const char *source, int source_len,
+                              const char *module_qn, CBMLSPDef *defs, int def_count,
+                              const char **import_names, const char **import_qns,
+                              int import_count, TSTree *cached_tree, CBMResolvedCallArray *out,
+                              const char **external_qns, int external_count) {
     if (!arena || !source || source_len <= 0 || !out) return;
 
     TSParser *parser = NULL;
@@ -3949,6 +3997,10 @@ void cbm_run_php_lsp_cross(
 
     PHPLSPContext ctx;
     php_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, out);
+    if (external_qns && external_count > 0) {
+        ctx.external_use_qns = external_qns;
+        ctx.external_use_count = external_count;
+    }
 
     /* Caller-supplied imports register first. process_file's own AST walk
      * adds file-internal `use` declarations on top of these. */

@@ -498,10 +498,17 @@ typedef struct {
 
     const char *module_qn;      // module qualified name
     const char *namespace_name; // declared namespace/package (Java/Kotlin/C#/PHP), NULL if none
-    const char **exports;       // NULL-terminated (NULL if none)
-    const char **constants;     // NULL-terminated (NULL if none)
-    const char **global_vars;   // NULL-terminated (NULL if none)
-    const char **macros;        // NULL-terminated, C/C++ only (NULL if none)
+    // PHP (#1186): `use` imports proven to name a symbol OUTSIDE the project
+    // (no project file declares the namespace). Local names and their dotted
+    // QNs, parallel NULL-terminated arrays in `arena`; set by the pipeline's
+    // IMPORTS writer on a full run. NULL / 0 = no evidence.
+    const char **php_vendor_names;
+    const char **php_vendor_qns;
+    int php_vendor_count;
+    const char **exports;     // NULL-terminated (NULL if none)
+    const char **constants;   // NULL-terminated (NULL if none)
+    const char **global_vars; // NULL-terminated (NULL if none)
+    const char **macros;      // NULL-terminated, C/C++ only (NULL if none)
 
     bool has_error;
     const char *error_msg;

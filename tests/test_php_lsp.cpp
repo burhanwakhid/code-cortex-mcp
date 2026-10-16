@@ -297,6 +297,108 @@ TEST(phplsp_unindexed_receiver_emits_block) {
     PASS();
 }
 
+/* Grouped `use A\B\{C as D}` (upstream d74579c9): the alias names the class
+ * under the group prefix, so the unindexed-receiver row carries the full
+ * vendor QN, not the bare clause name. */
+TEST(phplsp_grouped_use_alias_keeps_group_prefix) {
+    const char *src =
+        "<?php\n"
+        "namespace App;\n"
+        "use Vendor\\Pkg\\{Foo as Bar};\n"
+        "class C {\n"
+        "    public function run(Bar $x): void { $x->value(); }\n"
+        "}\n";
+    CBMFileResult *r = extract_php(src);
+    ASSERT(r);
+    const CBMResolvedCall *rc = find_resolved_with_strategy(r, "C.run", "Vendor.Pkg.Foo.value",
+                                                            "php_method_typed_unindexed");
+    if (!rc) {
+        for (int i = 0; i < r->resolved_calls.count; i++) {
+            const CBMResolvedCall *rcd = &r->resolved_calls.items[i];
+            printf("    %s -> %s [%s %.2f]\n", rcd->caller_qn ? rcd->caller_qn : "(null)",
+                   rcd->callee_qn ? rcd->callee_qn : "(null)",
+                   rcd->strategy ? rcd->strategy : "(null)", rcd->confidence);
+        }
+    }
+    ASSERT(rc != NULL);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1186 (upstream e8939e78 / 8815b5db): a receiver typed through a `use` the
+ * pipeline proved external must not bind a same-named PROJECT class by short
+ * name; its call carries php_external_receiver instead. Without the evidence
+ * the historical short-name fallback still applies. */
+static const CBMResolvedCall *php_cross_row(const CBMResolvedCallArray *out, const char *callee,
+                                            const char *strategy) {
+    for (int i = 0; i < out->count; i++) {
+        const CBMResolvedCall *rc = &out->items[i];
+        if (rc->callee_qn && strcmp(rc->callee_qn, callee) == 0 && rc->strategy &&
+            strcmp(rc->strategy, strategy) == 0)
+            return rc;
+    }
+    return NULL;
+}
+
+TEST(phplsp_vendor_receiver_never_binds_project_class_issue1186) {
+    const char *src = "<?php\n"
+                      "namespace App\\Http\\Integrations;\n"
+                      "use Saloon\\Http\\Request;\n"
+                      "class Foo {\n"
+                      "    public function run(Request $r) { $r->validated(); }\n"
+                      "}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.app.Http.Requests.Request.Request",
+         .short_name = "Request",
+         .label = "Class",
+         .def_module_qn = "test.app.Http.Requests.Request",
+         .method_names_str = "validated",
+         .lang = CBM_LANG_PHP},
+        {.qualified_name = "test.app.Http.Requests.Request.Request.validated",
+         .short_name = "validated",
+         .label = "Method",
+         .receiver_type = "test.app.Http.Requests.Request.Request",
+         .def_module_qn = "test.app.Http.Requests.Request",
+         .lang = CBM_LANG_PHP},
+    };
+    const char *project_target = "test.app.Http.Requests.Request.Request.validated";
+
+    /* Control: no vendor evidence -> the short-name fallback binds the project class. */
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_php_lsp_cross(&arena, src, (int)strlen(src), "test.app.Http.Integrations.Foo", defs, 2,
+                          NULL, NULL, 0, NULL, &out);
+    bool control_bound = false;
+    for (int i = 0; i < out.count; i++) {
+        if (out.items[i].callee_qn && strcmp(out.items[i].callee_qn, project_target) == 0 &&
+            out.items[i].confidence >= 0.9f)
+            control_bound = true;
+    }
+    cbm_arena_destroy(&arena);
+
+    /* With the evidence: the vendor class stays a vendor class. */
+    const char *external[] = {"Saloon.Http.Request"};
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out2 = {0};
+    cbm_run_php_lsp_cross_ex(&arena, src, (int)strlen(src), "test.app.Http.Integrations.Foo", defs,
+                             2, NULL, NULL, 0, NULL, &out2, external, 1);
+    bool project_bound = false;
+    for (int i = 0; i < out2.count; i++) {
+        if (out2.items[i].callee_qn && strcmp(out2.items[i].callee_qn, project_target) == 0)
+            project_bound = true;
+    }
+    const CBMResolvedCall *ext =
+        php_cross_row(&out2, "Saloon.Http.Request.validated", "php_external_receiver");
+    bool ext_ok = ext && ext->confidence >= 0.9f;
+    cbm_arena_destroy(&arena);
+
+    ASSERT_TRUE(control_bound);
+    ASSERT_FALSE(project_bound);
+    ASSERT_TRUE(ext_ok);
+    PASS();
+}
+
 /* ── 12. Specific regression from PHP_LSP_PRE_FLIGHT §4.2 ──────── */
 
 TEST(phplsp_regression_prompt_value_not_routed_to_helper) {
@@ -5147,6 +5249,8 @@ SUITE(php_lsp) {
     RUN_TEST(phplsp_this_method);
     RUN_TEST(phplsp_method_inherited_via_parent);
     RUN_TEST(phplsp_unindexed_receiver_emits_block);
+    RUN_TEST(phplsp_grouped_use_alias_keeps_group_prefix);
+    RUN_TEST(phplsp_vendor_receiver_never_binds_project_class_issue1186);
     RUN_TEST(phplsp_regression_prompt_value_not_routed_to_helper);
     RUN_TEST(phplsp_method_chain_return_type);
     RUN_TEST(phplsp_function_global_fallback);

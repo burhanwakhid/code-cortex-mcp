@@ -540,7 +540,7 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
 }
 
 /* Resolve one call and emit the appropriate edge. Returns 1 if resolved, 0 if not. */
-static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
+static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBMFileResult *result,
                                const CBMResolvedCallArray *lsp_calls, const char *rel,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
                                int imp_count, CBMLanguage lang) {
@@ -581,14 +581,19 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * service checks below miss it and the call is dropped. Detect it on the
      * callee_name FIRST so the HTTP_CALLS/ASYNC_CALLS edge is emitted regardless
      * (target is a synthesized route node, not the unindexed library). (#523) */
-    cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
+    /* A PHP call on a proven vendor class is classified by that class
+     * (#1186): it skips the registry below, so the route-verb fallback would
+     * otherwise mint a route registration for `GuzzleClient::get('/x')`. An
+     * LSP row with a graph target returned above. MUST match pass_parallel.cpp. */
+    cbm_svc_kind_t csvc;
+    const char *svc_name = cbm_pipeline_service_name(call, lsp, &csvc);
     if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
         const char *cu = call->first_string_arg;
         bool chas_url = cu && cu[0] != '\0' &&
                         (cu[0] == '/' || strstr(cu, "://") != NULL ||
                          (csvc == CBM_SVC_ASYNC && strlen(cu) > PAIR_LEN));
         if (chas_url) {
-            cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
+            cbm_resolution_t svc_res = {.qualified_name = svc_name,
                                         .strategy = "service_pattern",
                                         .confidence = PC_SVC_PATTERN_CONF,
                                         .candidate_count = 0};
@@ -604,8 +609,15 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * classify the call. MUST match pass_parallel.cpp. */
     bool rust_external = lsp && cbm_pipeline_rust_external_target(
                                     lang, lsp->strategy, lsp->callee_qn, ctx->project_name);
+    /* #1186: a PHP call on a vendor type (`new Request`, `Request::make`, or a
+     * receiver the LSP typed as an imported vendor class) takes the LSP result
+     * or no target: a same-named project symbol found by name alone is never
+     * the vendor's. Service classification below still runs. Mirrors
+     * pass_parallel.cpp. */
+    bool php_vendor_call = lang == CBM_LANG_PHP && (cbm_pipeline_php_vendor_call(result, call) ||
+                                                    cbm_pipeline_lsp_external_receiver(lsp));
     cbm_resolution_t res = {0};
-    if (!rust_external) {
+    if (!rust_external && !php_vendor_call) {
         res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn, imp_keys, imp_vals,
                                    imp_count);
     }
@@ -803,8 +815,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
                 continue;
             }
             total_calls++;
-            if (resolve_single_call(ctx, call, &result->resolved_calls, rel, module_qn, imp_keys,
-                                    imp_vals, imp_count, files[i].language)) {
+            if (resolve_single_call(ctx, call, result, &result->resolved_calls, rel, module_qn,
+                                    imp_keys, imp_vals, imp_count, files[i].language)) {
                 resolved++;
             } else {
                 unresolved++;

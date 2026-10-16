@@ -900,6 +900,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .cc_index = cc_index,
         .excluded_dirs = excluded_dirs,
         .excluded_count = excluded_count,
+        .namespace_map_partial = true, /* maps are built from changed files only */
     };
 
     for (int i = 0; i < ci; i++) {
