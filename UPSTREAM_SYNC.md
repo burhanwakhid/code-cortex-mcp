@@ -32,6 +32,28 @@ sync with upstream **[`DeusData/codebase-memory-mcp`](https://github.com/DeusDat
 > filesystem (immutable reopen); upstream has the same code. (3) Class-vs-Class
 > registry ties are now decided by QN order (upstream dropped the nesting
 > rule): rocksdb `KVIter : Iterator` binds `WriteThread.WriteGroup.Iterator`.
+> A "top-level type beats a nested one" tie rule fixed it but was reverted
+> (`f2025b93`): the registry has no per-candidate language, so another
+> language's top-level type beat the right nested one (rocksdb −56 USAGE).
+> (4) `list_projects` `total`/`has_more` count ghost or corrupt `.db` files
+> the page then skips (predates this sync; fixing it means opening every DB).
+> (5) `cli <optional-only tool>` waits 200 ms for piped stdin before running
+> with `{}` (fork adaptation of upstream 7ef75e52, which never reads it).
+>
+> **Post-sync Codex review (2026-10-17, 9 rounds, `codexmon review --base
+> main`).** Real defects fixed, each with a regression test: cross-repo
+> self-call floor swallowed calls to other hosts (`e225e431`; loopback
+> handling for `[::1]`, all of 127/8 and any `::1` spelling in `24d6979c`,
+> `1705c332`, `7311decd`); in-process `search_code` could throw
+> `std::bad_alloc` out of the handler, overshoot its file cap, hold whole
+> matched lines, or prefilter away UTF-8 quantifier matches (`5b996cf2`,
+> `24d6979c`, `1705c332`, `7311decd`, `e59116ab`, `851c1917`; cap now 64 MiB
+> per file, records cut at the reader's 2 KiB); seam-only tests broke the
+> default (seams-off) build (`1fb4dafa`); global gitignore matched relative to
+> a git-less subfolder instead of the enclosing repo root (`5c096cbf`); the
+> uninstall test blocked on a terminal stdin (`fd6b0f6d`); the constructor
+> tie rule also demoted C functions named after their file, and upstream's C#
+> `.ref.` stub rule hit any folder named `ref` (`e771715c`).
 >
 > **Range `59a05eb1..64c23fab` was taken as a CURATED pass on 2026-09-26**:
 > 131 commits (52 merges, 79 real). **16 upstream commits ported as 14
