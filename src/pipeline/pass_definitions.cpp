@@ -361,9 +361,15 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     }
     char props[CBM_SZ_2K];
     build_def_props(props, sizeof(props), def);
-    int64_t node_id = cbm_gbuf_upsert_node(
-        ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
-        def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
+    const char *def_rel = def->file_path ? def->file_path : rel;
+    char marked[CBM_SZ_4K];
+    const char *qn = def->label && strcmp(def->label, "Module") == 0
+                         ? cbm_stem_marks_module_qn(ctx->stem_marks, def->qualified_name, def_rel,
+                                                    lang, marked, sizeof(marked))
+                         : def->qualified_name;
+    int64_t node_id =
+        cbm_gbuf_upsert_node(ctx->gbuf, def->label ? def->label : "Function", def->name, qn,
+                             def_rel, (int)def->start_line, (int)def->end_line, props);
     /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
      * (helpers.cpp): callables + type-like containers (INHERITS/IMPLEMENTS/
      * method/field resolution), Variable/Field (READS/WRITES resolution), and

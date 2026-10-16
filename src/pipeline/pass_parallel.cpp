@@ -717,6 +717,7 @@ typedef struct {
     cbm_pkg_entries_t *pkg_entries; /* per-worker manifest arrays (separate allocation) */
 
     const cbm_cc_index_t *cc_index; /* compile_commands flags (C/C++), borrowed */
+    const cbm_stem_marks_t *stem_marks; /* Module QN marks (borrowed; may be NULL) */
 
     bool retain_sources;                 /* copy source into result->arena for cross-file LSP */
     size_t retain_total_budget_bytes;    /* project-wide retention cap (peak-RSS bound) */
@@ -744,14 +745,19 @@ typedef struct {
 enum { PP_OVERSIZED_WARN_MAX = 32 };
 
 /* Insert one definition node (and its route if present) into the local gbuf. */
-static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info_t *fi,
-                                 CBMDefinition *def) {
+static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_stem_marks_t *marks,
+                                 const cbm_file_info_t *fi, CBMDefinition *def) {
     char props[CBM_SZ_2K];
     build_def_props(props, sizeof(props), def);
+    const char *rel = def->file_path ? def->file_path : fi->rel_path;
+    char marked[CBM_SZ_4K];
+    const char *qn = def->label && strcmp(def->label, "Module") == 0
+                         ? cbm_stem_marks_module_qn(marks, def->qualified_name, rel, fi->language,
+                                                    marked, sizeof(marked))
+                         : def->qualified_name;
     int64_t func_id =
-        cbm_gbuf_upsert_node(ws->local_gbuf, def->label ? def->label : "Function", def->name,
-                             def->qualified_name, def->file_path ? def->file_path : fi->rel_path,
-                             (int)def->start_line, (int)def->end_line, props);
+        cbm_gbuf_upsert_node(ws->local_gbuf, def->label ? def->label : "Function", def->name, qn,
+                             rel, (int)def->start_line, (int)def->end_line, props);
     ws->nodes_created++;
     if (def->route_path && def->route_path[0] != '\0') {
         const char *rm = def->route_method ? def->route_method : "ANY";
@@ -976,7 +982,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
             if (def->qualified_name && def->name) {
-                insert_def_into_gbuf(ws, fi, def);
+                insert_def_into_gbuf(ws, ec->stem_marks, fi, def);
             }
         }
 
@@ -1205,6 +1211,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         .cancelled = ctx->cancelled,
         .pkg_entries = pkg_entries,
         .cc_index = ctx->cc_index,
+        .stem_marks = ctx->stem_marks,
         .retain_sources = resolved_opts.retain_sources,
         .retain_total_budget_bytes = resolved_opts.retain_total_budget_bytes,
         .retain_per_file_max_bytes = resolved_opts.retain_per_file_max_bytes,
@@ -1302,7 +1309,13 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-    const cbm_gbuf_node_t *def_node = cbm_gbuf_find_by_qn(ctx->gbuf, def->qualified_name);
+    char marked[CBM_SZ_4K];
+    const char *def_qn = strcmp(def->label, "Module") == 0
+                             ? cbm_stem_marks_module_qn(ctx->stem_marks, def->qualified_name,
+                                                        def->file_path ? def->file_path : rel, lang,
+                                                        marked, sizeof(marked))
+                             : def->qualified_name;
+    const cbm_gbuf_node_t *def_node = cbm_gbuf_find_by_qn(ctx->gbuf, def_qn);
     if (file_node && def_node) {
         cbm_gbuf_insert_edge(ctx->gbuf, file_node->id, def_node->id, "DEFINES", "{}");
         edges++;

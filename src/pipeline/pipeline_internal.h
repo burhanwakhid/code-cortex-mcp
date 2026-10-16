@@ -57,6 +57,44 @@ static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *nod
 #define CBM_MS_PER_SEC 1000.0
 #define CBM_US_PER_SEC_F 1e6
 
+/* ── Stem collisions (upstream f96001f4) ─────────────────────────── */
+
+/* A file and the directory beside it share a stem (`pkg/foo.sh` beside
+ * `pkg/foo/`): the file's Module QN equals the directory's Folder QN, and the
+ * graph buffer keeps only the Folder. One side yields:
+ * - the Folder, spelled `proj.pkg.foo/` (cbm_stem_marks_folder_qn);
+ * - but a Java/Go package directory keeps its plain QN -- it IS their module,
+ *   and their imports resolve to it -- so there the file's Module yields,
+ *   spelled `proj.pkg.foo#sh` (cbm_stem_marks_module_qn).
+ * Symbol QNs never change. Built from the discovered files once per run,
+ * read-only while extraction workers consult it. */
+typedef struct {
+    CBMArena arena;               /* owns the QN keys of both tables */
+    CBMHashTable *module_qns;     /* Module QNs of files outside Java/Go */
+    CBMHashTable *dir_module_qns; /* Module QNs of Java/Go files: their package dirs */
+} cbm_stem_marks_t;
+
+void cbm_stem_marks_init(cbm_stem_marks_t *m, const char *project, const cbm_file_info_t *files,
+                         int file_count);
+void cbm_stem_marks_free(cbm_stem_marks_t *m);
+/* rel_dir's Folder QN, marked when it must yield, written into buf; NULL
+ * when it does not fit. */
+const char *cbm_stem_marks_folder_qn(const cbm_stem_marks_t *m, const char *project,
+                                     const char *rel_dir, char *buf, size_t buf_size);
+/* The QN a file's Module definition takes: `qn#ext` when it must yield,
+ * written into buf; qn itself otherwise (and when m is NULL). */
+const char *cbm_stem_marks_module_qn(const cbm_stem_marks_t *m, const char *qn,
+                                     const char *rel_path, CBMLanguage lang, char *buf,
+                                     size_t buf_size);
+/* True when the stem-collision spelling of the two file sets can differ for
+ * a directory or Module that the incremental route would not re-spell: some
+ * file present in only one set takes part in a collision in either set. The
+ * incremental route never rebuilds Folder nodes, so such a run must rebuild
+ * fully. Paths in `old_paths` have unknown language (treated as non-Java/Go
+ * stems, the conservative side). */
+bool cbm_stem_marks_set_changed(const char *project, const cbm_file_info_t *files, int file_count,
+                                const char *const *old_paths, int old_count);
+
 /* ── Pipeline context (internal) ─────────────────────────────────── */
 
 /* Per-worker manifest collection entry. */
@@ -115,6 +153,10 @@ typedef struct {
     /* Directory subtrees excluded during discovery. Borrowed from pipeline.c. */
     char **excluded_dirs;
     int excluded_count;
+
+    /* Stem collisions of the discovered files: which Module definitions take
+     * `qn#ext`. Borrowed for the extraction phase; NULL elsewhere. */
+    const cbm_stem_marks_t *stem_marks;
 
     /* Sequential cross-LSP registry arena. The lsp_cross pass builds its
      * shared per-language registries here; resolved_calls entries may BORROW

@@ -906,6 +906,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int excluded_count = 0;
     cbm_pipeline_get_excluded(p, &excluded_dirs, &excluded_count);
 
+    cbm_stem_marks_t stem_marks;
+    cbm_stem_marks_init(&stem_marks, project, files, file_count);
     cbm_path_alias_collection_t *path_aliases =
         cbm_load_path_aliases_excluded(cbm_pipeline_repo_path(p), excluded_dirs, excluded_count);
     cbm_cc_index_t *cc_index = cbm_cc_index_build(cbm_pipeline_repo_path(p));
@@ -923,6 +925,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .cc_index = cc_index,
         .excluded_dirs = excluded_dirs,
         .excluded_count = excluded_count,
+        /* Re-extracted files spell their Module QNs from the stem collisions
+         * of the whole discovered set, as in a full run. */
+        .stem_marks = &stem_marks,
         .namespace_map_partial = true, /* maps are built from changed files only */
     };
 
@@ -1019,6 +1024,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     free(changed_files);
     cbm_registry_free(registry);
+    cbm_stem_marks_free(&stem_marks);
     cbm_path_alias_collection_free(path_aliases);
     cbm_cc_index_free(cc_index);
 

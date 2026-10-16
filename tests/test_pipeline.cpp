@@ -11507,7 +11507,252 @@ TEST(sem_json_str_honours_escapes) {
     PASS();
 }
 
+/* ── Stem collisions (upstream f96001f4) ──────────────────────────── */
+
+static int stem_count(const char *db_path, const char *sql) {
+    sqlite3 *db = NULL;
+    int n = -1;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK &&
+            sqlite3_step(st) == SQLITE_ROW) {
+            n = sqlite3_column_int(st, 0);
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return n;
+}
+
+static int stem_index(const char *repo, const char *db) {
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db, CBM_MODE_FULL);
+    if (!p) {
+        return -1;
+    }
+    (void)cbm_pipeline_set_project_name(p, "stem");
+    cbm_pipeline_set_persistence(p, false);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+static void stem_write(const char *tmp, const char *rel, const char *body) {
+    (void)th_write_file(TH_PATH(tmp, rel), body);
+}
+
+static void stem_unlink(const char *tmp, const char *rel) {
+    (void)cbm_unlink(TH_PATH(tmp, rel));
+}
+
+/* Every collision shape of cbm_stem_marks_t, plus `fillers` plain scripts. */
+static void stem_repo(const char *tmp, int fillers) {
+    stem_write(tmp, "genproto.sh", "#!/bin/sh\ngen_all() {\n  echo all\n}\n");
+    stem_write(tmp, "genproto/one.sh", "#!/bin/sh\ngen_one() {\n  echo one\n}\n");
+    stem_write(tmp, "rs/foo.rs", "pub mod bar;\npub fn top() {}\n");
+    stem_write(tmp, "rs/foo/bar.rs", "pub fn inner() {}\n");
+    stem_write(tmp, "c/foo.h", "int foo_add(int a, int b);\n");
+    stem_write(tmp, "c/foo.c", "#include \"foo.h\"\nint foo_add(int a, int b) { return a + b; }\n");
+    stem_write(tmp, "c/foo/x.c", "int foo_x(void) { return 1; }\n");
+    stem_write(tmp, "ts/foo.test.ts", "export function stemProbeA(): number { return 1; }\n");
+    stem_write(tmp, "ts/foo/test/a.ts", "export function stemProbeB(): number { return 2; }\n");
+    stem_write(tmp, "go.mod", "module example.com/stem\n\ngo 1.21\n");
+    stem_write(tmp, "goapi/api.sh", "#!/bin/sh\nrun_api() {\n  echo api\n}\n");
+    stem_write(tmp, "goapi/api/server.go", "package api\n\nfunc Serve() {}\n");
+    stem_write(tmp, "goapi/main/main.go",
+               "package main\n\nimport \"example.com/stem/goapi/api\"\n\n"
+               "func main() { api.Serve() }\n");
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "fill/f%02d.sh", i);
+        snprintf(body, sizeof(body), "#!/bin/sh\nfill_%02d() {\n  echo %d\n}\n", i, i);
+        stem_write(tmp, name, body);
+    }
+}
+
+/* A file and the directory beside it with one stem (genproto.sh, genproto/)
+ * shared a QN, and the graph buffer kept only the Folder: the file's Module
+ * was lost. Now one side yields (cbm_stem_marks_t). The Folder is spelled
+ * `stem.genproto/`, unless the directory is a Go package: it IS that
+ * package's module, so the file's Module yields as `stem.goapi.api#sh`. Run
+ * small (sequential extraction) and past MIN_FILES_FOR_PARALLEL (parallel
+ * workers), which insert Modules on separate paths. */
+TEST(pipeline_stem_folder_collision_keeps_both_nodes) {
+    static const char *const checks[][2] = {
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.genproto' AND "
+         "file_path='genproto.sh'",
+         "genproto.sh Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.genproto/' AND "
+         "file_path='genproto'",
+         "genproto/ Folder marked"},
+        {"SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+         "t.id=e.target_id WHERE e.type='CONTAINS_FILE' AND s.qualified_name='stem.genproto/' AND "
+         "t.file_path='genproto/one.sh'",
+         "marked Folder contains its file"},
+        {"SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+         "t.id=e.target_id WHERE e.type='DEFINES' AND s.label='File' AND "
+         "s.file_path='genproto.sh' AND t.label='Module' AND t.qualified_name='stem.genproto'",
+         "genproto.sh defines its Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.rs.foo' AND "
+         "file_path='rs/foo.rs'",
+         "Rust foo.rs Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.rs.foo.bar' AND "
+         "file_path='rs/foo/bar.rs'",
+         "Rust foo/bar.rs Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.rs.foo/'",
+         "rs/foo/ Folder marked"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.c.foo'",
+         "C stem pair Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.c.foo/'",
+         "c/foo/ Folder marked"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.ts.foo.test' AND "
+         "file_path='ts/foo.test.ts'",
+         "dotted foo.test.ts Module"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.ts.foo.test/'",
+         "ts/foo/test/ Folder marked"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.goapi.api'",
+         "Go package Folder keeps its QN"},
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.goapi.api#sh' "
+         "AND file_path='goapi/api.sh'",
+         "api.sh Module beside the Go package"},
+        {"SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+         "t.id=e.target_id WHERE e.type='DEFINES' AND s.label='File' AND "
+         "s.file_path='goapi/api.sh' AND t.qualified_name='stem.goapi.api#sh'",
+         "api.sh defines its Module"},
+        {"SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+         "t.id=e.target_id WHERE e.type='IMPORTS' AND s.file_path='goapi/main/main.go' AND "
+         "t.label='Folder' AND t.qualified_name='stem.goapi.api'",
+         "Go import lands on the package Folder"},
+    };
+    enum { STEM_CHECKS = sizeof(checks) / sizeof(checks[0]) };
+    static const int fillers[] = {0, 60};
+    int got[2][STEM_CHECKS];
+    int rcs[2];
+    for (int run = 0; run < 2; run++) {
+        char *tmp = th_mktempdir("cbm_stemdir");
+        ASSERT_NOT_NULL(tmp);
+        stem_repo(tmp, fillers[run]);
+        char db[512];
+        snprintf(db, sizeof(db), "%s/stem.db", tmp);
+        rcs[run] = stem_index(tmp, db);
+        for (int c = 0; c < STEM_CHECKS; c++) {
+            got[run][c] = stem_count(db, checks[c][0]);
+        }
+        th_rmtree(tmp);
+    }
+    int wrong = 0;
+    for (int run = 0; run < 2; run++) {
+        ASSERT_EQ(rcs[run], 0);
+        for (int c = 0; c < STEM_CHECKS; c++) {
+            if (got[run][c] != 1) {
+                printf("  fillers=%d: %s: %d\n", fillers[run], checks[c][1], got[run][c]);
+                wrong++;
+            }
+        }
+    }
+    ASSERT_EQ(wrong, 0);
+    PASS();
+}
+
+static std::atomic<int> g_stem_full_route{0};
+static void stem_route_sink(const char *line) {
+    if (line && strstr(line, "path=stem_mark_reindex")) {
+        g_stem_full_route.fetch_add(1);
+    }
+}
+
+/* The incremental route never rebuilds Folder nodes, so a deletion or
+ * addition that changes which side of a stem collision carries the mark must
+ * take the full route: deleting genproto.sh frees the Folder's plain QN;
+ * deleting a Go package's only Go file leaves a plain directory, whose Folder
+ * then yields to api.sh's Module; adding util.sh beside util/ marks that
+ * Folder. A deletion away from every collision stays incremental. */
+TEST(incremental_stem_mark_change_rebuilds) {
+    char *tmp = th_mktempdir("cbm_stemdel");
+    ASSERT_NOT_NULL(tmp);
+    stem_write(tmp, "genproto.sh", "#!/bin/sh\ngen_all() {\n  echo all\n}\n");
+    stem_write(tmp, "genproto/one.sh", "#!/bin/sh\ngen_one() {\n  echo one\n}\n");
+    stem_write(tmp, "goapi/api.sh", "#!/bin/sh\nrun_api() {\n  echo api\n}\n");
+    stem_write(tmp, "goapi/api/server.go", "package api\n\nfunc Serve() {}\n");
+    stem_write(tmp, "goapi/api/run.sh", "#!/bin/sh\nrun_it() {\n  echo run\n}\n");
+    stem_write(tmp, "misc/other.sh", "#!/bin/sh\nother() {\n  echo other\n}\n");
+    stem_write(tmp, "misc/keep.sh", "#!/bin/sh\nkeep() {\n  echo keep\n}\n");
+    stem_write(tmp, "util/inner.sh", "#!/bin/sh\ninner() {\n  echo inner\n}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/stemdel.db", tmp);
+    static const char marked_dir[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.genproto/'";
+    static const char plain_dir[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.genproto'";
+    static const char go_side[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.goapi.api#sh'";
+    static const char api_dir[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.goapi.api/'";
+    static const char api_mod[] = "SELECT COUNT(*) FROM nodes WHERE label='Module' AND "
+                                  "qualified_name='stem.goapi.api' AND file_path='goapi/api.sh'";
+    static const char util_dir[] =
+        "SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.util/'";
+    static const char util_mod[] = "SELECT COUNT(*) FROM nodes WHERE label='Module' AND "
+                                   "qualified_name='stem.util' AND file_path='util.sh'";
+
+    int full_rc = stem_index(tmp, db);
+    int full_marked = stem_count(db, marked_dir);
+    int full_go_side = stem_count(db, go_side);
+
+    cbm_log_set_sink(stem_route_sink);
+    g_stem_full_route.store(0);
+    stem_unlink(tmp, "misc/other.sh");
+    int other_rc = stem_index(tmp, db);
+    int other_full = g_stem_full_route.load();
+
+    g_stem_full_route.store(0);
+    stem_unlink(tmp, "genproto.sh");
+    int gen_rc = stem_index(tmp, db);
+    int gen_full = g_stem_full_route.load();
+    int gen_marked = stem_count(db, marked_dir);
+    int gen_plain = stem_count(db, plain_dir);
+
+    g_stem_full_route.store(0);
+    stem_unlink(tmp, "goapi/api/server.go");
+    int go_rc = stem_index(tmp, db);
+    int go_full = g_stem_full_route.load();
+    int go_side_after = stem_count(db, go_side);
+    int api_dir_after = stem_count(db, api_dir);
+    int api_mod_after = stem_count(db, api_mod);
+
+    g_stem_full_route.store(0);
+    stem_write(tmp, "util.sh", "#!/bin/sh\nutil() {\n  echo util\n}\n");
+    int add_rc = stem_index(tmp, db);
+    int add_full = g_stem_full_route.load();
+    int util_dir_after = stem_count(db, util_dir);
+    int util_mod_after = stem_count(db, util_mod);
+    cbm_log_set_sink(NULL);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full_rc, 0);
+    ASSERT_EQ(full_marked, 1);
+    ASSERT_EQ(full_go_side, 1);
+    ASSERT_EQ(other_rc, 0);
+    ASSERT_EQ(other_full, 0);
+    ASSERT_EQ(gen_rc, 0);
+    ASSERT_EQ(gen_full, 1);
+    ASSERT_EQ(gen_marked, 0);
+    ASSERT_EQ(gen_plain, 1);
+    ASSERT_EQ(go_rc, 0);
+    ASSERT_EQ(go_full, 1);
+    ASSERT_EQ(go_side_after, 0);
+    ASSERT_EQ(api_dir_after, 1);
+    ASSERT_EQ(api_mod_after, 1);
+    ASSERT_EQ(add_rc, 0);
+    ASSERT_EQ(add_full, 1);
+    ASSERT_EQ(util_dir_after, 1);
+    ASSERT_EQ(util_mod_after, 1);
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_stem_folder_collision_keeps_both_nodes);
+    RUN_TEST(incremental_stem_mark_change_rebuilds);
 #ifdef _WIN32
     RUN_TEST(pipeline_lease_windows_ambiguous_missing_and_replaced_names);
     RUN_TEST(pipeline_lease_windows_extended_component_is_not_retargeted);
