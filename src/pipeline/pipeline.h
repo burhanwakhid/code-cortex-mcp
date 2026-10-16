@@ -366,6 +366,16 @@ bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *st
 bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
                                           const char *strategy);
 
+/* Import-binding counterpart (#2127). True when the callee's root identifier
+ * is bound by an import of this file whose module chain contradicts the
+ * resolved target (`from unittest.mock import patch; patch()` must not bind a
+ * project `PkgConfigView.patch`), and the match came from a weak short-name
+ * strategy. Same drop-list as the guards above; the language set lives at the
+ * call sites and must be identical in pass_calls.c and pass_parallel.c.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_weak_import_bound_call(bool enabled, bool import_binding_contradicts,
+                                         const char *strategy);
+
 /* True if `name` is a method of a Python builtin type (str/bytes/list/dict/set/
  * file) or a builtin function seen as an attribute call. A language fact, kept
  * as a sorted table like the Perl builtins. */

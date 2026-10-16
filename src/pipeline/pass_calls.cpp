@@ -543,7 +543,7 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
 static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBMFileResult *result,
                                const CBMResolvedCallArray *lsp_calls, const char *rel,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
-                               int imp_count, CBMLanguage lang) {
+                               int imp_count, CBMLanguage lang, const CBMImportArray *imports) {
     const cbm_gbuf_node_t *source_node = calls_find_source(ctx, rel, call->enclosing_func_qn);
     if (!source_node) {
         return 0;
@@ -696,7 +696,15 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * has no receiver for the member guard to reason about, but when `run` is a
      * parameter of an enclosing scope it cannot be the module-level `run`.
      * cbm_suppress_weak_call owns the language set for both guards. */
-    bool drop_plain_call = cbm_suppress_weak_call(lang, call, res.strategy);
+    bool drop_plain_call =
+        cbm_suppress_weak_call(lang, call, res.strategy) ||
+        /* Import-binding suppression (#2127): an external `from m import f`
+         * binds `f` for the whole module, so a weak short-name match onto a
+         * project `X.f` outside m is fabricated. Python-only (the import
+         * paths are module chains) -- MUST match pass_parallel.cpp exactly. */
+        (lang == CBM_LANG_PYTHON && cbm_suppress_weak_import_bound_call(true, true, res.strategy) &&
+         cbm_python_import_binding_contradicts(imports, call->callee_name, res.qualified_name,
+                                               ctx->gbuf, ctx->project_name, rel));
 
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library
@@ -816,7 +824,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             }
             total_calls++;
             if (resolve_single_call(ctx, call, result, &result->resolved_calls, rel, module_qn,
-                                    imp_keys, imp_vals, imp_count, files[i].language)) {
+                                    imp_keys, imp_vals, imp_count, files[i].language,
+                                    &result->imports)) {
                 resolved++;
             } else {
                 unresolved++;
