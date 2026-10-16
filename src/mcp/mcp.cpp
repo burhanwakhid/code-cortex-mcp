@@ -6581,18 +6581,28 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
     }
     char path[CBM_SZ_1K];
     const char *override = getenv("CBM_INDEX_LOG");
+    /* A path that does not fit is cut off into another file's name, and "wb"
+     * would create or truncate that file: no logfile then. */
+    auto fits = [](int written, size_t cap) { return written > 0 && (size_t)written < cap; };
     if (override && override[0]) {
-        snprintf(path, sizeof(path), "%s", override);
+        if (!fits(snprintf(path, sizeof(path), "%s", override), sizeof(path))) {
+            cbm_log_warn("index.logfile_path_too_long", "source", "CBM_INDEX_LOG");
+            return false;
+        }
     } else {
         const char *cdir = cbm_resolve_cache_dir();
         if (!cdir) {
             return false;
         }
         char logdir[CBM_SZ_1K];
-        snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
+        if (!fits(snprintf(logdir, sizeof(logdir), "%s/logs", cdir), sizeof(logdir)) ||
+            !fits(snprintf(path, sizeof(path), "%s/%s-%lld.log", logdir,
+                           project ? project : "index", (long long)time(NULL)),
+                  sizeof(path))) {
+            cbm_log_warn("index.logfile_path_too_long", "source", "cache_dir");
+            return false;
+        }
         cbm_mkdir_p(logdir, 0755);
-        snprintf(path, sizeof(path), "%s/%s-%lld.log", logdir, project ? project : "index",
-                 (long long)time(NULL));
     }
     FILE *f = cbm_fopen(path, "wb");
     if (!f) {

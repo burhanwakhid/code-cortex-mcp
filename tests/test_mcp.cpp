@@ -2980,6 +2980,131 @@ TEST(index_response_reports_persisted_coverage_on_reindex) {
     PASS();
 }
 
+/* INV(long-log-override), upstream 71222984: CBM_INDEX_LOG was copied into the
+ * 1 KiB logfile path with no length check and opened "wb", so an override
+ * longer than that created (or truncated) a file at its cut-off prefix and
+ * echoed the cut name as the run's logfile. A path that does not fit is no
+ * logfile: the index still completes and reports the skip, nothing is written
+ * at the cut name (its directory stays empty), and the response names no
+ * logfile. The log root has its links resolved: the kernel bounds the EXPANDED
+ * path, and under macOS's /tmp -> /private/tmp link a near-1 KiB path can be
+ * neither created nor probed, which would hide the cut-off file. */
+TEST(index_long_log_override_writes_no_cut_path) {
+#ifdef _WIN32
+    SKIP_PLATFORM("Windows: MAX_PATH bounds the fixture's near-1 KiB log path");
+#else
+    enum { RI_PATH_CAP = 1024, RI_DIR_SEGMENTS = 4, RI_SEGMENT = 200, RI_NAME = 255 };
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-longlog-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp_dir));
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-longlog-cache-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    char tmpl[64];
+    snprintf(tmpl, sizeof(tmpl), "/tmp/cbm-longlog-root-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpl));
+    char logroot[4096];
+    ASSERT_NOT_NULL(realpath(tmpl, logroot));
+
+    char good_path[512];
+    char big_path[512];
+    snprintf(good_path, sizeof(good_path), "%s/good.py", tmp_dir);
+    snprintf(big_path, sizeof(big_path), "%s/big.py", tmp_dir);
+    FILE *fp = cbm_fopen(good_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    fputs("def alpha():\n    return 1\n", fp);
+    ASSERT_EQ(fclose(fp), 0);
+    fp = cbm_fopen(big_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    for (int i = 0; i < 2 * 1024 * 16; i++) { /* ~2 MiB > the 1 MiB cap below */
+        fputs("x = 1  # padding padding padding padding padding padding padd\n", fp);
+    }
+    ASSERT_EQ(fclose(fp), 0);
+
+    char logdir[RI_PATH_CAP];
+    int root_len = snprintf(logdir, sizeof(logdir), "%s", logroot);
+    ASSERT_TRUE(root_len > 0 &&
+                (size_t)root_len + RI_DIR_SEGMENTS * (RI_SEGMENT + 1) + 2 < sizeof(logdir));
+    size_t at = (size_t)root_len;
+    for (int seg = 0; seg < RI_DIR_SEGMENTS; seg++) {
+        logdir[at++] = '/';
+        memset(logdir + at, 'd', RI_SEGMENT);
+        at += RI_SEGMENT;
+    }
+    logdir[at] = '\0';
+    char name[RI_NAME + 1];
+    memset(name, 'x', RI_NAME);
+    memcpy(name, "skip-", 5);
+    name[RI_NAME] = '\0';
+    char override_path[2 * RI_PATH_CAP];
+    snprintf(override_path, sizeof(override_path), "%s/%s", logdir, name);
+    char cut[RI_PATH_CAP];
+    snprintf(cut, sizeof(cut), "%.*s", RI_PATH_CAP - 1, override_path);
+    bool made = cbm_mkdir_p(logdir, 0755) && strlen(override_path) >= RI_PATH_CAP &&
+                strlen(cut) > strlen(logdir) + 1;
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_MAX_FILE_BYTES", "1048576", 1);
+    cbm_setenv("CBM_INDEX_LOG", override_path, 1);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[700];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", tmp_dir);
+    char *resp = made ? cbm_mcp_handle_tool(srv, "index_repository", args) : NULL;
+    char *inner = resp ? extract_text_content(resp) : NULL;
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cbm_unsetenv("CBM_MAX_FILE_BYTES");
+    cbm_unsetenv("CBM_INDEX_LOG");
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+
+    bool cut_exists = cbm_file_exists(cut);
+    int entries = 0;
+    cbm_dir_t *d = cbm_opendir(logdir);
+    cbm_dirent_t *entry;
+    while (d && (entry = cbm_readdir(d)) != NULL) {
+        if (strcmp(entry->name, ".") != 0 && strcmp(entry->name, "..") != 0) {
+            entries++;
+        }
+    }
+    if (d) {
+        cbm_closedir(d);
+    }
+    const char *status = NULL;
+    long skipped = -1;
+    bool has_logfile = true;
+    yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    char status_buf[32] = "";
+    if (doc) {
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        status = yyjson_get_str(yyjson_obj_get(root, "status"));
+        snprintf(status_buf, sizeof(status_buf), "%s", status ? status : "");
+        skipped = (long)yyjson_get_int(yyjson_obj_get(root, "skipped_count"));
+        has_logfile = yyjson_obj_get(root, "logfile") != NULL;
+        yyjson_doc_free(doc);
+    }
+    free(inner);
+    th_rmtree(logroot);
+    th_rmtree(cache);
+    th_rmtree(tmp_dir);
+
+    ASSERT_TRUE(made);
+    ASSERT_STR_EQ(status_buf, "indexed");
+    ASSERT_GTE(skipped, 1); /* control: the run really had a skip to log */
+    ASSERT_FALSE(cut_exists);
+    ASSERT_EQ(entries, 0);
+    ASSERT_FALSE(has_logfile);
+    PASS();
+#endif
+}
+
 /* #963: a file whose one range covers nearly all of it is reported under its
  * own kind, parse_unusable — indexed, NOT skipped — and each entry names the END
  * of its range as "range_end". The number is not the file length (a grammar can
@@ -6253,10 +6378,13 @@ SUITE(mcp) {
     RUN_TEST(search_graph_semantic_only_skips_structural_scan);
     RUN_TEST(index_response_reports_persisted_coverage_on_reindex);
     RUN_TEST(index_response_reports_parse_unusable_range_end_issue963);
+    RUN_TEST(index_long_log_override_writes_no_cut_path);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(index_response_reports_walk_coverage);
 #endif
     RUN_TEST(tool_list_projects_pages_deterministically);
+    RUN_TEST(search_code_oversized_path_filter_is_tool_error);
+    RUN_TEST(search_graph_oversized_name_pattern_is_tool_error);
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
     RUN_TEST(search_code_windows_prefilter_precedes_content_scan);
     RUN_TEST(tool_get_graph_schema_empty);
