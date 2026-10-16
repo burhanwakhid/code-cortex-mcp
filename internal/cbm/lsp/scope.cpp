@@ -33,15 +33,17 @@ static CBMScopeChunk* alloc_chunk(CBMScope* scope) {
     return c;
 }
 
-void cbm_scope_bind(CBMScope* scope, const char* name, const CBMType* type) {
+/* Returns false when the binding could NOT be recorded in THIS frame (arena
+ * exhaustion in alloc_chunk). */
+bool cbm_scope_bind_checked(CBMScope* scope, const char* name, const CBMType* type) {
     if (!scope || !name) {
-        return;
+        return false;
     }
     for (CBMScopeChunk* c = scope->chunks; c != NULL; c = c->next) {
         for (int i = 0; i < c->used; i++) {
             if (c->bindings[i].name && strcmp(c->bindings[i].name, name) == 0) {
                 c->bindings[i].type = type;
-                return;
+                return true;
             }
         }
     }
@@ -49,26 +51,27 @@ void cbm_scope_bind(CBMScope* scope, const char* name, const CBMType* type) {
     if (!head || head->used >= CBM_SCOPE_CHUNK_BINDINGS) {
         head = alloc_chunk(scope);
         if (!head) {
-            return;
+            return false; /* arena exhausted: the shadow did NOT take effect */
         }
     }
     head->bindings[head->used].name = name;
     head->bindings[head->used].type = type;
     head->used++;
+    return true;
+}
+
+void cbm_scope_bind(CBMScope* scope, const char* name, const CBMType* type) {
+    (void)cbm_scope_bind_checked(scope, name, type);
 }
 
 const CBMType* cbm_scope_lookup(const CBMScope* scope, const char* name) {
-    if (!name) {
-        return cbm_type_unknown();
-    }
-    for (const CBMScope* s = scope; s != NULL; s = s->parent) {
-        for (CBMScopeChunk* c = s->chunks; c != NULL; c = c->next) {
-            for (int i = 0; i < c->used; i++) {
-                if (c->bindings[i].name && strcmp(c->bindings[i].name, name) == 0) {
-                    return c->bindings[i].type;
-                }
-            }
-        }
+    const CBMVarBinding* binding = cbm_scope_lookup_binding(scope, name);
+    if (binding) {
+        return binding->type;
     }
     return cbm_type_unknown();
+}
+
+bool cbm_scope_contains(const CBMScope* scope, const char* name) {
+    return cbm_scope_lookup_binding(scope, name) != NULL;
 }

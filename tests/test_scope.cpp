@@ -108,6 +108,30 @@ TEST(scope_child_shadows_parent) {
     PASS();
 }
 
+/* Upstream f339aa62: one chain walk returns presence and type together. */
+TEST(scope_lookup_binding_returns_nearest_complete_record) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMScope *root = cbm_scope_push(&a, NULL);
+    CBMScope *child = cbm_scope_push(&a, root);
+    cbm_scope_bind(root, "callback", named_t(&a, "Callback"));
+    cbm_scope_bind(child, "callback", named_t(&a, "Shadow"));
+    cbm_scope_bind(child, "unknown_local", cbm_type_unknown());
+
+    const CBMVarBinding *binding = cbm_scope_lookup_binding(child, "callback");
+    ASSERT_NOT_NULL(binding);
+    ASSERT_STR_EQ(binding->name, "callback");
+    ASSERT_STR_EQ(binding->type->data.named.qualified_name, "Shadow");
+    ASSERT_NULL(cbm_scope_lookup_binding(child, "missing"));
+    /* An UNKNOWN-typed binding is still present. */
+    ASSERT(cbm_scope_contains(child, "unknown_local"));
+    ASSERT(!cbm_scope_contains(root, "unknown_local"));
+    ASSERT(cbm_scope_bind_checked(child, "fresh", named_t(&a, "Fresh")));
+
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 /* ── Dynamic growth — the Phase 0 win ───────────────────────────── */
 
 TEST(scope_dynamic_growth_300_bindings) {
@@ -190,6 +214,7 @@ SUITE(scope) {
     RUN_TEST(scope_rebind_overwrites_in_place);
     RUN_TEST(scope_lookup_walks_parent_chain);
     RUN_TEST(scope_child_shadows_parent);
+    RUN_TEST(scope_lookup_binding_returns_nearest_complete_record);
     RUN_TEST(scope_dynamic_growth_300_bindings);
     RUN_TEST(scope_growth_chunk_boundary);
     RUN_TEST(scope_rebind_in_old_chunk);

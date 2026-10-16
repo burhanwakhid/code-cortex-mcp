@@ -4,6 +4,7 @@
 #include "type_rep.h"
 #include "../arena.h"
 #include <stdlib.h> /* getenv, atoi (cbm_lsp_max_walk_depth) */
+#include <string.h> /* strcmp (cbm_scope_lookup_binding) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,27 @@ typedef struct CBMScope {
     CBMScopeChunk *chunks;
     CBMArena *arena; // owning arena, propagated to children at push time
 } CBMScope;
+
+/* Return the complete nearest binding in one scope-chain walk, or NULL when
+ * unbound. Keep this internal hot-path primitive inline: all language
+ * resolvers use cbm_scope_lookup(), while Python also consumes the complete
+ * record (presence AND type) to avoid repeating the same linear scan. */
+static inline const CBMVarBinding *cbm_scope_lookup_binding(const CBMScope *scope,
+                                                            const char *name) {
+    if (!name) {
+        return NULL;
+    }
+    for (const CBMScope *s = scope; s != NULL; s = s->parent) {
+        for (const CBMScopeChunk *c = s->chunks; c != NULL; c = c->next) {
+            for (int i = 0; i < c->used; i++) {
+                if (c->bindings[i].name && strcmp(c->bindings[i].name, name) == 0) {
+                    return &c->bindings[i];
+                }
+            }
+        }
+    }
+    return NULL;
+}
 
 // Bail-to-UNKNOWN depth for type-lookup chains: alias resolution, MRO walks,
 // embedded-field/struct-traversal. Exceeding this collapses to cbm_type_unknown
@@ -60,7 +82,14 @@ static inline int cbm_lsp_max_walk_depth(void) {
 CBMScope *cbm_scope_push(CBMArena *a, CBMScope *current);
 CBMScope *cbm_scope_pop(CBMScope *scope);
 void cbm_scope_bind(CBMScope *scope, const char *name, const CBMType *type);
+/* Checked form: false when the binding could not be recorded in THIS frame
+ * (arena exhaustion). The void form discards that and returns silently, which
+ * lets a caller that then does a scope-CHAIN lookup see a PARENT binding of
+ * the same name and believe the child was bound. */
+bool cbm_scope_bind_checked(CBMScope *scope, const char *name, const CBMType *type);
 const CBMType *cbm_scope_lookup(const CBMScope *scope, const char *name);
+/* True when any lexical frame contains name, even when its type is UNKNOWN. */
+bool cbm_scope_contains(const CBMScope *scope, const char *name);
 
 #ifdef __cplusplus
 }
