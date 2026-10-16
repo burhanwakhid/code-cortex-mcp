@@ -1104,6 +1104,46 @@ TEST(discover_enclosing_info_exclude_rooted_subpath) {
     PASS();
 }
 
+/* core.excludesFile is anchored at the repository root, like info/exclude:
+ * indexing <root>/pkg, a global "/secret.py" means <root>/secret.py and must
+ * not hide pkg/secret.py, while "/pkg/drop.py" does hide pkg/drop.py. */
+TEST(discover_enclosing_global_excludes_rooted_at_repo_root) {
+    char *base = th_mktempdir("cbm_disc_enc_global");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".git/config"), "[core]\n");
+    th_mkdir_p(TH_PATH(base, "xdg/git"));
+    th_write_file(TH_PATH(base, "xdg/git/ignore"), "/secret.py\n/pkg/drop.py\n");
+    th_write_file(TH_PATH(base, "pkg/main.py"), "pass\n");
+    th_write_file(TH_PATH(base, "pkg/secret.py"), "pass\n");
+    th_write_file(TH_PATH(base, "pkg/drop.py"), "pass\n");
+
+    char saved[4096];
+    const char *prev = getenv("XDG_CONFIG_HOME");
+    bool had = prev != NULL;
+    snprintf(saved, sizeof(saved), "%s", had ? prev : "");
+    cbm_setenv("XDG_CONFIG_HOME", TH_PATH(base, "xdg"), 1);
+    cbm_discover_opts_t opts = {};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "pkg"), &opts, &files, &count);
+    if (had) {
+        cbm_setenv("XDG_CONFIG_HOME", saved, 1);
+    } else {
+        cbm_unsetenv("XDG_CONFIG_HOME");
+    }
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.py"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "secret.py"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "drop.py"));
+    ASSERT_EQ(count, 2);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 /* git consults the .gitignore of EVERY directory between the enclosing root
  * and the indexed one, not just the root's. Here only <root>/a/.gitignore has
  * an opinion, and it is rooted at a/ — so it needs both the intermediate file
@@ -1374,6 +1414,7 @@ SUITE(discover) {
 
     RUN_TEST(discover_enclosing_rooted_pattern_not_reanchored);
     RUN_TEST(discover_enclosing_info_exclude_rooted_subpath);
+    RUN_TEST(discover_enclosing_global_excludes_rooted_at_repo_root);
     RUN_TEST(discover_enclosing_intermediate_gitignore);
     RUN_TEST(discover_enclosing_deeper_ancestor_negation_wins);
     RUN_TEST(discover_gitignore_never_hides_tracked_files);

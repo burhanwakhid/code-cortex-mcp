@@ -803,10 +803,36 @@ static bool is_safety_core_dir(const char *name) {
  * which yield to tracked content; built-in skips and .cbmignore never do. */
 typedef enum { DIR_KEEP, DIR_SKIP, DIR_GIT_IGNORED } dir_verdict_t;
 
+/* The core.excludesFile matcher. git anchors it at the repository root, so
+ * when the walk root is a git-less folder inside an enclosing repository,
+ * `base` is that folder's path from the repository root (else ""), exactly
+ * like an ancestor link's base: a rooted "/secret.py" must not hide
+ * "pkg/secret.py" when indexing "pkg". */
+typedef struct {
+    const cbm_gitignore_t *gi;
+    const char *base;
+} global_ignore_t;
+
+static bool global_ignore_matches(const global_ignore_t *global, const char *rel_path,
+                                  bool is_dir) {
+    if (!global || !global->gi) {
+        return false;
+    }
+    if (!global->base[0]) {
+        return cbm_gitignore_matches(global->gi, rel_path, is_dir);
+    }
+    char based[CBM_SZ_4K];
+    int written = snprintf(based, sizeof(based), "%s/%s", global->base, rel_path);
+    if (written < 0 || (size_t)written >= sizeof(based)) {
+        return false; /* longer than the matcher can address: no opinion */
+    }
+    return cbm_gitignore_matches(global->gi, based, is_dir);
+}
+
 static dir_verdict_t directory_verdict(const char *entry_name, const char *rel_path,
                                        const cbm_discover_opts_t *opts,
                                        const gitignore_link_t *ignore_chain,
-                                       const cbm_gitignore_t *global_gi,
+                                       const global_ignore_t *global_gi,
                                        const cbm_gitignore_t *cbmignore) {
     if (cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL)) {
         /* #500: a .cbmignore negation (e.g. "!obj/") whose rule is the last
@@ -820,7 +846,7 @@ static dir_verdict_t directory_verdict(const char *entry_name, const char *rel_p
         }
     }
     bool git_ignored = gitignore_chain_result(ignore_chain, rel_path, true) > 0;
-    bool global_ignored = global_gi && cbm_gitignore_matches(global_gi, rel_path, true);
+    bool global_ignored = global_gi && global_ignore_matches(global_gi, rel_path, true);
     if (cbmignore) {
         int cbm_result = cbm_gitignore_match_result(cbmignore, rel_path, true);
         if (cbm_result > 0) {
@@ -844,7 +870,7 @@ static dir_verdict_t directory_verdict(const char *entry_name, const char *rel_p
 static const char *file_skip_reason(const char *entry_name, const char *rel_path,
                                     const cbm_discover_opts_t *opts,
                                     const gitignore_link_t *ignore_chain,
-                                    const cbm_gitignore_t *global_gi,
+                                    const global_ignore_t *global_gi,
                                     const cbm_gitignore_t *cbmignore, off_t file_size,
                                     struct discover_tracked *tracked, bool in_ignored_dir) {
     cbm_index_mode_t mode = opts ? opts->mode : CBM_MODE_FULL;
@@ -865,7 +891,7 @@ static const char *file_skip_reason(const char *entry_name, const char *rel_path
         !(indexable && tracked_has_file(tracked, rel_path))) {
         return "gitignore";
     }
-    bool global_ignored = global_gi && cbm_gitignore_matches(global_gi, rel_path, false) &&
+    bool global_ignored = global_gi && global_ignore_matches(global_gi, rel_path, false) &&
                           !(indexable && tracked_has_file(tracked, rel_path));
     if (cbmignore) {
         int cbm_result = cbm_gitignore_match_result(cbmignore, rel_path, false);
@@ -975,7 +1001,7 @@ static int safe_stat(const char *abs_path, struct stat *st, bool *is_symlink) {
 static void walk_dir_process_file(const char *abs_path, const char *rel_path, const char *name,
                                   const cbm_discover_opts_t *opts,
                                   const gitignore_link_t *ignore_chain,
-                                  const cbm_gitignore_t *global_gi,
+                                  const global_ignore_t *global_gi,
                                   const cbm_gitignore_t *cbmignore, off_t size, bool in_ignored_dir,
                                   file_list_t *out) {
     const char *skip_reason = file_skip_reason(name, rel_path, opts, ignore_chain, global_gi,
@@ -1060,7 +1086,7 @@ static bool walk_push_subdir(walk_stack_t *ws, const char *abs_path, const char 
 
 static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *frame,
                                    const cbm_discover_opts_t *opts,
-                                   const cbm_gitignore_t *global_gi,
+                                   const global_ignore_t *global_gi,
                                    const cbm_gitignore_t *cbmignore, walk_stack_t *ws,
                                    file_list_t *out) {
     char abs_path[CBM_SZ_4K];
@@ -1110,7 +1136,7 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
 
 static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_discover_opts_t *opts,
                      const cbm_gitignore_t *gitignore, const gitignore_link_t *ancestors,
-                     const cbm_gitignore_t *global_gi, const cbm_gitignore_t *cbmignore,
+                     const global_ignore_t *global_gi, const cbm_gitignore_t *cbmignore,
                      file_list_t *out) {
     walk_stack_t ws = {(walk_frame_t *)calloc(WALK_STACK_CAP, sizeof(walk_frame_t)), 0,
                        WALK_STACK_CAP};
@@ -1555,7 +1581,19 @@ static int discover_impl(const char *repo_path, const cbm_discover_opts_t *opts,
         tracked.repo_path = repo_path;
         fl.tracked = &tracked;
     }
-    walk_dir(repo_path, "", opts, gitignore, ancestors.chain, global_gi, cbmignore, &fl);
+    /* The enclosing repository's root anchors core.excludesFile, as it does
+     * the ancestor ignore files. */
+    const char *global_base = "";
+    if (has_enclosing_repo) {
+        size_t root_len = strlen(enclosing_root);
+        global_base = canonical_repo + root_len;
+        while (*global_base == '/') {
+            global_base++;
+        }
+    }
+    global_ignore_t global = {global_gi, global_base};
+    walk_dir(repo_path, "", opts, gitignore, ancestors.chain, global_gi ? &global : nullptr,
+             cbmignore, &fl);
 
     /* Cleanup */
     tracked_free(&tracked);
