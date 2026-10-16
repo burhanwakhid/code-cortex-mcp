@@ -96,6 +96,10 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
                              const char *qualified_name, const char *file_path, int start_line,
                              int end_line, const char *properties_json);
 
+/* Replace a node's properties JSON with a copy of `json`. Returns 0, or -1
+ * (node unchanged) on NULL input or OOM. */
+int cbm_gbuf_node_set_properties_json(cbm_gbuf_node_t *node, const char *json);
+
 /* Find a node by qualified name. Returns NULL if not found. */
 const cbm_gbuf_node_t *cbm_gbuf_find_by_qn(const cbm_gbuf_t *gb, const char *qn);
 

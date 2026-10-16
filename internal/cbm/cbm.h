@@ -545,6 +545,10 @@ typedef struct {
     const char **constants;   // NULL-terminated (NULL if none)
     const char **global_vars; // NULL-terminated (NULL if none)
     const char **macros;      // NULL-terminated, C/C++ only (NULL if none)
+    /* The file's own doc, set on its File node: the Go package comment or
+     * the Rust inner docs (//!). NULL for other languages and undocumented
+     * files. */
+    const char *module_doc;
 
     bool has_error;
     const char *error_msg;
@@ -648,6 +652,9 @@ typedef struct {
     bool defer_cpp_operators; // Internal opt-in; preserve pending count without full call records.
     bool deduplicate_usages;
     void *usage_dedup; // Per-walk scratch set; never retained in the result.
+    /* Doc-comment lookup state (extract_defs.cpp): the memo of parents' child
+     * arrays, NULL until first used and allocated in `scratch`. */
+    void *doc_memo;
     /* Per-file walk budget (thread CPU time, ns; 0 = unbounded). The unified
      * cursor walk checks it every 1024 nodes and stops when it is spent, so
      * no single file can hold a worker for minutes: a 23 MB single-expression

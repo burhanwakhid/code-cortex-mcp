@@ -352,7 +352,7 @@ void walk(Compactor &a, CBMFileResult &v) {
            pending_cpp_operator_count, cpp_operator_tracker, imports, usages, throws, rw, type_refs,
            env_accesses, type_assigns, impl_traits, resolved_calls, string_refs, infra_bindings,
            channels, field_types, module_qn, namespace_name, php_vendor_names, php_vendor_qns,
-           php_vendor_count, exports, constants, global_vars, macros, has_error, error_msg,
+           php_vendor_count, exports, constants, global_vars, macros, module_doc, has_error, error_msg,
            parse_incomplete, parse_unusable, error_ranges, error_region_count, is_test_file,
            imports_count, cached_tree, lsp_skipped, walk_truncated, lsp_skip_reason, tree_nodes,
            walk_nodes_visited, cached_lang, source, source_len] = v;
@@ -378,7 +378,7 @@ void walk(Compactor &a, CBMFileResult &v) {
     a.records(channels);
     a.records(field_types);
     a.array(overloads, overload_count);
-    a(module_qn, namespace_name, error_msg, error_ranges);
+    a(module_qn, namespace_name, error_msg, error_ranges, module_doc);
     a(php_vendor_names, php_vendor_qns); /* NULL-terminated; NULL at extraction end */
     a(exports, constants, global_vars, macros);
     /* Source bytes the parallel pass retains are copied verbatim, NUL and all.

@@ -253,7 +253,7 @@ template <class A> void fields(A &a, CBMFileResult &v) {
            pending_cpp_operator_count, cpp_operator_tracker, imports, usages, throws, rw, type_refs,
            env_accesses, type_assigns, impl_traits, resolved_calls, string_refs, infra_bindings,
            channels, field_types, module_qn, namespace_name, php_vendor_names, php_vendor_qns,
-           php_vendor_count, exports, constants, global_vars, macros, has_error, error_msg,
+           php_vendor_count, exports, constants, global_vars, macros, module_doc, has_error, error_msg,
            parse_incomplete, parse_unusable, error_ranges, error_region_count, is_test_file,
            imports_count, cached_tree, lsp_skipped, walk_truncated, lsp_skip_reason, tree_nodes,
            walk_nodes_visited, cached_lang, source, source_len] = v;
@@ -266,9 +266,9 @@ template <class A> void fields(A &a, CBMFileResult &v) {
         php_vendor_count = 0;
     }
     a(deferred_cpp_operator_count, pending_cpp_operator_count, module_qn, namespace_name, exports,
-      constants, global_vars, macros, has_error, error_msg, parse_incomplete, parse_unusable,
-      error_ranges, error_region_count, is_test_file, imports_count, lsp_skipped, walk_truncated,
-      lsp_skip_reason, tree_nodes, walk_nodes_visited, cached_lang);
+      constants, global_vars, macros, module_doc, has_error, error_msg, parse_incomplete,
+      parse_unusable, error_ranges, error_region_count, is_test_file, imports_count, lsp_skipped,
+      walk_truncated, lsp_skip_reason, tree_nodes, walk_nodes_visited, cached_lang);
     a.records(defs);
     a.records(calls);
     a.records(imports);

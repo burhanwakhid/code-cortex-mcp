@@ -1034,6 +1034,19 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
     return id;
 }
 
+int cbm_gbuf_node_set_properties_json(cbm_gbuf_node_t *node, const char *json) {
+    if (!node || !json) {
+        return CBM_NOT_FOUND;
+    }
+    char *copy = strdup(json);
+    if (!copy) {
+        return CBM_NOT_FOUND;
+    }
+    free(node->properties_json);
+    node->properties_json = copy;
+    return 0;
+}
+
 const cbm_gbuf_node_t *cbm_gbuf_find_by_qn(const cbm_gbuf_t *gb, const char *qn) {
     if (!gb || !qn) {
         return NULL;
