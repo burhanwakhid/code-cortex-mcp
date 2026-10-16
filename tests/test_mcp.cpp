@@ -689,16 +689,16 @@ TEST(tool_index_status_reports_an_unreadable_count_as_an_error) {
     free(inner);
     free(response);
 
-    /* Drop the tables from a second connection: the server's own connection
-     * may still hold cached statements open on them, which blocks a DROP on
-     * that connection (SQLITE_LOCKED); WAL lets another writer proceed. */
-    const char *db_path = cbm_store_db_path(store);
-    ASSERT_NOT_NULL(db_path);
-    sqlite3 *raw = NULL;
-    ASSERT_EQ(sqlite3_open(db_path, &raw), SQLITE_OK);
-    ASSERT_EQ(sqlite3_exec(raw, "DROP TABLE edges; DROP TABLE nodes;", NULL, NULL, NULL),
-              SQLITE_OK);
-    sqlite3_close(raw);
+    /* Other cached statements of the first call may still sit on a row and
+     * hold a read on the tables, which makes DROP TABLE fail with
+     * SQLITE_LOCKED. Reset them (they stay cached), then drop. */
+    sqlite3 *raw = cbm_store_get_db(store);
+    ASSERT_NOT_NULL(raw);
+    for (sqlite3_stmt *st = sqlite3_next_stmt(raw, NULL); st; st = sqlite3_next_stmt(raw, st)) {
+        sqlite3_reset(st);
+    }
+    ASSERT_EQ(cbm_store_exec(store, "DROP TABLE edges;"), 0);
+    ASSERT_EQ(cbm_store_exec(store, "DROP TABLE nodes;"), 0);
 
     response = cbm_mcp_handle_tool(srv, "index_status", "{\"project\":\"test-project\"}");
     inner = response ? extract_text_content(response) : NULL;
