@@ -35,6 +35,10 @@ enum {
     MCP_PATH_HASH_TIMEOUT_MS = 200,
     MCP_DEFAULT_IMPACT_LIMIT = 200, /* detect_changes per-symbol rows; rollup stays complete */
     MCP_SNIPPET_MAX_LINES = 500,    /* get_code_snippet line cap (whole-file Module guard) */
+    /* search_code `context`: lines of surrounding source per hit. Clamped at
+     * the handler and again where the window is computed, so the arithmetic
+     * never overflows. */
+    MCP_SEARCH_CONTEXT_MAX_LINES = 200,
     MCP_N_DEFAULTS_2 = 2,
     MCP_URI_PREFIX = 7,      /* strlen("file://") */
     MCP_CONTENT_PREFIX = 15, /* strlen("Content-Length:") */
@@ -646,8 +650,9 @@ static const tool_def_t TOOLS[] = {
      "filter on result file paths (e.g. ^src/ or \\\\.(go|ts)$)\"},\"mode\":{\"type\":\"string\","
      "\"enum\":[\"compact\",\"full\",\"files\"],\"default\":\"compact\",\"description\":\"compact: "
      "signatures+metadata (default). full: with source. files: just file list.\"},"
-     "\"context\":{\"type\":\"integer\",\"description\":\"Lines of context around each match "
-     "(like grep -C). Only used in compact mode.\"},"
+     "\"context\":{\"type\":\"integer\",\"default\":0,\"minimum\":0,\"maximum\":200,"
+     "\"description\":\"Lines of context around each match (like grep -C). Only used in "
+     "compact mode.\"},"
      "\"regex\":{\"type\":\"boolean\",\"default\":false},\"limit\":{\"type\":\"integer\","
      "\"description\":\"Max enriched results per call. Default 10. Response includes "
      "'total_grep_matches' and 'total_results' so callers can detect truncation. No "
@@ -8518,11 +8523,15 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, sear
             free(source);
         }
     } else if (context_lines > 0 && r->match_count > 0) {
-        int ctx_start = r->match_lines[0] - context_lines;
-        int ctx_end = r->match_lines[r->match_count - SKIP_ONE] + context_lines;
-        if (ctx_start < SKIP_ONE) {
-            ctx_start = SKIP_ONE;
-        }
+        /* Bounded here as well as at the handler: the window must stay
+         * match +/- MCP_SEARCH_CONTEXT_MAX_LINES for any caller, and the
+         * arithmetic must not overflow for any value. */
+        int ctx_lines = context_lines > MCP_SEARCH_CONTEXT_MAX_LINES ? MCP_SEARCH_CONTEXT_MAX_LINES
+                                                                     : context_lines;
+        int first_match = r->match_lines[0];
+        int last_match = r->match_lines[r->match_count - SKIP_ONE];
+        int ctx_start = first_match > ctx_lines ? first_match - ctx_lines : SKIP_ONE;
+        int ctx_end = last_match > INT_MAX - ctx_lines ? INT_MAX : last_match + ctx_lines;
         char *ctx = read_file_lines(abs_path, ctx_start, ctx_end);
         if (ctx) {
             char *safe_context = sanitize_utf8_lossy(ctx);
@@ -8741,13 +8750,35 @@ static const char *strip_root_prefix(const char *path, const char *root, size_t 
     return p;
 }
 
+/* True when "<root_path>/<file>" resolves inside root_path. The scan stream
+ * carries whatever its walker opened: the scoped list is the index's paths,
+ * and an indexed path that passes through a directory link is a regular file
+ * to lstat, so grep reads the link's target. This is the containment check
+ * attach_result_source already applies before it reads a result's source,
+ * applied to the match itself (upstream f7b541ee). */
+static bool search_hit_file_within_root(const char *root_path, const char *file) {
+    char abs_path[CBM_SZ_4K];
+    int length = snprintf(abs_path, sizeof(abs_path), "%s/%s", root_path, file);
+    if (length < 0 || (size_t)length >= sizeof(abs_path)) {
+        return false;
+    }
+    return cbm_path_within_root(root_path, abs_path);
+}
+
+/* `check_containment`: drop the hits of a file that resolves outside the
+ * root, checked once per distinct file (grep groups a file's hits); dropped
+ * hits are not counted, like a path_filter miss. The in-process scan has
+ * already applied it and passes false. */
 static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_t root_len,
                                           bool has_path_filter, cbm_regex_t *path_regex,
-                                          int grep_limit, int *out_count) {
+                                          int grep_limit, bool check_containment, int *out_count) {
     int gm_cap = CBM_SZ_64;
     int gm_count = 0;
     grep_match_t *gm = (grep_match_t *)malloc(gm_cap * sizeof(grep_match_t));
     char line[CBM_SZ_2K];
+    std::string current_file;
+    bool current_inside = false;
+    bool have_current = false;
 
     while (fgets(line, sizeof(line), fp) && gm_count < grep_limit) {
         size_t len = strlen(line);
@@ -8784,6 +8815,16 @@ static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_
 
         if (has_path_filter && cbm_regexec(path_regex, file, 0, NULL, 0) != CBM_REG_OK) {
             continue;
+        }
+        if (check_containment) {
+            if (!have_current || current_file != file) {
+                current_file = file;
+                have_current = true;
+                current_inside = search_hit_file_within_root(root_path, file);
+            }
+            if (!current_inside) {
+                continue;
+            }
         }
 
         safe_grow(gm, gm_count, gm_cap, PAIR_LEN);
@@ -9552,6 +9593,7 @@ enum {
 };
 
 struct search_scan_shared_t {
+    const char *root_path; /* NULL: no containment check (tests) */
     const std::vector<const char *> *paths;
     const char *pattern;
     bool use_regex;
@@ -9597,6 +9639,13 @@ static void search_scan_worker(search_scan_shared_t *sh) {
         if (budget > 0 && search_scan_read_file(paths[i], buffer, &length)) {
             search_scan_buffer(sh->outputs[i], &patterns, sh->use_regex, paths[i], buffer.data(),
                                length, &left);
+            /* A file that resolves outside the root (a directory link on its
+             * indexed path) yields no record, as collect_grep_matches drops
+             * grep's hits for it. Checked only for files with hits. */
+            if (left < budget && sh->root_path && !cbm_path_within_root(sh->root_path, paths[i])) {
+                sh->outputs[i].clear();
+                left = budget;
+            }
         }
         std::lock_guard<std::mutex> guard(sh->lock);
         sh->counts[i] = budget - left;
@@ -9633,8 +9682,9 @@ static void search_scan_join(search_scan_shared_t *sh, std::string &out) {
     }
 }
 
-static bool search_scan_in_process(const char *filelist_path, const char *pattern, bool use_regex,
-                                   const char *file_pattern, int max_records, std::string &out) {
+static bool search_scan_in_process(const char *filelist_path, const char *root_path,
+                                   const char *pattern, bool use_regex, const char *file_pattern,
+                                   int max_records, std::string &out) {
     std::vector<char> list;
     size_t list_length = 0;
     if (!search_scan_read_file(filelist_path, list, &list_length)) {
@@ -9665,6 +9715,7 @@ static bool search_scan_in_process(const char *filelist_path, const char *patter
         return true;
     }
     search_scan_shared_t sh;
+    sh.root_path = root_path;
     sh.paths = &paths;
     sh.pattern = pattern;
     sh.use_regex = use_regex;
@@ -9706,7 +9757,7 @@ static grep_match_t *search_scan_collect(const std::string &records, const char 
         return NULL;
     }
     grep_match_t *gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter,
-                                            path_regex, grep_limit, out_count);
+                                            path_regex, grep_limit, false, out_count);
     (void)fclose(fp);
     return gm;
 }
@@ -9724,7 +9775,7 @@ char *cbm_mcp_search_scan_for_test(const char *filelist_path, const char *patter
     return NULL;
 #else
     std::string records;
-    if (!search_scan_in_process(filelist_path, pattern, use_regex, file_pattern, max_records,
+    if (!search_scan_in_process(filelist_path, NULL, pattern, use_regex, file_pattern, max_records,
                                 records)) {
         return NULL;
     }
@@ -9741,6 +9792,11 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     int limit = cbm_mcp_get_int_arg(args, "limit", MCP_DEFAULT_LIMIT);
     int context_lines = cbm_mcp_get_int_arg(args, "context", 0);
+    if (context_lines < 0) {
+        context_lines = 0;
+    } else if (context_lines > MCP_SEARCH_CONTEXT_MAX_LINES) {
+        context_lines = MCP_SEARCH_CONTEXT_MAX_LINES;
+    }
     /* Reply byte budget (0 disables). Default sized so a compact reply never
      * hits it and a full-mode reply stays under ~6k tokens. */
     enum { SEARCH_DEFAULT_MAX_BYTES = 24000 };
@@ -9761,6 +9817,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     path_filter = NULL;
 
     if (!pattern) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(project);
         free(file_pattern);
         return cbm_mcp_text_result("pattern is required", true);
@@ -9768,6 +9827,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     /* Project is required */
     if (!project) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(pattern);
         free(file_pattern);
         char *_err = build_project_list_error("project is required");
@@ -9778,6 +9840,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     char *root_path = get_project_root(srv, project);
     if (!root_path) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(pattern);
         free(project);
         free(file_pattern);
@@ -9874,6 +9939,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         char errmsg[CBM_SZ_256];
         snprintf(errmsg, sizeof(errmsg), "search failed: cannot create temp file (%s)",
                  strerror(errno));
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(root_path);
         free(pattern);
         free(project);
@@ -9916,8 +9984,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
      * the recursive fallback for an unindexed root keeps grep. */
     if (!gm && scoped) {
         std::string records;
-        if (search_scan_in_process(filelist, pattern, use_regex, file_pattern, grep_limit,
-                                   records)) {
+        if (search_scan_in_process(filelist, root_path, pattern, use_regex, file_pattern,
+                                   grep_limit, records)) {
             gm = search_scan_collect(records, root_path, has_path_filter, &path_regex, grep_limit,
                                      &gm_count);
         }
@@ -9951,7 +10019,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         }
 
         gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter, &path_regex,
-                                  grep_limit, &gm_count);
+                                  grep_limit, true, &gm_count);
         cbm_pclose(fp);
         cbm_unlink(tmpfile);
         if (scoped) {

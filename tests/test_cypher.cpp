@@ -9,6 +9,7 @@
 #include <store/store.h>
 #include <string.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <foundation/compat_thread.h>
 #ifndef _WIN32
 #include <sys/wait.h>
@@ -4710,6 +4711,29 @@ TEST(cypher_grouping_keeps_first_seen_groups) {
     PASS();
 }
 
+/* The caller-supplied output-row limit sizes the initial binding array; a
+ * value above the engine ceiling is clamped to it before that happens, and a
+ * value inside the ceiling still bounds the row count. */
+TEST(cypher_exec_max_rows_above_ceiling_is_clamped) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name", "test", INT_MAX, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 4);
+    cbm_cypher_result_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name", "test", 2, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+
 SUITE(cypher) {
     /* Lexer */
     RUN_TEST(cypher_lex_simple_match);
@@ -4928,4 +4952,5 @@ SUITE(cypher) {
     RUN_TEST(cypher_order_by_is_the_stable_reference_order);
     RUN_TEST(cypher_distinct_keeps_first_occurrences);
     RUN_TEST(cypher_grouping_keeps_first_seen_groups);
+    RUN_TEST(cypher_exec_max_rows_above_ceiling_is_clamped);
 }
