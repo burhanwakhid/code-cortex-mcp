@@ -1924,9 +1924,115 @@ TEST(pylsp_issue1527_depth_failure_reports_all_entry_points) {
 }
 #endif /* CBM_ENABLE_TEST_SEAMS */
 
+/* A chain's LENGTH is not nesting depth (#1527 follow-up). An operator chain
+ * `a + a + ... + a` and a receiver chain `b.a().a()...` are evaluated link by
+ * link, so neither consumes the evaluator's depth guard: the file keeps its
+ * LSP resolution (an unrelated call in another function still resolves), no
+ * file-level failure is recorded, and the chain's result type still drives
+ * the call made on it. Before the iterative evaluation, 300 terms already
+ * exceeded the guard. The per-file extraction runs at the smallest size (as
+ * upstream); the cross-file dispatch runs at every size. */
+static const int pylsp_long_chain_sizes[] = {300, 2000, 20000};
+
+static char *pylsp_long_chain_source(bool receiver, int links) {
+    size_t sz = (size_t)links * 8 + 512;
+    char *src = (char *)malloc(sz);
+    if (!src)
+        return NULL;
+    size_t pos = (size_t)snprintf(src, sz,
+                                  "from typing import Self\n"
+                                  "class V:\n"
+                                  "    def done(self):\n"
+                                  "        return 1\n"
+                                  "class B:\n"
+                                  "    def a(self) -> Self:\n"
+                                  "        return self\n"
+                                  "    def done(self):\n"
+                                  "        return 1\n"
+                                  "class S:\n"
+                                  "    def m(self):\n"
+                                  "        return 1\n");
+    if (receiver) {
+        pos += (size_t)snprintf(src + pos, sz - pos, "def chain(b: B):\n    b");
+        for (int i = 0; i < links; i++)
+            pos += (size_t)snprintf(src + pos, sz - pos, ".a()");
+        pos += (size_t)snprintf(src + pos, sz - pos, ".done()\n");
+    } else {
+        pos += (size_t)snprintf(src + pos, sz - pos, "def deep(a: V):\n    x = a");
+        for (int i = 1; i < links; i++)
+            pos += (size_t)snprintf(src + pos, sz - pos, " + a");
+        pos += (size_t)snprintf(src + pos, sz - pos, "\n    x.done()\n");
+    }
+    snprintf(src + pos, sz - pos, "def run():\n    s = S()\n    s.m()\n");
+    return src;
+}
+
+static int pylsp_long_chain_case(bool receiver) {
+    CBMLSPDef defs[7] = {};
+    const char *qns[] = {"test.V",    "test.V.done", "test.B", "test.B.a",
+                         "test.B.done", "test.S",    "test.S.m"};
+    const char *shorts[] = {"V", "done", "B", "a", "done", "S", "m"};
+    const char *recv[] = {NULL, "test.V", NULL, "test.B", "test.B", NULL, "test.S"};
+    const char *rets[] = {NULL, "int", NULL, "test.B", "int", NULL, "int"};
+    for (int i = 0; i < 7; i++) {
+        defs[i].qualified_name = qns[i];
+        defs[i].short_name = shorts[i];
+        defs[i].label = recv[i] ? "Method" : "Class";
+        defs[i].receiver_type = recv[i];
+        defs[i].return_types = rets[i];
+        defs[i].lang = CBM_LANG_PYTHON;
+    }
+    const char *chain_fn = receiver ? "chain" : "deep";
+    const char *done = receiver ? "B.done" : "V.done";
+    int sizes = (int)(sizeof(pylsp_long_chain_sizes) / sizeof(pylsp_long_chain_sizes[0]));
+    for (int i = 0; i < sizes; i++) {
+        int links = pylsp_long_chain_sizes[i];
+        char *src = pylsp_long_chain_source(receiver, links);
+        ASSERT_NOT_NULL(src);
+        bool per_file_ok = true;
+        if (i == 0) {
+            CBMFileResult *r = extract_py(src);
+            per_file_ok = r && !r->has_error && !r->lsp_skipped &&
+                          find_resolved(r, "run", "S.m") >= 0 &&
+                          find_resolved(r, chain_fn, done) >= 0;
+            printf("    per-file %s chain of %d: ok=%d\n", receiver ? "receiver" : "binary",
+                   links, (int)per_file_ok);
+            if (r)
+                cbm_free_result(r);
+        }
+        CBMFileResult cross = {};
+        cbm_arena_init(&cross.arena);
+        cbm_pxc_run_one(CBM_LANG_PYTHON, &cross, src, (int)strlen(src), "test", defs, 7, NULL,
+                        NULL, 0);
+        free(src);
+        bool no_error = !cross.has_error && !cross.lsp_skipped;
+        bool unrelated = find_resolved(&cross, "run", "S.m") >= 0;
+        bool typed = find_resolved(&cross, chain_fn, done) >= 0;
+        printf("    cross %s chain of %d: skipped=%d run->S.m=%d %s=%d resolved=%d\n",
+               receiver ? "receiver" : "binary", links, (int)cross.lsp_skipped, (int)unrelated,
+               done, (int)typed, cross.resolved_calls.count);
+        cbm_arena_destroy(&cross.arena);
+        ASSERT_TRUE(per_file_ok);
+        ASSERT_TRUE(no_error);
+        ASSERT_TRUE(unrelated);
+        ASSERT_TRUE(typed);
+    }
+    PASS();
+}
+
+TEST(pylsp_issue1527_long_binary_chain_is_not_nesting) {
+    return pylsp_long_chain_case(false);
+}
+
+TEST(pylsp_issue1527_long_receiver_chain_is_not_nesting) {
+    return pylsp_long_chain_case(true);
+}
+
 SUITE(py_lsp) {
     RUN_TEST(pylsp_issue1527_chain_statements_resolve_completely);
     RUN_TEST(pylsp_issue1527_large_module_resolves_every_call);
+    RUN_TEST(pylsp_issue1527_long_binary_chain_is_not_nesting);
+    RUN_TEST(pylsp_issue1527_long_receiver_chain_is_not_nesting);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(pylsp_scale_work_is_linear);
     RUN_TEST(pylsp_issue1527_memo_allocation_failure_is_reported);

@@ -16176,10 +16176,90 @@ TEST(clsp_issue1527_depth_failure_reports_all_entry_points) {
 }
 #endif /* CBM_ENABLE_TEST_SEAMS */
 
+/* A chain's LENGTH is not nesting depth (#1527 follow-up). An operator chain
+ * `a + a + ... + a` and a receiver chain `b.a().a()...` are evaluated link by
+ * link, so neither consumes the evaluator's depth guard: the file keeps its
+ * LSP resolution (an unrelated call in another function still resolves), no
+ * file-level failure is recorded, and the chain's result type still drives
+ * the call made on it. Before the iterative evaluation, 300 terms already
+ * exceeded the guard and rolled back every resolution of the file.
+ *
+ * FORK DIVERGENCE: upstream also runs 20000 terms through the per-file walk.
+ * This fork skips the LSP walks of a file whose tree is deeper than
+ * CBM_LSP_MAX_TREE_DEPTH (4096) before any resolver runs (stack protection
+ * for the other recursive resolvers), so 20000 asserts that rule instead. */
+static const int clsp_long_chain_sizes[] = {300, 2000, 20000};
+
+static char *clsp_long_chain_source(bool receiver, int links) {
+    size_t sz = (size_t)links * 8 + 512;
+    char *src = (char *)malloc(sz);
+    if (!src)
+        return NULL;
+    size_t pos = (size_t)snprintf(src, sz,
+                                  "struct V { void done() {} };\n"
+                                  "struct B { B& a() { return *this; } void done() {} };\n"
+                                  "struct S { int m() { return 1; } };\n");
+    if (receiver) {
+        pos += (size_t)snprintf(src + pos, sz - pos, "void chain(B b) {\n  b");
+        for (int i = 0; i < links; i++)
+            pos += (size_t)snprintf(src + pos, sz - pos, ".a()");
+        pos += (size_t)snprintf(src + pos, sz - pos, ".done();\n}\n");
+    } else {
+        pos += (size_t)snprintf(src + pos, sz - pos, "void deep(V a) {\n  auto x = a");
+        for (int i = 1; i < links; i++)
+            pos += (size_t)snprintf(src + pos, sz - pos, " + a");
+        pos += (size_t)snprintf(src + pos, sz - pos, ";\n  x.done();\n}\n");
+    }
+    snprintf(src + pos, sz - pos, "void run() { S s; s.m(); }\n");
+    return src;
+}
+
+static int clsp_long_chain_case(bool receiver) {
+    int sizes = (int)(sizeof(clsp_long_chain_sizes) / sizeof(clsp_long_chain_sizes[0]));
+    for (int i = 0; i < sizes; i++) {
+        int links = clsp_long_chain_sizes[i];
+        char *src = clsp_long_chain_source(receiver, links);
+        ASSERT_NOT_NULL(src);
+        CBMFileResult *r = extract_cpp(src);
+        free(src);
+        ASSERT_NOT_NULL(r);
+        if (links > 4096) {
+            bool skipped = r->lsp_skipped && r->lsp_skip_reason == CBM_LSP_SKIP_TREE_DEPTH;
+            printf("    %s chain of %d: tree_depth skip=%d\n", receiver ? "receiver" : "binary",
+                   links, (int)skipped);
+            cbm_free_result(r);
+            ASSERT_TRUE(skipped);
+            continue;
+        }
+        bool no_error = !r->has_error && !r->lsp_skipped;
+        bool unrelated = find_resolved(r, "run", "S.m") >= 0;
+        bool typed = receiver ? find_resolved(r, "chain", "B.done") >= 0
+                              : find_resolved(r, "deep", "V.done") >= 0;
+        printf("    %s chain of %d: skipped=%d run->S.m=%d %s=%d resolved=%d\n",
+               receiver ? "receiver" : "binary", links, (int)r->lsp_skipped, (int)unrelated,
+               receiver ? "B.done" : "V.done", (int)typed, r->resolved_calls.count);
+        cbm_free_result(r);
+        ASSERT_TRUE(no_error);
+        ASSERT_TRUE(unrelated);
+        ASSERT_TRUE(typed);
+    }
+    PASS();
+}
+
+TEST(clsp_issue1527_long_binary_chain_is_not_nesting) {
+    return clsp_long_chain_case(false);
+}
+
+TEST(clsp_issue1527_long_receiver_chain_is_not_nesting) {
+    return clsp_long_chain_case(true);
+}
+
 SUITE(c_lsp) {
     RUN_TEST(clsp_issue1527_long_fluent_chain_resolves_every_link);
     RUN_TEST(registry_issue1527_index_preserves_registration_order);
     RUN_TEST(scope_issue1527_recovery_sizes_from_all_bindings);
+    RUN_TEST(clsp_issue1527_long_binary_chain_is_not_nesting);
+    RUN_TEST(clsp_issue1527_long_receiver_chain_is_not_nesting);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(clsp_issue1527_fluent_chain_work_is_polynomial);
     RUN_TEST(clsp_issue1527_scale_work_is_linear);
