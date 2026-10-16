@@ -20,16 +20,16 @@ enum {
     MCP_COL_7 = 7,
     MCP_COL_10 = 10,
     MCP_COL_16 = 16,
-    MCP_DB_EXT = 3,      /* strlen(".db") */
-    MCP_SEPARATOR = 2,   /* space for separator chars */
+    MCP_DB_EXT = 3,    /* strlen(".db") */
+    MCP_SEPARATOR = 2, /* space for separator chars */
     MCP_DEFAULT_DEPTH = 3,
     MCP_DEFAULT_BFS_DEPTH = 2,
     MCP_DEFAULT_LIMIT = 10,
-    MCP_BFS_LIMIT = 100,            /* default per-direction trace budget (limit param raises) */
-    MCP_BFS_SCAN_LIMIT = 1000,      /* max ordered candidate rows before test filtering */
-    MCP_BFS_LIMIT_MAX = 5000,       /* hard ceiling for the limit param (context-bomb guard) */
-    MCP_PATH_WORK_DEFAULT = 10000,  /* CALLS edges examined by targeted from_function search */
-    MCP_PATH_WORK_MAX = 100000,     /* hard ceiling independent of repository size */
+    MCP_BFS_LIMIT = 100,           /* default per-direction trace budget (limit param raises) */
+    MCP_BFS_SCAN_LIMIT = 1000,     /* max ordered candidate rows before test filtering */
+    MCP_BFS_LIMIT_MAX = 5000,      /* hard ceiling for the limit param (context-bomb guard) */
+    MCP_PATH_WORK_DEFAULT = 10000, /* CALLS edges examined by targeted from_function search */
+    MCP_PATH_WORK_MAX = 100000,    /* hard ceiling independent of repository size */
     MCP_PATH_HASH_FILE_MAX = 2 * 1024 * 1024,
     MCP_PATH_HASH_REQUEST_MAX = 32 * 1024 * 1024,
     MCP_PATH_HASH_TIMEOUT_MS = 200,
@@ -9422,20 +9422,19 @@ static bool search_scan_line_matches(const search_scan_patterns_t *patterns, boo
          * BSD grep matched past it: try each NUL-separated piece. */
         for (const char *piece = line; piece <= line + length; piece += strlen(piece) + SKIP_ONE) {
             int eflags = piece == line ? 0 : REG_NOTBOL; /* ^ is the line start only */
-            for (const cbm_regex_t &re : patterns->line_regexes) {
-                if (cbm_regexec(&re, piece, 0, NULL, eflags) == CBM_REG_OK) {
-                    return true;
-                }
+            if (std::any_of(patterns->line_regexes.begin(), patterns->line_regexes.end(),
+                            [piece, eflags](const cbm_regex_t &re) {
+                                return cbm_regexec(&re, piece, 0, NULL, eflags) == CBM_REG_OK;
+                            })) {
+                return true;
             }
         }
         return false;
     }
-    for (const std::string &item : patterns->items) {
-        if (memmem(line, length, item.data(), item.size()) != NULL) {
-            return true;
-        }
-    }
-    return false;
+    return std::any_of(patterns->items.begin(), patterns->items.end(),
+                       [line, length](const std::string &item) {
+                           return memmem(line, length, item.data(), item.size()) != NULL;
+                       });
 }
 
 /* Start of the first line at or after `pos` that may match: a literal or
@@ -9589,6 +9588,7 @@ static void search_scan_buffer(std::string &out, const search_scan_patterns_t *p
     size_t pos = 0;
     while (pos < length && *budget > 0) {
         size_t line_start = pos;
+        // cppcheck-suppress knownConditionTrueFalse ; line_mode is set on __APPLE__ only
         if (!line_mode) {
             line_start = search_scan_next_candidate(patterns, use_regex, buffer, pos, length);
             if (line_start >= length) {

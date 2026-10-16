@@ -1242,6 +1242,7 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
         return empty_result(); /* unresolvably ambiguous — see REG_MAX_CANDIDATES */
     }
     qn_array_t view;
+    // cppcheck-suppress variableScope ; view.items points here
     char *view_items[REG_MAX_CANDIDATES];
     if (skip_members) {
         candidates_without_members(r, arr, &view, view_items);

@@ -10,8 +10,8 @@
 #define CBM_MCP_INTERNAL_H
 
 #include "mcp/mcp.h"
-#include "pipeline/pipeline.h" /* cbm_changed_hunk_t */
-#include "store/store.h"       /* cbm_node_t */
+#include "pipeline/pipeline.h"    /* cbm_changed_hunk_t */
+#include "store/store.h"          /* cbm_node_t */
 #include "mcp/index_supervisor.h" /* cbm_index_worker_result_t */
 
 #ifdef __cplusplus

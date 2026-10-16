@@ -737,7 +737,7 @@ typedef struct {
 
     cbm_pkg_entries_t *pkg_entries; /* per-worker manifest arrays (separate allocation) */
 
-    const cbm_cc_index_t *cc_index; /* compile_commands flags (C/C++), borrowed */
+    const cbm_cc_index_t *cc_index;     /* compile_commands flags (C/C++), borrowed */
     const cbm_stem_marks_t *stem_marks; /* Module QN marks (borrowed; may be NULL) */
 
     bool retain_sources;                 /* copy source into result->arena for cross-file LSP */

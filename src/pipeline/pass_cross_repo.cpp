@@ -25,6 +25,8 @@
 #include <string.h>
 #include <time.h>
 
+#include <algorithm>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -458,10 +460,9 @@ static void cr_load_local_routes(struct sqlite3 *db, const char *project, cr_loc
  * the GET node. */
 static bool call_served_locally(const cr_local_routes *local, int64_t route_id, const char *method,
                                 const char *curl) {
-    for (int64_t id : local->ids) {
-        if (id == route_id) {
-            return true;
-        }
+    if (std::any_of(local->ids.begin(), local->ids.end(),
+                    [route_id](int64_t id) { return id == route_id; })) {
+        return true;
     }
     for (const std::string &qn : local->qns) {
         const char *rmethod = NULL;

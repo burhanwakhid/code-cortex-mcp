@@ -1,4 +1,6 @@
 #include "pipeline/result_store.h"
+#include <algorithm>
+#include <iterator>
 #include <vector>
 /*
  * pipeline.c — Indexing pipeline orchestrator.
@@ -943,11 +945,11 @@ static bool infra_values_file(const char *fp) {
     const char *base = slash ? slash + SKIP_ONE : fp;
     size_t n = strlen(base);
     static const char *const suffixes[] = {".tfvars", ".tfvars.json", ".env"};
-    for (const char *suffix : suffixes) {
-        size_t sl = strlen(suffix);
-        if (n >= sl && strcmp(base + n - sl, suffix) == 0) {
-            return true;
-        }
+    if (std::any_of(std::begin(suffixes), std::end(suffixes), [base, n](const char *suffix) {
+            size_t sl = strlen(suffix);
+            return n >= sl && strcmp(base + n - sl, suffix) == 0;
+        })) {
+        return true;
     }
     return strcmp(base, ".env") == 0 || strncmp(base, ".env.", INFRA_SLEN(".env.")) == 0;
 }
@@ -1099,12 +1101,8 @@ static bool is_exposed_endpoint_key(const char *key_path) {
     norm[n] = '\0';
     static const char *const endpoints[] = {"pushendpoint", "posturl", "callback",
                                             "callbackurl",  "webhook", "webhookurl"};
-    for (const char *endpoint : endpoints) {
-        if (strcmp(norm, endpoint) == 0) {
-            return true;
-        }
-    }
-    return false;
+    return std::any_of(std::begin(endpoints), std::end(endpoints),
+                       [&norm](const char *endpoint) { return strcmp(norm, endpoint) == 0; });
 }
 
 /* Try to create an infra Route node from one string_ref. */

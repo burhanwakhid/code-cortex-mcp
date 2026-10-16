@@ -4105,6 +4105,7 @@ static CBMFileResult *extract_file_impl_body(const char *source, int source_len,
      * copy with those rows blanked; offsets and positions of everything kept
      * are unchanged. Freed right after the parse: nothing reads the copy. */
     char *sql_blanked = nullptr;
+    // cppcheck-suppress knownConditionTrueFalse ; false only in CBM_ENABLE_TEST_SEAMS builds
     if (language == CBM_LANG_SQL && cbm_sql_values_exclusion_on(rel_path) && source_len > 0) {
         sql_blanked = cbm_sql_blank_literal_rows(source, (uint32_t)source_len);
         if (sql_blanked) {

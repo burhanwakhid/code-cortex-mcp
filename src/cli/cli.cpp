@@ -11,7 +11,7 @@
 #include "foundation/constants.h"
 #include "foundation/sha256.h"
 #include "foundation/str_util.h" // cbm_is_project_index_db
-#include "mcp/mcp.h" // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
+#include "mcp/mcp.h"             // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
 
 /* CLI buffer size constants. */
 enum {

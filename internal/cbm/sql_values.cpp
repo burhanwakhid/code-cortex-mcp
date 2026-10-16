@@ -454,8 +454,8 @@ bool cbm_sql_values_kept_ranges(const char *src, uint32_t len, CBMSqlKeptRanges 
     TSPoint from_pt = {0, 0};
     for (uint32_t k = 0; k <= ex.count; k++) {
         uint32_t to = k < ex.count ? ex.items[k].start_byte : len;
-        TSPoint to_pt = k < ex.count ? ex.items[k].start_point : sqlv_point(&sc);
         if (to > from) {
+            TSPoint to_pt = k < ex.count ? ex.items[k].start_point : sqlv_point(&sc);
             kept[n++] = TSRange{from_pt, to_pt, from, to};
         }
         if (k < ex.count) {

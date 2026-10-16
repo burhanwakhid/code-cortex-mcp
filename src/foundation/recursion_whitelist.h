@@ -24,13 +24,16 @@
  *   - find_first_descendant_by_kind (Verilog/SystemVerilog name wrappers)
  *   - find_first_descendant_of (Dart/Zig import URI/string nesting)
  *   - find_route_path_literal (route decorator/call args, explicit max_depth bound)
+ *   - go_stmt_binding (Go var_declaration -> var_spec_list -> var_spec; the
+ *     grammar bounds the nesting at two levels)
  *
  * To add a function: add it below AND add NOLINT(misc-no-recursion) on
  * the function definition line. The lint gate verifies both match.
  */
-#define CBM_RECURSION_WHITELIST                                                               \
-    "parse_or_expr", "parse_xor_expr", "parse_and_expr", "parse_not_expr", "parse_atom_expr", \
-        "eval_expr", "cypher_expr_selectivity", "glob_match", "glob_match_star",              \
-        "glob_match_doublestar", "glob_match_doublestar_slash", "glob_match_doublestar_any",  \
-        "parse_bool_expr", "parse_bool_atom", "r_collect_imports",                            \
-        "find_first_descendant_by_kind", "find_first_descendant_of", "find_route_path_literal"
+#define CBM_RECURSION_WHITELIST                                                                 \
+    "parse_or_expr", "parse_xor_expr", "parse_and_expr", "parse_not_expr", "parse_atom_expr",   \
+        "eval_expr", "cypher_expr_selectivity", "glob_match", "glob_match_star",                \
+        "glob_match_doublestar", "glob_match_doublestar_slash", "glob_match_doublestar_any",    \
+        "parse_bool_expr", "parse_bool_atom", "r_collect_imports",                              \
+        "find_first_descendant_by_kind", "find_first_descendant_of", "find_route_path_literal", \
+        "go_stmt_binding"
