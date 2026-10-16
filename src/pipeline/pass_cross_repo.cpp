@@ -177,6 +177,33 @@ static const char *cr_url_path(const char *url) {
     return path_start ? path_start : "/";
 }
 
+/* True when url names a host other than this machine: "scheme://host/..."
+ * with a host that is not localhost or a loopback address. Such a call goes
+ * to another service even when the caller serves the same path itself, so
+ * the #1459 caller-local floor must not swallow it. */
+static bool cr_url_names_remote_host(const char *url) {
+    const char *scheme_end = url ? strstr(url, "://") : NULL;
+    if (!scheme_end) {
+        return false; /* a bare path: same origin */
+    }
+    const char *host = scheme_end + CR_SCHEME_SKIP;
+    const char *at = strpbrk(host, "@/");
+    if (at && *at == '@') {
+        host = at + SKIP_ONE; /* drop userinfo */
+    }
+    size_t len = strcspn(host, ":/?#");
+    if (len == 0) {
+        return false;
+    }
+    static const char *const loopback[] = {"localhost", "127.0.0.1", "0.0.0.0", "[::1]"};
+    for (const char *name : loopback) {
+        if (strlen(name) == len && strncasecmp(host, name, len) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Look up a node's name and file_path by id. */
 static void lookup_node_info(struct sqlite3 *db, int64_t node_id, char *name_out, size_t name_sz,
                              char *file_out, size_t file_sz) {
@@ -524,7 +551,8 @@ static int match_http_routes(cbm_store_t *src_store, const char *src_project,
         char route_qn[CR_QN_BUF];
         char cpath[CBM_SZ_256];
         const char *curl = cbm_route_canon_path(cr_url_path(url_path), cpath, sizeof(cpath));
-        if (call_served_locally(&local, route_id, method, curl)) {
+        if (!cr_url_names_remote_host(url_path) &&
+            call_served_locally(&local, route_id, method, curl)) {
             continue;
         }
         snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method[0] ? method : "ANY", curl);

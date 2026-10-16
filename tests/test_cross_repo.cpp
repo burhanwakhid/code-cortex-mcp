@@ -584,6 +584,46 @@ TEST(cross_repo_methodless_call_to_local_get_route_blocks_cross_http_issue1459) 
     PASS();
 }
 
+/* The #1459 floor is for same-origin calls. A call that names another host
+ * ("https://payments.example/api/users") is a cross-service call even when the
+ * caller serves the same path itself; one to a loopback host is still local. */
+TEST(cross_repo_absolute_remote_url_skips_caller_local_floor) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_http_pair(&fixture, "mono-abs", "pay-abs", "/api/users", "mono") &&
+        cross_repo_seed_local_handler(&fixture, "mono-abs", "mono") &&
+        cross_repo_exec(&fixture, "mono-abs",
+                        "UPDATE edges SET properties = '{\"url_path\":"
+                        "\"https://user@payments.example:8443/api/users\",\"method\":\"GET\"}' "
+                        "WHERE type = 'HTTP_CALLS';") &&
+        cross_repo_seed_http_pair(&fixture, "mono-lo", "pay-lo", "/api/users", "mono") &&
+        cross_repo_seed_local_handler(&fixture, "mono-lo", "mono") &&
+        cross_repo_exec(&fixture, "mono-lo",
+                        "UPDATE edges SET properties = '{\"url_path\":"
+                        "\"http://LOCALHOST:3000/api/users\",\"method\":\"GET\"}' "
+                        "WHERE type = 'HTTP_CALLS';");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed absolute-URL fixtures");
+    }
+    const char *remote_target = "pay-abs";
+    cbm_cross_repo_result_t remote = cbm_cross_repo_match("mono-abs", &remote_target, 1);
+    const char *loop_target = "pay-lo";
+    cbm_cross_repo_result_t loop = cbm_cross_repo_match("mono-lo", &loop_target, 1);
+    int remote_edges = cross_repo_count_edges(&fixture, "mono-abs", "CROSS_HTTP_CALLS");
+    int loop_edges = cross_repo_count_edges(&fixture, "mono-lo", "CROSS_HTTP_CALLS");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(remote.failed);
+    ASSERT_FALSE(loop.failed);
+    ASSERT_EQ(remote.http_edges, 1);
+    ASSERT_EQ(remote_edges, 1);
+    ASSERT_EQ(loop.http_edges, 0);
+    ASSERT_EQ(loop_edges, 0);
+    PASS();
+}
+
 /* Control for the #1459 floor: without a caller-local handler the path match
  * still links the caller to the remote handler, in both run directions. */
 TEST(cross_repo_caller_without_local_handler_keeps_cross_http_issue1459) {
@@ -622,4 +662,5 @@ SUITE(cross_repo) {
     RUN_TEST(cross_repo_caller_local_handler_blocks_cross_http_issue1459);
     RUN_TEST(cross_repo_methodless_call_to_local_get_route_blocks_cross_http_issue1459);
     RUN_TEST(cross_repo_caller_without_local_handler_keeps_cross_http_issue1459);
+    RUN_TEST(cross_repo_absolute_remote_url_skips_caller_local_floor);
 }
