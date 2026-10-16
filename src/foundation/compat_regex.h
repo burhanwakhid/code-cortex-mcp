@@ -23,6 +23,10 @@ extern "C" {
 #define CBM_REG_ICASE 2
 #define CBM_REG_NOSUB 4
 #define CBM_REG_NEWLINE 8
+/* The dialect `grep -E` speaks on this platform: on Apple, REG_ENHANCED (the
+ * \w \s \d \b escapes BSD grep accepts); elsewhere no change (glibc's ERE
+ * already is GNU grep's). Ignored by the Windows std::regex backend. */
+#define CBM_REG_GREP 16
 
 /* ── Error codes ──────────────────────────────────────────────── */
 

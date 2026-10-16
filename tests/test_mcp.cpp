@@ -6775,6 +6775,309 @@ TEST(tool_trace_call_path_qn_fallback_frees_name_miss) {
 }
 
 
+/* ── In-process search_code scan (upstream c9cacdf0, fork seam) ──────
+ * The scoped scan used to shell out to `xargs grep -Hn` and now runs in
+ * process on POSIX. These cases pin its records to the `grep -Hn` shape,
+ * file order, binary handling and the --include globs of the platform grep. */
+#ifndef _WIN32
+typedef struct {
+    char dir[256];
+    char list[512];
+    char files[6][512];
+    int count;
+} scan_fixture_t;
+
+static bool scan_fixture_open(scan_fixture_t *fx) {
+    memset(fx, 0, sizeof(*fx));
+    const char *tmp = th_mktempdir("cbm_scan");
+    if (!tmp) {
+        return false;
+    }
+    snprintf(fx->dir, sizeof(fx->dir), "%s", tmp);
+    snprintf(fx->list, sizeof(fx->list), "%s/list", tmp);
+    return true;
+}
+
+/* Add a file holding exactly `length` bytes (NUL bytes allowed). */
+static bool scan_fixture_add(scan_fixture_t *fx, const char *name, const char *data,
+                             size_t length) {
+    if (fx->count >= 6) {
+        return false;
+    }
+    char dir[sizeof(fx->dir)];
+    memcpy(dir, fx->dir, sizeof(dir));
+    char *path = fx->files[fx->count];
+    snprintf(path, sizeof(fx->files[0]), "%s/%s", dir, name);
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        return false;
+    }
+    bool ok = fwrite(data, 1, length, fp) == length;
+    ok = fclose(fp) == 0 && ok;
+    fx->count += ok ? 1 : 0;
+    return ok;
+}
+
+/* Write the scoped file list as search_code does (NUL records); `extra`
+ * names one more path that need not exist. */
+static bool scan_fixture_list(const scan_fixture_t *fx, const char *extra) {
+    FILE *fp = fopen(fx->list, "wb");
+    if (!fp) {
+        return false;
+    }
+    bool ok = true;
+    for (int i = 0; i < fx->count; i++) {
+        ok = ok && fputs(fx->files[i], fp) != EOF && fputc('\0', fp) != EOF;
+    }
+    if (extra) {
+        ok = ok && fputs(extra, fp) != EOF && fputc('\0', fp) != EOF;
+    }
+    return fclose(fp) == 0 && ok;
+}
+
+static char *scan_fixture_run(const scan_fixture_t *fx, const char *pattern, bool use_regex,
+                              const char *file_pattern, int max_records) {
+    return cbm_mcp_search_scan_for_test(fx->list, pattern, use_regex, file_pattern, max_records);
+}
+
+/* Append one expected record to `buf`. */
+static void scan_expect(char *buf, size_t cap, const char *path, int line, const char *content) {
+    size_t used = strlen(buf);
+    snprintf(buf + used, cap - used, "%s:%d:%s\n", path, line, content);
+}
+#endif
+
+TEST(search_code_scan_in_process_writes_grep_records) {
+#ifdef _WIN32
+    SKIP_PLATFORM("Windows keeps the Select-String scan");
+#else
+    scan_fixture_t fx;
+    ASSERT_TRUE(scan_fixture_open(&fx));
+    /* The last line has no newline and line 3 is empty. */
+    static const char a[] = "alpha\nbeta gamma\n\nalpha beta\nlast alpha";
+    static const char b[] = "nothing\nalpha\n";
+    ASSERT_TRUE(scan_fixture_add(&fx, "a.txt", a, sizeof(a) - 1));
+    ASSERT_TRUE(scan_fixture_add(&fx, "b.txt", b, sizeof(b) - 1));
+    ASSERT_TRUE(scan_fixture_list(&fx, NULL));
+    const char *pa = fx.files[0];
+    const char *pb = fx.files[1];
+    char want[4096];
+
+    /* Literal: every matching line, file order, then line order. */
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), pa, 1, "alpha");
+    scan_expect(want, sizeof(want), pa, 4, "alpha beta");
+    scan_expect(want, sizeof(want), pa, 5, "last alpha");
+    scan_expect(want, sizeof(want), pb, 2, "alpha");
+    char *got = scan_fixture_run(&fx, "alpha", false, NULL, 500);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+
+    /* A multi-line pattern is one pattern per line, as with grep -f. */
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), pa, 2, "beta gamma");
+    scan_expect(want, sizeof(want), pa, 4, "alpha beta");
+    got = scan_fixture_run(&fx, "gamma\nbeta", false, NULL, 500);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+
+    /* An empty pattern matches every line, the empty one included. */
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), pa, 1, "alpha");
+    scan_expect(want, sizeof(want), pa, 2, "beta gamma");
+    scan_expect(want, sizeof(want), pa, 3, "");
+    scan_expect(want, sizeof(want), pa, 4, "alpha beta");
+    scan_expect(want, sizeof(want), pa, 5, "last alpha");
+    scan_expect(want, sizeof(want), pb, 1, "nothing");
+    scan_expect(want, sizeof(want), pb, 2, "alpha");
+    got = scan_fixture_run(&fx, "", false, NULL, 500);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+
+    /* Extended regex, anchored per line. */
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), pa, 1, "alpha");
+    scan_expect(want, sizeof(want), pa, 4, "alpha beta");
+    scan_expect(want, sizeof(want), pa, 5, "last alpha");
+    scan_expect(want, sizeof(want), pb, 2, "alpha");
+    got = scan_fixture_run(&fx, "^(alpha|last)", true, NULL, 500);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+
+    /* `$` is the line end, never a later line's. */
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), pa, 2, "beta gamma");
+    got = scan_fixture_run(&fx, "a gamma$", true, NULL, 500);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+
+    /* No match, and an invalid regex (grep -E refused it): no records. */
+    got = scan_fixture_run(&fx, "zzqqxx", false, NULL, 500);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "");
+    free(got);
+    got = scan_fixture_run(&fx, "(alpha", true, NULL, 500);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "");
+    free(got);
+    th_rmtree(fx.dir);
+    PASS();
+#endif
+}
+
+TEST(search_code_scan_in_process_binary_and_crlf) {
+#ifdef _WIN32
+    SKIP_PLATFORM("Windows keeps the Select-String scan");
+#else
+    scan_fixture_t fx;
+    ASSERT_TRUE(scan_fixture_open(&fx));
+    /* A NUL in the first 32 KiB marks the whole file binary: no records. */
+    static const char bin[] = "alpha\n\0alpha\n";
+    ASSERT_TRUE(scan_fixture_add(&fx, "bin.dat", bin, sizeof(bin) - 1));
+    /* A later NUL (past both greps' first buffer): BSD grep keeps printing
+     * lines, GNU grep stops at the last complete line before it. */
+    enum { FILLER_LINES = 12000 }; /* 10 bytes each: past a 96 KiB probe */
+    size_t late_cap = (size_t)FILLER_LINES * 10 + 64;
+    char *late = (char *)malloc(late_cap);
+    ASSERT_NOT_NULL(late);
+    size_t used = 0;
+    for (int i = 0; i < FILLER_LINES; i++) {
+        memcpy(late + used, "xxxxxxxxx\n", 10);
+        used += 10;
+    }
+    static const char tail[] = "alpha one\nalpha two\0\nalpha three\n";
+    memcpy(late + used, tail, sizeof(tail) - 1);
+    used += sizeof(tail) - 1;
+    ASSERT_TRUE(scan_fixture_add(&fx, "late.txt", late, used));
+    free(late);
+    static const char crlf[] = "alpha\r\nbeta\r\n";
+    ASSERT_TRUE(scan_fixture_add(&fx, "crlf.txt", crlf, sizeof(crlf) - 1));
+    /* Bytes that are not UTF-8 are matched like any other. */
+    static const char latin1[] = "caf\xe9 alpha\n";
+    ASSERT_TRUE(scan_fixture_add(&fx, "latin1.txt", latin1, sizeof(latin1) - 1));
+    ASSERT_TRUE(scan_fixture_list(&fx, NULL));
+    char want[4096];
+
+    /* The record keeps the line's CR; the result parser trims it. */
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), fx.files[1], FILLER_LINES + 1, "alpha one");
+#ifdef __APPLE__
+    {
+        /* BSD grep printed the NUL line whole and kept going. */
+        size_t len = strlen(want);
+        snprintf(want + len, sizeof(want) - len, "%s:%d:alpha two", fx.files[1],
+                 FILLER_LINES + 2);
+        len = strlen(want);
+        want[len] = '\0'; /* the record's NUL byte ends the C string here */
+    }
+#endif
+    char *got = scan_fixture_run(&fx, "alpha", false, NULL, 500);
+    ASSERT_NOT_NULL(got);
+#ifdef __APPLE__
+    /* The records hold a NUL, so compare the text before it, then the rest. */
+    ASSERT_STR_EQ(got, want);
+#else
+    scan_expect(want, sizeof(want), fx.files[2], 1, "alpha\r");
+    scan_expect(want, sizeof(want), fx.files[3], 1, "caf\xe9 alpha");
+    ASSERT_STR_EQ(got, want);
+#endif
+    free(got);
+
+    /* `$` before a CR: grep sees the CR and does not match. */
+    got = scan_fixture_run(&fx, "^beta$", true, NULL, 500);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "");
+    free(got);
+    th_rmtree(fx.dir);
+    PASS();
+#endif
+}
+
+TEST(search_code_scan_in_process_limits_globs_and_literals) {
+#ifdef _WIN32
+    SKIP_PLATFORM("Windows keeps the Select-String scan");
+#else
+    scan_fixture_t fx;
+    ASSERT_TRUE(scan_fixture_open(&fx));
+    static const char a[] = "alpha\nalpha\nalpha\n";
+    ASSERT_TRUE(scan_fixture_add(&fx, "a.c", a, sizeof(a) - 1));
+    char sub[600];
+    snprintf(sub, sizeof(sub), "%s/sub", fx.dir);
+    ASSERT_EQ(th_mkdir_p(sub), 0);
+    /* Literal-looking text the regexes below must not require. */
+    static const char b[] = "abbcd\nab{2,3}cd\nxyzcd\nmodels.Model\nfoo bar\n";
+    ASSERT_TRUE(scan_fixture_add(&fx, "sub/b.h", b, sizeof(b) - 1));
+    char want[4096];
+
+    /* The record budget stops the scan, as the closed pipe stopped grep. */
+    ASSERT_TRUE(scan_fixture_list(&fx, NULL));
+    want[0] = '\0';
+    scan_expect(want, sizeof(want), fx.files[0], 1, "alpha");
+    scan_expect(want, sizeof(want), fx.files[0], 2, "alpha");
+    char *got = scan_fixture_run(&fx, "alpha", false, NULL, 2);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, want);
+    free(got);
+
+    /* A listed file that cannot be read is skipped, as grep skipped it. */
+    char missing[600];
+    snprintf(missing, sizeof(missing), "%s/missing.txt", fx.dir);
+    ASSERT_TRUE(scan_fixture_list(&fx, missing));
+    got = scan_fixture_run(&fx, "zzqq", false, NULL, 500);
+    ASSERT_NOT_NULL(got);
+    ASSERT_STR_EQ(got, "");
+    free(got);
+
+    /* Regex candidates come from a literal every match contains: an
+     * interval, a group with alternation, an escape and a bracket never
+     * contribute text that a match may lack. */
+    static const struct {
+        const char *re;
+        int line;
+    } cases[] = {{"ab{2,3}cd", 1}, {"(ab|xyz)cd", 3}, {"ab\\{2,3\\}cd", 2},
+                 {"[xy]yzcd", 3},  {"models\\.Mod", 4}, {"foo.*bar", 5}};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        got = scan_fixture_run(&fx, cases[i].re, true, NULL, 500);
+        ASSERT_NOT_NULL(got);
+        char line_tag[32];
+        snprintf(line_tag, sizeof(line_tag), ":%d:", cases[i].line);
+        if (!strstr(got, line_tag)) {
+            printf("  regex %s missed line %d: %s\n", cases[i].re, cases[i].line, got);
+        }
+        ASSERT_NOT_NULL(strstr(got, line_tag));
+        free(got);
+    }
+
+    /* --include: the full path and the base name match on both greps; a
+     * relative directory glob matches a path suffix only on GNU grep. */
+    got = scan_fixture_run(&fx, "cd", false, "*.h", 500);
+    ASSERT_NOT_NULL(got);
+    ASSERT_NOT_NULL(strstr(got, "b.h:1:"));
+    ASSERT_NULL(strstr(got, "a.c:"));
+    free(got);
+    got = scan_fixture_run(&fx, "alpha", false, "a.?", 500);
+    ASSERT_NOT_NULL(got);
+    ASSERT_NOT_NULL(strstr(got, "a.c:1:"));
+    free(got);
+    got = scan_fixture_run(&fx, "cd", false, "sub/*.h", 500);
+    ASSERT_NOT_NULL(got);
+#ifdef __APPLE__
+    ASSERT_STR_EQ(got, "");
+#else
+    ASSERT_NOT_NULL(strstr(got, "b.h:1:"));
+#endif
+    free(got);
+    th_rmtree(fx.dir);
+    PASS();
+#endif
+}
+
+
 SUITE(mcp) {
     RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
     RUN_TEST(autoindex_limit_admits_under_limit_issue713);
@@ -7007,4 +7310,7 @@ SUITE(mcp) {
     RUN_TEST(bm25_label_and_path_filter_survive_the_inner_limit);
     RUN_TEST(bm25_searches_legacy_four_column_fts_without_error_issue518);
     RUN_TEST(tool_trace_call_path_qn_fallback_frees_name_miss);
+    RUN_TEST(search_code_scan_in_process_writes_grep_records);
+    RUN_TEST(search_code_scan_in_process_binary_and_crlf);
+    RUN_TEST(search_code_scan_in_process_limits_globs_and_literals);
 }

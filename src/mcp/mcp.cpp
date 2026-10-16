@@ -111,6 +111,8 @@ void cbm_mcp_test_set_trace_hash_limits(size_t per_file_bytes, size_t per_reques
 #include <unistd.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <fnmatch.h>
+#include <regex.h> /* REG_NOTBOL for cbm_regexec's pass-through exec flags */
 #endif
 #include <yyjson/yyjson.h>
 #include <limits.h>
@@ -1139,6 +1141,7 @@ bool cbm_mcp_get_bool_arg(const char *args_json, const char *key) {
 
 struct cbm_mcp_server {
     cbm_store_t *store;               /* currently open project store (or NULL) */
+    bool read_batch_tool;             /* this request's store reads run in a read batch */
     bool owns_store;                  /* true if we opened the store */
     char *current_project;            /* which project store is open for (heap) */
     time_t store_last_used;           /* last time resolve_store was called for a named project */
@@ -1638,10 +1641,22 @@ static void store_meta_note_project(const char *path, const char *project, const
     cbm_store_meta_close(meta);
 }
 
+static cbm_store_t *resolve_store_open(cbm_mcp_server_t *srv, const char *project);
+
+/* Query-only callers (every read tool). A tool listed in
+ * mcp_tool_reads_in_batch runs its reads in one store read batch. */
+static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
+    cbm_store_t *store = resolve_store_open(srv, project);
+    if (store && srv->read_batch_tool) {
+        (void)cbm_store_read_batch_begin(store);
+    }
+    return store;
+}
+
 /* Open the right project's .db file for query tools.
  * Caches the connection — reopens only when project changes.
  * Tracks last-access time so the event loop can evict idle stores. */
-static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
+static cbm_store_t *resolve_store_open(cbm_mcp_server_t *srv, const char *project) {
     srv->store_resolution_incomplete = false;
     srv->store_resolution_state = CBM_INTEGRITY_OK;
     if (!project) {
@@ -9036,6 +9051,487 @@ static bool compile_path_filter(const char *filter, cbm_regex_t *re, int *rc) {
     return *rc == CBM_REG_OK;
 }
 
+#ifndef _WIN32
+/* ── In-process content scan (POSIX) ────────────────────────────────
+ * search_code used to hand the scoped file list to `xargs grep -Hn` through a
+ * shell: a process spawn per call plus BSD grep's ~130 MB/s on macOS. This
+ * scanner reads the same list in the same order and produces the records
+ * `grep -Hn` printed, which collect_grep_matches then parses exactly as it
+ * parsed grep's pipe, so everything after the scan is unchanged:
+ *   - patterns: the pattern split on '\n', as `grep -f` reads its file; an
+ *     empty pattern matches every line;
+ *   - literal mode is a substring match (grep -F); regex mode is the
+ *     platform's POSIX ERE in grep's dialect (CBM_REG_GREP);
+ *   - --include: the glob against the listed path or, on Apple, its base name
+ *     (BSD grep), elsewhere any suffix that starts after a '/' (GNU grep);
+ *   - a NUL byte in the first SEARCH_SCAN_BINARY_PROBE bytes marks the file
+ *     binary and yields no record. A later NUL: BSD grep keeps printing lines,
+ *     GNU grep stops line output, so lines stop at the last complete line
+ *     before it there;
+ *   - matching is bytewise: a line with invalid UTF-8 matches like any other
+ *     (grep under a UTF-8 locale skipped such lines);
+ *   - an unreadable listed file or a directory is skipped, as grep -d skip did.
+ * The scan stops after `max_records` records: collect_grep_matches stops after
+ * the same number, and grep was cut off by the closed pipe at that point too. */
+#ifdef __APPLE__
+enum { SEARCH_SCAN_BINARY_PROBE = CBM_SZ_32K }; /* BSD grep's first buffer */
+#else
+enum { SEARCH_SCAN_BINARY_PROBE = 3 * CBM_SZ_32K }; /* GNU grep's 96 KiB first buffer */
+#endif
+
+struct search_scan_patterns_t {
+    std::vector<std::string> items;
+    std::vector<cbm_regex_t> line_regexes; /* regex mode: one per non-empty pattern */
+    std::vector<cbm_regex_t> span_regexes; /* the same with CBM_REG_NEWLINE, for spans */
+    bool any_empty = false;                /* an empty pattern: every line matches */
+    bool compiled = false;
+    /* Regex mode, one pattern: a literal every match must contain (the longest
+     * one found by search_scan_required_literal), or empty when there is none.
+     * Candidate lines are then found with memmem instead of the regex engine. */
+    std::string required;
+};
+
+enum { SEARCH_SCAN_MIN_REQUIRED = 3 }; /* shorter literals filter too little */
+
+/* The longest run of plain characters that every match of the ERE `re` must
+ * contain, or "" when none is certain. Conservative by construction: any
+ * construct it does not fully understand ends the current run, and a top-level
+ * '|' (outside groups and brackets) means no single literal is required. A
+ * character followed by a quantifier is optional ('?', '*', '{') or still
+ * required once ('+') but cannot continue a run past itself. */
+static std::string search_scan_required_literal(const char *re) {
+    std::string best;
+    std::string run;
+    int depth = 0;
+    auto flush = [&]() {
+        if (run.size() > best.size()) {
+            best = run;
+        }
+        run.clear();
+    };
+    for (const char *p = re; *p;) {
+        char c = *p;
+        if (c == '[') {
+            /* Bracket expression: skip to its closing ']' (a leading ']' or
+             * '^]' is a member, as are [:class:] / [=x=] / [.x.] forms). */
+            flush();
+            const char *q = p + SKIP_ONE;
+            if (*q == '^') {
+                q++;
+            }
+            if (*q == ']') {
+                q++;
+            }
+            while (*q && *q != ']') {
+                if (*q == '[' && (q[SKIP_ONE] == ':' || q[SKIP_ONE] == '=' || q[SKIP_ONE] == '.')) {
+                    char kind = q[SKIP_ONE];
+                    const char *close = q + PAIR_LEN;
+                    while (*close && !(close[0] == kind && close[SKIP_ONE] == ']')) {
+                        close++;
+                    }
+                    if (!*close) {
+                        return std::string();
+                    }
+                    q = close + PAIR_LEN;
+                    continue;
+                }
+                q++;
+            }
+            if (!*q) {
+                return std::string();
+            }
+            p = q + SKIP_ONE;
+            continue;
+        }
+        if (c == '{') {
+            /* An interval's bounds are not text: skip to its '}'. */
+            flush();
+            const char *close = strchr(p, '}');
+            if (!close) {
+                return std::string();
+            }
+            p = close + SKIP_ONE;
+            continue;
+        }
+        if (c == '(') {
+            flush();
+            depth++;
+            p++;
+            continue;
+        }
+        if (c == ')') {
+            flush();
+            depth = depth > 0 ? depth - SKIP_ONE : 0;
+            p++;
+            continue;
+        }
+        if (c == '|') {
+            if (depth == 0) {
+                return std::string();
+            }
+            flush();
+            p++;
+            continue;
+        }
+        bool literal = false;
+        char lit = 0;
+        size_t width = SKIP_ONE;
+        if (c == '\\') {
+            unsigned char e = (unsigned char)p[SKIP_ONE];
+            if (e && !isalnum(e) && e != '<' && e != '>' && e != '`' && e != '\'') {
+                literal = true;
+                lit = (char)e;
+                width = PAIR_LEN;
+            } else if (!e) {
+                return std::string();
+            } else {
+                width = PAIR_LEN; /* \w \s \b \d \1 ...: not a plain character */
+            }
+        } else if (c != '.' && c != '^' && c != '$' && c != '*' && c != '+' && c != '?' &&
+                   c != '{' && c != '}') {
+            literal = true;
+            lit = c;
+        }
+        char next = p[width];
+        bool quantified = next == '*' || next == '+' || next == '?' || next == '{';
+        if (depth > 0 || !literal) {
+            flush();
+        } else if (quantified) {
+            if (next == '+') {
+                run.push_back(lit);
+            }
+            flush();
+        } else {
+            run.push_back(lit);
+        }
+        p += width;
+    }
+    flush();
+    return best.size() >= (size_t)SEARCH_SCAN_MIN_REQUIRED ? best : std::string();
+}
+
+static void search_scan_patterns_free(search_scan_patterns_t *patterns) {
+    for (cbm_regex_t &re : patterns->line_regexes) {
+        cbm_regfree(&re);
+    }
+    for (cbm_regex_t &re : patterns->span_regexes) {
+        cbm_regfree(&re);
+    }
+    patterns->line_regexes.clear();
+    patterns->span_regexes.clear();
+}
+
+/* False when a regex does not compile: grep then exited with an error and
+ * printed no record, so the scan yields none either. */
+static bool search_scan_patterns_parse(search_scan_patterns_t *patterns, const char *pattern,
+                                       bool use_regex) {
+    const char *start = pattern;
+    for (;;) {
+        const char *end = strchr(start, '\n');
+        size_t length = end ? (size_t)(end - start) : strlen(start);
+        patterns->items.emplace_back(start, length);
+        patterns->any_empty = patterns->any_empty || length == 0;
+        if (!end) {
+            break;
+        }
+        start = end + SKIP_ONE;
+    }
+    /* grep -f reads lines: the trailing newline write_pattern_file adds ends
+     * the last line instead of adding an empty pattern. The caller passes the
+     * pattern without that newline, so nothing to drop here. */
+    if (!use_regex) {
+        return true;
+    }
+    for (const std::string &item : patterns->items) {
+        if (item.empty()) {
+            continue;
+        }
+        cbm_regex_t line_re;
+        if (cbm_regcomp(&line_re, item.c_str(), CBM_REG_EXTENDED | CBM_REG_NOSUB | CBM_REG_GREP) !=
+            CBM_REG_OK) {
+            search_scan_patterns_free(patterns);
+            return false;
+        }
+        patterns->line_regexes.push_back(line_re);
+        cbm_regex_t span_re;
+        if (cbm_regcomp(&span_re, item.c_str(),
+                        CBM_REG_EXTENDED | CBM_REG_GREP | CBM_REG_NEWLINE) != CBM_REG_OK) {
+            search_scan_patterns_free(patterns);
+            return false;
+        }
+        patterns->span_regexes.push_back(span_re);
+    }
+    patterns->compiled = true;
+    if (patterns->items.size() == SKIP_ONE && !patterns->any_empty) {
+        patterns->required = search_scan_required_literal(patterns->items[0].c_str());
+    }
+    return true;
+}
+
+/* grep --include for a command-line operand (see the block comment above). */
+static bool search_scan_include_matches(const char *glob, const char *path) {
+    if (fnmatch(glob, path, 0) == 0) {
+        return true;
+    }
+#ifdef __APPLE__
+    const char *base = strrchr(path, '/');
+    return base && fnmatch(glob, base + SKIP_ONE, 0) == 0;
+#else
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' && p[SKIP_ONE] != '/' && fnmatch(glob, p + SKIP_ONE, 0) == 0) {
+            return true;
+        }
+    }
+    return false;
+#endif
+}
+
+/* Whether one line (NUL-terminated at its end) matches any pattern. */
+static bool search_scan_line_matches(const search_scan_patterns_t *patterns, bool use_regex,
+                                     const char *line, size_t length) {
+    if (patterns->any_empty) {
+        return true;
+    }
+    if (use_regex) {
+        /* A line can hold a NUL only on Apple (see search_scan_buffer), where
+         * BSD grep matched past it: try each NUL-separated piece. */
+        for (const char *piece = line; piece <= line + length; piece += strlen(piece) + SKIP_ONE) {
+            int eflags = piece == line ? 0 : REG_NOTBOL; /* ^ is the line start only */
+            for (const cbm_regex_t &re : patterns->line_regexes) {
+                if (cbm_regexec(&re, piece, 0, NULL, eflags) == CBM_REG_OK) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    for (const std::string &item : patterns->items) {
+        if (memmem(line, length, item.data(), item.size()) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Start of the first line at or after `pos` that may match: a literal or
+ * regex hit found over the whole remaining span, backed up to its line start.
+ * Never skips a line that matches on its own: the span engines find the
+ * leftmost hit, and a per-line hit is a hit in the span too (REG_NEWLINE
+ * gives ^ $ . [^...] their per-line meaning). The caller re-checks the line,
+ * since a span hit can cross a newline through a class such as \s. Returns
+ * `length` when nothing further can match. */
+static size_t search_scan_next_candidate(const search_scan_patterns_t *patterns, bool use_regex,
+                                         const char *buffer, size_t pos, size_t length) {
+    if (patterns->any_empty) {
+        return pos;
+    }
+    size_t best = length;
+    if (use_regex && !patterns->required.empty()) {
+        const void *hit = memmem(buffer + pos, length - pos, patterns->required.data(),
+                                 patterns->required.size());
+        best = hit ? (size_t)((const char *)hit - buffer) : length;
+    } else if (use_regex) {
+        for (const cbm_regex_t &re : patterns->span_regexes) {
+            cbm_regmatch_t m[1];
+            if (cbm_regexec(&re, buffer + pos, 1, m, 0) == CBM_REG_OK && m[0].rm_so >= 0 &&
+                pos + (size_t)m[0].rm_so < best) {
+                best = pos + (size_t)m[0].rm_so;
+            }
+        }
+    } else {
+        for (const std::string &item : patterns->items) {
+            const void *hit = memmem(buffer + pos, length - pos, item.data(), item.size());
+            if (hit && (size_t)((const char *)hit - buffer) < best) {
+                best = (size_t)((const char *)hit - buffer);
+            }
+        }
+    }
+    if (best >= length) {
+        return length;
+    }
+    while (best > pos && buffer[best - SKIP_ONE] != '\n') {
+        best--;
+    }
+    return best;
+}
+
+/* Append one `grep -Hn` record. */
+static void search_scan_emit(std::string &out, const char *path, size_t line_number,
+                             const char *line, size_t line_length) {
+    char number[CBM_SZ_32];
+    int n = snprintf(number, sizeof(number), ":%zu:", line_number);
+    out.append(path);
+    out.append(number, n > 0 ? (size_t)n : 0);
+    out.append(line, line_length);
+    out.push_back('\n');
+}
+
+/* Scan one file's bytes (buffer[length] is writable). Returns the records
+ * added; stops at *budget records. */
+static void search_scan_buffer(std::string &out, const search_scan_patterns_t *patterns,
+                               bool use_regex, const char *path, char *buffer, size_t length,
+                               int *budget) {
+    size_t probe =
+        length < (size_t)SEARCH_SCAN_BINARY_PROBE ? length : (size_t)SEARCH_SCAN_BINARY_PROBE;
+    if (memchr(buffer, '\0', probe)) {
+        return; /* binary: grep prints no line of it */
+    }
+    const char *nul = (const char *)memchr(buffer, '\0', length);
+    bool line_mode = false; /* NUL inside the scanned span: no span search */
+    if (nul) {
+#ifdef __APPLE__
+        line_mode = true;
+#else
+        size_t keep = 0;
+        for (size_t i = (size_t)(nul - buffer); i > 0; i--) {
+            if (buffer[i - SKIP_ONE] == '\n') {
+                keep = i;
+                break;
+            }
+        }
+        length = keep;
+#endif
+    }
+    buffer[length] = '\0';
+    size_t line_number = 1;
+    size_t pos = 0;
+    while (pos < length && *budget > 0) {
+        size_t line_start = pos;
+        if (!line_mode) {
+            line_start = search_scan_next_candidate(patterns, use_regex, buffer, pos, length);
+            if (line_start >= length) {
+                break;
+            }
+            for (const char *p = buffer + pos; p < buffer + line_start;) {
+                const char *newline =
+                    (const char *)memchr(p, '\n', (size_t)(buffer + line_start - p));
+                if (!newline) {
+                    break;
+                }
+                line_number++;
+                p = newline + SKIP_ONE;
+            }
+        }
+        char *newline = (char *)memchr(buffer + line_start, '\n', length - line_start);
+        size_t line_end = newline ? (size_t)(newline - buffer) : length;
+        buffer[line_end] = '\0';
+        bool matched = search_scan_line_matches(patterns, use_regex, buffer + line_start,
+                                                line_end - line_start);
+        if (newline) {
+            *newline = '\n';
+        }
+        if (matched) {
+            search_scan_emit(out, path, line_number, buffer + line_start, line_end - line_start);
+            (*budget)--;
+        }
+        pos = line_end + SKIP_ONE;
+        line_number++;
+    }
+}
+
+/* Read a whole file into `buffer` (one spare byte past the data). False when
+ * it cannot be opened or read (a directory, a vanished file). */
+static bool search_scan_read_file(const char *path, std::vector<char> &buffer, size_t *length) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        return false;
+    }
+    size_t used = 0;
+    bool ok = true;
+    for (;;) {
+        if (buffer.size() - used < (size_t)CBM_SZ_64K + SKIP_ONE) {
+            buffer.resize(buffer.empty() ? (size_t)CBM_SZ_64K * PAIR_LEN
+                                         : buffer.size() * PAIR_LEN);
+        }
+        size_t want = buffer.size() - used - SKIP_ONE;
+        size_t got = fread(buffer.data() + used, 1, want, fp);
+        used += got;
+        if (got < want) {
+            ok = !ferror(fp);
+            break;
+        }
+    }
+    (void)fclose(fp);
+    *length = used;
+    return ok;
+}
+
+/* Scan the NUL-separated file list into `grep -Hn` records. False when the
+ * list cannot be read (the caller then runs grep). */
+static bool search_scan_in_process(const char *filelist_path, const char *pattern, bool use_regex,
+                                   const char *file_pattern, int max_records, std::string &out) {
+    std::vector<char> list;
+    size_t list_length = 0;
+    if (!search_scan_read_file(filelist_path, list, &list_length)) {
+        return false;
+    }
+    search_scan_patterns_t patterns;
+    if (!search_scan_patterns_parse(&patterns, pattern, use_regex)) {
+        return true; /* grep -E rejected the pattern: no records */
+    }
+    std::vector<char> buffer;
+    int budget = max_records;
+    size_t pos = 0;
+    while (pos < list_length && budget > 0) {
+        const char *end = (const char *)memchr(list.data() + pos, '\0', list_length - pos);
+        size_t record_end = end ? (size_t)(end - list.data()) : list_length;
+        list[record_end] = '\0';
+        const char *path = list.data() + pos;
+        bool listed = record_end > pos;
+        pos = record_end + SKIP_ONE;
+        if (!listed || (file_pattern && !search_scan_include_matches(file_pattern, path))) {
+            continue;
+        }
+        size_t length = 0;
+        if (!search_scan_read_file(path, buffer, &length)) {
+            continue;
+        }
+        search_scan_buffer(out, &patterns, use_regex, path, buffer.data(), length, &budget);
+    }
+    search_scan_patterns_free(&patterns);
+    return true;
+}
+
+/* Records from search_scan_in_process, parsed by the grep-pipe parser. */
+static grep_match_t *search_scan_collect(const std::string &records, const char *root_path,
+                                         bool has_path_filter, cbm_regex_t *path_regex,
+                                         int grep_limit, int *out_count) {
+    if (records.empty()) {
+        *out_count = 0;
+        return (grep_match_t *)malloc(sizeof(grep_match_t)); /* empty set; caller frees */
+    }
+    FILE *fp = fmemopen((void *)records.data(), records.size(), "r");
+    if (!fp) {
+        return NULL;
+    }
+    grep_match_t *gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter,
+                                            path_regex, grep_limit, out_count);
+    (void)fclose(fp);
+    return gm;
+}
+#endif /* !_WIN32 */
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+char *cbm_mcp_search_scan_for_test(const char *filelist_path, const char *pattern, bool use_regex,
+                                   const char *file_pattern, int max_records) {
+#ifdef _WIN32
+    (void)filelist_path;
+    (void)pattern;
+    (void)use_regex;
+    (void)file_pattern;
+    (void)max_records;
+    return NULL;
+#else
+    std::string records;
+    if (!search_scan_in_process(filelist_path, pattern, use_regex, file_pattern, max_records,
+                                records)) {
+        return NULL;
+    }
+    return heap_strdup(records.c_str());
+#endif
+}
+#endif
+
 static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char *pattern = cbm_mcp_get_string_arg(args, "pattern");
     char *project = get_project_arg_or_cwd(srv, args, true);
@@ -9213,7 +9709,24 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         gm = (grep_match_t *)malloc(sizeof(grep_match_t)); /* empty set; freed below */
         cbm_unlink(tmpfile);
         cbm_unlink(filelist);
-    } else {
+    }
+#ifndef _WIN32
+    /* An indexed project is scanned in process (see search_scan_in_process);
+     * the recursive fallback for an unindexed root keeps grep. */
+    if (!gm && scoped) {
+        std::string records;
+        if (search_scan_in_process(filelist, pattern, use_regex, file_pattern, grep_limit,
+                                   records)) {
+            gm = search_scan_collect(records, root_path, has_path_filter, &path_regex, grep_limit,
+                                     &gm_count);
+        }
+        if (gm) {
+            cbm_unlink(tmpfile);
+            cbm_unlink(filelist);
+        }
+    }
+#endif
+    if (!gm) {
         char cmd[CBM_SZ_4K];
         cbm_search_code_build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile,
                                        filelist, root_path);
@@ -11421,11 +11934,43 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
+/* Read tools whose work is store reads from start to end run them in one store
+ * read batch (cbm_store_read_batch_begin). Left out: tools that write, or hold
+ * the store across a long scan or a git subprocess (search_code,
+ * index_status, detect_changes, inspect_symbol). */
+static bool mcp_tool_reads_in_batch(const char *tool_name) {
+    static const char *const batched[] = {
+        "query_graph",      "trace_path",       "trace_call_path",  "search_graph",
+        "get_architecture", "get_graph_schema", "get_code_snippet",
+    };
+    for (size_t i = 0; tool_name && i < sizeof(batched) / sizeof(batched[0]); i++) {
+        if (strcmp(tool_name, batched[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json);
+
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     g_project_note[0] = '\0';
     if (!tool_name) {
         return cbm_mcp_text_result("missing tool name", true);
     }
+    if (!srv) {
+        return dispatch_tool(srv, tool_name, args_json);
+    }
+    srv->read_batch_tool = mcp_tool_reads_in_batch(tool_name);
+    char *result = dispatch_tool(srv, tool_name, args_json);
+    /* The store outlives the request (it is cached between calls): end its
+     * batch here so no read transaction stays open between tool calls. */
+    srv->read_batch_tool = false;
+    cbm_store_read_batch_end(srv->store);
+    return result;
+}
+
+static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
 
     if (strcmp(tool_name, "list_projects") == 0) {
         return handle_list_projects(srv, args_json);

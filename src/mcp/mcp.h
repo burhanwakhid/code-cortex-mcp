@@ -67,6 +67,11 @@ bool cbm_mcp_result_is_index_busy(const char *json);
 /* Override trace_path hash budgets for deterministic boundary tests. Passing
  * zero for either byte cap restores that cap's production default. */
 void cbm_mcp_test_set_trace_hash_limits(size_t per_file_bytes, size_t per_request_bytes);
+/* search_code's in-process scan over a NUL-separated file list: the
+ * `grep -Hn` records it produced (heap string; caller frees), or NULL when the
+ * list cannot be read. NULL on Windows, which keeps the subprocess scan. */
+char *cbm_mcp_search_scan_for_test(const char *filelist_path, const char *pattern, bool use_regex,
+                                   const char *file_pattern, int max_records);
 #endif
 
 /* Return true when notifications/cancelled params target the active request. */

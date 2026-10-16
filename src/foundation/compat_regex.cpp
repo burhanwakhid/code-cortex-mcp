@@ -68,6 +68,11 @@ int translate_flags(int flags) {
     if (flags & CBM_REG_NEWLINE) {
         f |= REG_NEWLINE;
     }
+#ifdef REG_ENHANCED
+    if (flags & CBM_REG_GREP) {
+        f |= REG_ENHANCED;
+    }
+#endif
     return f;
 }
 #endif
