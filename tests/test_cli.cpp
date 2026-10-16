@@ -4250,6 +4250,190 @@ static bool cleanup_bytes_equal(const std::string& path, const char *expected) {
     fclose(f);
     return n == strlen(expected) && memcmp(bytes, expected, n) == 0;
 }
+/* #1359 / upstream 7ef75e52: `cli list_projects` with no arguments blocked
+ * forever whenever fd 0 was a pipe nobody closes (an ssh session's stdin, a
+ * Node child_process parent that never calls stdin.end()). A call complete
+ * without arguments must never wait on a stream; a regular file
+ * (`< args.json`) always reaches EOF and keeps working. */
+TEST(cli_stdin_gate_schema_shapes) {
+    const char *no_props = "{\"type\":\"object\",\"properties\":{}}";
+    const char *no_props_key = "{\"type\":\"object\"}";
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema(no_props, CBM_CLI_STDIN_STREAM));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema(no_props, CBM_CLI_STDIN_FILE));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema(no_props_key, CBM_CLI_STDIN_STREAM));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema(no_props_key, CBM_CLI_STDIN_FILE));
+
+    /* A required argument: the bare call cannot succeed, so stdin is the
+     * documented channel from a pipe and from a file alike. */
+    const char *required =
+        "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}},\"required\":[\"p\"]}";
+    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema(required, CBM_CLI_STDIN_STREAM));
+    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema(required, CBM_CLI_STDIN_FILE));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema(required, CBM_CLI_STDIN_TERMINAL));
+
+    /* Optional-only: a file is read, a stream never is. */
+    const char *optional = "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}}}";
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema(optional, CBM_CLI_STDIN_STREAM));
+    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema(optional, CBM_CLI_STDIN_FILE));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema(optional, CBM_CLI_STDIN_TERMINAL));
+    const char *empty_required =
+        "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}},\"required\":[]}";
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema(empty_required, CBM_CLI_STDIN_STREAM));
+
+    /* The live optional-only tool. */
+    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("list_projects", CBM_CLI_STDIN_STREAM));
+    ASSERT_TRUE(cbm_cli_args_from_stdin_allowed("list_projects", CBM_CLI_STDIN_FILE));
+    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("list_projects", CBM_CLI_STDIN_TERMINAL));
+    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("no_such_tool", CBM_CLI_STDIN_FILE));
+
+    /* Fork policy: an optional-only tool reads a stream only once it turns
+     * readable (bounded wait in main), never unconditionally. */
+    ASSERT_EQ(cbm_cli_stdin_policy("list_projects", CBM_CLI_STDIN_STREAM),
+              CBM_CLI_STDIN_READ_IF_READY);
+    ASSERT_EQ(cbm_cli_stdin_policy("list_projects", CBM_CLI_STDIN_FILE), CBM_CLI_STDIN_READ);
+    ASSERT_EQ(cbm_cli_stdin_policy("list_projects", CBM_CLI_STDIN_TERMINAL), CBM_CLI_STDIN_SKIP);
+    ASSERT_EQ(cbm_cli_stdin_policy("query_graph", CBM_CLI_STDIN_STREAM), CBM_CLI_STDIN_READ);
+    ASSERT_EQ(cbm_cli_stdin_policy("no_such_tool", CBM_CLI_STDIN_STREAM), CBM_CLI_STDIN_SKIP);
+    PASS();
+}
+
+/* The classifier behind the gate, on real descriptors: a regular file is FILE
+ * (reads always end), a pipe is STREAM (ends only when its writer closes). */
+TEST(cli_stdin_kind_classifies_file_and_pipe) {
+    FILE *file = tmpfile();
+    ASSERT_NOT_NULL(file);
+    ASSERT_EQ(cbm_cli_stdin_kind(fileno(file)), CBM_CLI_STDIN_FILE);
+    (void)fclose(file);
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX pipe()");
+#else
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+    ASSERT_EQ(cbm_cli_stdin_kind(fds[0]), CBM_CLI_STDIN_STREAM);
+    (void)close(fds[0]);
+    (void)close(fds[1]);
+    PASS();
+#endif
+}
+
+/* Upstream ba6307f0 (#2200): uninstall keeps project indexes unless
+ * --delete-indexes is given. A generic -y is not consent to erase them, a
+ * non-terminal stdin is never asked, and --dry-run never deletes. The
+ * internal settings store is never an index. HOME and CBM_CACHE_DIR point
+ * at a scratch tree so the real install is never touched. */
+extern "C" void cbm_set_auto_answer_for_test(int value);
+
+typedef struct {
+    char root[256];
+    char index_db[512];
+    char config_db[512];
+    char bin[512];
+    char *old_home;
+    char *old_cache;
+} uninstall_fx_t;
+
+static bool uninstall_fx_setup(uninstall_fx_t *fx) {
+    memset(fx, 0, sizeof(*fx));
+    snprintf(fx->root, sizeof(fx->root), "/tmp/cli-uninstall-idx-XXXXXX");
+    if (!cbm_mkdtemp(fx->root)) {
+        return false;
+    }
+    const char *home = getenv("HOME");
+    const char *cache = getenv("CBM_CACHE_DIR");
+    fx->old_home = home ? strdup(home) : NULL;
+    fx->old_cache = cache ? strdup(cache) : NULL;
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", fx->root);
+    cbm_setenv("HOME", fx->root, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    snprintf(fx->index_db, sizeof(fx->index_db), "%s/proj.db", cache_dir);
+    snprintf(fx->config_db, sizeof(fx->config_db), "%s/" CBM_CONFIG_DB_FILENAME, cache_dir);
+    snprintf(fx->bin, sizeof(fx->bin), "%s/.local/bin/code-cortex-mcp", fx->root);
+    return th_write_file(fx->index_db, "index") == 0 &&
+           th_write_file(fx->config_db, "settings") == 0 &&
+           th_write_file(fx->bin, "binary") == 0;
+}
+
+static void uninstall_fx_teardown(uninstall_fx_t *fx) {
+    if (fx->old_home) {
+        cbm_setenv("HOME", fx->old_home, 1);
+    } else {
+        cbm_unsetenv("HOME");
+    }
+    if (fx->old_cache) {
+        cbm_setenv("CBM_CACHE_DIR", fx->old_cache, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(fx->old_home);
+    free(fx->old_cache);
+    th_rmtree(fx->root);
+}
+
+static int uninstall_fx_run(int argc, const char *const *args) {
+    char *argv[4] = {NULL, NULL, NULL, NULL};
+    for (int i = 0; i < argc && i < 4; i++) {
+        argv[i] = (char *)args[i];
+    }
+    cbm_set_auto_answer_for_test(0);
+    /* stdin is never a terminal under the runner, so nothing can block. */
+    int rc = cbm_cmd_uninstall(argc, argv);
+    cbm_set_auto_answer_for_test(0);
+    return rc;
+}
+
+TEST(cli_uninstall_keeps_indexes_without_delete_indexes) {
+    const char *variants[][1] = {{"-y"}, {"-n"}, {"--dry-run"}};
+    for (int v = 0; v < 3; v++) {
+        uninstall_fx_t fx;
+        ASSERT_TRUE(uninstall_fx_setup(&fx));
+        int rc = uninstall_fx_run(1, variants[v]);
+        bool index_kept = cbm_is_regular_file(fx.index_db);
+        bool config_kept = cbm_is_regular_file(fx.config_db);
+        bool bin_gone = !cbm_is_regular_file(fx.bin);
+        uninstall_fx_teardown(&fx);
+        ASSERT_EQ(rc, 0);
+        ASSERT_TRUE(index_kept);
+        ASSERT_TRUE(config_kept);
+        ASSERT_TRUE(bin_gone == (v != 2)); /* dry-run keeps the binary too */
+    }
+    PASS();
+}
+
+TEST(cli_uninstall_delete_indexes_is_explicit_and_overrides_no) {
+    const char *with_no[] = {"--delete-indexes", "-n"};
+    uninstall_fx_t fx;
+    ASSERT_TRUE(uninstall_fx_setup(&fx));
+    int rc = uninstall_fx_run(2, with_no);
+    bool index_gone = !cbm_is_regular_file(fx.index_db);
+    bool config_kept = cbm_is_regular_file(fx.config_db);
+    uninstall_fx_teardown(&fx);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(index_gone);
+    ASSERT_TRUE(config_kept);
+
+    const char *dry[] = {"--delete-indexes", "--dry-run"};
+    ASSERT_TRUE(uninstall_fx_setup(&fx));
+    rc = uninstall_fx_run(2, dry);
+    bool dry_kept = cbm_is_regular_file(fx.index_db) && cbm_is_regular_file(fx.bin);
+    uninstall_fx_teardown(&fx);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(dry_kept);
+    PASS();
+}
+
+TEST(cli_uninstall_help_changes_nothing) {
+    const char *help[] = {"--delete-indexes", "--help"};
+    uninstall_fx_t fx;
+    ASSERT_TRUE(uninstall_fx_setup(&fx));
+    int rc = uninstall_fx_run(2, help);
+    bool kept = cbm_is_regular_file(fx.index_db) && cbm_is_regular_file(fx.bin);
+    uninstall_fx_teardown(&fx);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(kept);
+    PASS();
+}
+
 /* Upstream 46015320: the cache directory also holds internal stores next to
  * the project indexes: the user's settings (_config.db) and the cross-repo
  * store (_cross_repo.db). Index enumeration treated every *.db as a project,
@@ -4407,6 +4591,11 @@ TEST(cli_build_args_json_array_flag_checks_item_type) {
 SUITE(cli) {
     RUN_TEST(cli_remove_indexes_respects_lease);
     RUN_TEST(cli_index_enumeration_skips_internal_cache_dbs);
+    RUN_TEST(cli_uninstall_keeps_indexes_without_delete_indexes);
+    RUN_TEST(cli_uninstall_delete_indexes_is_explicit_and_overrides_no);
+    RUN_TEST(cli_uninstall_help_changes_nothing);
+    RUN_TEST(cli_stdin_gate_schema_shapes);
+    RUN_TEST(cli_stdin_kind_classifies_file_and_pipe);
     RUN_TEST(cli_build_args_json_array_flag_accepts_json_literal);
     RUN_TEST(cli_build_args_json_array_flag_checks_item_type);
 

@@ -42,6 +42,7 @@ enum {
 #include "foundation/profile.h"
 #include "foundation/win_utf8.h" /* cbm_wide_to_utf8 — Windows UTF-8 argv (#423/#20); no-op on POSIX */
 #ifdef _WIN32
+#include <io.h>       /* _get_osfhandle (cli stdin readiness probe) */
 #include <shellapi.h> /* CommandLineToArgvW — not pulled in by windows.h under WIN32_LEAN_AND_MEAN */
 #endif
 #include <yyjson/yyjson.h>
@@ -52,6 +53,8 @@ enum {
 #include <signal.h>
 #include "foundation/cbm_atomic.h"
 #ifndef _WIN32
+#include <errno.h>
+#include <poll.h> /* cli stdin readiness probe */
 #include <unistd.h>
 #endif
 #ifndef CBM_VERSION
@@ -261,14 +264,54 @@ static const char *cli_strip_flag_value(int *argc, char **argv, const char *flag
     return NULL;
 }
 
-/* Portable "is fd a terminal?" — _isatty on Windows, isatty on POSIX. */
-#ifdef _WIN32
-#define cli_isatty(fd) _isatty(fd)
-#else
-#define cli_isatty(fd) isatty(fd)
-#endif
-
 enum { CLI_SLURP_CHUNK = 4096 };
+
+/* How long an optional-only tool waits for a piped stdin to turn readable
+ * (data or EOF) before running with `{}`. `echo`/`printf`/`cat` producers are
+ * readable at once; a held-open pipe nobody writes costs only this. */
+enum { CLI_STDIN_READY_WAIT_MS = 200, CLI_STDIN_READY_POLL_MS = 10 };
+
+/* True when fd 0 has data or has reached EOF within timeout_ms. */
+static bool cli_stdin_ready_within(int timeout_ms) {
+#ifdef _WIN32
+    HANDLE handle = (HANDLE)_get_osfhandle(0);
+    if (handle == INVALID_HANDLE_VALUE || GetFileType(handle) != FILE_TYPE_PIPE) {
+        return false;
+    }
+    for (int waited = 0;; waited += CLI_STDIN_READY_POLL_MS) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(handle, NULL, 0, NULL, &available, NULL)) {
+            return GetLastError() == ERROR_BROKEN_PIPE; /* writer closed: EOF */
+        }
+        if (available > 0) {
+            return true;
+        }
+        if (waited >= timeout_ms) {
+            return false;
+        }
+        Sleep(CLI_STDIN_READY_POLL_MS);
+    }
+#else
+    struct pollfd pfd = {0, POLLIN, 0};
+    int rc;
+    do {
+        rc = poll(&pfd, 1, timeout_ms);
+    } while (rc < 0 && errno == EINTR);
+    return rc > 0;
+#endif
+}
+
+static bool cli_stdin_should_read(const char *tool_name) {
+    switch (cbm_cli_stdin_policy(tool_name, cbm_cli_stdin_kind(0))) {
+    case CBM_CLI_STDIN_READ:
+        return true;
+    case CBM_CLI_STDIN_READ_IF_READY:
+        return cli_stdin_ready_within(CLI_STDIN_READY_WAIT_MS);
+    case CBM_CLI_STDIN_SKIP:
+        break;
+    }
+    return false;
+}
 
 /* Read an open stream fully into a heap, NUL-terminated string. Caller frees.
  * Returns NULL on allocation failure. Reads binary-clean (UTF-8 JSON, no shell
@@ -466,8 +509,10 @@ static int run_cli(int argc, char **argv) {
             return SKIP_ONE;
         }
         args_json = heap_args;
-    } else if (!cli_isatty(0)) {
-        /* piped stdin (UTF-8 clean, no shell quoting): cli <tool> < args.json */
+    } else if (cli_stdin_should_read(tool_name)) {
+        /* piped stdin (UTF-8 clean, no shell quoting): cli <tool> < args.json.
+         * Gated (#1359): a call complete without arguments must not wait on a
+         * pipe nobody is going to write to or close — see cbm_cli_stdin_policy. */
         heap_args = cli_slurp_stream(stdin);
         if (heap_args && heap_args[0]) {
             args_json = heap_args;
@@ -537,7 +582,7 @@ static void print_help(void) {
     printf("  code-cortex-mcp              Run MCP server on stdio\n");
     printf("  code-cortex-mcp cli <tool> [json]  Run a single tool\n");
     printf("  code-cortex-mcp install [-y|-n] [--force] [--dry-run]\n");
-    printf("  code-cortex-mcp uninstall [-y|-n] [--dry-run]\n");
+    printf("  code-cortex-mcp uninstall [-y|-n] [--dry-run] [--delete-indexes]\n");
     printf("  code-cortex-mcp update [-y|-n]\n");
     printf("  code-cortex-mcp config <list|get|set|reset>\n");
     printf("  code-cortex-mcp doctor       Check install, hooks, and whether cwd is indexed\n");

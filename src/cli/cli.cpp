@@ -69,6 +69,8 @@ enum {
 #ifndef _WIN32
 #include <signal.h>
 #include <unistd.h>
+#else
+#include <io.h> /* _isatty, _fileno (uninstall index prompt) */
 #endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -3602,6 +3604,92 @@ int cbm_cmd_config(int argc, char **argv) {
     return rc;
 }
 
+/* ── CLI stdin argument gate (#1359, upstream 7ef75e52) ─────────── */
+
+cbm_cli_stdin_kind_t cbm_cli_stdin_kind(int fd) {
+#ifdef _WIN32
+    bool terminal = _isatty(fd) != 0;
+#else
+    bool terminal = isatty(fd) != 0;
+#endif
+    if (terminal) {
+        return CBM_CLI_STDIN_TERMINAL;
+    }
+    struct stat state;
+    if (fstat(fd, &state) == 0 && S_ISREG(state.st_mode)) {
+        return CBM_CLI_STDIN_FILE;
+    }
+    return CBM_CLI_STDIN_STREAM;
+}
+
+/* Schema -> decision core of the stdin gate, public so every schema shape
+ * stays TESTED whatever the shipped tool table holds.
+ *   no properties   -> never: stdin cannot carry anything the tool accepts.
+ *   optional only   -> a regular file only. The bare call is already complete
+ *                      with `{}`, so blocking on a stream for optional extras
+ *                      deadlocks every caller that leaves an inherited pipe
+ *                      open (an ssh session's stdin, a Node child_process
+ *                      parent that never calls stdin.end()). A `< args.json`
+ *                      file always reaches EOF.
+ *   any required    -> file or stream: the bare call cannot succeed anyway, so
+ *                      the documented `echo '<json>' | cli <tool>` channel is
+ *                      the only way this invocation can carry its arguments. */
+bool cbm_cli_stdin_allowed_for_schema(const char *schema_str, cbm_cli_stdin_kind_t stdin_kind) {
+    if (stdin_kind == CBM_CLI_STDIN_TERMINAL || !schema_str) {
+        return false;
+    }
+    yyjson_doc *schema_doc = yyjson_read(schema_str, strlen(schema_str), 0);
+    if (!schema_doc) {
+        /* The schemas are compile-time constants, so a parse failure means a
+         * malformed literal rather than caller input. Keep the documented stdin
+         * channel rather than silently narrowing it. */
+        return true;
+    }
+    yyjson_val *root = yyjson_doc_get_root(schema_doc);
+    yyjson_val *props = yyjson_obj_get(root, "properties");
+    yyjson_val *required = yyjson_obj_get(root, "required");
+    bool accepts_arguments = props && yyjson_is_obj(props) && yyjson_obj_size(props) > 0;
+    bool requires_arguments = required && yyjson_is_arr(required) && yyjson_arr_size(required) > 0;
+    yyjson_doc_free(schema_doc);
+    if (!accepts_arguments) {
+        return false;
+    }
+    return requires_arguments || stdin_kind == CBM_CLI_STDIN_FILE;
+}
+
+bool cbm_cli_args_from_stdin_allowed(const char *tool_name, cbm_cli_stdin_kind_t stdin_kind) {
+    return cbm_cli_stdin_policy(tool_name, stdin_kind) == CBM_CLI_STDIN_READ;
+}
+
+cbm_cli_stdin_policy_t cbm_cli_stdin_policy(const char *tool_name,
+                                            cbm_cli_stdin_kind_t stdin_kind) {
+    /* An interactive run has nothing piped to read: consulting the terminal
+     * would just sit waiting for the user to type JSON. */
+    if (stdin_kind == CBM_CLI_STDIN_TERMINAL) {
+        return CBM_CLI_STDIN_SKIP;
+    }
+    /* Unknown tool: dispatch rejects it by name and no stdin content can
+     * change that, so the read would only risk the same hang. */
+    const char *schema_str = cbm_mcp_tool_input_schema(tool_name);
+    if (!schema_str) {
+        return CBM_CLI_STDIN_SKIP;
+    }
+    if (cbm_cli_stdin_allowed_for_schema(schema_str, stdin_kind)) {
+        return CBM_CLI_STDIN_READ;
+    }
+    /* Fork: `project` is optional on most tools here (cwd resolution), so an
+     * optional-only schema is the common case, not just list_projects, and
+     * `echo '<json>' | cli search_graph` is the documented channel. A stream
+     * is read when it turns readable (data or EOF) within a short bounded
+     * window; a pipe nobody writes to or closes costs that window, never a
+     * hang. */
+    if (stdin_kind == CBM_CLI_STDIN_STREAM &&
+        cbm_cli_stdin_allowed_for_schema(schema_str, CBM_CLI_STDIN_FILE)) {
+        return CBM_CLI_STDIN_READ_IF_READY;
+    }
+    return CBM_CLI_STDIN_SKIP;
+}
+
 /* ── Interactive prompt ───────────────────────────────────────── */
 
 /* Global auto-answer mode: 0=interactive, 1=always yes, -1=always no */
@@ -4918,12 +5006,68 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
     }
 }
 
+/* A generic auto-answer is not consent to erase project indexes (upstream
+ * #2200). An explicit --delete-indexes takes precedence even over --no;
+ * otherwise only a separate interactive answer can select deletion, and its
+ * default is to keep them. Dry-run never deletes. */
+static bool uninstall_decide_index_deletion(const char *home, bool requested, bool dry_run) {
+    int index_count = count_db_indexes(home);
+    if (index_count <= 0) {
+        return false;
+    }
+    printf("\nFound %d index(es):\n", index_count);
+    cbm_list_indexes(home);
+    bool delete_indexes = requested;
+    if (!requested) {
+        bool can_ask = g_auto_answer == 0;
+#ifdef _WIN32
+        can_ask = can_ask && _isatty(_fileno(stdin));
+#else
+        can_ask = can_ask && isatty(fileno(stdin));
+#endif
+        delete_indexes = can_ask && prompt_yn("Delete these indexes? (default: no)");
+    }
+    if (!delete_indexes) {
+        const char *cache_dir = get_cache_dir(home);
+        printf("Indexes kept in %s. To remove them, uninstall with --delete-indexes "
+               "or delete the project .db files there.\n",
+               cache_dir ? cache_dir : "the cache directory");
+        return false;
+    }
+    if (dry_run) {
+        printf("(dry-run — indexes would be deleted)\n");
+        return false;
+    }
+    return true;
+}
+
 int cbm_cmd_uninstall(int argc, char **argv) {
+    for (int i = 0; i < argc; i++) {
+        if (argv && argv[i] && (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)) {
+            printf("Usage: code-cortex-mcp uninstall [options]\n\n"
+                   "Removes the code-cortex-mcp binary and its agent configurations.\n"
+                   "THIS IS DESTRUCTIVE. Project indexes are kept by default. An interactive\n"
+                   "terminal is asked separately; the default answer is to keep them.\n\n"
+                   "Options:\n"
+                   "  --dry-run          Show what would be removed, change nothing\n"
+                   "  --delete-indexes   Also delete every project index (overrides --no)\n"
+                   "  -y, --yes          Do not prompt; indexes are kept unless explicitly "
+                   "deleted\n"
+                   "  -n, --no           Decline prompts; --delete-indexes still takes "
+                   "precedence\n"
+                   "  -h, --help         Show this help and exit\n\n"
+                   "Run with --dry-run first if you are unsure.\n");
+            return 0;
+        }
+    }
     parse_auto_answer(argc, argv);
     bool dry_run = false;
+    bool delete_indexes_requested = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
+        } else if (strcmp(argv[i], "--delete-indexes") == 0) {
+            delete_indexes_requested = true;
         }
     }
 
@@ -4942,17 +5086,11 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     uninstall_cli_agents(&agents, home, dry_run);
     uninstall_editor_agents(&agents, home, dry_run);
 
-    /* Step 2: Remove indexes */
-    int index_count = count_db_indexes(home);
-    if (index_count > 0) {
-        printf("\nFound %d index(es):\n", index_count);
-        cbm_list_indexes(home);
-        if (prompt_yn("Delete these indexes?")) {
-            int idx_removed = cbm_remove_indexes(home);
-            printf("Removed %d index(es).\n", idx_removed);
-        } else {
-            printf("Indexes kept.\n");
-        }
+    /* Step 2: Remove indexes — only when explicitly requested (see
+     * uninstall_decide_index_deletion). */
+    if (uninstall_decide_index_deletion(home, delete_indexes_requested, dry_run)) {
+        int idx_removed = cbm_remove_indexes(home);
+        printf("Removed %d index(es).\n", idx_removed);
     }
 
     /* Step 3: Remove binary */

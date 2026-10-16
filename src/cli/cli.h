@@ -35,6 +35,40 @@ const char *cbm_cli_get_version(void);
  * must free. Caller frees the returned JSON string. */
 char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char **err_out);
 
+/* What a descriptor is, as far as the stdin argument gate cares. */
+typedef enum {
+    CBM_CLI_STDIN_TERMINAL = 0, /* interactive: nothing piped to read */
+    CBM_CLI_STDIN_FILE = 1,     /* regular file (`< args.json`): always reaches EOF */
+    CBM_CLI_STDIN_STREAM = 2,   /* pipe, socket, device: EOF only when the writer closes */
+} cbm_cli_stdin_kind_t;
+
+/* Classify an open descriptor: terminal (isatty), regular file (fstat), else stream. */
+cbm_cli_stdin_kind_t cbm_cli_stdin_kind(int fd);
+
+/* Decide whether `cli <tool>` may take its JSON arguments from stdin, given
+ * that no --args-file, raw-JSON positional and no --flag form was supplied.
+ * Never from a terminal, never for a tool whose input_schema declares no
+ * properties. A regular file is read for any tool that takes arguments; a
+ * stream only for a tool with a REQUIRED argument. A tool callable without
+ * arguments (list_projects) is complete with `{}`, and an inherited stream
+ * nobody closes would block that read forever (#1359). */
+bool cbm_cli_args_from_stdin_allowed(const char *tool_name, cbm_cli_stdin_kind_t stdin_kind);
+
+/* The schema half of cbm_cli_args_from_stdin_allowed (exposed for tests). */
+bool cbm_cli_stdin_allowed_for_schema(const char *schema_str, cbm_cli_stdin_kind_t stdin_kind);
+
+/* What `cli <tool>` does with a non-flag stdin. READ: slurp it (the upstream
+ * gate above said yes). READ_IF_READY (fork): an optional-only tool on a
+ * stream; read it only if it turns readable within a short bounded window,
+ * so `echo '<json>' | cli search_graph` keeps working while a pipe nobody
+ * closes cannot block the call. SKIP: run with `{}`. */
+typedef enum {
+    CBM_CLI_STDIN_SKIP = 0,
+    CBM_CLI_STDIN_READ = 1,
+    CBM_CLI_STDIN_READ_IF_READY = 2,
+} cbm_cli_stdin_policy_t;
+cbm_cli_stdin_policy_t cbm_cli_stdin_policy(const char *tool_name, cbm_cli_stdin_kind_t stdin_kind);
+
 /* Print per-tool help (usage + the tool's flags with type/description/required)
  * derived from its input_schema, to stdout. Returns 0 if the tool is known,
  * non-zero (and prints nothing) if it is not. */
