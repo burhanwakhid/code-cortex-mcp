@@ -1409,6 +1409,74 @@ TEST(contract_edge_parallel_service_edges) {
     PASS();
 }
 
+/* Infra Routes (QN prefix __route__infra__) whose name contains `needle`. */
+static int count_infra_routes_matching(cbm_store_t *store, const char *project,
+                                       const char *needle) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_label(store, project, "Route", &nodes, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int hits = 0;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].qualified_name &&
+            strncmp(nodes[i].qualified_name, "__route__infra__", 16) == 0 && nodes[i].name &&
+            strstr(nodes[i].name, needle)) {
+            hits++;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    return hits;
+}
+
+/* A config URL becomes an infra Route only under a key that names an endpoint
+ * this service exposes. Reference links are not: across 17 infra repositories
+ * the infra Routes were changelog `pull_request` links (deckhouse 6,240),
+ * alert `runbook_url`s, chart `home`/`source`, kubeconfig `server`s, Argo
+ * `repoURL`s and docs `link`s -- and one root handler took all of them. */
+TEST(contract_edge_no_infra_routes_from_reference_links) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"CHANGELOG/v1.29.yml", "candi:\n"
+                                "  fixes:\n"
+                                "    - summary: fix a race\n"
+                                "      pull_request: https://github.com/org/repo/pull/1234\n"},
+        {"modules/cni/oss.yaml", "- name: Cilium\n"
+                                 "  link: https://github.com/cilium/cilium\n"},
+        {"charts/app/alerts.yaml", "groups:\n"
+                                   "  - name: app\n"
+                                   "    rules:\n"
+                                   "      - alert: Down\n"
+                                   "        annotations:\n"
+                                   "          runbook_url: https://runbooks.example.io/down\n"},
+        {"apps/app.yaml", "spec:\n"
+                          "  source:\n"
+                          "    repoURL: https://charts.example.io/stable\n"
+                          "  home: https://app.example.io\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 4);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(count_infra_routes_matching(store, lp.project, "https://"), 0);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
+/* The endpoint keys keep minting in their camelCase / _url spellings. */
+TEST(contract_edge_infra_routes_from_endpoint_key_spellings) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"pubsub.yaml", "subscriptions:\n"
+                        "  - name: orders\n"
+                        "    pushEndpoint: https://orders.internal.example/push\n"},
+        {"hooks.yaml", "payments:\n"
+                       "  callbackUrl: https://pay.internal.example/callback\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 2);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(count_infra_routes_matching(store, lp.project, "orders.internal.example") >= 1);
+    ASSERT_TRUE(count_infra_routes_matching(store, lp.project, "pay.internal.example") >= 1);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
 /* Run "git -C <dir> <args>"; direct git invocation (no shell builtins) so it
  * works under both POSIX shells and cmd.exe. Returns the command exit status. */
 static int run_git(const char *dir, const char *args) {
@@ -1497,6 +1565,8 @@ SUITE(lang_contract) {
     /* Cross-cutting / semantic edge-type presence (P6). Each asserts the
      * pipeline still emits that edge type; a RED here is a real regression. */
     RUN_TEST(contract_edge_defines);
+    RUN_TEST(contract_edge_no_infra_routes_from_reference_links);
+    RUN_TEST(contract_edge_infra_routes_from_endpoint_key_spellings);
     RUN_TEST(contract_edge_defines_method);
     RUN_TEST(contract_edge_contains_file);
     RUN_TEST(contract_edge_inherits);

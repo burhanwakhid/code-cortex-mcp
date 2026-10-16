@@ -37,6 +37,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include "foundation/mem.h"
 #include "foundation/sha256.h"
 
+#include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -777,6 +778,53 @@ static void *gh_compute_thread_fn(void *arg) {
     return NULL;
 }
 
+/* ── Secret hygiene: config values that are secret material stay out ─── */
+
+#define INFRA_SLEN(lit) (sizeof(lit) - SKIP_ONE)
+
+/* A file of values, not declarations: .tfvars assigns Terraform variables,
+ * .env the process environment -- where deployments keep their secrets. */
+static bool infra_values_file(const char *fp) {
+    const char *slash = strrchr(fp, '/');
+    const char *base = slash ? slash + SKIP_ONE : fp;
+    size_t n = strlen(base);
+    static const char *const suffixes[] = {".tfvars", ".tfvars.json", ".env"};
+    for (const char *suffix : suffixes) {
+        size_t sl = strlen(suffix);
+        if (n >= sl && strcmp(base + n - sl, suffix) == 0) {
+            return true;
+        }
+    }
+    return strcmp(base, ".env") == 0 || strncmp(base, ".env.", INFRA_SLEN(".env.")) == 0;
+}
+
+/* A manifest's data / stringData / binaryData hold configuration payload
+ * (a Secret keeps its values there); a value under them never declares an
+ * endpoint the service exposes. */
+static bool infra_payload_key(const char *key_path) {
+    if (!key_path) {
+        return false;
+    }
+    size_t first = strcspn(key_path, ".");
+    return (first == INFRA_SLEN("data") && strncmp(key_path, "data", first) == 0) ||
+           (first == INFRA_SLEN("stringData") && strncmp(key_path, "stringData", first) == 0) ||
+           (first == INFRA_SLEN("binaryData") && strncmp(key_path, "binaryData", first) == 0);
+}
+
+/* `url` as a route: scheme, host and path. Userinfo (`user:pass@`), the query
+ * and the fragment are where credentials and tokens ride; none is part of
+ * the endpoint. */
+static void infra_url_route_form(const char *url, char *out, size_t out_sz) {
+    const char *scheme_end = strstr(url, "://");
+    const char *host = scheme_end ? scheme_end + INFRA_SLEN("://") : url;
+    const char *path = host + strcspn(host, "/?#");
+    const char *at = static_cast<const char *>(memchr(host, '@', (size_t)(path - host)));
+    const char *host_start = at ? at + SKIP_ONE : host;
+    size_t path_len = strcspn(path, "?#");
+    snprintf(out, out_sz, "%.*s%.*s%.*s", (int)(host - url), url, (int)(path - host_start),
+             host_start, (int)path_len, path);
+}
+
 /* Extract Route nodes from URL strings found in config files (YAML, HCL, TOML).
  * These are infrastructure-defined endpoints (Cloud Scheduler, Terraform). */
 /* Process infra bindings: topic→URL pairs from IaC configs.
@@ -785,6 +833,13 @@ static void *gh_compute_thread_fn(void *arg) {
 /* Process one infra binding: create Route node + INFRA_MAPS edge. */
 static int process_one_infra_binding(cbm_gbuf_t *gbuf, const CBMInfraBinding *ib,
                                      const char *rel_path) {
+    /* Secret hygiene, as for config routes: a values file or a token-shaped
+     * URL mints nothing; a kept URL loses its credentials and query. */
+    if (infra_values_file(rel_path) || cbm_is_secret_value(ib->target_url)) {
+        return 0;
+    }
+    char url[CBM_ROUTE_QN_SIZE];
+    infra_url_route_form(ib->target_url, url, sizeof(url));
     /* source_name/target_url are raw YAML/HCL scalars (only surrounding quotes
      * are stripped), so they can carry quotes, backslashes and — for a
      * multi-line scalar — raw newlines. The broker comes from a fixed table but
@@ -802,11 +857,11 @@ static int process_one_infra_binding(cbm_gbuf_t *gbuf, const CBMInfraBinding *ib
     char esc_url[CBM_SZ_1K];
     cbm_json_escape(esc_broker, sizeof(esc_broker), ib->broker ? ib->broker : "async");
     cbm_json_escape(esc_topic, sizeof(esc_topic), ib->source_name);
-    cbm_json_escape(esc_url, sizeof(esc_url), ib->target_url);
+    cbm_json_escape(esc_url, sizeof(esc_url), url);
     char url_route_qn[CBM_ROUTE_QN_SIZE];
-    snprintf(url_route_qn, sizeof(url_route_qn), "__route__infra__%s", ib->target_url);
-    int64_t url_route_id = cbm_gbuf_upsert_node(gbuf, "Route", ib->target_url, url_route_qn,
-                                                rel_path, 0, 0, "{\"source\":\"infra\"}");
+    snprintf(url_route_qn, sizeof(url_route_qn), "__route__infra__%s", url);
+    int64_t url_route_id = cbm_gbuf_upsert_node(gbuf, "Route", url, url_route_qn, rel_path, 0, 0,
+                                                "{\"source\":\"infra\"}");
     char topic_route_qn[CBM_ROUTE_QN_SIZE];
     snprintf(topic_route_qn, sizeof(topic_route_qn), "__route__%s__%s",
              ib->broker ? ib->broker : "async", ib->source_name);
@@ -866,21 +921,32 @@ static bool is_infra_file(const char *fp) {
             strstr(fp, ".tf") != NULL || strstr(fp, ".hcl") != NULL || strstr(fp, ".toml") != NULL);
 }
 
-/* True when a YAML key path denotes an UPSTREAM dependency, CONFIG value, or
- * HEALTHCHECK target rather than an endpoint this service exposes. Such URLs
- * (auth JWKS, downstream service base URLs, package-registry URLs, healthcheck
- * curl targets) are NOT routes the service serves and must not mint Route nodes
- * (#521). Exposed-endpoint keys (push_endpoint, post_url, callback, webhook)
- * are intentionally absent here so they still produce infra Route nodes. */
-static bool is_upstream_config_key(const char *key_path) {
+/* True when a config key names an endpoint THIS service exposes -- a URL other
+ * systems call on it: a push subscription's endpoint, a post/callback/webhook
+ * URL. Only such keys mint infra Route nodes. Every other config URL is a
+ * reference: an upstream dependency, a registry or repository, a docs or
+ * runbook link, a changelog's pull-request link, a kubeconfig server. A deny
+ * list of those (#521) could not keep up: in 17 infra repositories almost
+ * every infra Route came from such a key (deckhouse: 6,240 `pull_request`
+ * links). The leaf key decides, compared ignoring case, `_` and `-`. */
+static bool is_exposed_endpoint_key(const char *key_path) {
     if (!key_path) {
-        /* No key context (e.g. flat string) — keep prior behaviour and mint. */
         return false;
     }
-    static const char *const deny[] = {"jwks",     "registry",     "registries", "healthcheck",
-                                       "upstream", "_service_url", "auth",       NULL};
-    for (int i = 0; deny[i]; i++) {
-        if (strstr(key_path, deny[i]) != NULL) {
+    const char *leaf = strrchr(key_path, '.');
+    leaf = leaf ? leaf + SKIP_ONE : key_path;
+    char norm[CBM_SZ_64];
+    size_t n = 0;
+    for (const char *p = leaf; *p && n + 1 < sizeof(norm); p++) {
+        if (*p != '_' && *p != '-') {
+            norm[n++] = (char)tolower((unsigned char)*p);
+        }
+    }
+    norm[n] = '\0';
+    static const char *const endpoints[] = {"pushendpoint", "posturl", "callback",
+                                            "callbackurl",  "webhook", "webhookurl"};
+    for (const char *endpoint : endpoints) {
+        if (strcmp(norm, endpoint) == 0) {
             return true;
         }
     }
@@ -892,12 +958,14 @@ static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, con
     if (sr->kind != CBM_STRREF_URL || !sr->value || !strstr(sr->value, "://")) {
         return;
     }
-    /* Skip upstream/config/healthcheck URLs — they are not exposed routes (#521). */
-    if (is_upstream_config_key(sr->key_path)) {
+    /* Only an endpoint this service exposes is a route it serves (#521). */
+    if (!is_exposed_endpoint_key(sr->key_path)) {
         return;
     }
+    char url[CBM_ROUTE_QN_SIZE];
+    infra_url_route_form(sr->value, url, sizeof(url));
     char route_qn[CBM_ROUTE_QN_SIZE];
-    snprintf(route_qn, sizeof(route_qn), "__route__infra__%s", sr->value);
+    snprintf(route_qn, sizeof(route_qn), "__route__infra__%s", url);
     /* key_path is joined from RAW YAML key node text — a quoted key ("log.level":)
      * keeps its quotes — so it must be escaped before it lands in properties. */
     char route_props[CBM_SZ_512];
@@ -910,15 +978,15 @@ static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, con
     } else {
         rn = snprintf(route_props, sizeof(route_props), "{\"source\":\"infra\"}");
     }
-    cbm_gbuf_upsert_node(gbuf, "Route", sr->value, route_qn, fp, 0, 0,
+    cbm_gbuf_upsert_node(gbuf, "Route", url, route_qn, fp, 0, 0,
                          cbm_json_props_checked(route_props, rn, sizeof(route_props)));
 }
 
 /* A URL string_ref that does NOT denote a route the service serves: a value
  * containing whitespace is a command/sentence with an embedded URL (e.g. a
  * Docker healthcheck `curl --fail http://... || exit 1`); a NULL key_path is a
- * context-less/duplicate ref; an upstream/config/healthcheck key is an external
- * dependency, not an exposed route. (#521) */
+ * context-less/duplicate ref; any key but an exposed-endpoint key is a
+ * reference, not an exposed route. (#521) */
 static bool route_sr_denied(const CBMStringRef *sr) {
     if (!sr->value || strchr(sr->value, ' ')) {
         return true;
@@ -926,7 +994,12 @@ static bool route_sr_denied(const CBMStringRef *sr) {
     if (!sr->key_path) {
         return true;
     }
-    return is_upstream_config_key(sr->key_path);
+    /* Secret hygiene: payload values and token-shaped values are denied by
+     * value, so no sibling ref of the same URL mints it either. */
+    if (infra_payload_key(sr->key_path) || cbm_is_secret_value(sr->value)) {
+        return true;
+    }
+    return !is_exposed_endpoint_key(sr->key_path);
 }
 
 static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_info_t *files,
@@ -940,7 +1013,8 @@ static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_i
     CBMHashTable *denied = cbm_ht_create(16);
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < file_count; i++) {
-            if (!result_cache[i] || !is_infra_file(files[i].rel_path)) {
+            if (!result_cache[i] || !is_infra_file(files[i].rel_path) ||
+                infra_values_file(files[i].rel_path)) {
                 continue;
             }
             for (int si = 0; si < result_cache[i]->string_refs.count; si++) {
