@@ -7,6 +7,7 @@
 #include "../src/foundation/compat_fs.h" /* cbm_unlink / cbm_rmdir */
 #include "../src/foundation/log.h"     /* cbm_log_set_sink — routing capture */
 #include "../src/foundation/sha256.h"
+#include "../src/foundation/str_util.h" /* CBM_CROSS_REPO_DB_FILENAME */
 #include "test_framework.h"
 #include "test_helpers.h" /* th_write_file / th_rmtree / th_mktempdir */
 #include <mcp/mcp.h>
@@ -1143,6 +1144,83 @@ TEST(detect_changes_zero_overlap_falls_back_issue1363) {
     free(project);
     cbm_mcp_server_free(srv);
     th_rmtree(repo);
+    PASS();
+}
+
+static bool uscore_make_db(const char *cache, const char *file, const char *project,
+                           const char *fn) {
+    char dbpath[CBM_SZ_1K];
+    snprintf(dbpath, sizeof(dbpath), "%s/%s", cache, file);
+    cbm_store_t *st = cbm_store_open_path(dbpath);
+    if (!st) {
+        return false;
+    }
+    bool ok = cbm_store_upsert_project(st, project, "/tmp/x") == CBM_STORE_OK;
+    cbm_node_t n = {};
+    n.project = project;
+    n.label = "Function";
+    n.name = fn;
+    n.qualified_name = fn;
+    n.file_path = "a.py";
+    n.start_line = 1;
+    n.end_line = 1;
+    ok = ok && cbm_store_upsert_node(st, &n) > 0;
+    cbm_store_close(st);
+    return ok;
+}
+
+/* Upstream a8abd976: cache entry classification uses the exact internal
+ * names (cbm_is_project_index_db). CI workspace paths produce real project
+ * names beginning with one or more underscores; they were hidden from
+ * list_projects, lookup and the not-found hint. */
+TEST(tool_underscore_projects_visible_in_cache_scans) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-uscore-cache-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    bool seeded =
+        uscore_make_db(cache, "__w-org-uscorerepo.db", "__w-org-uscorerepo", "uscore_target_fn") &&
+        uscore_make_db(cache, "_config-extra.db", "_config-extra", "uscore_extra_fn") &&
+        uscore_make_db(cache, CBM_CROSS_REPO_DB_FILENAME, "hidden-cross", "hidden_fn");
+    cbm_mcp_server_t *srv = seeded ? cbm_mcp_server_new(NULL) : NULL;
+    bool listed = false;
+    bool queried[2] = {false, false};
+    bool hidden = false;
+    if (srv) {
+        char *response = cbm_mcp_handle_tool(srv, "list_projects", "{}");
+        listed = response && strstr(response, "__w-org-uscorerepo") &&
+                 strstr(response, "_config-extra") && !strstr(response, "hidden-cross");
+        free(response);
+        const char *args[] = {
+            "{\"project\":\"__w-org-uscorerepo\",\"name_pattern\":\"uscore_target_fn\"}",
+            "{\"project\":\"_config-extra\",\"name_pattern\":\"uscore_extra_fn\"}"};
+        const char *targets[] = {"uscore_target_fn", "uscore_extra_fn"};
+        for (size_t i = 0; i < 2; i++) {
+            response = cbm_mcp_handle_tool(srv, "search_graph", args[i]);
+            queried[i] = response && !strstr(response, "\"isError\":true") &&
+                         !strstr(response, "project not found") && strstr(response, targets[i]);
+            free(response);
+        }
+        response = cbm_mcp_handle_tool(
+            srv, "search_graph", "{\"project\":\"hidden-cross\",\"name_pattern\":\"hidden_fn\"}");
+        hidden = response && strstr(response, "project not found");
+        free(response);
+        cbm_mcp_server_free(srv);
+    }
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(cache);
+    ASSERT_TRUE(seeded);
+    ASSERT_TRUE(listed);
+    ASSERT_TRUE(queried[0]);
+    ASSERT_TRUE(queried[1]);
+    ASSERT_TRUE(hidden);
     PASS();
 }
 
@@ -5693,8 +5771,9 @@ TEST(mcp_destructive_symlink_paths_preserve_backing_database) {
             cbm_mcp_server_free(srv);
         } else if (operation == 2) {
             // Earlier MCP operations also created _config.db in this cache.
-            // Existing CLI cleanup counts it alongside the alias database.
-            ASSERT_EQ(cbm_remove_indexes(root), 2);
+            // It is the user's settings store, not a project index, so CLI
+            // cleanup removes only the alias database (upstream 46015320).
+            ASSERT_EQ(cbm_remove_indexes(root), 1);
         } else {
             cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
             std::string missing = std::string(root) + "/missing-root";
@@ -6418,6 +6497,7 @@ SUITE(mcp) {
     RUN_TEST(detect_changes_node_in_hunks_overlap_issue1363);
     RUN_TEST(detect_changes_seeds_only_touched_symbol_issue1363);
     RUN_TEST(detect_changes_zero_overlap_falls_back_issue1363);
+    RUN_TEST(tool_underscore_projects_visible_in_cache_scans);
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
     RUN_TEST(tool_manage_adr_unified_backend_issue256);

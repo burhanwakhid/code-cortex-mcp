@@ -9,6 +9,7 @@
  *
  * Total: 47 Go tests → 47 C tests
  */
+#include "../src/foundation/str_util.h" /* CBM_CONFIG_DB_FILENAME */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "test_helpers.h"
@@ -4249,6 +4250,55 @@ static bool cleanup_bytes_equal(const std::string& path, const char *expected) {
     fclose(f);
     return n == strlen(expected) && memcmp(bytes, expected, n) == 0;
 }
+/* Upstream 46015320: the cache directory also holds internal stores next to
+ * the project indexes: the user's settings (_config.db) and the cross-repo
+ * store (_cross_repo.db). Index enumeration treated every *.db as a project,
+ * so install --reset-indexes / uninstall deleted the user's config along with
+ * the indexes, and list/count over-reported. Internal stores are exact
+ * filenames: a real project whose name starts with "_" is still an index. */
+TEST(cli_index_enumeration_skips_internal_cache_dbs) {
+    char root[256] = "/tmp/cbm_internal_dbs_XXXXXX";
+    ASSERT(cbm_mkdtemp(root));
+    cleanup_lease_env cache(root);
+
+    cbm_config_t *cfg = cbm_config_open(root);
+    int set_rc = cfg ? cbm_config_set(cfg, "auto_index", "true") : -1;
+    cbm_config_close(cfg);
+
+    std::string config_path = std::string(root) + "/" CBM_CONFIG_DB_FILENAME;
+    std::string cross_path = std::string(root) + "/" CBM_CROSS_REPO_DB_FILENAME;
+    std::string proj_path = std::string(root) + "/proj.db";
+    std::string underscore_proj_path = std::string(root) + "/_work-api.db";
+    ASSERT_EQ(th_write_file(cross_path.c_str(), "cross"), 0);
+    ASSERT_EQ(th_write_file(proj_path.c_str(), "db"), 0);
+    ASSERT_EQ(th_write_file(underscore_proj_path.c_str(), "db"), 0);
+
+    int listed = cbm_list_indexes(root);
+    int removed = cbm_remove_indexes(root);
+
+    bool config_kept = cbm_is_regular_file(config_path.c_str());
+    bool cross_kept = cbm_is_regular_file(cross_path.c_str());
+    bool proj_absent = !cbm_is_regular_file(proj_path.c_str());
+    bool underscore_proj_absent = !cbm_is_regular_file(underscore_proj_path.c_str());
+    char value[32] = "";
+    cfg = cbm_config_open(root);
+    if (cfg) {
+        snprintf(value, sizeof(value), "%s", cbm_config_get(cfg, "auto_index", ""));
+        cbm_config_close(cfg);
+    }
+    th_rmtree(root);
+
+    ASSERT_EQ(set_rc, 0);
+    ASSERT_EQ(listed, 2);
+    ASSERT_EQ(removed, 2);
+    ASSERT_TRUE(config_kept);
+    ASSERT_TRUE(cross_kept);
+    ASSERT_TRUE(proj_absent);
+    ASSERT_TRUE(underscore_proj_absent);
+    ASSERT_STR_EQ(value, "true");
+    PASS();
+}
+
 TEST(cli_remove_indexes_respects_lease) {
     char root[256] = "/tmp/cbm_cleanup_lease_XXXXXX";
     ASSERT(cbm_mkdtemp(root));
@@ -4356,6 +4406,7 @@ TEST(cli_build_args_json_array_flag_checks_item_type) {
 
 SUITE(cli) {
     RUN_TEST(cli_remove_indexes_respects_lease);
+    RUN_TEST(cli_index_enumeration_skips_internal_cache_dbs);
     RUN_TEST(cli_build_args_json_array_flag_accepts_json_literal);
     RUN_TEST(cli_build_args_json_array_flag_checks_item_type);
 

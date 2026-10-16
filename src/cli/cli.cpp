@@ -10,6 +10,7 @@
 #include "foundation/platform.h"
 #include "foundation/constants.h"
 #include "foundation/sha256.h"
+#include "foundation/str_util.h" // cbm_is_project_index_db
 #include "mcp/mcp.h" // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
 
 /* CLI buffer size constants. */
@@ -46,7 +47,6 @@ enum {
     SQL_PARAM_1 = 1,   /* sqlite3_bind parameter index 1 */
     SQL_PARAM_2 = 2,
     SEMVER_PARTS = 3, /* major.minor.patch */
-    DB_EXT_LEN = 3,   /* strlen(".db") */
     MIN_ARGC_CMD = 3,
     /* minimum argc for subcommand with arg */ /* sqlite3_bind parameter index 2 */ /* 10 MB cap
                                                                                        factor */
@@ -3314,8 +3314,7 @@ int cbm_list_indexes(const char *home_dir) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+        if (cbm_is_project_index_db(ent->name)) {
             printf("  %s/%s\n", cache_dir, ent->name);
             count++;
         }
@@ -3337,8 +3336,7 @@ static int remove_indexes_in_dir(const char *cache_dir) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+        if (cbm_is_project_index_db(ent->name)) {
             char path[CLI_BUF_1K];
             snprintf(path, sizeof(path), "%s/%s", cache_dir, ent->name);
             cbm_db_lease_t *lease = NULL;
@@ -3391,7 +3389,7 @@ cbm_config_t *cbm_config_open(const char *cache_dir) {
     }
 
     char dbpath[CLI_BUF_1K];
-    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", cache_dir);
+    snprintf(dbpath, sizeof(dbpath), "%s/" CBM_CONFIG_DB_FILENAME, cache_dir);
 
     /* Ensure directory exists */
     mkdirp(cache_dir, DIR_PERMS);
@@ -4312,8 +4310,7 @@ static int count_db_indexes(const char *home) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+        if (cbm_is_project_index_db(ent->name)) {
             count++;
         }
     }

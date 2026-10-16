@@ -730,16 +730,13 @@ static int collect_all_projects(char ***out) {
 
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
+        /* Internal stores are exact filenames (cbm_is_internal_cache_db).
+         * Substring filtering would hide legitimate projects such as
+         * orders_config_service or api-wal. */
+        if (!cbm_is_project_index_db(ent->name)) {
+            continue;
+        }
         size_t len = strlen(ent->name);
-        if (len < CR_COL_4 || strcmp(ent->name + len - CR_DB_EXT_LEN, ".db") != 0) {
-            continue;
-        }
-        if (strstr(ent->name, "_cross_repo") || strstr(ent->name, "_config")) {
-            continue;
-        }
-        if (strstr(ent->name, "-wal") || strstr(ent->name, "-shm")) {
-            continue;
-        }
         if (count >= cap) {
             cap *= PAIR_LEN;
             char **tmp = (char **)realloc(projects, (size_t)cap * sizeof(char *));

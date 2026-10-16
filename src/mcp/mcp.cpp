@@ -21,7 +21,6 @@ enum {
     MCP_COL_10 = 10,
     MCP_COL_16 = 16,
     MCP_DB_EXT = 3,      /* strlen(".db") */
-    MCP_MIN_DB_NAME = 4, /* min length for "x.db" */
     MCP_SEPARATOR = 2,   /* space for separator chars */
     MCP_DEFAULT_DEPTH = 3,
     MCP_DEFAULT_BFS_DEPTH = 2,
@@ -1517,7 +1516,7 @@ static char *get_project_arg_or_cwd(cbm_mcp_server_t *srv, const char *args_json
  * /corrupt dbs (0-byte file, missing `projects` table, or >1 row). On success
  * the internal name is copied into name_out; if out_store is non-NULL the open
  * handle is transferred to the caller (who must cbm_store_close it). On failure
- * the store is always closed. Defined after is_project_db_file below. */
+ * the store is always closed. Defined below. */
 typedef enum {
     DB_PROJECT_INVALID = 0,
     DB_PROJECT_FOUND,
@@ -1532,7 +1531,7 @@ static db_project_result_t db_internal_project_name(const char *full_path, char 
 /* #704 fallback: scan the cache dir for the db whose sole internal project name
  * equals `project`, returning an open store handle (caller owns it) or NULL.
  * Used only when <project>.db is absent or its internal name differs from the
- * passed name (drifted filename). Defined after is_project_db_file below. */
+ * passed name (drifted filename). Defined below. */
 static cbm_store_t *resolve_store_fallback_scan(const char *project, bool *incomplete,
                                                 bool memo_only);
 
@@ -2038,7 +2037,6 @@ char *cbm_mcp_coverage_note(cbm_mcp_server_t *srv, const char *project, const ch
 }
 
 /* Forward decl — definition lives below alongside list_projects. */
-static bool is_project_db_file(const char *name, size_t len);
 
 /* Forward decl — definition lives below in handle_trace_call_path's helpers. */
 static void free_node_contents(cbm_node_t *n);
@@ -2063,8 +2061,7 @@ static int collect_db_project_names(const char *dir_path, char *out, size_t out_
             break;
         }
         const char *n = entry->name;
-        size_t len = strlen(n);
-        if (!is_project_db_file(n, len)) {
+        if (!cbm_is_project_index_db(n)) {
             continue;
         }
         /* #704: advertise the db's INTERNAL project name, not its filename, and
@@ -2241,23 +2238,6 @@ static bool project_has_adr(cbm_store_t *store, const char *project, const char 
 
 /* ── Tool handler implementations ─────────────────────────────── */
 
-/* Return true if filename is a valid project .db file (not temp/internal).
- *
- * Project names derived from /tmp/... source roots legitimately begin with
- * "tmp-" (cbm_project_name_from_path: "/tmp/bench/..." → "tmp-bench-...";
- * see tests/test_pipeline.c fixtures), so the prefix must NOT be excluded.
- * The "_" prefix is reserved for internal/hidden DBs, and ":memory:" is the
- * SQLite in-memory marker (defensive — never appears as a real file). */
-static bool is_project_db_file(const char *name, size_t len) {
-    if (len < MCP_MIN_DB_NAME || strcmp(name + len - MCP_DB_EXT, ".db") != 0) {
-        return false;
-    }
-    if (strncmp(name, "_", SLEN("_")) == 0 || strncmp(name, ":memory:", SLEN(":memory:")) == 0) {
-        return false;
-    }
-    return true;
-}
-
 /* db_internal_project_name — see forward declaration above resolve_store. */
 /* `ctx` cannot be const-qualified: sqlite3_progress_handler fixes the callback
  * type as int(*)(void*), so constifying the parameter changes the function
@@ -2393,8 +2373,7 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project, bool *incom
             break;
         }
         const char *n = entry->name;
-        size_t len = strlen(n);
-        if (!is_project_db_file(n, len)) {
+        if (!cbm_is_project_index_db(n)) {
             continue;
         }
         char full_path[CBM_SZ_2K];
@@ -2641,8 +2620,7 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
             break;
         }
         const char *name = entry->name;
-        size_t len = strlen(name);
-        if (!is_project_db_file(name, len)) {
+        if (!cbm_is_project_index_db(name)) {
             continue;
         }
         char full_path[CBM_SZ_2K];
