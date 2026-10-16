@@ -5627,6 +5627,60 @@ TEST(walk_defs_wide_class_body_keeps_every_nested_class) {
     PASS();
 }
 
+/* #1735: the #1071 check's cost. cbm_subtract_macro_invocation_regions asked
+ * "is this region a macro call?" before "is it inside a function?", and the
+ * first question reads the region's source: regions x span bytes on any file
+ * with many error regions, whatever its language. Counted (test seam), never
+ * timed. */
+#ifdef CBM_ENABLE_TEST_SEAMS
+enum { MACRO_SCAN_SRC_CAP = 8192 };
+
+TEST(macro_check_reads_no_source_for_regions_outside_functions_issue1735) {
+    /* 40 functions, each followed by a top-level junk line: 40 regions, none
+     * of them inside a function. */
+    char src[MACRO_SCAN_SRC_CAP];
+    int len = snprintf(src, sizeof(src), "#define ALLOC(T, n) ((T *)malloc(sizeof(T) * (n)))\n");
+    for (int i = 0; i < 40; i++) {
+        len += snprintf(src + len, sizeof(src) - (size_t)len,
+                        "int ok%d(void) {\n    return %d;\n}\n} ] junk ( {\n", i, i);
+    }
+    ASSERT_LT(len, MACRO_SCAN_SRC_CAP);
+    uint64_t before = cbm_test_macro_line_scan_bytes();
+    CBMFileResult *r = extract(src, CBM_LANG_C, "t", "junk.c");
+    uint64_t scanned = cbm_test_macro_line_scan_bytes() - before;
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete); /* top-level junk stays reported */
+    ASSERT_GT(r->error_region_count, 0);
+    ASSERT_EQ(scanned, 0u);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(macro_check_locates_lines_with_one_table_issue1735) {
+    /* 60 functions whose bodies hold a real syntax error: every region sits
+     * inside a function, so the check has to look at each one's lines. */
+    char src[MACRO_SCAN_SRC_CAP];
+    int len = snprintf(src, sizeof(src), "#define ALLOC(T, n) ((T *)malloc(sizeof(T) * (n)))\n");
+    for (int i = 0; i < 60; i++) {
+        len += snprintf(src + len, sizeof(src) - (size_t)len,
+                        "int f%d(void) {\n    int x = ;\n    return x;\n}\n", i);
+    }
+    ASSERT_LT(len, MACRO_SCAN_SRC_CAP);
+    uint64_t before = cbm_test_macro_line_scan_bytes();
+    CBMFileResult *r = extract(src, CBM_LANG_C, "t", "inbody.c");
+    uint64_t scanned = cbm_test_macro_line_scan_bytes() - before;
+    ASSERT_NOT_NULL(r);
+    /* #1071 unchanged: a real in-body error is not a macro call and stays
+     * reported, one range per function. */
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 60);
+    /* Region spans read off the line table, not one walk per region. */
+    ASSERT_LTE(scanned, (uint64_t)len);
+    cbm_free_result(r);
+    PASS();
+}
+#endif
+
 /* ── #2176: binary `.res` resources must not hang the indexer ──────────
  * tree-sitter lexes an unparseable stretch by retrying at every byte with
  * every external token marked valid. The ReScript scanner then ran its
@@ -9389,6 +9443,10 @@ SUITE(extraction) {
     RUN_TEST(body_tokens_wide_body_samples_from_the_start);
     RUN_TEST(rescript_error_recovery_lexing_is_linear);
     RUN_TEST(extract_rescript_binary_blob_finishes);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(macro_check_reads_no_source_for_regions_outside_functions_issue1735);
+    RUN_TEST(macro_check_locates_lines_with_one_table_issue1735);
+#endif
     RUN_TEST(extract_c_prototypes_are_declarations);
     RUN_TEST(extract_declaration_keys_match_definitions);
     RUN_TEST(extract_declaration_keys_preserve_scope_and_overloads);

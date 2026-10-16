@@ -755,6 +755,9 @@ void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def);
 void cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call);
 #ifdef CBM_ENABLE_TEST_SEAMS
 void cbm_test_relocate_call(CBMArena *dst, const CBMArena *scratch, CBMCall *call);
+// Test-only: source bytes this thread has read to locate and inspect regions
+// for the #1071 macro-invocation check, cumulative (#1735).
+uint64_t cbm_test_macro_line_scan_bytes(void);
 // Count of reference nodes whose parent the unified walk could not supply, so
 // usage extraction fell back to ts_node_parent (a descent from the root).
 void cbm_usage_slow_parent_fallback_test_reset(void);

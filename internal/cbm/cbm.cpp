@@ -2259,6 +2259,19 @@ static int *cbm_build_line_offsets(CBMArena *arena, const char *src, int src_len
     return offsets;
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Source bytes this thread has read to locate and inspect regions for the
+ * #1071 macro check. Lets a test pin the check's cost as a count instead of a
+ * clock (#1735). Compiled only into seam-enabled test artifacts. */
+static thread_local uint64_t tl_macro_line_scan_bytes = 0;
+uint64_t cbm_test_macro_line_scan_bytes(void) {
+    return tl_macro_line_scan_bytes;
+}
+#define CBM_MACRO_LINE_SCAN(n) (tl_macro_line_scan_bytes += (uint64_t)(n))
+#else
+#define CBM_MACRO_LINE_SCAN(n) ((void)0)
+#endif
+
 /* Same question by line number, for callers asking about one whole region.
  * Reads the span from line_offsets (built for line_count lines) when there is
  * one, and walks the source to find it otherwise. */
@@ -2273,6 +2286,7 @@ static bool cbm_span_is_macro_invocation(const char *src, int src_len, uint32_t 
             return false; /* the file never reaches the first line */
         }
         int span_end = end_line < line_count ? line_offsets[end_line + 1] : src_len;
+        CBM_MACRO_LINE_SCAN(span_end - line_offsets[start_line]);
         return cbm_byte_span_is_macro_invocation(src, src_len, line_offsets[start_line], span_end,
                                                  macros);
     }
@@ -2284,6 +2298,7 @@ static bool cbm_span_is_macro_invocation(const char *src, int src_len, uint32_t 
         }
     }
     if (line != start_line) {
+        CBM_MACRO_LINE_SCAN(span_start);
         return false;
     }
     int span_end = span_start;
@@ -2292,6 +2307,7 @@ static bool cbm_span_is_macro_invocation(const char *src, int src_len, uint32_t 
             line++;
         }
     }
+    CBM_MACRO_LINE_SCAN(span_end);
     return cbm_byte_span_is_macro_invocation(src, src_len, span_start, span_end, macros);
 }
 
@@ -2326,11 +2342,16 @@ static void cbm_subtract_macro_invocation_regions(cbm_error_regions_t *regs,
     if (macros->count == 0) {
         return; /* no function-like macro, so no region is a benign invocation */
     }
+    /* Both questions are pure, so asking the cheap one first changes no answer:
+     * "is the region inside a function?" reads only the definition list, while
+     * "is it a macro call?" has to read the region's source. A region no
+     * function encloses -- every region of a file with no functions, such as a
+     * SQL data dump -- never touches the source (#1735). */
     int kept = 0;
     for (int i = 0; i < regs->count; i++) {
-        bool benign = cbm_span_is_macro_invocation(src, src_len, regs->starts[i], regs->ends[i],
-                                                   macros, line_offsets, line_count) &&
-                      cbm_region_inside_callable(regs->starts[i], regs->ends[i], defs);
+        bool benign = cbm_region_inside_callable(regs->starts[i], regs->ends[i], defs) &&
+                      cbm_span_is_macro_invocation(src, src_len, regs->starts[i], regs->ends[i],
+                                                   macros, line_offsets, line_count);
         if (!benign) {
             regs->starts[kept] = regs->starts[i];
             regs->ends[kept] = regs->ends[i];
@@ -2372,10 +2393,8 @@ static bool cbm_line_is_toplevel_macro_call(const char *src, int src_len, uint32
                                             const int *line_offsets, uint32_t line_count,
                                             const CBMDefArray *defs,
                                             const cbm_macro_names_t *macros) {
-    return macros->count > 0 &&
-           cbm_span_is_macro_invocation(src, src_len, line, line, macros, line_offsets,
-                                        line_count) &&
-           !cbm_region_inside_callable(line, line, defs);
+    return macros->count > 0 && !cbm_region_inside_callable(line, line, defs) &&
+           cbm_span_is_macro_invocation(src, src_len, line, line, macros, line_offsets, line_count);
 }
 
 /* Cut every raw region down to the runs of lines the preprocessed parse could
