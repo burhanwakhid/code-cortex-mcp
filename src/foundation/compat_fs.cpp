@@ -119,6 +119,7 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     free(u8);
     d->entry.is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     d->entry.d_type = 0;
+    d->entry.is_link = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
     return &d->entry;
 }
 
@@ -647,6 +648,7 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
         d->entry.name[nlen] = '\0';
         d->entry.is_dir = (de->d_type == DT_DIR);
         d->entry.d_type = de->d_type;
+        d->entry.is_link = (de->d_type == DT_LNK);
         return &d->entry;
     }
     return NULL;

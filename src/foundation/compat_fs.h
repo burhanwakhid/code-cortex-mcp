@@ -26,6 +26,10 @@ typedef struct {
     char name[CBM_DIRENT_NAME_MAX];
     bool is_dir;
     unsigned char d_type; /* DT_REG, DT_DIR, DT_LNK, etc. (POSIX only, 0 on Windows) */
+    /* A symbolic link (POSIX DT_LNK) or a reparse point (a Windows junction or
+     * directory symbolic link, which also sets is_dir there). A walk that must
+     * stay inside the repository never follows one. */
+    bool is_link;
 } cbm_dirent_t;
 
 /* Open a directory for iteration. Returns NULL on error. */

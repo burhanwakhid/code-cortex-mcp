@@ -390,7 +390,11 @@ static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_con
 
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL && *count < max_count) {
-        if (!ent->is_dir) {
+        /* A link is not followed, as discovery does not follow one. is_dir is
+         * also true for a junction or a directory symbolic link on Windows,
+         * and either can lead out of the repository. On POSIX readdir reports
+         * a link as DT_LNK, never DT_DIR. */
+        if (!ent->is_dir || ent->is_link) {
             continue;
         }
         const char *name = ent->name;
