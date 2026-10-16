@@ -331,13 +331,12 @@ TEST(handles_gin_go) {
     PASS();
 }
 
-/* Spring (Java) — @RequestMapping decorator sets route_path in extraction.
- * REAL BUG: internal/cbm/extract_defs.c:extract_route_from_decorators only walks
- * ts_node_prev_sibling(func) for decorator nodes of type "call".  Java annotations
- * (@GetMapping/@RequestMapping) live INSIDE the method's `modifiers` child (not a
- * prev_sibling) and are `annotation`/`marker_annotation` nodes (not `call`), so
- * route_path is never set → no Route/HANDLES for Spring controllers. */
+/* Spring (Java) — class-level @RequestMapping must prefix method mappings
+ * (upstream a19fe033). A HANDLES count alone can pass with partial routes
+ * ("/orders"), but callers/search_graph need the actual endpoint names
+ * ("/api/orders"). */
 TEST(handles_spring_java) {
+    static const char *routes[] = {"/api/orders", "/api/orders/{id}", NULL};
     static const EtFile f[] = {{"OrderController.java",
                                 "package com.example;\n\n"
                                 "import org.springframework.web.bind.annotation.RequestMapping;\n"
@@ -349,7 +348,8 @@ TEST(handles_spring_java) {
                                 "    @GetMapping(\"/orders/{id}\")\n"
                                 "    public String getOrder(int id) {\n"
                                 "        return \"order:\" + id;\n    }\n}\n"}};
-    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
+    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
 
@@ -358,13 +358,10 @@ TEST(handles_spring_java) {
  * `produces` and `consumes` is ordinary source. The argument scan stopped
  * after the third attribute, so the path was never read and no Route node
  * formed. A HANDLES count alone cannot catch that: before the fix a bogus "/"
- * Route still formed and took the HANDLES edge.
- *
- * Fork-side: upstream asserts "/api/orders". This tree does not compose a
- * class-level @RequestMapping prefix into method routes (nor emit the class
- * route on its own), so the exact set here is the method path alone. */
+ * Route still formed and took the HANDLES edge. The class-level
+ * @RequestMapping prefix composes into the method route. */
 TEST(handles_spring_java_path_attribute_fourth) {
-    static const char *routes[] = {"/orders", NULL};
+    static const char *routes[] = {"/api/orders", NULL};
     static const EtFile f[] = {{"OrderController.java",
                                 "package com.example;\n\n"
                                 "import org.springframework.web.bind.annotation.RequestMapping;\n"
@@ -376,6 +373,91 @@ TEST(handles_spring_java_path_attribute_fourth) {
                                 "                path = \"/orders\")\n"
                                 "    public String listOrders() {\n"
                                 "        return \"orders\";\n    }\n}\n"}};
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* JAX-RS (Java): the verb (@GET) and the path (@Path) are sibling
+ * annotations, and the class-level @Path must prefix method-level paths
+ * (upstream 041eb99c, #1005): the first-mapping-annotation scan dropped every
+ * method-level @Path, collapsing all methods onto a single "/" Route node. */
+TEST(handles_jaxrs_java) {
+    static const char *routes[] = {"/api/v1/widgets", "/api/v1/widgets/count", NULL};
+    static const EtFile f[] = {{"WidgetResource.java", "package com.example;\n\n"
+                                                       "import jakarta.ws.rs.GET;\n"
+                                                       "import jakarta.ws.rs.Path;\n\n"
+                                                       "@Path(\"/api/v1/widgets\")\n"
+                                                       "public class WidgetResource {\n"
+                                                       "    @GET\n"
+                                                       "    public String list() {\n"
+                                                       "        return \"widgets\";\n    }\n\n"
+                                                       "    @GET\n"
+                                                       "    @Path(\"/count\")\n"
+                                                       "    public String count() {\n"
+                                                       "        return \"42\";\n    }\n}\n"}};
+    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* JAX-RS (Java), upstream 452485f7: @Path values are URI templates relative
+ * to the enclosing resource, and the leading slash is optional. The
+ * slash-less spelling must produce the same rooted Route set. */
+TEST(handles_jaxrs_java_relative_path) {
+    static const char *routes[] = {"/api/v1/widgets", "/api/v1/widgets/count", NULL};
+    static const EtFile f[] = {{"WidgetResource.java", "package com.example;\n\n"
+                                                       "import jakarta.ws.rs.GET;\n"
+                                                       "import jakarta.ws.rs.Path;\n\n"
+                                                       "@Path(\"api/v1/widgets\")\n"
+                                                       "public class WidgetResource {\n"
+                                                       "    @GET\n"
+                                                       "    public String list() {\n"
+                                                       "        return \"widgets\";\n    }\n\n"
+                                                       "    @GET\n"
+                                                       "    @Path(\"count\")\n"
+                                                       "    public String count() {\n"
+                                                       "        return \"42\";\n    }\n}\n"}};
+    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* Negative control: the relative-template acceptance is scoped to JAX-RS
+ * @Path. A slash-less string on a Spring mapping annotation is still not read
+ * as a route path, so the handler keeps the "/" fallback. */
+TEST(handles_spring_java_relative_string_not_route) {
+    static const char *routes[] = {"/", NULL};
+    static const EtFile f[] = {
+        {"OrderController.java",
+         "package com.example;\n\n"
+         "import org.springframework.web.bind.annotation.RequestMapping;\n"
+         "import org.springframework.web.bind.annotation.GetMapping;\n\n"
+         "@RequestMapping(\"api\")\npublic class OrderController {\n"
+         "    @GetMapping(\"orders\")\n"
+         "    public String listOrders() {\n"
+         "        return \"orders\";\n    }\n}\n"}};
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* JAX-RS (Scala), upstream d4931241: class-level @Path must be composed with
+ * both an empty method path and a non-empty one. Without the Scala branch,
+ * unrelated resources collapse onto the global verb/root Route node. */
+TEST(handles_jaxrs_scala) {
+    static const char *routes[] = {"/billingAccount", "/billingAccount/{id}",
+                                   "/billingAccount/{id}/attachment/{attachmentId}/content", NULL};
+    static const EtFile f[] = {
+        {"BillingAccountApiController.scala",
+         "package com.example\n\n"
+         "import jakarta.ws.rs.{GET, POST, Path}\n\n"
+         "@Path(\"/billingAccount\")\nclass BillingAccountApiController {\n"
+         "  @POST\n  @Path(\"\")\n"
+         "  def createBillingAccount(): String = \"created\"\n\n"
+         "  @GET\n  @Path(\"{id}\")\n"
+         "  def retrieveBillingAccount(): String = \"account\"\n\n"
+         "  @GET\n  @Path(\"{id}/attachment/{attachmentId}/content\")\n"
+         "  def retrieveAttachment(): String = \"attachment\"\n}\n"}};
+    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 3));
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
@@ -1443,6 +1525,10 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_gin_go);
     RUN_TEST(handles_spring_java);
     RUN_TEST(handles_spring_java_path_attribute_fourth);
+    RUN_TEST(handles_jaxrs_java);
+    RUN_TEST(handles_jaxrs_java_relative_path);
+    RUN_TEST(handles_spring_java_relative_string_not_route);
+    RUN_TEST(handles_jaxrs_scala);
     RUN_TEST(handles_aspnet_csharp);
     RUN_TEST(handles_laravel_php);
     RUN_TEST(handles_rails_ruby);

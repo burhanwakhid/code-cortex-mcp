@@ -29,6 +29,7 @@
 #define MAX_RETURN_TYPES 16
 #define MAX_RETURN_TYPES_MINUS_1 15
 #define MAX_ATTR_WRAPPERS 16 // stacked C#/PHP attribute_list siblings per declaration (#1692)
+#define MAX_ATTR_WRAPPERS_MINUS_1 15
 
 // Tree traversal limits.
 enum {
@@ -1399,7 +1400,8 @@ static bool is_route_string_kind(const char *kind) {
            strcmp(kind, "interpreted_string_literal") == 0;
 }
 
-static const char *route_path_from_string_node(CBMArena *a, TSNode node, const char *source) {
+static const char *route_path_from_string_node(CBMArena *a, TSNode node, const char *source,
+                                               bool allow_relative) {
     if (!is_route_string_kind(ts_node_type(node))) {
         return NULL;
     }
@@ -1411,21 +1413,31 @@ static const char *route_path_from_string_node(CBMArena *a, TSNode node, const c
     if (plen >= PAIR_CHARS && (path[0] == '"' || path[0] == '\'')) {
         path = cbm_arena_strndup(a, path + SKIP_CHAR, (size_t)(plen - PAIR_CHARS));
     }
-    return (path && path[0] == '/') ? path : NULL;
+    if (!path || path[0] == '/' || !allow_relative) {
+        return (path && path[0] == '/') ? path : NULL;
+    }
+    /* JAX-RS @Path values are relative URI templates; a leading slash is
+     * optional and ignored by the framework. Route nodes use absolute-looking
+     * paths consistently, so normalize a non-empty relative value here. An
+     * empty @Path("") means "the class path itself": leave it unset so the
+     * caller falls back exactly as it does for a method without @Path. */
+    return path[0] ? cbm_arena_sprintf(a, "/%s", path) : NULL;
 }
 
 static const char *find_route_path_literal(CBMArena *a, TSNode node, const char *source,
-                                           int max_depth) { // NOLINT(misc-no-recursion)
+                                           int max_depth,
+                                           bool allow_relative) { // NOLINT(misc-no-recursion)
     if (ts_node_is_null(node) || max_depth < 0) {
         return NULL;
     }
-    const char *path = route_path_from_string_node(a, node, source);
+    const char *path = route_path_from_string_node(a, node, source, allow_relative);
     if (path || max_depth == 0) {
         return path;
     }
     uint32_t nc = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < nc && i < DECORATOR_SCAN_LIMIT; i++) {
-        path = find_route_path_literal(a, ts_node_named_child(node, i), source, max_depth - 1);
+        path = find_route_path_literal(a, ts_node_named_child(node, i), source, max_depth - 1,
+                                       allow_relative);
         if (path) {
             return path;
         }
@@ -1433,8 +1445,10 @@ static const char *find_route_path_literal(CBMArena *a, TSNode node, const char 
     return NULL;
 }
 
-// Extract route path from decorator arguments (first string that starts with /).
-static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const char *source) {
+// Extract route path from decorator arguments. Generic mappings keep only
+// slash-prefixed strings; JAX-RS @Path additionally accepts relative templates.
+static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const char *source,
+                                                bool allow_relative) {
     /* Every argument is checked. Java and Kotlin put no order on annotation
      * attributes, so `path` can sit anywhere in the list. Stopping early left
      * a real route unread and formed no Route node. Each argument's own
@@ -1447,7 +1461,8 @@ static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const 
          *   @GetMapping(path = {"/orders"})
          * Walk a bounded subtree and keep the first string literal that is
          * path-shaped, while ignoring non-route literals such as media types. */
-        const char *path = find_route_path_literal(a, arg, source, CBM_DESCENDANT_MAX_DEPTH);
+        const char *path =
+            find_route_path_literal(a, arg, source, CBM_DESCENDANT_MAX_DEPTH, allow_relative);
         if (path) {
             return path;
         }
@@ -1593,7 +1608,7 @@ static bool try_route_from_decorator_call(CBMArena *a, TSNode dchild, const char
 
     TSNode args = find_decorator_args(dchild);
     if (!ts_node_is_null(args)) {
-        const char *path = extract_route_path_from_args(a, args, source);
+        const char *path = extract_route_path_from_args(a, args, source, false);
         if (path) {
             *out_path = path;
             *out_method = method;
@@ -1673,44 +1688,90 @@ static bool try_route_from_annotation(CBMArena *a, TSNode annotation, const char
     TSNode args = annotation_args_node(annotation);
     const char *path = NULL;
     if (!ts_node_is_null(args)) {
-        path = extract_route_path_from_args(a, args, source);
+        path = extract_route_path_from_args(a, args, source, false);
     }
     *out_path = path ? path : "/";
     *out_method = method;
     return true;
 }
 
-/* Scan the annotation nodes nested in a JVM/C# `modifiers`/`attribute_list`
- * wrapper (and direct children) for a route-mapping annotation. Java/Kotlin
- * Spring annotations (@GetMapping, @RequestMapping, ...) live here rather than
- * as prev-siblings, so the prev-sibling decorator walk never sees them. */
-static bool extract_route_from_annotations(CBMArena *a, TSNode func_node, const char *source,
-                                           const CBMLangSpec *spec, const char **out_path,
-                                           const char **out_method) {
+/* Scan ALL annotation nodes nested in a JVM/C# `modifiers`/`attribute_list`
+ * wrapper (and direct children), collecting route information from the whole
+ * set instead of stopping at the first mapping annotation. Java/Kotlin Spring
+ * annotations (@GetMapping, @RequestMapping, ...) live here rather than as
+ * prev-siblings, so the prev-sibling decorator walk never sees them.
+ *
+ * JAX-RS splits the route across two annotations: the verb comes from a bare
+ * @GET/@POST/... and the path from a sibling @Path("..."). Returning on the
+ * first mapping annotation therefore dropped every method-level @Path (the
+ * @GET matched first, defaulted the path to "/", and @Path was never read),
+ * and class-level @Path prefixes were never recognized at all (upstream
+ * 041eb99c, #1005). */
+static void scan_route_annotations(CBMArena *a, TSNode owner, const char *source,
+                                   const CBMLangSpec *spec, const char **out_map_path,
+                                   const char **out_method, const char **out_jax_path) {
+    *out_map_path = NULL;
+    *out_method = NULL;
+    *out_jax_path = NULL;
+
+    /* MINUS_1: the owner node itself is appended below, after the wrappers. */
     TSNode wrappers[MAX_ATTR_WRAPPERS];
-    int wn = find_jvm_modifiers(func_node, spec->language, wrappers, MAX_ATTR_WRAPPERS);
+    int wn = find_jvm_modifiers(owner, spec->language, wrappers, MAX_ATTR_WRAPPERS_MINUS_1);
+    /* Direct-child annotations (some grammars attach the annotation as a child
+     * of the method node rather than under `modifiers`). */
+    wrappers[wn++] = owner;
+
     for (int w = 0; w < wn; w++) {
-        TSNode modifiers = wrappers[w];
-        uint32_t mc = ts_node_child_count(modifiers);
-        for (uint32_t mi = 0; mi < mc; mi++) {
-            TSNode mchild = ts_node_child(modifiers, mi);
-            if (cbm_kind_in_set(mchild, spec->decorator_node_types) &&
-                try_route_from_annotation(a, mchild, source, out_path, out_method)) {
-                return true;
+        uint32_t cc = ts_node_child_count(wrappers[w]);
+        for (uint32_t ci = 0; ci < cc; ci++) {
+            TSNode child = ts_node_child(wrappers[w], ci);
+            if (!cbm_kind_in_set(child, spec->decorator_node_types)) {
+                continue;
+            }
+            TSNode name_node = annotation_name_node(child);
+            if (ts_node_is_null(name_node)) {
+                continue;
+            }
+            char *name = cbm_node_text(a, name_node, source);
+            if (!name) {
+                continue;
+            }
+            if (!*out_jax_path && strcmp(name, "Path") == 0) {
+                TSNode args = annotation_args_node(child);
+                if (!ts_node_is_null(args)) {
+                    *out_jax_path = extract_route_path_from_args(a, args, source, true);
+                }
+                continue;
+            }
+            if (!*out_method) {
+                const char *method = annotation_route_method(name);
+                if (method) {
+                    *out_method = method;
+                    TSNode args = annotation_args_node(child);
+                    if (!ts_node_is_null(args)) {
+                        *out_map_path = extract_route_path_from_args(a, args, source, false);
+                    }
+                }
             }
         }
     }
-    /* Direct-child annotations (some grammars attach the annotation as a child
-     * of the method node rather than under `modifiers`). */
-    uint32_t cc = ts_node_child_count(func_node);
-    for (uint32_t ci = 0; ci < cc; ci++) {
-        TSNode child = ts_node_child(func_node, ci);
-        if (cbm_kind_in_set(child, spec->decorator_node_types) &&
-            try_route_from_annotation(a, child, source, out_path, out_method)) {
-            return true;
-        }
+}
+
+static bool extract_route_from_annotations(CBMArena *a, TSNode func_node, const char *source,
+                                           const CBMLangSpec *spec, const char **out_path,
+                                           const char **out_method) {
+    const char *map_path = NULL;
+    const char *method = NULL;
+    const char *jax_path = NULL;
+    scan_route_annotations(a, func_node, source, spec, &map_path, &method, &jax_path);
+    /* Method-level routes still require a verb/mapping annotation; a lone
+     * @Path (JAX-RS sub-resource locator) is not an endpoint by itself. */
+    if (!method) {
+        return false;
     }
-    return false;
+    *out_method = method;
+    *out_path = map_path ? map_path : (jax_path ? jax_path : "/");
+    return true;
 }
 
 static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const char *source,
@@ -1753,6 +1814,53 @@ static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const c
     /* Spring/JAX-RS annotations live inside the method's `modifiers` child, not
      * as prev-siblings — scan there too. */
     extract_route_from_annotations(a, func_node, source, spec, out_path, out_method);
+}
+
+/* Compose a class-level route prefix with a method route (upstream 041eb99c /
+ * a19fe033): exactly one slash between them, "/" on either side is neutral. */
+static const char *join_route_paths(CBMArena *a, const char *prefix, const char *path) {
+    if (!path || !path[0]) {
+        return prefix;
+    }
+    if (!prefix || !prefix[0] || strcmp(prefix, "/") == 0) {
+        return path;
+    }
+    if (strcmp(path, "/") == 0) {
+        return prefix;
+    }
+    size_t plen = strlen(prefix);
+    bool prefix_slash = prefix[plen - 1] == '/';
+    bool path_slash = path[0] == '/';
+    if (prefix_slash && path_slash) {
+        return cbm_arena_sprintf(a, "%s%s", prefix, path + SKIP_CHAR);
+    }
+    if (!prefix_slash && !path_slash) {
+        return cbm_arena_sprintf(a, "%s/%s", prefix, path);
+    }
+    return cbm_arena_sprintf(a, "%s%s", prefix, path);
+}
+
+/* The route prefix a JVM controller/resource class declares: Spring
+ * @RequestMapping("/api") (and friends), or JAX-RS class-level @Path. */
+static const char *jvm_class_route_prefix(CBMArena *a, TSNode class_node, const char *source,
+                                          const CBMLangSpec *spec) {
+    if (ts_node_is_null(class_node)) {
+        return NULL;
+    }
+    const char *map_path = NULL;
+    const char *method = NULL;
+    const char *jax_path = NULL;
+    scan_route_annotations(a, class_node, source, spec, &map_path, &method, &jax_path);
+    if (map_path) {
+        return map_path; /* @RequestMapping("/api") and friends */
+    }
+    if (jax_path) {
+        return jax_path; /* JAX-RS class-level @Path("/api") carries no verb */
+    }
+    if (method) {
+        return "/"; /* mapping annotation without a path argument */
+    }
+    return NULL;
 }
 
 // Extract decorator names from preceding decorator/annotation nodes
@@ -4771,8 +4879,8 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
 }
 
 // Push a single method definition
-static void push_method_def(CBMExtractCtx *ctx, TSNode child, const char *class_qn,
-                            const CBMLangSpec *spec, TSNode name_node) {
+static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
+                            const char *class_qn, const CBMLangSpec *spec, TSNode name_node) {
     CBMArena *a = ctx->arena;
 
     char *name = cbm_node_text(a, name_node, ctx->source);
@@ -4833,6 +4941,13 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, const char *class_
 
     def.decorators = extract_decorators(a, child, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, child, ctx->source, spec, &def.route_path, &def.route_method);
+    /* Class-level @RequestMapping / JAX-RS @Path prefix (upstream 041eb99c,
+     * a19fe033; Scala resources declare it the same way, d4931241). */
+    if (def.route_path && (ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN ||
+                           ctx->language == CBM_LANG_SCALA)) {
+        const char *prefix = jvm_class_route_prefix(a, class_node, ctx->source, spec);
+        def.route_path = join_route_paths(a, prefix, def.route_path);
+    }
     def.docstring = extract_docstring(a, child, ctx->source, ctx->language);
 
     if (spec->branching_node_types && spec->branching_node_types[0]) {
@@ -4857,7 +4972,7 @@ static void extract_objc_impl_methods(CBMExtractCtx *ctx, TSNode impl_node, cons
         if (cbm_kind_in_set(inner, spec->function_node_types)) {
             TSNode nm = resolve_method_name(inner, ctx->language);
             if (!ts_node_is_null(nm)) {
-                push_method_def(ctx, inner, class_qn, spec, nm);
+                push_method_def(ctx, inner, impl_node, class_qn, spec, nm);
             }
         }
     }
@@ -4915,7 +5030,7 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
             continue;
         }
 
-        push_method_def(ctx, method_node, class_qn, spec, name_node);
+        push_method_def(ctx, method_node, class_node, class_qn, spec, name_node);
     }
 }
 
@@ -6562,7 +6677,12 @@ static void push_class_body_children(TSNode node, const CBMLangSpec *spec, walk_
             // nested-class path keeps methods from being re-walked (and thus
             // double-extracted) as top-level functions. Gated to Groovy so other
             // grammars that also name a node "closure" are unaffected.
-            (strcmp(ck, "closure") == 0 && spec->language == CBM_LANG_GROOVY)) {
+            (strcmp(ck, "closure") == 0 && spec->language == CBM_LANG_GROOVY) ||
+            // Scala's class/object/trait body is a `template_body`: without it
+            // the generic walk re-extracted every method as a free Function
+            // (a second node, and for JAX-RS a second, un-prefixed Route).
+            // Upstream fixed the same omission in 87a0e3f7.
+            (strcmp(ck, "template_body") == 0 && spec->language == CBM_LANG_SCALA)) {
             push_nested_class_nodes(child, spec, stack, top, new_enclosing, ctx);
             return;
         }

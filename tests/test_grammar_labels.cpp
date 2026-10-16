@@ -98,7 +98,9 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"perl", "Function:2,Module:1"},
     {"dart", "Class:1,Function:1,Module:1"},
     {"swift", "Class:1,Function:1,Module:1"},
-    {"scala", "Class:1,Function:1,Method:1,Module:1"},
+    /* No Function twin: the class method is not re-walked as a free function
+     * (template_body, as upstream). */
+    {"scala", "Class:1,Method:1,Module:1"},
     {"gdscript", "Function:1,Module:1"},
     {"groovy", "Class:1,Method:1,Module:1"},
     {"zig", "Function:2,Module:1"},
