@@ -11,6 +11,7 @@
 #include "cbm.h"
 #include "lsp/py_lsp.h"
 #include "lsp/lsp_work.h"
+#include "../src/pipeline/lsp_resolve.h"
 #include "result_compact.h" /* cbm_result_compact */
 #include "../src/pipeline/pass_lsp_cross.h"
 
@@ -2028,7 +2029,177 @@ TEST(pylsp_issue1527_long_receiver_chain_is_not_nesting) {
     return pylsp_long_chain_case(true);
 }
 
+/* Upstream bf5ea5a4: module-level Python calls are owned by the file's Module
+ * QN (the caller the extractor records), so the pipeline join finds the
+ * exact LSP resolution instead of a `<module>.__module__` caller nothing
+ * matches. The fork's resolved rows carry no site range, so the join is
+ * checked through the production lookup on the extracted call itself. */
+static bool pylsp_module_call_joins(const CBMFileResult *r, const char *caller,
+                                    const char *callee_name, const char *target) {
+    const CBMCall *call = NULL;
+    int call_count = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *candidate = &r->calls.items[i];
+        if (candidate->enclosing_func_qn && strcmp(candidate->enclosing_func_qn, caller) == 0 &&
+            candidate->callee_name && strcmp(candidate->callee_name, callee_name) == 0) {
+            call = candidate;
+            call_count++;
+        }
+    }
+    if (call_count != 1)
+        return false;
+    const CBMResolvedCall *hit = cbm_pipeline_find_lsp_resolution(&r->resolved_calls, call, false);
+    if (!hit || !hit->caller_qn || strcmp(hit->caller_qn, caller) != 0 || !hit->callee_qn ||
+        strcmp(hit->callee_qn, target) != 0)
+        return false;
+    CBMCall wrong = *call;
+    wrong.enclosing_func_qn = "unrelated.module.caller";
+    return cbm_pipeline_find_lsp_resolution(&r->resolved_calls, &wrong, false) == NULL;
+}
+
+static bool pylsp_module_no_phantom_caller(const CBMFileResult *r) {
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const char *caller = r->resolved_calls.items[i].caller_qn;
+        if (caller && strstr(caller, "__module__"))
+            return false;
+    }
+    return true;
+}
+
+TEST(pylsp_module_callers_join_exact_raw_occurrences) {
+    /* The fork joins resolutions per (caller, callee leaf) -- its Python rows
+     * carry no site range -- so the two classes use distinct method names. */
+    static const char source[] = "class Alpha:\n"
+                                 "    def render(self):\n"
+                                 "        return 1\n"
+                                 "class Beta:\n"
+                                 "    def draw(self):\n"
+                                 "        return 2\n"
+                                 "def helper():\n"
+                                 "    return 3\n"
+                                 "def control():\n"
+                                 "    function_a = Alpha()\n"
+                                 "    function_a.render()\n"
+                                 "    helper()\n"
+                                 "class Controller:\n"
+                                 "    def control(self):\n"
+                                 "        method_b = Beta()\n"
+                                 "        method_b.draw()\n"
+                                 "module_a = Alpha()\n"
+                                 "module_b = Beta()\n"
+                                 "module_a.render()\n"
+                                 "module_b.draw()\n";
+    CBMFileResult *r = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                        "app.py", 0, NULL, NULL);
+    bool correct = r && !r->has_error && !r->lsp_skipped && r->module_qn &&
+                   strcmp(r->module_qn, "test.app") == 0 &&
+                   pylsp_module_call_joins(r, "test.app", "module_a.render",
+                                           "test.app.Alpha.render") &&
+                   pylsp_module_call_joins(r, "test.app", "module_b.draw",
+                                           "test.app.Beta.draw") &&
+                   pylsp_module_call_joins(r, "test.app.control", "function_a.render",
+                                           "test.app.Alpha.render") &&
+                   pylsp_module_call_joins(r, "test.app.Controller.control", "method_b.draw",
+                                           "test.app.Beta.draw") &&
+                   pylsp_module_no_phantom_caller(r);
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(correct);
+
+    /* A package Module keeps its raw caller identity too. */
+    static const char init_source[] = "PACKAGE_SIZE = len([1])\n";
+    r = cbm_extract_file(init_source, (int)strlen(init_source), CBM_LANG_PYTHON, "test",
+                         "pkg/__init__.py", 0, NULL, NULL);
+    correct = r && !r->has_error && !r->lsp_skipped && r->module_qn &&
+              strcmp(r->module_qn, "test.pkg.__init__") == 0 &&
+              pylsp_module_call_joins(r, "test.pkg.__init__", "len", "builtins.len") &&
+              pylsp_module_no_phantom_caller(r);
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pylsp_module_named_lambda_keeps_module_owner) {
+    static const char source[] = "class Number:\n"
+                                 "    def __add__(self, other):\n"
+                                 "        return self\n"
+                                 "module_number = Number()\n"
+                                 "add = lambda left, right: left + right\n"
+                                 "first = add(module_number, module_number)\n";
+    CBMFileResult *r = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                        "app.py", 0, NULL, NULL);
+    bool correct = r && !r->has_error && !r->lsp_skipped && pylsp_module_no_phantom_caller(r);
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+/* Cross-file entry points: the module caller is an arena copy, so it
+ * outlives a temporary module_qn input buffer. */
+TEST(pylsp_module_cross_callers_own_input) {
+    static const char source[] = "from helpers import Alpha, Beta\n"
+                                 "module_a = Alpha()\n"
+                                 "module_b = Beta()\n"
+                                 "module_a.render()\n"
+                                 "module_b.render()\n";
+    CBMLSPDef defs[4] = {};
+    const char *qns[] = {"test.helpers.Alpha", "test.helpers.Alpha.render", "test.helpers.Beta",
+                         "test.helpers.Beta.render"};
+    const char *shorts[] = {"Alpha", "render", "Beta", "render"};
+    const char *recv[] = {NULL, "test.helpers.Alpha", NULL, "test.helpers.Beta"};
+    for (int i = 0; i < 4; i++) {
+        defs[i].qualified_name = qns[i];
+        defs[i].short_name = shorts[i];
+        defs[i].label = recv[i] ? "Method" : "Class";
+        defs[i].receiver_type = recv[i];
+        defs[i].def_module_qn = "test.helpers";
+        defs[i].return_types = recv[i] ? "int" : NULL;
+        defs[i].lang = CBM_LANG_PYTHON;
+    }
+    const char *import_names[] = {"Alpha", "Beta"};
+    const char *import_qns[] = {"test.helpers.Alpha", "test.helpers.Beta"};
+    bool correct = true;
+    for (int prebuilt = 0; prebuilt < 2; prebuilt++) {
+        CBMArena arena, shared;
+        cbm_arena_init(&arena);
+        cbm_arena_init(&shared);
+        CBMTypeRegistry *base = prebuilt ? cbm_py_build_cross_registry(&shared, defs, 4) : NULL;
+        char module_input[64];
+        snprintf(module_input, sizeof(module_input), "%s", "test.app");
+        CBMResolvedCallArray out = {};
+        CBMLSPStatus status =
+            prebuilt ? cbm_run_py_lsp_cross_with_registry_status(&arena, source, (int)strlen(source),
+                                                                 module_input, base, import_names,
+                                                                 import_qns, 2, NULL, &out)
+                     : cbm_run_py_lsp_cross_status(&arena, source, (int)strlen(source),
+                                                   module_input, defs, 4, import_names, import_qns,
+                                                   2, NULL, &out);
+        /* Overwrite the caller's input: returned caller strings must not alias it. */
+        memset(module_input, 'x', strlen(module_input));
+        int alpha = -1, beta = -1;
+        for (int i = 0; i < out.count; i++) {
+            const CBMResolvedCall *rc = &out.items[i];
+            if (!rc->caller_qn || strcmp(rc->caller_qn, "test.app") != 0 || !rc->callee_qn)
+                continue;
+            if (strcmp(rc->callee_qn, "test.helpers.Alpha.render") == 0)
+                alpha = i;
+            if (strcmp(rc->callee_qn, "test.helpers.Beta.render") == 0)
+                beta = i;
+        }
+        correct = correct && status == CBM_LSP_COMPLETE && alpha >= 0 && beta >= 0;
+        cbm_arena_destroy(&arena);
+        cbm_arena_destroy(&shared);
+    }
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
 SUITE(py_lsp) {
+    RUN_TEST(pylsp_module_callers_join_exact_raw_occurrences);
+    RUN_TEST(pylsp_module_named_lambda_keeps_module_owner);
+    RUN_TEST(pylsp_module_cross_callers_own_input);
     RUN_TEST(pylsp_issue1527_chain_statements_resolve_completely);
     RUN_TEST(pylsp_issue1527_large_module_resolves_every_call);
     RUN_TEST(pylsp_issue1527_long_binary_chain_is_not_nesting);

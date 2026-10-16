@@ -61,7 +61,8 @@ typedef struct {
     // caller QNs.
     const char *enclosing_func_qn;
     const char *enclosing_class_qn;
-    const char *module_qn;
+    const char *module_qn;      // Python symbol scope (package __init__ omitted)
+    const char *file_module_qn; // raw file identity (Module caller QN)
 
     // Output: resolved calls accumulate here.
     CBMResolvedCallArray *resolved_calls;

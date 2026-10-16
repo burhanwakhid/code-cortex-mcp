@@ -2075,8 +2075,15 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
          * last segment is NOT the symbol (otherwise "pkg.mod" already IS the
          * thing named) and the member is a real definition, never another
          * Module/File. */
-        if (target->label &&
-            (strcmp(target->label, "Module") == 0 || strcmp(target->label, "File") == 0)) {
+        /* A Python package import (`from pkg import X`) resolves to the
+         * package's Folder, while X is defined in pkg/__init__.py under the
+         * package scope `pkg.X` (upstream 132ded8c: package symbols resolve
+         * under their package). Prefer that member the same way. */
+        bool python_package =
+            target->label && strcmp(target->label, "Folder") == 0 &&
+            cbm_language_for_filename(path_leaf(source_rel ? source_rel : "")) == CBM_LANG_PYTHON;
+        if (target->label && (strcmp(target->label, "Module") == 0 ||
+                              strcmp(target->label, "File") == 0 || python_package)) {
             char symbuf[256];
             const char *sym = import_candidate_symbol(imp->module_path, symbuf, sizeof(symbuf));
             if (sym && sym[0] && strcmp(sym, "*") != 0) {

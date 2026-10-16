@@ -397,6 +397,7 @@ typedef enum {
     CBM_LSP_COMPLETE = 0,
     CBM_LSP_MEMO_FAILED,
     CBM_LSP_DEPTH_EXCEEDED,
+    CBM_LSP_SCOPE_FAILED,
 } CBMLSPStatus;
 
 // Growable arrays used during extraction.
@@ -488,11 +489,17 @@ typedef enum {
     CBM_LSP_SKIP_TREE_DEPTH = 5,   // the tree is too deep for the recursive resolvers
     CBM_LSP_SKIP_EVAL_DEPTH = 6,   // an LSP walk stopped at the expression nesting limit
     CBM_LSP_SKIP_EVAL_MEMO = 7,    // an LSP walk stopped on an evaluation-memo failure
+    CBM_LSP_SKIP_EVAL_SCOPE = 8,   // the Python package symbol scope could not be allocated
 } CBMLspSkipReason;
 
 // Stable lower_snake name of a CBMLspSkipReason, as the coverage report and the
 // extract.lsp.skipped log line spell it.
 const char *cbm_lsp_skip_reason_name(uint8_t reason);
+
+/* Python symbol scope only: callers must establish the language explicitly.
+ * A trailing .__init__ is omitted when a nonempty prefix precedes it; raw
+ * Module/file identity is unchanged. NULL returns zero. */
+size_t cbm_fqn_symbol_scope_len(const char *module_qn);
 
 typedef struct {
     CBMFieldType *items;

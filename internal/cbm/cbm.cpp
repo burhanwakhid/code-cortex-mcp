@@ -1116,6 +1116,8 @@ const char *cbm_lsp_skip_reason_name(uint8_t reason) {
         return "eval_depth";
     case CBM_LSP_SKIP_EVAL_MEMO:
         return "eval_memo";
+    case CBM_LSP_SKIP_EVAL_SCOPE:
+        return "eval_scope";
     default:
         return "unknown";
     }

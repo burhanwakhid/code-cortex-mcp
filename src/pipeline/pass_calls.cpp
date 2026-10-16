@@ -618,8 +618,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                                     cbm_pipeline_lsp_external_receiver(lsp));
     cbm_resolution_t res = {0};
     if (!rust_external && !php_vendor_call) {
-        res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn, imp_keys, imp_vals,
-                                   imp_count);
+        res = cbm_registry_resolve_lang(ctx->registry, call->callee_name, module_qn, imp_keys,
+                                        imp_vals, imp_count, lang);
     }
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         /* Resolution is empty when the callee belongs to an EXTERNAL client

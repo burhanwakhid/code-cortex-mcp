@@ -639,9 +639,9 @@ static bool is_checked_exception(const char *name) {
 
 static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
                                     const char *module_qn, const char **imp_keys,
-                                    const char **imp_vals, int imp_count) {
+                                    const char **imp_vals, int imp_count, CBMLanguage lang) {
     cbm_resolution_t res =
-        cbm_registry_resolve(reg, name, module_qn, imp_keys, imp_vals, imp_count);
+        cbm_registry_resolve_lang(reg, name, module_qn, imp_keys, imp_vals, imp_count, lang);
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         return NULL;
     }
@@ -2574,8 +2574,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                (cbm_pipeline_php_vendor_call(result, call) ||
                                 (lsp && !lsp_target && cbm_pipeline_lsp_external_receiver(lsp)));
         if ((!res.qualified_name || !res.qualified_name[0]) && !rust_external && !php_vendor_call) {
-            res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
-                                       imp_vals, imp_count);
+            res = cbm_registry_resolve_lang(rc->registry, call->callee_name, module_qn, imp_keys,
+                                            imp_vals, imp_count, lang);
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_resolve, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
@@ -2776,8 +2776,8 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             (lang == CBM_LANG_SQL)
                 ? cbm_registry_resolve_lineage(rc->registry, usage->ref_name, module_qn, imp_keys,
                                                imp_vals, imp_count)
-                : cbm_registry_resolve(rc->registry, usage->ref_name, module_qn, imp_keys, imp_vals,
-                                       imp_count);
+                : cbm_registry_resolve_lang(rc->registry, usage->ref_name, module_qn, imp_keys,
+                                            imp_vals, imp_count, lang);
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             continue;
         }
@@ -2807,7 +2807,8 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
 /* Resolve throws/raises for one file. */
 static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                 CBMFileResult *result, const char *rel, const char *module_qn,
-                                const char **imp_keys, const char **imp_vals, int imp_count) {
+                                const char **imp_keys, const char **imp_vals, int imp_count,
+                                CBMLanguage lang) {
     for (int t = 0; t < result->throws.count; t++) {
         CBMThrow *thr = &result->throws.items[t];
         if (!thr->exception_name || !thr->enclosing_func_qn) {
@@ -2822,8 +2823,8 @@ static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             continue;
         }
         const char *edge_type = is_checked_exception(thr->exception_name) ? "THROWS" : "RAISES";
-        cbm_resolution_t res = cbm_registry_resolve(rc->registry, thr->exception_name, module_qn,
-                                                    imp_keys, imp_vals, imp_count);
+        cbm_resolution_t res = cbm_registry_resolve_lang(
+            rc->registry, thr->exception_name, module_qn, imp_keys, imp_vals, imp_count, lang);
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             continue;
         }
@@ -2850,8 +2851,8 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         if (!src) {
             continue;
         }
-        cbm_resolution_t res = cbm_registry_resolve(rc->registry, rw->var_name, module_qn, imp_keys,
-                                                    imp_vals, imp_count);
+        cbm_resolution_t res = cbm_registry_resolve_lang(rc->registry, rw->var_name, module_qn,
+                                                         imp_keys, imp_vals, imp_count, lang);
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             continue;
         }
@@ -2893,7 +2894,8 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (cbm_pipeline_php_vendor_ref(result, def->base_classes[b])) {
             continue;
         }
-        const char *bqn = resolve_as_class(rc->registry, def->base_classes[b], mq, ik, iv, ic);
+        const char *bqn =
+            resolve_as_class(rc->registry, def->base_classes[b], mq, ik, iv, ic, fs->lang);
         /* Same external-base gate as the sequential semantic pass. */
         if (!bqn ||
             cbm_python_external_base_contradicts(fs->lang, fs->imports, def->base_classes[b], bqn,
@@ -2915,7 +2917,8 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
 /* Resolve decorators → DECORATES edges for one definition. */
 static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                    const CBMDefinition *def, const cbm_gbuf_node_t *node,
-                                   const char *mq, const char **ik, const char **iv, int ic) {
+                                   const char *mq, const char **ik, const char **iv, int ic,
+                                   CBMLanguage lang) {
     if (!def->decorators) {
         return;
     }
@@ -2925,14 +2928,14 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
         if (fn[0] == '\0') {
             continue;
         }
-        cbm_resolution_t res = cbm_registry_resolve(rc->registry, fn, mq, ik, iv, ic);
+        cbm_resolution_t res = cbm_registry_resolve_lang(rc->registry, fn, mq, ik, iv, ic, lang);
         if ((!res.qualified_name || res.qualified_name[0] == '\0') && !strchr(fn, '.')) {
             /* C# attributes are referenced by their short name (`[Log]`) but
              * declared with an `Attribute` suffix (`class LogAttribute`). */
             char with_suffix[CBM_SZ_256];
             int wn = snprintf(with_suffix, sizeof(with_suffix), "%sAttribute", fn);
             if (wn > 0 && (size_t)wn < sizeof(with_suffix)) {
-                res = cbm_registry_resolve(rc->registry, with_suffix, mq, ik, iv, ic);
+                res = cbm_registry_resolve_lang(rc->registry, with_suffix, mq, ik, iv, ic, lang);
             }
         }
         const cbm_gbuf_node_t *dn = NULL;
@@ -2992,7 +2995,7 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         }
         resolve_def_inherits(rc, ws, result, def, node, &fs, module_qn, imp_keys, imp_vals,
                              imp_count);
-        resolve_def_decorators(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_def_decorators(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count, lang);
     }
     for (int t = 0; t < result->impl_traits.count; t++) {
         CBMImplTrait *it = &result->impl_traits.items[t];
@@ -3000,9 +3003,9 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             continue;
         }
         const char *tqn = resolve_as_class(rc->registry, it->trait_name, module_qn, imp_keys,
-                                           imp_vals, imp_count);
+                                           imp_vals, imp_count, lang);
         const char *sqn = resolve_as_class(rc->registry, it->struct_name, module_qn, imp_keys,
-                                           imp_vals, imp_count);
+                                           imp_vals, imp_count, lang);
         if (!tqn || !sqn) {
             continue;
         }
@@ -3338,7 +3341,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         /* ── THROWS / RAISES ───────────────────────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_throws(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_file_throws(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang);
         atomic_fetch_add_explicit(&rc->time_ns_throws, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
 

@@ -305,8 +305,8 @@ static const char *pxc_resolve_base_qn(const pxc_base_scope_t *bs, const char *r
         return NULL;
     }
     const cbm_registry_t *reg = bs->reg;
-    cbm_resolution_t res =
-        cbm_registry_resolve(reg, raw, module_qn, bs->imp_keys, bs->imp_vals, bs->imp_count);
+    cbm_resolution_t res = cbm_registry_resolve_lang(reg, raw, module_qn, bs->imp_keys,
+                                                     bs->imp_vals, bs->imp_count, bs->lang);
     if (!res.qualified_name || !res.qualified_name[0]) {
         return NULL;
     }
@@ -1808,6 +1808,22 @@ static void pxc_mark_module_defs(const CBMModuleDefIndex *idx, bool *selected,
         return;
     }
     pxc_module_entry_t *e = (pxc_module_entry_t *)cbm_ht_get(idx->ht, module_qn);
+    if (!e && caller_lang == CBM_LANG_PYTHON) {
+        /* A Python package is named by its directory (`proj.pkg`) while its
+         * definitions live in the `proj.pkg.__init__` module (upstream
+         * 132ded8c). Probe that module when the plain key misses. */
+        static const char init_seg[] = ".__init__";
+        size_t len = strlen(module_qn);
+        char *candidate = len < SIZE_MAX - sizeof(init_seg)
+                              ? static_cast<char *>(malloc(len + sizeof(init_seg)))
+                              : NULL;
+        if (candidate) {
+            memcpy(candidate, module_qn, len);
+            memcpy(candidate + len, init_seg, sizeof(init_seg));
+            e = (pxc_module_entry_t *)cbm_ht_get(idx->ht, candidate);
+            free(candidate);
+        }
+    }
     int added = pxc_mark_entry_defs(selected, e, all_defs, caller_lang);
     if (total) {
         *total += added;
