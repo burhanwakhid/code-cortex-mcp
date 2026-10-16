@@ -1039,6 +1039,27 @@ TEST(registry_tie_same_stem_function_and_plain_ref_folder) {
     PASS();
 }
 
+/* Two equally scored types: the top-level one wins over one nested in
+ * another type, though the nested QN sorts first (rocksdb `KVIter : Iterator`
+ * bound WriteThread.WriteGroup.Iterator). From inside the enclosing type the
+ * nested one still wins on scope. */
+TEST(registry_type_tie_prefers_top_level_over_nested) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "WriteThread", "proj.db.write_thread.WriteThread", "Class");
+    cbm_registry_add(r, "WriteGroup", "proj.db.write_thread.WriteThread.WriteGroup", "Class");
+    cbm_registry_add(r, "Iterator", "proj.db.write_thread.WriteThread.WriteGroup.Iterator",
+                     "Class");
+    cbm_registry_add(r, "Iterator", "proj.include.rocksdb.iterator.Iterator", "Class");
+    cbm_resolution_t out = cbm_registry_resolve(r, "Iterator", "proj.utilities.ttl.db_ttl_impl",
+                                                NULL, NULL, 0);
+    ASSERT_STR_EQ(out.qualified_name, "proj.include.rocksdb.iterator.Iterator");
+    cbm_resolution_t in = cbm_registry_resolve(
+        r, "Iterator", "proj.db.write_thread.WriteThread.WriteGroup", NULL, NULL, 0);
+    ASSERT_STR_EQ(in.qualified_name, "proj.db.write_thread.WriteThread.WriteGroup.Iterator");
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(python_builtin_member_table_matches_builtin_type_methods) {
     /* Ends and middle of the sorted table, so a mis-sorted insert shows up. */
     ASSERT_TRUE(cbm_python_is_builtin_member("add"));
@@ -1653,6 +1674,7 @@ SUITE(registry) {
     RUN_TEST(registry_tie_ignores_nesting_depth);
     RUN_TEST(registry_tie_prefers_class_over_its_constructor);
     RUN_TEST(registry_tie_same_stem_function_and_plain_ref_folder);
+    RUN_TEST(registry_type_tie_prefers_top_level_over_nested);
     RUN_TEST(registry_tie_prefers_csharp_implementation_over_ref_stub);
     RUN_TEST(python_builtin_member_table_matches_builtin_type_methods);
     RUN_TEST(weak_member_unique_name_exempt_is_python_self_rooted_unique_and_specific_only);
