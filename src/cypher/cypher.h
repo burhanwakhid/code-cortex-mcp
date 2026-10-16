@@ -348,6 +348,9 @@ void cbm_query_free(cbm_query_t *q);
 void cbm_cypher_test_set_deadline_ms(int64_t budget_ms);
 
 #ifdef CBM_ENABLE_TEST_SEAMS
+/* Run execute_single's streamed pipeline in chunks of this many start nodes on
+ * this thread (0 restores the default, 1024). */
+void cbm_cypher_test_set_stream_chunk(int start_nodes);
 /* Override only the deadline clock on this thread; NULL restores real time. */
 typedef uint64_t (*cbm_cypher_test_clock_fn)(void);
 void cbm_cypher_test_set_deadline_clock(cbm_cypher_test_clock_fn clock_fn);
