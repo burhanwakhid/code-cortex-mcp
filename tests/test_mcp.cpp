@@ -3302,6 +3302,142 @@ TEST(tool_list_projects_pages_deterministically) {
  * separate "cannot change meaning" from "might".
  *
  * Runs on every platform — the predicate is pure. */
+/* Fixture for the oversized-regex tool tests: a project rooted at a temp dir
+ * with src/handler.go defining HandleRequest, and a Function node for it. */
+static cbm_mcp_server_t *setup_regex_guard_server(char *tmp, size_t tmp_sz, char *src_dir,
+                                                  size_t src_sz, char *file, size_t file_sz) {
+    snprintf(tmp, tmp_sz, "/tmp/cbm_regex_guard_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return NULL;
+    }
+    snprintf(src_dir, src_sz, "%s/src", tmp);
+    snprintf(file, file_sz, "%s/handler.go", src_dir);
+    if (cbm_mkdir(src_dir) != 0) {
+        return NULL;
+    }
+    FILE *fp = cbm_fopen(file, "wb");
+    if (!fp) {
+        return NULL;
+    }
+    (void)fputs("package src\n\nfunc HandleRequest() {}\n", fp);
+    (void)fclose(fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *project = "regex-guard";
+    cbm_mcp_server_set_project(srv, project);
+    cbm_store_upsert_project(st, project, tmp);
+    cbm_node_t fn = {.project = project,
+                     .label = "Function",
+                     .name = "HandleRequest",
+                     .qualified_name = "regex-guard.src.handler.HandleRequest",
+                     .file_path = "src/handler.go",
+                     .start_line = 3,
+                     .end_line = 3};
+    (void)cbm_store_upsert_node(st, &fn);
+    return srv;
+}
+
+static void cleanup_regex_guard_dir(const char *tmp, const char *src_dir, const char *file) {
+    cbm_unlink(file);
+    cbm_rmdir(src_dir);
+    cbm_rmdir(tmp);
+}
+
+/* An over-budget regex is refused by the wrapper before the platform compiler
+ * expands it. search_code reports that as a tool error naming the argument and
+ * the reason, for path_filter and for a regex=true pattern alike, and keeps
+ * answering afterwards. The pattern is 14^4 = 38,416 expanded atoms: over the
+ * 32,768-unit budget, and tens of MB to hold even when unguarded. */
+TEST(search_code_oversized_path_filter_is_tool_error) {
+    char tmp[512], src_dir[768], file[900];
+    cbm_mcp_server_t *srv =
+        setup_regex_guard_server(tmp, sizeof(tmp), src_dir, sizeof(src_dir), file, sizeof(file));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"regex-guard\","
+             "\"path_filter\":\"((((a){14}){14}){14}){14}\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "path_filter"));
+    ASSERT_NOT_NULL(strstr(resp, "too large to compile"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":98,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"((((a){14}){14}){14}){14}\",\"regex\":true,"
+             "\"project\":\"regex-guard\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "too large to compile"));
+    ASSERT_NOT_NULL(strstr(resp, "regex=true"));
+    free(resp);
+
+    /* An uncompilable path_filter is an error too, not a silently dropped filter. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"regex-guard\","
+             "\"path_filter\":\"src/(\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "invalid path_filter regex"));
+    free(resp);
+
+    /* The server still answers an ordinary filtered call. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":100,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"regex-guard\","
+             "\"path_filter\":\"^src/\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "src/handler.go"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_regex_guard_dir(tmp, src_dir, file);
+    PASS();
+}
+
+/* search_graph compiles name_pattern inside SQLite's REGEXP function. An
+ * over-budget pattern is refused there, the row scan aborts, and the tool
+ * reports the reason as a tool error instead of an empty result. The next call
+ * answers normally. */
+TEST(search_graph_oversized_name_pattern_is_tool_error) {
+    char tmp[512], src_dir[768], file[900];
+    cbm_mcp_server_t *srv =
+        setup_regex_guard_server(tmp, sizeof(tmp), src_dir, sizeof(src_dir), file, sizeof(file));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"regex-guard\",\"name_pattern\":\"((((a){14}){14}){14}){14}\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "too large to compile"));
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(
+        srv, "search_graph", "{\"project\":\"regex-guard\",\"name_pattern\":\"^HandleRequest$\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    ASSERT_NOT_NULL(strstr(resp, "HandleRequest"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_regex_guard_dir(tmp, src_dir, file);
+    PASS();
+}
+
 TEST(search_code_file_pattern_prefilter_boundaries) {
     ASSERT_TRUE(cbm_search_code_file_pattern_can_prefilter("*.pas"));
     ASSERT_TRUE(cbm_search_code_file_pattern_can_prefilter("*.PAS"));

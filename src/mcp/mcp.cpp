@@ -3475,8 +3475,11 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     };
 
     cbm_search_output_t out = {0};
-    if (!semantic_only) {
-        cbm_store_search(store, &params, &out);
+    char search_error[CBM_SZ_512] = "";
+    if (!semantic_only && cbm_store_search(store, &params, &out) != CBM_STORE_OK) {
+        /* A refused or invalid regex aborts the row scan inside SQLite; the
+         * store's reason is the caller's only hint about the pattern. */
+        snprintf(search_error, sizeof(search_error), "search_graph: %s", cbm_store_error(store));
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -3533,6 +3536,10 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     free(file_pattern);
     free(relationship);
 
+    if (search_error[0]) {
+        free(json);
+        return cbm_mcp_text_result(search_error, true);
+    }
     return mcp_text_result_take_owned(json, false);
 }
 
@@ -8955,12 +8962,16 @@ static bool write_pattern_file(char *tmpfile, int tmpfile_sz, const char *patter
     return true;
 }
 
-/* Compile a path filter regex. Returns true if compiled successfully. */
-static bool compile_path_filter(const char *filter, cbm_regex_t *re) {
+/* Compile a path filter regex. Returns true when *re holds the compiled filter.
+ * An absent or empty filter compiles nothing and reports CBM_REG_OK in *rc; a
+ * filter the regex wrapper refuses or cannot compile reports its error there. */
+static bool compile_path_filter(const char *filter, cbm_regex_t *re, int *rc) {
+    *rc = CBM_REG_OK;
     if (!filter || !filter[0]) {
         return false;
     }
-    return cbm_regcomp(re, filter, CBM_REG_EXTENDED | CBM_REG_NOSUB) == CBM_REG_OK;
+    *rc = cbm_regcomp(re, filter, CBM_REG_EXTENDED | CBM_REG_NOSUB);
+    return *rc == CBM_REG_OK;
 }
 
 static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
@@ -8985,7 +8996,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     free(mode_str);
 
     cbm_regex_t path_regex;
-    bool has_path_filter = compile_path_filter(path_filter, &path_regex);
+    int path_filter_rc = CBM_REG_OK; /* reported after validate_search_args below */
+    bool has_path_filter = compile_path_filter(path_filter, &path_regex, &path_filter_rc);
     free(path_filter);
     path_filter = NULL;
 
@@ -9037,6 +9049,29 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
      * out to system grep, so validating with std::regex here would falsely
      * reject patterns like "def\\s+\\w+_handler" that grep handles fine. See
      * UPSTREAM_SYNC.md. */
+
+    /* A path_filter the regex wrapper refused or could not compile is reported
+     * instead of silently searching unfiltered. A regex=true pattern is not
+     * compiled here (see above), but it gets the same compile-size bound:
+     * grep expands bounded repetition the same way. */
+    const char *regex_error = nullptr;
+    if (path_filter_rc != CBM_REG_OK) {
+        regex_error = path_filter_rc == CBM_REG_ETOOBIG
+                          ? "path_filter: " CBM_REG_ETOOBIG_REASON
+                          : "invalid path_filter regex: check for unbalanced (), [], or {}";
+    } else if (use_regex && cbm_regex_too_big(pattern, CBM_REG_EXTENDED)) {
+        regex_error = CBM_REG_ETOOBIG_REASON " (regex=true)";
+    }
+    if (regex_error) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
+        free(root_path);
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        return cbm_mcp_text_result(regex_error, true);
+    }
 
     /* ── Phase 0.5: Multi-word → regex conversion ───────────── */
     /* If pattern contains whitespace and is not already a regex, convert to a

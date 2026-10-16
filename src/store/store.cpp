@@ -638,9 +638,12 @@ static void sqlite_regexp(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
             sqlite3_result_error_nomem(ctx);
             return;
         }
-        if (cbm_regcomp(re, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) != 0) {
+        int comp_rc = cbm_regcomp(re, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB);
+        if (comp_rc != 0) {
             free(re);
-            sqlite3_result_error(ctx, "invalid regex", CBM_NOT_FOUND);
+            sqlite3_result_error(
+                ctx, comp_rc == CBM_REG_ETOOBIG ? CBM_REG_ETOOBIG_REASON : "invalid regex",
+                CBM_NOT_FOUND);
             return;
         }
         sqlite3_set_auxdata(ctx, 0, re, regex_free_cb);
@@ -666,9 +669,12 @@ static void sqlite_iregexp(sqlite3_context *ctx, int argc, sqlite3_value **argv)
             sqlite3_result_error_nomem(ctx);
             return;
         }
-        if (cbm_regcomp(re, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB | CBM_REG_ICASE) != 0) {
+        int comp_rc = cbm_regcomp(re, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB | CBM_REG_ICASE);
+        if (comp_rc != 0) {
             free(re);
-            sqlite3_result_error(ctx, "invalid regex", CBM_NOT_FOUND);
+            sqlite3_result_error(
+                ctx, comp_rc == CBM_REG_ETOOBIG ? CBM_REG_ETOOBIG_REASON : "invalid regex",
+                CBM_NOT_FOUND);
             return;
         }
         sqlite3_set_auxdata(ctx, 0, re, regex_free_cb);
