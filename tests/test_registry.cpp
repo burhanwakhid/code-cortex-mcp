@@ -1472,6 +1472,29 @@ TEST(unique_field_qn_needs_exactly_one_field_of_that_name) {
     PASS();
 }
 
+TEST(field_name_ambiguous_needs_two_fields_of_that_name) {
+    /* The cross-file pass is worth running for an untyped C member only when
+     * two or more Fields carry its name: with one the unique-name fallback
+     * binds it, with none nothing binds either way. */
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "only_here", "proj.a.Alpha.only_here", "Field");
+    cbm_registry_add(r, "count", "proj.a.Alpha.count", "Field");
+    cbm_registry_add(r, "count", "proj.b.Beta.count", "Field");
+    cbm_registry_add(r, "close", "proj.cb.Callbacks.close", "Field");
+    cbm_registry_add(r, "close", "proj.io.close", "Function");
+
+    ASSERT_TRUE(cbm_registry_field_name_ambiguous(r, "count"));
+    ASSERT_FALSE(cbm_registry_field_name_ambiguous(r, "only_here"));
+    /* A function namesake is not a second candidate. */
+    ASSERT_FALSE(cbm_registry_field_name_ambiguous(r, "close"));
+    ASSERT_FALSE(cbm_registry_field_name_ambiguous(r, "absent"));
+    ASSERT_FALSE(cbm_registry_field_name_ambiguous(r, NULL));
+    ASSERT_FALSE(cbm_registry_field_name_ambiguous(NULL, "count"));
+    cbm_registry_free(r);
+    PASS();
+}
+
 
 TEST(c_bare_call_does_not_weigh_field_namesakes) {
     /* 2026-10-13 kernel audit: a struct member named like a header function
@@ -1598,6 +1621,7 @@ SUITE(registry) {
     RUN_TEST(fuzzy_no_import_map_passthrough);
     RUN_TEST(call_onto_field_follows_language_and_shape);
     RUN_TEST(unique_field_qn_needs_exactly_one_field_of_that_name);
+    RUN_TEST(field_name_ambiguous_needs_two_fields_of_that_name);
     RUN_TEST(c_member_access_binds_by_owner_only);
     RUN_TEST(c_bare_call_does_not_weigh_field_namesakes);
 }

@@ -3779,18 +3779,24 @@ static void c_emit_unresolved_call(CLSPContext* ctx, const char* expr_text, cons
 
 // FNV-1a over (caller, type, field) with 0xff separators (cbm_negmemo_key
 // shape); never 0, the set's empty-slot sentinel.
-static uint64_t c_field_ref_hash(const char* caller_qn, const char* type_qn,
-                                 const char* field_name) {
-    const char* parts[] = {caller_qn, type_qn, field_name};
-    uint64_t h = 1469598103934665603ULL;
-    for (int part = 0; part < 3; part++) {
-        for (const unsigned char* p = (const unsigned char*)parts[part]; *p; p++) {
-            h ^= (uint64_t)*p;
-            h *= 1099511628211ULL;
-        }
-        h ^= (uint64_t)0xffu;
+static uint64_t c_field_ref_hash_part(uint64_t h, const char* part) {
+    for (const unsigned char* p = (const unsigned char*)part; *p; p++) {
+        h ^= (uint64_t)*p;
         h *= 1099511628211ULL;
     }
+    h ^= (uint64_t)0xffu;
+    return h * 1099511628211ULL;
+}
+
+// The caller's share of the hash is computed once per enclosing function.
+static uint64_t c_field_ref_hash(CLSPContext* ctx, const char* type_qn, const char* field_name) {
+    if (ctx->field_ref_caller != ctx->enclosing_func_qn) {
+        ctx->field_ref_caller = ctx->enclosing_func_qn;
+        ctx->field_ref_caller_hash =
+            c_field_ref_hash_part(1469598103934665603ULL, ctx->enclosing_func_qn);
+    }
+    uint64_t h = c_field_ref_hash_part(ctx->field_ref_caller_hash, type_qn);
+    h = c_field_ref_hash_part(h, field_name);
     return h ? h : 1ULL;
 }
 
@@ -3834,7 +3840,7 @@ static void c_emit_field_reference(CLSPContext* ctx, TSNode node) {
 
     /* Decided once per (function, type, field), hit or miss: the owner lookup
      * below formats a module-qualified name on its way. */
-    uint64_t key = c_field_ref_hash(ctx->enclosing_func_qn, type_qn, field_name);
+    uint64_t key = c_field_ref_hash(ctx, type_qn, field_name);
     if (cbm_negmemo_contains(&ctx->field_ref_seen, key))
         return;
     cbm_negmemo_insert(&ctx->field_ref_seen, ctx->arena, key);

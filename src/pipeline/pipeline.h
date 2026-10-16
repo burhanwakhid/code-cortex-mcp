@@ -304,6 +304,10 @@ bool cbm_c_member_binds_by_owner(bool is_c, bool is_member_access);
  * a member); NULL when none or several do. */
 const char *cbm_registry_unique_field_qn(const cbm_registry_t *r, const char *member_name);
 
+/* True when two or more distinct Fields in the registry carry `member_name`:
+ * only then does binding the member depend on the type of its object. */
+bool cbm_registry_field_name_ambiguous(const cbm_registry_t *r, const char *member_name);
+
 /* One guard for a resolved CALLS target: true when a suffix_match edge crosses
  * a language boundary (cbm_suppress_cross_language_suffix_match) or a textual
  * Go match binds a Field (cbm_go_suppress_textual_field_call). Shared by

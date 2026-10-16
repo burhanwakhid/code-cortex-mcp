@@ -1781,6 +1781,27 @@ const char *cbm_registry_unique_field_qn(const cbm_registry_t *r, const char *me
     return only;
 }
 
+bool cbm_registry_field_name_ambiguous(const cbm_registry_t *r, const char *member_name) {
+    const char **qns = NULL;
+    int count = 0;
+    if (!r || !member_name || cbm_registry_find_by_name(r, member_name, &qns, &count) != 0 ||
+        !qns) {
+        return false;
+    }
+    const char *first = NULL;
+    for (int i = 0; i < count; i++) {
+        const char *label = qns[i] ? cbm_registry_label_of(r, qns[i]) : NULL;
+        if (!label || strcmp(label, "Field") != 0) {
+            continue;
+        }
+        if (first && strcmp(first, qns[i]) != 0) {
+            return true;
+        }
+        first = qns[i];
+    }
+    return false;
+}
+
 bool cbm_suppress_call_target(CBMLanguage lang, const cbm_gbuf_node_t *target,
                               const char *strategy) {
     return cbm_suppress_cross_language_suffix_match(lang, target->file_path, strategy) ||

@@ -1639,6 +1639,10 @@ typedef struct {
     std::atomic<int64_t> *shared_ids;
     std::atomic<int> *cancelled;
     std::atomic<int> next_file_idx;
+    /* Visit order: file indexes by descending size, so the costliest files
+     * (the cross-file LSP re-parse grows with size) start first and do not
+     * run alone at the end of the phase. NULL = index order. */
+    const int *order;
 
     /* Cross-file LSP inputs — pre-built once by the caller in pipeline.c
      * and shared read-only by usage across workers (typed non-const to
@@ -2522,10 +2526,37 @@ static void lsp_idx_put(CBMHashTable *lsp_idx, const char *caller_qn, const char
     }
 }
 
+/* One file's field-owner index, built on first use and shared by the
+ * cross-LSP eligibility check and the call, usage and read/write resolvers.
+ * Rebuilt when the cross-file pass has appended rows since. */
+struct pp_field_index_t {
+    cbm_pipeline_lsp_field_index_t index = {};
+    const CBMResolvedCall *items = nullptr;
+    int count = -1;
+    bool ready = false;
+    pp_field_index_t() = default;
+    pp_field_index_t(const pp_field_index_t &) = delete;
+    pp_field_index_t &operator=(const pp_field_index_t &) = delete;
+    ~pp_field_index_t() {
+        cbm_pipeline_lsp_field_index_free(&index);
+    }
+    /* NULL when the index could not be allocated: lookups scan the rows. */
+    const cbm_pipeline_lsp_field_index_t *get(const CBMResolvedCallArray *arr) {
+        if (count != arr->count || items != arr->items) {
+            cbm_pipeline_lsp_field_index_free(&index);
+            ready = cbm_pipeline_lsp_field_index_build(arr, &index);
+            items = arr->items;
+            count = arr->count;
+        }
+        return ready ? &index : nullptr;
+    }
+};
+
 /* Resolve calls for one file and emit CALLS/HTTP_CALLS/ASYNC_CALLS edges. */
 static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
-                               const char **imp_vals, int imp_count, CBMLanguage lang) {
+                               const char **imp_vals, int imp_count, CBMLanguage lang,
+                               pp_field_index_t *fidx) {
     cbm_materialize_deferred_cpp_operators(result);
     /* Build a per-file hash index of resolved_calls keyed by
      * "caller_qn|callee_short" for O(1) lookup. cbm_pipeline_find_lsp_
@@ -2573,10 +2604,6 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
     }
 
-    /* Field-owner rows, indexed on the first C member call that needs them. */
-    cbm_pipeline_lsp_field_index_t field_index = {};
-    bool field_index_built = false;
-    bool field_index_ready = false;
     for (int c = 0; c < result->calls.count; c++) {
         CBMCall *call = &result->calls.items[c];
         if (!call->callee_name) {
@@ -2828,14 +2855,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 continue;
             }
             if (field_policy == CBM_FIELD_CALL_BY_OWNER) {
-                if (!field_index_built) {
-                    field_index_ready =
-                        cbm_pipeline_lsp_field_index_build(&result->field_refs, &field_index);
-                    field_index_built = true;
-                }
                 bool typed = false;
                 target_node = cbm_pipeline_c_member_call_field(
-                    &result->field_refs, field_index_ready ? &field_index : NULL, rc->main_gbuf,
+                    &result->field_refs, fidx->get(&result->field_refs), rc->main_gbuf,
                     rc->project_name, call->enclosing_func_qn, call->callee_name, &typed);
                 if (!target_node && !typed) {
                     const char *only = cbm_registry_unique_field_qn(
@@ -2882,17 +2904,16 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         cbm_ht_foreach(lsp_idx, lsp_idx_free_key, NULL);
         cbm_ht_free(lsp_idx);
     }
-    cbm_pipeline_lsp_field_index_free(&field_index);
 }
 
 /* Resolve usages for one file. */
 static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                 CBMFileResult *result, const char *rel, const char *module_qn,
                                 const char **imp_keys, const char **imp_vals, int imp_count,
-                                CBMLanguage lang) {
+                                CBMLanguage lang, pp_field_index_t *fidx) {
     cbm_lang_memo_t lang_memo = {};
-    cbm_pipeline_lsp_field_index_t field_index = {};
-    bool field_index_ready = cbm_pipeline_lsp_field_index_build(&result->field_refs, &field_index);
+    const cbm_pipeline_lsp_field_index_t *field_index =
+        result->field_refs.count > 0 ? fidx->get(&result->field_refs) : nullptr;
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
         if (!usage->ref_name) {
@@ -2910,8 +2931,7 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
          * below. Twin of pass_usages.cpp resolve_usage_edges. */
         if (cbm_c_member_binds_by_owner(lang == CBM_LANG_C, usage->is_member_access)) {
             cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor(
-                &result->field_refs, field_index_ready ? &field_index : NULL,
-                usage->enclosing_func_qn, usage->ref_name);
+                &result->field_refs, field_index, usage->enclosing_func_qn, usage->ref_name);
             char member_esc[CBM_SZ_256];
             cbm_json_escape(member_esc, sizeof(member_esc), usage->ref_name);
             char member_props[CBM_SZ_512];
@@ -2982,7 +3002,6 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                              cbm_json_props_checked(uprops, un, sizeof(uprops)));
         ws->usages_resolved++;
     }
-    cbm_pipeline_lsp_field_index_free(&field_index);
 }
 
 /* Resolve throws/raises for one file. */
@@ -3020,10 +3039,11 @@ static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
 /* Resolve reads/writes for one file. */
 static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFileResult *result,
                             const char *rel, const char *module_qn, const char **imp_keys,
-                            const char **imp_vals, int imp_count, CBMLanguage lang) {
+                            const char **imp_vals, int imp_count, CBMLanguage lang,
+                            pp_field_index_t *fidx) {
     cbm_lang_memo_t lang_memo = {};
-    cbm_pipeline_lsp_field_index_t field_index = {};
-    bool field_index_ready = cbm_pipeline_lsp_field_index_build(&result->field_refs, &field_index);
+    const cbm_pipeline_lsp_field_index_t *field_index =
+        result->field_refs.count > 0 ? fidx->get(&result->field_refs) : nullptr;
     for (int r = 0; r < result->rw.count; r++) {
         CBMReadWrite *rw = &result->rw.items[r];
         if (!rw->var_name) {
@@ -3038,8 +3058,7 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
          * pass_usages.cpp resolve_rw_edges. */
         if (cbm_c_member_binds_by_owner(lang == CBM_LANG_C, rw->is_member_access)) {
             cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor(
-                &result->field_refs, field_index_ready ? &field_index : NULL, rw->enclosing_func_qn,
-                rw->var_name);
+                &result->field_refs, field_index, rw->enclosing_func_qn, rw->var_name);
             const char *member_edge = rw->is_write ? "WRITES" : "READS";
             const CBMResolvedCall *owner;
             bool typed = false;
@@ -3082,7 +3101,6 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         const char *etype = rw->is_write ? "WRITES" : "READS";
         cbm_gbuf_insert_edge(ws->local_edge_buf, src->id, tgt->id, etype, "{}");
     }
-    cbm_pipeline_lsp_field_index_free(&field_index);
 }
 
 /* The per-file facts the base-class gate needs beyond the import map. */
@@ -3314,32 +3332,41 @@ extern "C" bool cbm_test_cpp_sites_need_cross(const CBMFileResult *result) {
  * header is known only to the cross-file pass. A member access that still has
  * no owner is therefore a request for that pass, exactly like an unqualified
  * call site -- without it a file with no pending call would keep none of its
- * edges onto header-declared fields. */
-static bool pp_has_unowned_c_member(const CBMFileResult *result, CBMLanguage lang) {
+ * edges onto header-declared fields. Only a member name two or more project
+ * Fields carry needs the owner: with one, the untyped fallback binds that
+ * Field (cbm_registry_unique_field_qn); with none, nothing binds either way. */
+static bool pp_unowned_member_needs_cross(const cbm_registry_t *reg,
+                                          const cbm_pipeline_lsp_field_index_t *index,
+                                          const CBMFileResult *result, const char *func_qn,
+                                          const char *member) {
+    cbm_pipeline_lsp_field_cursor_t owners =
+        cbm_pipeline_lsp_field_cursor(&result->field_refs, index, func_qn, member);
+    return cbm_pipeline_lsp_field_next(&owners) == NULL &&
+           cbm_registry_field_name_ambiguous(reg, member);
+}
+
+static bool pp_has_unowned_c_member(const cbm_registry_t *reg, const CBMFileResult *result,
+                                    CBMLanguage lang, pp_field_index_t *fidx) {
     if (lang != CBM_LANG_C) {
         return false;
     }
-    cbm_pipeline_lsp_field_index_t field_index = {};
-    bool ready = cbm_pipeline_lsp_field_index_build(&result->field_refs, &field_index);
+    const cbm_pipeline_lsp_field_index_t *field_index = fidx->get(&result->field_refs);
     bool unowned = false;
     for (int i = 0; i < result->usages.count && !unowned; i++) {
         const CBMUsage *usage = &result->usages.items[i];
         if (!usage->is_member_access || !usage->ref_name) {
             continue;
         }
-        cbm_pipeline_lsp_field_cursor_t owners =
-            cbm_pipeline_lsp_field_cursor(&result->field_refs, ready ? &field_index : NULL,
-                                          usage->enclosing_func_qn, usage->ref_name);
-        unowned = cbm_pipeline_lsp_field_next(&owners) == NULL;
+        unowned = pp_unowned_member_needs_cross(reg, field_index, result, usage->enclosing_func_qn,
+                                                usage->ref_name);
     }
     for (int i = 0; i < result->rw.count && !unowned; i++) {
         const CBMReadWrite *rw = &result->rw.items[i];
         if (!rw->is_member_access || !rw->var_name) {
             continue;
         }
-        cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor(
-            &result->field_refs, ready ? &field_index : NULL, rw->enclosing_func_qn, rw->var_name);
-        unowned = cbm_pipeline_lsp_field_next(&owners) == NULL;
+        unowned = pp_unowned_member_needs_cross(reg, field_index, result, rw->enclosing_func_qn,
+                                                rw->var_name);
     }
     for (int i = 0; i < result->calls.count && !unowned; i++) {
         const CBMCall *call = &result->calls.items[i];
@@ -3347,12 +3374,9 @@ static bool pp_has_unowned_c_member(const CBMFileResult *result, CBMLanguage lan
             (!strchr(call->callee_name, '.') && !strstr(call->callee_name, "->"))) {
             continue;
         }
-        cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor(
-            &result->field_refs, ready ? &field_index : NULL, call->enclosing_func_qn,
-            cbm_lsp_bare_segment(call->callee_name));
-        unowned = cbm_pipeline_lsp_field_next(&owners) == NULL;
+        unowned = pp_unowned_member_needs_cross(reg, field_index, result, call->enclosing_func_qn,
+                                                cbm_lsp_bare_segment(call->callee_name));
     }
-    cbm_pipeline_lsp_field_index_free(&field_index);
     return unowned;
 }
 
@@ -3375,12 +3399,12 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
     cbm_service_pattern_cache_begin();
 
     while (SKIP_ONE) {
-        int file_idx =
-            atomic_fetch_add_explicit(&rc->next_file_idx, SKIP_ONE, memory_order_relaxed);
-        if (file_idx >= rc->file_count) {
+        int pos = atomic_fetch_add_explicit(&rc->next_file_idx, SKIP_ONE, memory_order_relaxed);
+        if (pos >= rc->file_count) {
             break;
         }
-        cbm_scale_tick(&rc->scale, file_idx);
+        int file_idx = rc->order ? rc->order[pos] : pos;
+        cbm_scale_tick(&rc->scale, pos);
         if (atomic_load_explicit(rc->cancelled, memory_order_relaxed)) {
             break;
         }
@@ -3394,6 +3418,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
             continue;
         }
         cbm::ResultStore::Lease stored_result;
+        pp_field_index_t fidx; /* this file's field-owner index, freed per file */
         if (rc->result_store) {
             std::string error;
             stored_result = rc->result_store->acquire(file_idx, error);
@@ -3456,14 +3481,14 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
             cpp_cross_lsp && !primitive_complete && pp_cpp_sites_need_cross(result);
         /* A C member access with no field-owner row yet asks for the cross
          * pass too: only it knows the structs headers declare. */
-        bool unowned_c_member = pp_has_unowned_c_member(result, lang);
+        bool calls_need_cross =
+            pending_calls > 0 &&
+            (jvm_cross_lsp ||
+             (cpp_cross_lsp ? cpp_sites_pending : result->resolved_calls.count < pending_calls));
         bool cross_lsp_eligible =
-            (rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) &&
-             ((pending_calls > 0 &&
-               (jvm_cross_lsp || (cpp_cross_lsp ? cpp_sites_pending
-                                                : result->resolved_calls.count < pending_calls))) ||
-              unowned_c_member) &&
-             !is_generated && !primitive_complete);
+            rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) && !is_generated &&
+            !primitive_complete &&
+            (calls_need_cross || pp_has_unowned_c_member(rc->registry, result, lang, &fidx));
 
         /* Skip files with nothing else to resolve and no cross-LSP work. */
         if (result->calls.count == 0 && result->usages.count == 0 && result->throws.count == 0 &&
@@ -3593,13 +3618,15 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         /* ── CALLS resolution ──────────────────────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_calls(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang);
+        resolve_file_calls(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang,
+                           &fidx);
         atomic_fetch_add_explicit(&rc->time_ns_calls, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
 
         /* ── USAGE resolution ──────────────────────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_usages(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang);
+        resolve_file_usages(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang,
+                            &fidx);
         atomic_fetch_add_explicit(&rc->time_ns_usages, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
 
@@ -3611,7 +3638,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         /* ── READS / WRITES ────────────────────────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_rw(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang);
+        resolve_file_rw(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang, &fidx);
         atomic_fetch_add_explicit(&rc->time_ns_rw, extract_now_ns() - _ph_t0, memory_order_relaxed);
 
         /* ── INHERITS + DECORATES + IMPLEMENTS ──────────────────── */
@@ -3688,6 +3715,16 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .cross_registries = cross_registries,
     };
     rc.lsp_failures = lsp_failures;
+    /* Largest first; without memory for the order, index order. */
+    int *order = static_cast<int *>(malloc((size_t)file_count * sizeof(int)));
+    if (order) {
+        for (int i = 0; i < file_count; i++) {
+            order[i] = i;
+        }
+        std::stable_sort(order, order + file_count,
+                         [files](int a, int b) { return files[a].size > files[b].size; });
+    }
+    rc.order = order;
     atomic_init(&rc.next_file_idx, 0);
     atomic_init(&rc.lsp_cross_processed, 0);
     atomic_init(&rc.lsp_cross_skipped_no_source, 0);
@@ -3711,6 +3748,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         }
     }
     free(lsp_failures);
+    free(order);
     /* Workers joined: the shared Rust registry (if built) is no longer read.
      * Free its dedicated arena + the lock (registry was self-contained: it strdup'd
      * all QNs, so freeing all_defs afterward is safe). */

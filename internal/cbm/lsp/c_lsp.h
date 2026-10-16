@@ -71,6 +71,10 @@ typedef struct {
     // per pair; a row per occurrence would cost a record for every member
     // access in the corpus. Arena-backed (dies with ctx->arena).
     CBMNegMemo field_ref_seen;
+    // The key hash over the enclosing function's QN, kept while the walk stays
+    // in that function, so each member access hashes only type and field.
+    const char *field_ref_caller;
+    uint64_t field_ref_caller_hash;
 
     // Output
     CBMResolvedCallArray *resolved_calls;

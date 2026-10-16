@@ -435,11 +435,18 @@ static inline const char *cbm_pipeline_service_name(const CBMCall *call,
  * read/write resolvers join them by enclosing function and member name, which
  * is exactly the granularity of the function -> Field edge they emit. */
 
+/* One indexed row with its member name (the callee QN's bare segment),
+ * computed once instead of in every comparison. */
+typedef struct {
+    const CBMResolvedCall *row;
+    const char *member;
+} cbm_pipeline_lsp_field_entry_t;
+
 /* field_refs rows sorted by (caller, member name, target). A NULL `rows` with
  * a nonzero source array means the allocation failed and lookups scan the
  * array instead, so no typed edge is ever lost to an index. */
 typedef struct {
-    const CBMResolvedCall **rows;
+    cbm_pipeline_lsp_field_entry_t *rows;
     int count;
 } cbm_pipeline_lsp_field_index_t;
 
@@ -453,12 +460,17 @@ static inline int cbm_pipeline_lsp_field_key_cmp(const CBMResolvedCall *row, con
     return by_caller != 0 ? by_caller : strcmp(cbm_lsp_bare_segment(row->callee_qn), member);
 }
 
+static inline int cbm_pipeline_lsp_field_entry_key_cmp(const cbm_pipeline_lsp_field_entry_t *entry,
+                                                       const char *caller_qn, const char *member) {
+    int by_caller = strcmp(entry->row->caller_qn, caller_qn);
+    return by_caller != 0 ? by_caller : strcmp(entry->member, member);
+}
+
 static inline int cbm_pipeline_lsp_field_row_cmp(const void *left_ptr, const void *right_ptr) {
-    const CBMResolvedCall *left = *(const CBMResolvedCall *const *)left_ptr;
-    const CBMResolvedCall *right = *(const CBMResolvedCall *const *)right_ptr;
-    int by_key = cbm_pipeline_lsp_field_key_cmp(left, right->caller_qn,
-                                                cbm_lsp_bare_segment(right->callee_qn));
-    return by_key != 0 ? by_key : strcmp(left->callee_qn, right->callee_qn);
+    const cbm_pipeline_lsp_field_entry_t *left = (const cbm_pipeline_lsp_field_entry_t *)left_ptr;
+    const cbm_pipeline_lsp_field_entry_t *right = (const cbm_pipeline_lsp_field_entry_t *)right_ptr;
+    int by_key = cbm_pipeline_lsp_field_entry_key_cmp(left, right->row->caller_qn, right->member);
+    return by_key != 0 ? by_key : strcmp(left->row->callee_qn, right->row->callee_qn);
 }
 
 /* False means only allocation failure; lookups then take the linear path. */
@@ -475,15 +487,17 @@ static inline bool cbm_pipeline_lsp_field_index_build(const CBMResolvedCallArray
     if (field_count == 0) {
         return true;
     }
-    const CBMResolvedCall **rows =
-        (const CBMResolvedCall **)malloc((size_t)field_count * sizeof(*rows));
+    cbm_pipeline_lsp_field_entry_t *rows =
+        (cbm_pipeline_lsp_field_entry_t *)malloc((size_t)field_count * sizeof(*rows));
     if (!rows) {
         return false;
     }
     int next = 0;
     for (int i = 0; i < arr->count; i++) {
         if (cbm_pipeline_lsp_field_row_usable(&arr->items[i])) {
-            rows[next++] = &arr->items[i];
+            rows[next].row = &arr->items[i];
+            rows[next].member = cbm_lsp_bare_segment(arr->items[i].callee_qn);
+            next++;
         }
     }
     qsort(rows, (size_t)field_count, sizeof(*rows), cbm_pipeline_lsp_field_row_cmp);
@@ -493,7 +507,7 @@ static inline bool cbm_pipeline_lsp_field_index_build(const CBMResolvedCallArray
 }
 
 static inline void cbm_pipeline_lsp_field_index_free(cbm_pipeline_lsp_field_index_t *index) {
-    free((void *)index->rows);
+    free(index->rows);
     index->rows = NULL;
     index->count = 0;
 }
@@ -517,7 +531,7 @@ static inline cbm_pipeline_lsp_field_cursor_t cbm_pipeline_lsp_field_cursor(
         int high = index->count;
         while (low < high) {
             int middle = low + ((high - low) / 2);
-            if (cbm_pipeline_lsp_field_key_cmp(index->rows[middle], caller_qn, member) < 0) {
+            if (cbm_pipeline_lsp_field_entry_key_cmp(&index->rows[middle], caller_qn, member) < 0) {
                 low = middle + 1;
             } else {
                 high = middle;
@@ -537,12 +551,12 @@ static inline const CBMResolvedCall *cbm_pipeline_lsp_field_next(
         if (cursor->next >= cursor->index->count) {
             return NULL;
         }
-        const CBMResolvedCall *row = cursor->index->rows[cursor->next];
-        if (cbm_pipeline_lsp_field_key_cmp(row, cursor->caller_qn, cursor->member) != 0) {
+        const cbm_pipeline_lsp_field_entry_t *entry = &cursor->index->rows[cursor->next];
+        if (cbm_pipeline_lsp_field_entry_key_cmp(entry, cursor->caller_qn, cursor->member) != 0) {
             return NULL;
         }
         cursor->next++;
-        return row;
+        return entry->row;
     }
     while (cursor->arr && cursor->next < cursor->arr->count) {
         const CBMResolvedCall *row = &cursor->arr->items[cursor->next++];
