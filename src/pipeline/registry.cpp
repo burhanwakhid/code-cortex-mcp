@@ -271,48 +271,17 @@ static bool csharp_reference_assembly_qn(const char *qn) {
  *   1. the more plainly callable candidate (`dev_name` the function over the
  *      struct fields; Kotlin `where(...)` the method over the property); a
  *      constructor ranks after its type (callable_rank);
- *   2. between two types, a top-level type over a nested one;
- *   3. for C#, an implementation over a reference-assembly stub;
- *   4. the lexicographically smaller QN (include/linux over tools/virtio).
+ *   2. for C#, an implementation over a reference-assembly stub;
+ *   3. the lexicographically smaller QN (include/linux over tools/virtio).
  * Nesting depth is deliberately not a criterion (upstream 51364158): "least
  * nested wins" sent django's `Model.objects.filter` to the template
  * `Library.filter`, one segment shallower than `QuerySet.filter`.
  * `best_rank` is callable_rank(r, best), cached by the caller so a tie costs
  * one label lookup. */
-/* 0 = qn is not a type, 1 = a top-level type, 2 = a type nested in another
- * type (its QN parent is itself type-like: WriteThread.WriteGroup.Iterator). */
-static int type_nesting(const cbm_registry_t *r, const char *qn) {
-    const char *label = r ? (const char *)cbm_ht_get(r->exact, qn) : NULL;
-    if (!cbm_label_is_type_like(label)) {
-        return 0;
-    }
-    const char *dot = strrchr(qn, '.');
-    char parent[CBM_SZ_1K];
-    size_t len = dot ? (size_t)(dot - qn) : 0;
-    if (len == 0 || len >= sizeof(parent)) {
-        return 1;
-    }
-    memcpy(parent, qn, len);
-    parent[len] = '\0';
-    const char *parent_label = (const char *)cbm_ht_get(r->exact, parent);
-    return cbm_label_is_type_like(parent_label) ? 2 : 1;
-}
-
 static bool candidate_outranks_on_tie(const cbm_registry_t *r, const char *candidate,
                                       int candidate_rank, const char *best, int best_rank) {
     if (candidate_rank != best_rank) {
         return candidate_rank < best_rank;
-    }
-    /* Between two types, a top-level type outranks one nested in another:
-     * a bare name reaches a nested type only from inside its enclosing type,
-     * which scope scoring already rewards, so `KVIter : Iterator` means the
-     * public Iterator, not WriteThread.WriteGroup.Iterator. */
-    if (candidate_rank == REG_RANK_OTHER_DEF) {
-        int cn = type_nesting(r, candidate);
-        int bn = type_nesting(r, best);
-        if (cn != 0 && bn != 0 && cn != bn) {
-            return cn < bn;
-        }
     }
     bool cs = csharp_reference_stub(r, candidate);
     bool bs = csharp_reference_stub(r, best);
