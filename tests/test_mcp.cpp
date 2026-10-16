@@ -668,6 +668,63 @@ TEST(tool_index_status_includes_git_metadata) {
     PASS();
 }
 
+/* #2012: a COUNT(*) that cannot be read must not be reported as an empty
+ * project. Dropping the tables after the first call makes the count read fail
+ * deterministically. Ported from DeusData/codebase-memory-mcp@73c509f4. */
+TEST(tool_index_status_reports_an_unreadable_count_as_an_error) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    /* First call: a healthy project, and it caches the count statements. */
+    char *response = cbm_mcp_handle_tool(srv, "index_status", "{\"project\":\"test-project\"}");
+    char *inner = response ? extract_text_content(response) : NULL;
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "status")), "ready");
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    /* Drop the tables from a second connection: the server's own connection
+     * may still hold cached statements open on them, which blocks a DROP on
+     * that connection (SQLITE_LOCKED); WAL lets another writer proceed. */
+    const char *db_path = cbm_store_db_path(store);
+    ASSERT_NOT_NULL(db_path);
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open(db_path, &raw), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(raw, "DROP TABLE edges; DROP TABLE nodes;", NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(raw);
+
+    response = cbm_mcp_handle_tool(srv, "index_status", "{\"project\":\"test-project\"}");
+    inner = response ? extract_text_content(response) : NULL;
+    ASSERT_NOT_NULL(inner);
+    doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+
+    /* Not "empty": that is the false all-clear the issue is about. */
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "status")), "error");
+    /* A failed read is not a count, so no negative number reaches the caller. */
+    ASSERT_TRUE(yyjson_get_int(yyjson_obj_get(root, "nodes")) >= 0);
+    ASSERT_TRUE(yyjson_get_int(yyjson_obj_get(root, "edges")) >= 0);
+    const char *hint = yyjson_get_str(yyjson_obj_get(root, "hint"));
+    ASSERT_NOT_NULL(hint);
+    ASSERT_NOT_NULL(strstr(hint, "could not be read"));
+    ASSERT_TRUE(strstr(hint, "Project is empty") == NULL);
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  TOOL HANDLERS WITH DATA
  * ══════════════════════════════════════════════════════════════════ */
@@ -7724,6 +7781,7 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_index_status_includes_git_metadata);
+    RUN_TEST(tool_index_status_reports_an_unreadable_count_as_an_error);
 
     /* Tool handlers with validation */
     RUN_TEST(tool_trace_call_path_not_found);

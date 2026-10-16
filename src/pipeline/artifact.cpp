@@ -577,6 +577,9 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
         nodes = cbm_store_count_nodes(count_store, project_name);
         edges = cbm_store_count_edges(count_store, project_name);
         cbm_store_close(count_store);
+        /* A failed read is CBM_STORE_ERR; never record it as a count. */
+        nodes = nodes < 0 ? 0 : nodes;
+        edges = edges < 0 ? 0 : edges;
     }
 
     /* Write metadata */

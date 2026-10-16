@@ -2168,10 +2168,18 @@ int cbm_store_count_nodes(cbm_store_t *s, const char *project) {
     }
 
     bind_text(stmt, SKIP_ONE, project);
+    /* A step that does not yield a row is a failed read (SQLITE_CORRUPT,
+     * SQLITE_BUSY, SQLITE_IOERR), not a count of zero. Report it through the
+     * error channel this function already uses for a failed prepare, so a
+     * caller cannot mistake an unreadable table for an empty project. */
+    int count = CBM_STORE_ERR;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
-        return sqlite3_column_int(stmt, 0);
+        count = sqlite3_column_int(stmt, 0);
     }
-    return 0;
+    /* Reset now: a cached statement left on its row holds a read on the
+     * table until its next use. */
+    sqlite3_reset(stmt);
+    return count;
 }
 
 int cbm_store_delete_nodes_by_project(cbm_store_t *s, const char *project) {
@@ -2486,10 +2494,13 @@ int cbm_store_count_edges(cbm_store_t *s, const char *project) {
     }
 
     bind_text(stmt, SKIP_ONE, project);
+    /* See cbm_store_count_nodes: a non-row step is a failed read, not zero. */
+    int count = CBM_STORE_ERR;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
-        return sqlite3_column_int(stmt, 0);
+        count = sqlite3_column_int(stmt, 0);
     }
-    return 0;
+    sqlite3_reset(stmt);
+    return count;
 }
 
 int cbm_store_count_edges_by_type(cbm_store_t *s, const char *project, const char *type) {
