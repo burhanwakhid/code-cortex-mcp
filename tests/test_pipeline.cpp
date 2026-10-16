@@ -5169,6 +5169,559 @@ TEST(pipeline_arg_url_rejects_non_http_slash_arguments) {
     PASS();
 }
 
+/* HANDLES edges from the function named `source_name` (any when NULL) to
+ * Routes whose qualified name equals `route_qn`. */
+static int handles_to_route(cbm_store_t *s, const char *project, const char *source_name,
+                            const char *route_qn) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "HANDLES", &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {};
+        cbm_node_t target = {};
+        bool source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        bool target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.name && target.qualified_name &&
+            (!source_name || strcmp(source.name, source_name) == 0) &&
+            strcmp(target.qualified_name, route_qn) == 0) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* Upstream ac72d189 (fastapi, 2026-10-05): one binary indexed the same tree
+ * to 3,253 or to 1,119,241 HANDLES edges. A prefix Route took the directory of
+ * whichever registrar's CALLS edge came first (worker order) and linked every
+ * decorated handler under it, with no filter for the root prefix `/`; every
+ * infra URL then copied the handlers of the root route. Now: every registrar
+ * counts, a root mount bridges nothing, and an infra URL matches a root route
+ * only of its own service. FORK: run on both resolvers (the parallel one is
+ * where the merge order varies). */
+static int route_bridge_fixture_run(bool parallel) {
+    ThSavedEnv workers_env("CBM_WORKERS"), single_env("CBM_INDEX_SINGLE_THREAD");
+    char tmp[256] = "/tmp/cbm_routebridge_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    std::string repo = std::string(tmp) + "/repo";
+    /* two apps mounted at the root and under /api, from two directories */
+    ASSERT_EQ(th_write_file((repo + "/svc/a/main.py").c_str(), "from fastapi import FastAPI\n"
+                                                               "app = FastAPI()\n"
+                                                               "app.mount(\"/\", None)\n"
+                                                               "app.mount(\"/api\", None)\n"
+                                                               "\n"
+                                                               "@app.get(\"/items\")\n"
+                                                               "def read_items():\n"
+                                                               "    return []\n"),
+              0);
+    ASSERT_EQ(th_write_file((repo + "/svc/a/api/routes.py").c_str(),
+                            "from fastapi import APIRouter\n"
+                            "router = APIRouter()\n"
+                            "\n"
+                            "@router.get(\"/ax\")\n"
+                            "def api_a():\n"
+                            "    return 1\n"),
+              0);
+    ASSERT_EQ(th_write_file((repo + "/svc/b/main.py").c_str(), "from fastapi import FastAPI\n"
+                                                               "app = FastAPI()\n"
+                                                               "app.mount(\"/\", None)\n"
+                                                               "app.mount(\"/api\", None)\n"
+                                                               "app.mount(\"/c\", None)\n"
+                                                               "\n"
+                                                               "@app.get(\"/users\")\n"
+                                                               "def read_users():\n"
+                                                               "    return []\n"),
+              0);
+    ASSERT_EQ(th_write_file((repo + "/svc/b/api/routes.py").c_str(),
+                            "from fastapi import APIRouter\n"
+                            "router = APIRouter()\n"
+                            "\n"
+                            "@router.get(\"/by\")\n"
+                            "def api_b():\n"
+                            "    return 2\n"),
+              0);
+    /* a real root handler, and a documentation site's link to a chat server */
+    ASSERT_EQ(th_write_file((repo + "/web/site.py").c_str(), "from flask import Flask\n"
+                                                             "app = Flask(__name__)\n"
+                                                             "\n"
+                                                             "@app.route(\"/\")\n"
+                                                             "def index():\n"
+                                                             "    return \"ok\"\n"
+                                                             "\n"
+                                                             "@app.route(\"/c\")\n"
+                                                             "def contact():\n"
+                                                             "    return \"c\"\n"),
+              0);
+    ASSERT_EQ(th_write_file((repo + "/mkdocs.yml").c_str(),
+                            "site_name: demo\n"
+                            "extra:\n"
+                            "  social:\n"
+                            "    - icon: fontawesome/brands/discord\n"
+                            "      link: https://discord.com/invite/abc123\n"
+                            "    - icon: fontawesome/brands/github\n"
+                            "      link: https://github.com/carol\n"),
+              0);
+    if (parallel) {
+        for (int i = 0; i < 52; i++) {
+            std::string body = "def filler" + std::to_string(i) + "():\n    return " +
+                               std::to_string(i) + "\n";
+            ASSERT_EQ(th_write_file((repo + "/fill/f" + std::to_string(i) + ".py").c_str(),
+                                    body.c_str()),
+                      0);
+        }
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    } else {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    }
+
+    std::string db_path = std::string(tmp) + "/routebridge.db";
+    cbm_pipeline_t *p = cbm_pipeline_new(repo.c_str(), db_path.c_str(), CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path.c_str());
+    ASSERT_NOT_NULL(s);
+
+    /* decorator routes are untouched */
+    ASSERT_EQ(handles_to_route(s, project, "read_items", "__route__GET__/items"), 1);
+    ASSERT_EQ(handles_to_route(s, project, "index", "__route__ANY__/"), 1);
+    /* a root mount names no part of a handler's path: nothing is bridged */
+    ASSERT_EQ(handles_to_route(s, project, "read_items", "__route__ANY__/"), 0);
+    ASSERT_EQ(handles_to_route(s, project, "read_users", "__route__ANY__/"), 0);
+    /* /api is registered from both directories: both api handlers, whatever
+     * order the registrations' CALLS edges landed in */
+    ASSERT_EQ(handles_to_route(s, project, "api_a", "__route__ANY__/api"), 1);
+    ASSERT_EQ(handles_to_route(s, project, "api_b", "__route__ANY__/api"), 1);
+    /* a prefix and a URL path match on whole segments only: `c` is no segment
+     * of svc/b/main.py, and `/c` is no route of github.com/carol */
+    ASSERT_EQ(handles_to_route(s, project, "read_users", "__route__ANY__/c"), 0);
+    ASSERT_EQ(handles_to_route(s, project, "contact", "__route__ANY__/c"), 1);
+    ASSERT_EQ(handles_to_route(s, project, NULL, "__route__infra__https://github.com/carol"), 0);
+    /* the chat link is no route of this repository's root handler */
+    ASSERT_EQ(
+        handles_to_route(s, project, NULL, "__route__infra__https://discord.com/invite/abc123"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    return 0;
+}
+
+TEST(pipeline_route_prefix_bridge_is_order_free_and_root_bridges_nothing) {
+    ASSERT_EQ(route_bridge_fixture_run(false), 0);
+    PASS();
+}
+
+TEST(pipeline_route_prefix_bridge_is_order_free_parallel) {
+    ASSERT_EQ(route_bridge_fixture_run(true), 0);
+    PASS();
+}
+
+/* Count HTTP_CALLS-style edges whose url_path property contains `keyword`. */
+static int count_edges_with_url_path(cbm_store_t *s, const char *project, const char *keyword) {
+    cbm_edge_t *es = NULL;
+    int n = 0;
+    cbm_store_find_edges_by_url_path(s, project, keyword, &es, &n);
+    if (es) {
+        cbm_store_free_edges(es, n);
+    }
+    return n;
+}
+
+/* Index `repo` with the parallel resolver (CBM_WORKERS=4, `fillers` > 50
+ * pad files) or the sequential one (`fillers` == 0, single-threaded). */
+static void write_ts_fillers(const std::string &repo, int fillers) {
+    for (int i = 0; i < fillers; i++) {
+        std::string body = "export function filler" + std::to_string(i) +
+                           "(): number {\n  return " + std::to_string(i) + ";\n}\n";
+        th_write_file((repo + "/src/filler" + std::to_string(i) + ".ts").c_str(), body.c_str());
+    }
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    } else {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    }
+}
+
+/* Upstream 38d422f0 (distilled from PR #1245): detect_url_in_args (parallel
+ * resolver) runs for every resolved call with no callee gating, so a
+ * filesystem path with a document/log extension passed to a project-defined
+ * open/read/write helper passed normalize_url_arg and the route literal
+ * guard, minting a Route node + an HTTP_CALLS edge for a file. The callees
+ * are project functions on purpose: a bare builtin `open(...)` never resolves
+ * and so never reaches emit_service_edge. requests.get('/api/items') is the
+ * positive control that must keep its Route + HTTP_CALLS. */
+TEST(pipeline_arg_url_rejects_document_file_paths) {
+    ThSavedEnv workers_env("CBM_WORKERS"), single_env("CBM_INDEX_SINGLE_THREAD");
+    char tmp[256] = "/tmp/cbm_arg_url_docs_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    std::string repo = std::string(tmp) + "/repo";
+    ASSERT_EQ(th_write_file((repo + "/src/files.py").c_str(),
+                            "import requests\n"
+                            "def open_file(path):\n"
+                            "    return path\n"
+                            "def read_file(path):\n"
+                            "    return path\n"
+                            "def write_file(path):\n"
+                            "    return path\n"
+                            "def load_docs():\n"
+                            "    open_file('/new/file.txt')\n"
+                            "    read_file('/docs/guide.md')\n"
+                            "    write_file('/data/app.log')\n"
+                            "    read_file('/reports/summary.pdf')\n"
+                            "    open_file('/docs/index.rst')\n"
+                            "def fetch_items():\n"
+                            "    return requests.get('/api/items')\n"),
+              0);
+    write_ts_fillers(repo, 52);
+
+    std::string db_path = std::string(tmp) + "/arg_url_docs.db";
+    cbm_pipeline_t *p = cbm_pipeline_new(repo.c_str(), db_path.c_str(), CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path.c_str());
+    ASSERT_NOT_NULL(s);
+
+    /* Positive control first: the genuine HTTP call still mints its route. */
+    ASSERT_GTE(count_nodes_named_in(s, project, "/api/items"), 1);
+    ASSERT_GTE(count_edges_with_url_path(s, project, "/api/items"), 1);
+    /* No Route node for any filesystem document path... */
+    ASSERT_EQ(count_nodes_named_in(s, project, "/new/file.txt"), 0);
+    ASSERT_EQ(count_nodes_named_in(s, project, "/docs/guide.md"), 0);
+    ASSERT_EQ(count_nodes_named_in(s, project, "/data/app.log"), 0);
+    ASSERT_EQ(count_nodes_named_in(s, project, "/reports/summary.pdf"), 0);
+    ASSERT_EQ(count_nodes_named_in(s, project, "/docs/index.rst"), 0);
+    /* ...and no HTTP_CALLS edge carrying one as its url_path either. */
+    ASSERT_EQ(count_edges_with_url_path(s, project, "/new/file.txt"), 0);
+    ASSERT_EQ(count_edges_with_url_path(s, project, "/docs/guide.md"), 0);
+    ASSERT_EQ(count_edges_with_url_path(s, project, "/data/app.log"), 0);
+    ASSERT_EQ(count_edges_with_url_path(s, project, "/reports/summary.pdf"), 0);
+    ASSERT_EQ(count_edges_with_url_path(s, project, "/docs/index.rst"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Upstream c5a3c6ea (distilled from #1245): the route-registration suffix
+ * table knew `.add_api_websocket_route` but not the decorator forms
+ * `.websocket` / `.websocket_route`, so `@router.websocket('/ws')` produced no
+ * Route node. `@app.get('/health')` is the positive control. FORK: both
+ * resolvers (upstream ran the sequential one only). */
+static int websocket_routes_case(int fillers) {
+    ThSavedEnv workers_env("CBM_WORKERS"), single_env("CBM_INDEX_SINGLE_THREAD");
+    char tmp[256] = "/tmp/cbm_py_ws_routes_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    std::string repo = std::string(tmp) + "/repo";
+    ASSERT_EQ(th_write_file((repo + "/app.py").c_str(),
+                            "from fastapi import APIRouter, FastAPI, WebSocket\n\n"
+                            "app = FastAPI()\n"
+                            "router = APIRouter()\n\n"
+                            "@app.get('/health')\n"
+                            "def health():\n"
+                            "    return {'ok': True}\n\n"
+                            "@router.websocket('/ws')\n"
+                            "async def ws_endpoint(websocket: WebSocket):\n"
+                            "    await websocket.accept()\n\n"
+                            "@app.websocket_route('/events')\n"
+                            "async def events_endpoint(websocket: WebSocket):\n"
+                            "    await websocket.accept()\n"),
+              0);
+    write_ts_fillers(repo, fillers);
+
+    std::string db_path = std::string(tmp) + "/py_ws.db";
+    cbm_pipeline_t *p = cbm_pipeline_new(repo.c_str(), db_path.c_str(), CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path.c_str());
+    ASSERT_NOT_NULL(s);
+
+    /* Positive control: the HTTP decorator mints its Route node. */
+    ASSERT_GTE(count_nodes_named_in(s, project, "/health"), 1);
+    /* The two WebSocket decorator forms must mint Route nodes too. */
+    ASSERT_GTE(count_nodes_named_in(s, project, "/ws"), 1);
+    ASSERT_GTE(count_nodes_named_in(s, project, "/events"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    return 0;
+}
+
+TEST(pipeline_python_websocket_decorators_register_routes) {
+    return websocket_routes_case(0);
+}
+
+TEST(pipeline_python_websocket_decorators_register_routes_parallel) {
+    return websocket_routes_case(52);
+}
+
+/* HTTP_CALLS edges out of the function `source_name` whose Route target's
+ * qualified name contains `route_qn_part` (e.g. "__route__GET__"). */
+static int http_calls_to_route(cbm_store_t *s, const char *project, const char *source_name,
+                               const char *route_qn_part) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "HTTP_CALLS", &edges, &edge_count) !=
+        CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {};
+        cbm_node_t target = {};
+        bool source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        bool target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.name && target.qualified_name &&
+            strcmp(source.name, source_name) == 0 && strstr(target.qualified_name, route_qn_part)) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* Route-registration CALLS edges (via=route_registration) out of the function
+ * `source_name`. */
+static int route_registrations_from(cbm_store_t *s, const char *project, const char *source_name) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {};
+        bool source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        if (source_ok && source.name && strcmp(source.name, source_name) == 0 &&
+            edges[i].properties_json &&
+            strstr(edges[i].properties_json, "\"via\":\"route_registration\"")) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* Upstream 84248535: a call the HTTP service patterns classify (axios, an
+ * axios.create instance) gets exactly ONE HTTP_CALLS edge, typed with the verb
+ * its callee names. The arg-URL heuristic (detect_url_in_args, via=arg_url)
+ * exists for calls the patterns do not know -- a local fetch wrapper such as
+ * callApi('/api/orders') -- and must not add a second, method-less
+ * __route__ANY__ edge for the same call site. `fillers` > 0 forces the
+ * parallel resolver (the RED case); 0 keeps the sequential one, which must
+ * agree. */
+static int typed_http_no_url_twin_case(int fillers) {
+    ThSavedEnv workers_env("CBM_WORKERS"), single_env("CBM_INDEX_SINGLE_THREAD");
+    char tmp[256] = "/tmp/cbm_http_twin_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    std::string repo = std::string(tmp) + "/repo";
+    ASSERT_EQ(th_write_file((repo + "/src/api.ts").c_str(),
+                            "import axios from 'axios';\n"
+                            "const axiosInstance = axios.create({ baseURL: "
+                            "'http://localhost:5000' });\n"
+                            "export function getModel(id: string) {\n"
+                            "  return axiosInstance.get(`/api/models/${id}`);\n"
+                            "}\n"
+                            "export function addModel(body: unknown) {\n"
+                            "  return axiosInstance.post('/api/models', body);\n"
+                            "}\n"
+                            "export function removeModel(id: string) {\n"
+                            "  return axios.delete(`/api/models/${id}`);\n"
+                            "}\n"),
+              0);
+    ASSERT_EQ(th_write_file((repo + "/src/wrapper.ts").c_str(),
+                            "function callApi(path: string): Promise<Response> {\n"
+                            "  return fetch(path);\n"
+                            "}\n"
+                            "export function listOrders() {\n"
+                            "  return callApi('/api/orders');\n"
+                            "}\n"),
+              0);
+    write_ts_fillers(repo, fillers);
+
+    std::string db_path = std::string(tmp) + "/http_twin.db";
+    cbm_pipeline_t *p = cbm_pipeline_new(repo.c_str(), db_path.c_str(), CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path.c_str());
+    ASSERT_NOT_NULL(s);
+
+    static const struct {
+        const char *caller;
+        const char *typed_route;
+    } typed[] = {{"getModel", "__route__GET__"},
+                 {"addModel", "__route__POST__"},
+                 {"removeModel", "__route__DELETE__"}};
+    for (const auto &t : typed) {
+        /* The typed edge stays ... */
+        ASSERT_EQ(http_calls_to_route(s, project, t.caller, t.typed_route), 1);
+        /* ... and it is the only HTTP_CALLS edge of that call site. */
+        ASSERT_EQ(http_calls_to_route(s, project, t.caller, "__route__ANY__"), 0);
+        ASSERT_EQ(http_calls_to_route(s, project, t.caller, "__route__"), 1);
+    }
+    if (fillers > 0) {
+        /* Control: the heuristic still covers the call no pattern knows. The
+         * sequential resolver has no arg-URL heuristic. */
+        ASSERT_EQ(http_calls_to_route(s, project, "listOrders", "__route__ANY__"), 1);
+    }
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    return 0;
+}
+
+TEST(pipeline_typed_http_call_has_no_arg_url_twin) {
+    return typed_http_no_url_twin_case(52);
+}
+
+TEST(pipeline_typed_http_call_has_no_arg_url_twin_sequential) {
+    return typed_http_no_url_twin_case(0);
+}
+
+/* Upstream d3059efe: `import Axios from "axios"` -- the default-import
+ * binding capitalized -- must classify `Axios.get/post/delete(url)` as HTTP
+ * client calls exactly like `axios.*`. The library table matched only the
+ * lowercase id, so the calls fell through to the `.get`/`.post` route-suffix
+ * fallback and became route REGISTRATIONS. A real Express registration in
+ * the same project stays a registration. */
+static int capitalized_axios_case(int fillers) {
+    ThSavedEnv workers_env("CBM_WORKERS"), single_env("CBM_INDEX_SINGLE_THREAD");
+    char tmp[256] = "/tmp/cbm_axios_cap_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    std::string repo = std::string(tmp) + "/repo";
+    ASSERT_EQ(th_write_file((repo + "/src/service.ts").c_str(),
+                            "import Axios from \"axios\";\n"
+                            "export function getSettings(eventId: string) {\n"
+                            "  return Axios.get(`/api/admin/events/${eventId}/settings`);\n"
+                            "}\n"
+                            "export function addUser(eventId: string, participant: unknown) {\n"
+                            "  return Axios.post(`/api/admin/users/${eventId}`, participant);\n"
+                            "}\n"
+                            "export function removeUser(id: string) {\n"
+                            "  return Axios.delete(`/api/admin/users/${id}`);\n"
+                            "}\n"),
+              0);
+    ASSERT_EQ(th_write_file((repo + "/src/server.ts").c_str(),
+                            "function listUsers(req: unknown, res: unknown) {}\n"
+                            "export function mount(router: any) {\n"
+                            "  router.get('/api/admin/users', listUsers);\n"
+                            "}\n"),
+              0);
+    write_ts_fillers(repo, fillers);
+
+    std::string db_path = std::string(tmp) + "/axios_cap.db";
+    cbm_pipeline_t *p = cbm_pipeline_new(repo.c_str(), db_path.c_str(), CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path.c_str());
+    ASSERT_NOT_NULL(s);
+
+    static const struct {
+        const char *caller;
+        const char *typed_route;
+    } client[] = {{"getSettings", "__route__GET__"},
+                  {"addUser", "__route__POST__"},
+                  {"removeUser", "__route__DELETE__"}};
+    for (const auto &c : client) {
+        ASSERT_EQ(route_registrations_from(s, project, c.caller), 0);
+        ASSERT_EQ(http_calls_to_route(s, project, c.caller, c.typed_route), 1);
+    }
+    /* Control: the server-side registration is untouched. */
+    ASSERT_EQ(route_registrations_from(s, project, "mount"), 1);
+    ASSERT_EQ(http_calls_to_route(s, project, "mount", "__route__"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    return 0;
+}
+
+TEST(pipeline_capitalized_axios_import_is_http_client) {
+    return capitalized_axios_case(52);
+}
+
+TEST(pipeline_capitalized_axios_import_is_http_client_sequential) {
+    return capitalized_axios_case(0);
+}
+
+/* Upstream a7016270 (#1186): the parallel pass appended the call's
+ * ,"args":[...] member to every HTTP_CALLS / ASYNC_CALLS edge; the sequential
+ * pass did not, so one service call carried different properties depending on
+ * repo size. Index the same call on both resolvers and require identical,
+ * valid-JSON HTTP_CALLS properties that carry the args member. */
+static std::string http_calls_props_for(int fillers) {
+    ThSavedEnv workers_env("CBM_WORKERS"), single_env("CBM_INDEX_SINGLE_THREAD");
+    char tmp[256] = "/tmp/cbm_http_args_XXXXXX";
+    if (!cbm_mkdtemp(tmp)) {
+        return "";
+    }
+    std::string repo = std::string(tmp) + "/repo";
+    th_write_file((repo + "/svc/client.py").c_str(), "import requests\n"
+                                                     "def fetch_items(page):\n"
+                                                     "    return requests.get('/api/items', "
+                                                     "params={\"page\": page})\n");
+    write_ts_fillers(repo, fillers);
+    std::string db_path = std::string(tmp) + "/http_args.db";
+    std::string props;
+    cbm_pipeline_t *p = cbm_pipeline_new(repo.c_str(), db_path.c_str(), CBM_MODE_FULL);
+    if (p && cbm_pipeline_run(p) == 0) {
+        cbm_store_t *s = cbm_store_open_path(db_path.c_str());
+        cbm_edge_t *edges = NULL;
+        int n = 0;
+        if (s && cbm_store_find_edges_by_type(s, cbm_pipeline_project_name(p), "HTTP_CALLS",
+                                              &edges, &n) == CBM_STORE_OK &&
+            n == 1 && edges[0].properties_json) {
+            props = edges[0].properties_json;
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, n);
+        }
+        if (s) {
+            cbm_store_close(s);
+        }
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    th_rmtree(tmp);
+    return props;
+}
+
+TEST(pipeline_sequential_service_edge_has_parallel_args_shape) {
+    std::string seq = http_calls_props_for(0);
+    std::string par = http_calls_props_for(52);
+    ASSERT_FALSE(seq.empty());
+    ASSERT_FALSE(par.empty());
+    ASSERT_NOT_NULL(strstr(seq.c_str(), ",\"args\":["));
+    yyjson_doc *doc = yyjson_read(seq.c_str(), seq.size(), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_doc_free(doc);
+    ASSERT_STR_EQ(seq.c_str(), par.c_str());
+    PASS();
+}
+
 /* Reproduce-first for the determinism gap distilled from upstream #1925
  * (e410c86f): the complexity pass walked Function/Method seeds in the graph
  * buffer's label-list order and each node's CALLS targets in adjacency order.
@@ -9064,6 +9617,16 @@ SUITE(pipeline) {
     RUN_TEST(http_route_literal_guard_rejects_regex_replacement_operands);
     RUN_TEST(http_route_literal_guard_rejects_comments_keeps_wildcard);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
+    RUN_TEST(pipeline_route_prefix_bridge_is_order_free_and_root_bridges_nothing);
+    RUN_TEST(pipeline_route_prefix_bridge_is_order_free_parallel);
+    RUN_TEST(pipeline_arg_url_rejects_document_file_paths);
+    RUN_TEST(pipeline_python_websocket_decorators_register_routes);
+    RUN_TEST(pipeline_python_websocket_decorators_register_routes_parallel);
+    RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin);
+    RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin_sequential);
+    RUN_TEST(pipeline_capitalized_axios_import_is_http_client);
+    RUN_TEST(pipeline_capitalized_axios_import_is_http_client_sequential);
+    RUN_TEST(pipeline_sequential_service_edge_has_parallel_args_shape);
     RUN_TEST(pipeline_complexity_props_independent_of_worker_order);
     RUN_TEST(registry_fuzzy_confidence_single);
     RUN_TEST(registry_fuzzy_confidence_distance);

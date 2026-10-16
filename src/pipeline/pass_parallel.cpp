@@ -1745,30 +1745,35 @@ static const char *find_route_path_in_args(const CBMCall *call, const char **out
     return found;
 }
 
-/* Build props JSON, append args, close brace, emit edge. */
-static void finalize_and_emit(cbm_gbuf_t *gbuf, int64_t src_id, int64_t tgt_id,
-                              const char *edge_type, char *props, int n, const CBMCall *call) {
+/* Append the call's args (and, for CALLS, its line) to props and close the
+ * brace. Shared with the sequential pass, whose service edges must carry the
+ * same bytes (pass_calls.cpp emit_http_async_edge; upstream a7016270). */
+bool cbm_pipeline_close_call_props(char *props, int n, const CBMCall *call, bool with_line) {
     if (n <= 0 || (size_t)n >= CBM_SZ_2K - PP_ESC_SPACE) {
         /* The base blob did not fit: it has no closing brace and may be cut
          * mid-string, so it is malformed JSON — never store it. */
-        cbm_gbuf_insert_edge(gbuf, src_id, tgt_id, edge_type, CBM_JSON_EMPTY_OBJECT);
-        return;
+        return false;
     }
     size_t pos = append_args_json(props, CBM_SZ_2K, (size_t)n, call);
-    if (call->start_line > 0 && strcmp(edge_type, "CALLS") == 0 &&
-        pos < CBM_SZ_2K - PP_LINE_MARGIN) {
+    if (with_line && call->start_line > 0 && pos < CBM_SZ_2K - PP_LINE_MARGIN) {
         int ln = snprintf(props + pos, CBM_SZ_2K - pos, ",\"line\":%d", call->start_line);
         if (ln > 0) {
             pos += (size_t)ln;
         }
     }
     if (pos >= CBM_SZ_2K - SKIP_ONE) {
-        cbm_gbuf_insert_edge(gbuf, src_id, tgt_id, edge_type, CBM_JSON_EMPTY_OBJECT);
-        return;
+        return false;
     }
     props[pos] = '}';
     props[pos + SKIP_ONE] = '\0';
-    cbm_gbuf_insert_edge(gbuf, src_id, tgt_id, edge_type, props);
+    return true;
+}
+
+/* Build props JSON, append args, close brace, emit edge. */
+static void finalize_and_emit(cbm_gbuf_t *gbuf, int64_t src_id, int64_t tgt_id,
+                              const char *edge_type, char *props, int n, const CBMCall *call) {
+    bool closed = cbm_pipeline_close_call_props(props, n, call, strcmp(edge_type, "CALLS") == 0);
+    cbm_gbuf_insert_edge(gbuf, src_id, tgt_id, edge_type, closed ? props : CBM_JSON_EMPTY_OBJECT);
 }
 
 /* Build Route node QN and properties for HTTP/async service edges. */
@@ -2110,41 +2115,43 @@ static void emit_grpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, cons
 /* Emit GRAPHQL_CALLS edge. Extract operation from first string arg if available. */
 static void emit_graphql_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
                               const cbm_resolution_t *res) {
-    const char *op = call->first_string_arg;
-    if (!op || !op[0]) {
-        op = call->callee_name;
-    }
-    /* Try to extract a query/mutation name from the operation string */
-    char op_name[CBM_SZ_256];
-    snprintf(op_name, sizeof(op_name), "%s", op);
-    /* Trim leading whitespace and "query "/"mutation " prefix */
-    const char *p = op_name;
-    while (*p == ' ' || *p == '\t' || *p == '\n') {
-        p++;
-    }
-    if (strncmp(p, "query ", CBM_SZ_6) == 0) {
-        p += CBM_SZ_6;
-    } else if (strncmp(p, "mutation ", CBM_SZ_8) == 0) {
-        p += CBM_SZ_8;
+    /* The Route is keyed by the operation NAME only (upstream 92cb0ec2, #598),
+     * never by the operation text:
+     *   named operation          -> __graphql__<Name>                  name "<Name>"
+     *   anonymous query/mutation/ -> __graphql__<type>__anonymous       name "(anonymous <type>)"
+     *   subscription (incl. the `{ ... }` query shorthand)
+     *   no GraphQL document      -> __graphql__operation__anonymous    name "(anonymous operation)"
+     *   (URL, variable, missing string argument)
+     * Keys are bounded by the GraphQL Name grammar and deterministic. */
+    const char *op_type = "operation";
+    char op_name[CBM_SZ_128];
+    bool named = cbm_service_pattern_graphql_operation(call->first_string_arg, &op_type, op_name,
+                                                       sizeof(op_name));
+
+    char route_name[CBM_SZ_256];
+    char route_qn[CBM_SZ_256];
+    if (named) {
+        snprintf(route_name, sizeof(route_name), "%s", op_name);
+        snprintf(route_qn, sizeof(route_qn), "__graphql__%s", op_name);
+    } else {
+        snprintf(route_name, sizeof(route_name), "(anonymous %s)", op_type);
+        snprintf(route_qn, sizeof(route_qn), "__graphql__%s__anonymous", op_type);
     }
 
-    char route_qn[CBM_SZ_512];
-    snprintf(route_qn, sizeof(route_qn), "__graphql__%s", p);
+    int64_t route_id = cbm_gbuf_upsert_node(gbuf, "Route", route_name, route_qn, "", 0, 0,
+                                            "{\"source\":\"graphql\"}");
 
-    int64_t route_id =
-        cbm_gbuf_upsert_node(gbuf, "Route", p, route_qn, "", 0, 0, "{\"source\":\"graphql\"}");
-
-    /* The operation is the GraphQL document itself — a template literal that
-     * routinely carries raw newlines and quotes (gql(`query {\n user(id:"1")\n}`)).
-     * Interpolated raw it produced malformed properties on every such call. */
+    /* Names are GraphQL Name tokens and op_type is a fixed keyword, but the
+     * callee is sliced source text: escape everything that is interpolated. */
     char esc_c[CBM_SZ_256];
     char esc_op[CBM_SZ_512];
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
-    cbm_json_escape(esc_op, sizeof(esc_op), p);
+    cbm_json_escape(esc_op, sizeof(esc_op), route_name);
     char props[CBM_SZ_1K];
     int n = snprintf(props, sizeof(props),
-                     "{\"callee\":\"%s\",\"operation\":\"%s\",\"confidence\":%.2f}", esc_c, esc_op,
-                     res->confidence);
+                     "{\"callee\":\"%s\",\"operation\":\"%s\",\"operation_type\":\"%s\","
+                     "\"confidence\":%.2f}",
+                     esc_c, esc_op, op_type, res->confidence);
     cbm_gbuf_insert_edge(gbuf, source->id, route_id, "GRAPHQL_CALLS",
                          cbm_json_props_checked(props, n, sizeof(props)));
 }
@@ -2239,8 +2246,12 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
     bool has_url = (arg && arg[0] != '\0' && (arg[0] == '/' || strstr(arg, "://") != NULL));
     bool has_topic = (arg && arg[0] != '\0' && svc == CBM_SVC_ASYNC && strlen(arg) > PP_ESC_SPACE);
 
+    /* Set when this call already has its HTTP_CALLS edge from the service
+     * patterns (typed with the verb its callee names). */
+    bool http_edge_emitted = false;
     if ((svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) && (has_url || has_topic)) {
         emit_http_async_service_edge(gbuf, source, call, res, svc, arg);
+        http_edge_emitted = svc == CBM_SVC_HTTP;
     } else if (svc == CBM_SVC_GRPC) {
         emit_grpc_edge(gbuf, source, call, res);
     } else if (svc == CBM_SVC_GRAPHQL) {
@@ -2253,7 +2264,41 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         emit_normal_calls_edge(gbuf, source, target, call, res);
     }
 
-    detect_url_in_args(gbuf, source, call);
+    /* The arg-URL heuristic is for calls no service pattern knows (a local
+     * fetch wrapper). On a classified HTTP call it only minted a method-less
+     * __route__ANY__ twin of the typed edge, which cross-repo matching then
+     * bound to server handlers of any method (upstream 84248535). */
+    if (!http_edge_emitted) {
+        detect_url_in_args(gbuf, source, call);
+    }
+}
+
+/* The #725 guard refuses a suffix_match binding across a language boundary,
+ * which leaves the callee unresolved. An unresolved callee the route
+ * classifier recognises is still a registration: `Route::get('/x', ...)`
+ * beside a JS `get`, `app.get('/x', h)` beside a Python `get`. Emit exactly
+ * the Route + CALLS + HANDLES that the unresolved-callee (callee_suffix)
+ * fallback in resolve_file_calls emits for it, classified by callee name the
+ * same way emit_service_edge classifies that fallback, and nothing else: no
+ * CALLS edge to the refused target and no URL-argument scan (upstream
+ * 124c5e29). Mirrors pass_calls.cpp. */
+static void emit_xlang_refused_route(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
+                                     const CBMCall *call, const char *module_qn,
+                                     const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
+                                     const char **imp_keys, const char **imp_vals, int imp_count) {
+    if (cbm_service_pattern_route_method(call->callee_name) == NULL) {
+        return;
+    }
+    cbm_svc_kind_t svc = cbm_service_pattern_match(call->callee_name);
+    if (svc != CBM_SVC_NONE && svc != CBM_SVC_ROUTE_REG) {
+        return;
+    }
+    const char *handler_ref = NULL;
+    const char *route_path = find_route_path_in_args(call, &handler_ref);
+    if (route_path) {
+        emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn, registry,
+                                main_gbuf, imp_keys, imp_vals, imp_count);
+    }
 }
 
 /* Find the source node for an edge: enclosing function or file node. */
@@ -2535,7 +2580,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         /* Dynamic-language weak-member suppression (#592/#606/#1276). The
          * receiver-aware guard must NOT drop this call here: doing so would also
          * skip the #523 callee-name service bypass below, emit_service_edge's
-         * route/gRPC/config branches, and its unconditional detect_url_in_args
+         * route/gRPC/config branches, and its detect_url_in_args
          * (which classifies verb-suffix HTTP clients like api.patch('/x')).
          * Instead, defer to the emit path and suppress ONLY the plain-CALLS
          * fall-through (emit_normal_calls_edge), so every service edge stays
@@ -2615,6 +2660,15 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * bypass below, which only fires when target_node is NULL and so cannot
          * reach this case (a self-edge target skips emission either way). */
         if (target_node && cbm_suppress_call_target(lang, target_node, res.strategy)) {
+            /* A route registration behind a refused cross-language binding
+             * still gets its Route (upstream 124c5e29). */
+            if (source_node->id != target_node->id &&
+                cbm_suppress_cross_language_suffix_match(lang, target_node->file_path,
+                                                         res.strategy)) {
+                emit_xlang_refused_route(ws->local_edge_buf, source_node, call, module_qn,
+                                         rc->registry, rc->main_gbuf, imp_keys, imp_vals,
+                                         imp_count);
+            }
             continue;
         }
         if (!target_node || source_node->id == target_node->id) {

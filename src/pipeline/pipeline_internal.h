@@ -741,6 +741,14 @@ void cbm_pp_bp_nap_cycles_reset(void);
  * extract loops so the two cannot drift. */
 const char *cbm_walk_coverage_entry(const CBMFileResult *r, char *reason, size_t reason_sz);
 
+/* Finish a call edge's props: `props` is a CBM_SZ_2K buffer holding `n` bytes
+ * of an unclosed JSON object. Appends the call's ,"args":[...] (and, when
+ * `with_line`, its ,"line":N), then the closing brace. Returns false (props
+ * unusable, store "{}" instead) when the blob did not fit. The one formatter
+ * behind both passes' HTTP_CALLS / ASYNC_CALLS props (pass_parallel.cpp,
+ * upstream a7016270). */
+bool cbm_pipeline_close_call_props(char *props, int n, const CBMCall *call, bool with_line);
+
 #ifdef __cplusplus
 }
 #endif

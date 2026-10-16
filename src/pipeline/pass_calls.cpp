@@ -219,6 +219,20 @@ static void free_import_map(const char **keys, const char **vals, int count) {
     }
 }
 
+/* An unresolved callee the route classifier recognises by name
+ * (`Route::get`, `$router->get`, `app.get`) with a path-shaped first argument
+ * is a registration (upstream #952 fallback, mirrors the parallel path's
+ * callee_suffix fallback; a callee another service family claims is not). */
+static bool unresolved_route_registration(const CBMCall *call) {
+    if (cbm_service_pattern_route_method(call->callee_name) == NULL || !call->first_string_arg ||
+        call->first_string_arg[0] != '/' ||
+        cbm_service_pattern_is_comment_text(call->first_string_arg)) {
+        return false;
+    }
+    cbm_svc_kind_t svc = cbm_service_pattern_match(call->callee_name);
+    return svc == CBM_SVC_NONE || svc == CBM_SVC_ROUTE_REG;
+}
+
 /* Handle a route registration call: create Route node + HANDLES edge. */
 static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                       const cbm_gbuf_node_t *source_node, const char *module_qn,
@@ -437,8 +451,11 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
      * method/broker); at CBM_SZ_512 a long callee/URL pair truncated the blob and
      * every branch below then declined to close it, storing an unterminated
      * "url_path" string on an edge whose url_path_gen generated column makes
-     * json_extract — and PRAGMA quick_check — fail. */
-    char props[CBM_SZ_1K];
+     * json_extract — and PRAGMA quick_check — fail.
+     * The call's args and the closing brace come from the parallel path's own
+     * formatter (cbm_pipeline_close_call_props, upstream a7016270), so a
+     * service edge is byte-identical whichever pass emits it. */
+    char props[CBM_SZ_2K];
     int n = snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"", esc_callee,
                      esc_url);
     if (method && n > 0 && (size_t)n < sizeof(props)) {
@@ -447,14 +464,9 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     if (broker && n > 0 && (size_t)n < sizeof(props)) {
         n += snprintf(props + n, sizeof(props) - (size_t)n, ",\"broker\":\"%s\"", broker);
     }
-    if (n > 0 && (size_t)n < (int)sizeof(props) - SKIP_ONE) {
-        props[n] = '}';
-        props[n + SKIP_ONE] = '\0';
-        n++;
-    } else {
-        n = -1; /* truncated somewhere above — never store the partial blob */
-    }
-    calls_emit_edge(ctx->gbuf, source->id, route_id, edge_type, props, sizeof(props), n, call);
+    bool closed = cbm_pipeline_close_call_props(props, n, call, false);
+    cbm_gbuf_insert_edge(ctx->gbuf, source->id, route_id, edge_type,
+                         closed ? props : CBM_JSON_EMPTY_OBJECT);
 }
 
 /* Classify a resolved call and emit the appropriate edge. */
@@ -601,6 +613,16 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
          * Native `fetch()` (#856) belongs here too, not in the substring
          * tables above: it only counts as the global API once resolution has
          * already failed to find a local/imported `fetch` definition. */
+        /* Route registration on an unresolvable callee (upstream #952):
+         * facade-style Laravel (`Route::get('/x', ...)`) — the facade class
+         * lives in vendor/ and is never indexed, so resolution is ALWAYS empty
+         * in real apps. Classify by callee suffix + path-shaped first arg like
+         * the parallel path's callee_suffix fallback. */
+        if (unresolved_route_registration(call)) {
+            handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals,
+                                      imp_count);
+            return SKIP_ONE;
+        }
         cbm_svc_kind_t esvc = cbm_service_pattern_match(call->callee_name);
         if (esvc == CBM_SVC_NONE && cbm_service_pattern_is_global_fetch(call->callee_name)) {
             esvc = CBM_SVC_HTTP;
@@ -682,6 +704,19 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * Store.commit() call to a JS function named commit (or a Bash main to a
      * Python main); a textual Go call match never binds a struct Field node. */
     if (cbm_suppress_call_target(lang, target_node, res.strategy)) {
+        /* Refusing a cross-language binding leaves the callee unresolved, and
+         * an unresolved route-registration callee is still a registration:
+         * `Route::get('/x', ...)` beside a JS `get`, `app.get('/x', h)` beside
+         * a Python `get`. Give it the same Route the unresolved-callee
+         * fallback above mints, and nothing else. Dropping the whole call lost
+         * every GET registration in a mixed-language repo while POST (no
+         * `post` to collide with) survived (upstream 124c5e29). */
+        if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy) &&
+            unresolved_route_registration(call)) {
+            handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals,
+                                      imp_count);
+            return SKIP_ONE;
+        }
         return 0;
     }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,

@@ -47,6 +47,7 @@
 #include <store/store.h>
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
+#include "service_patterns.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -1512,6 +1513,384 @@ TEST(override_go_interface) {
     PASS();
 }
 
+/* Upstream d141ee93 (#686): Go router groups. Fiber (and Gin/Echo, same
+ * syntax) build the external path from `grp := app.Group("/admin")` plus
+ * `grp.Post("/x")`, so the full path is never one literal at the
+ * registration site. The Route must carry the composed path, including
+ * nested groups (`v1 := api.Group("/v1")`) and groups built inline
+ * (`app.Group("/x").Get(...)`). Controls: a route on the root app keeps its
+ * own path, a variable later re-bound to a different group uses the binding
+ * in effect at the call, and a non-literal group prefix leaves the route
+ * unprefixed (never guessed). Exact Route set on BOTH the sequential and the
+ * parallel pipeline. */
+static const EtFile et_fiber_groups_issue686[] = {
+    {"main.go", "package main\n\n"
+                "import \"github.com/gofiber/fiber/v2\"\n\n"
+                "func health(c *fiber.Ctx) error { return nil }\n"
+                "func getUser(c *fiber.Ctx) error { return nil }\n"
+                "func updateCustomer(c *fiber.Ctx) error { return nil }\n"
+                "func listOrders(c *fiber.Ctx) error { return nil }\n"
+                "func ping(c *fiber.Ctx) error { return nil }\n"
+                "func report(c *fiber.Ctx) error { return nil }\n"
+                "func dyn(c *fiber.Ctx) error { return nil }\n\n"
+                "func main() {\n"
+                "    app := fiber.New()\n"
+                "    app.Get(\"/health\", health)\n"
+                "    api := app.Group(\"/api\")\n"
+                "    v1 := api.Group(\"/v1\", authMiddleware)\n"
+                "    v1.Get(\"/users/:id\", getUser)\n"
+                "    admin := app.Group(\"/admin\")\n"
+                "    admin.Post(\"/customers/:id\", updateCustomer)\n"
+                "    grp := api.Group(\"/shop\")\n"
+                "    grp.Get(\"/orders\", listOrders)\n"
+                "    grp = app.Group(\"/internal\")\n"
+                "    grp.Get(\"/ping\", ping)\n"
+                "    app.Group(\"/reports\").Get(\"/daily\", report)\n"
+                "    prefix := \"/p\"\n"
+                "    dg := app.Group(prefix)\n"
+                "    dg.Get(\"/dyn\", dyn)\n"
+                "    app.Listen(\":3000\")\n"
+                "}\n\n"
+                "func authMiddleware(c *fiber.Ctx) error { return c.Next() }\n"}};
+
+static const char *et_fiber_groups_issue686_routes[] = {
+    "/health",        "/api/v1/users/:id", "/admin/customers/:id", "/api/shop/orders",
+    "/internal/ping", "/reports/daily",    "/dyn",                 NULL};
+
+/* et_routes_exact over the parallel pipeline (pad files are Python, so they
+ * add no Route). FORK: upstream's et_routes_exact_mode. */
+static int et_routes_exact_parallel(const EtFile *files, int nfiles, const char **routes) {
+    static char pad_name[ET_PARALLEL_PAD][48];
+    static char pad_body[ET_PARALLEL_PAD][64];
+    EtFile all[ET_PAD_MAX] = {};
+    int n = 0;
+    for (int i = 0; i < nfiles; i++) {
+        all[n++] = files[i];
+    }
+    for (int i = 0; i < ET_PARALLEL_PAD; i++) {
+        snprintf(pad_name[i], sizeof(pad_name[i]), "pad/pad_%02d.py", i);
+        snprintf(pad_body[i], sizeof(pad_body[i]), "def pad_%02d():\n    return %d\n", i, i);
+        all[n].name = pad_name[i];
+        all[n].content = pad_body[i];
+        n++;
+    }
+    return et_routes_exact(all, n, routes);
+}
+
+TEST(handles_fiber_group_prefix_sequential_issue686) {
+    ASSERT_TRUE(et_routes_exact(et_fiber_groups_issue686, 1, et_fiber_groups_issue686_routes));
+    PASS();
+}
+
+TEST(handles_fiber_group_prefix_parallel_issue686) {
+    ASSERT_TRUE(
+        et_routes_exact_parallel(et_fiber_groups_issue686, 1, et_fiber_groups_issue686_routes));
+    PASS();
+}
+
+/* #686 control for the same mechanism on Gin: `v1 := r.Group("/v1")` with the
+ * idiomatic brace block. */
+TEST(handles_gin_group_prefix_issue686) {
+    static const EtFile f[] = {{"main.go", "package main\n\n"
+                                           "import \"github.com/gin-gonic/gin\"\n\n"
+                                           "func listOrders(c *gin.Context) {}\n"
+                                           "func createOrder(c *gin.Context) {}\n\n"
+                                           "func main() {\n"
+                                           "    r := gin.Default()\n"
+                                           "    v1 := r.Group(\"/v1\")\n"
+                                           "    {\n"
+                                           "        v1.GET(\"/orders\", listOrders)\n"
+                                           "        v1.POST(\"/orders\", createOrder)\n"
+                                           "    }\n"
+                                           "}\n"}};
+    static const char *routes[] = {"/v1/orders", "/v1/orders", NULL}; /* GET + POST */
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* Upstream 92cb0ec2 (#598): a call that resolves to a GraphQL client used to
+ * name its Route after the WHOLE operation text (minus a leading
+ * "query "/"mutation "), so an anonymous `query { ... }` became one long Route
+ * and even a named operation carried its variables and selection set in the
+ * name. GraphQL Routes are now keyed by operation name only; anonymous
+ * operations share one bounded key per operation type. The Route set is
+ * asserted exactly (QN + name). Parallel path only: GRAPHQL_CALLS is emitted
+ * by pass_parallel.cpp. */
+typedef struct {
+    const char *qn;
+    const char *name;
+} EtGqlRoute;
+
+static int et_graphql_routes_exact(const EtFile *files, int nfiles, const EtGqlRoute *want,
+                                   int nwant) {
+    EtProj lp;
+    cbm_store_t *store = et_index_parallel(&lp, files, nfiles);
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    int ok = store != NULL;
+    int got = 0;
+    if (!store || cbm_store_find_nodes_by_label(store, lp.project, "Route", &nodes, &node_count) !=
+                      CBM_STORE_OK) {
+        ok = 0;
+    }
+    for (int ni = 0; nodes && ni < node_count; ni++) {
+        const char *qn = nodes[ni].qualified_name ? nodes[ni].qualified_name : "";
+        const char *name = nodes[ni].name ? nodes[ni].name : "";
+        if (strncmp(qn, "__graphql__", 11) != 0) {
+            continue;
+        }
+        got++;
+        int matched = 0;
+        for (int wi = 0; wi < nwant; wi++) {
+            if (strcmp(qn, want[wi].qn) == 0 && strcmp(name, want[wi].name) == 0) {
+                matched = 1;
+                break;
+            }
+        }
+        /* Operation text (selection sets, variables) must never leak into a key. */
+        if (!matched || strchr(qn, '{') || strchr(name, '{') || strlen(qn) > 160) {
+            fprintf(stderr, "  [ET-GQL] unexpected Route qn='%s' name='%s'\n", qn, name);
+            ok = 0;
+        }
+    }
+    if (got != nwant) {
+        fprintf(stderr, "  [ET-GQL] FAIL graphql routes expected=%d actual=%d\n", nwant, got);
+        ok = 0;
+    }
+    int edges = store ? cbm_store_count_edges_by_type(store, lp.project, "GRAPHQL_CALLS") : -1;
+    if (edges < nwant) {
+        fprintf(stderr, "  [ET-GQL] FAIL GRAPHQL_CALLS=%d expected>=%d\n", edges, nwant);
+        ok = 0;
+    }
+    cbm_store_free_nodes(nodes, node_count);
+    et_cleanup(&lp, store);
+    return ok;
+}
+
+TEST(graphql_route_keyed_by_operation_name_issue598) {
+    static const EtFile f[] = {
+        {"graphql/client.py", "def gql(query):\n    return query\n"},
+        {"api/ops.py",
+         "from graphql.client import gql\n\n\n"
+         "def get_user():\n"
+         "    return gql('query GetUser($id: ID!) { user(id: $id) { name } }')\n\n\n"
+         "def update_user():\n"
+         "    return gql('mutation UpdateUser($id: ID!) { updateUser(id: $id) { id } }')\n\n\n"
+         "def list_users():\n"
+         "    return gql('fragment U on User { id } query ListUsers { users { ...U } }')\n\n\n"
+         "def on_event():\n"
+         "    return gql('subscription OnEvent { event { id } }')\n\n\n"
+         "def products():\n"
+         "    return gql('query { products(search: \"x\") { items { sku } } }')\n\n\n"
+         "def orders():\n"
+         "    return gql('{ orders { id total } }')\n\n\n"
+         "def logout():\n"
+         "    return gql('mutation { logout }')\n"}};
+    static const EtGqlRoute want[] = {
+        {"__graphql__GetUser", "GetUser"},
+        {"__graphql__UpdateUser", "UpdateUser"},
+        {"__graphql__ListUsers", "ListUsers"},
+        {"__graphql__OnEvent", "OnEvent"},
+        /* products + orders: `query { }` and the `{ }` shorthand are both
+         * anonymous queries and share one key. */
+        {"__graphql__query__anonymous", "(anonymous query)"},
+        {"__graphql__mutation__anonymous", "(anonymous mutation)"},
+    };
+    ASSERT_TRUE(et_graphql_routes_exact(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                        (int)(sizeof(want) / sizeof(want[0]))));
+    PASS();
+}
+
+/* #598 parser edges the end-to-end fixture cannot reach through one language's
+ * string extraction: comments/strings/interpolations that contain braces, a
+ * bare word, non-document arguments and name truncation. */
+TEST(graphql_operation_identity_parser_issue598) {
+    const char *type = NULL;
+    char name[16];
+    static const struct {
+        const char *doc;
+        int named;
+        const char *type;
+        const char *name;
+    } cases[] = {
+        {"# fetch { all }\nquery Q1 { a }", 1, "query", "Q1"},
+        {"${UserFields} query WithFrag($id: ID) { u { ...UserFields } }", 1, "query", "WithFrag"},
+        {"fragment F on T @dir(x: \"{\") { a } mutation M2 { b }", 1, "mutation", "M2"},
+        {"\"\"\"doc { brace\"\"\" subscription S3 { c }", 1, "subscription", "S3"},
+        {"  query  \n ( $x: Int ) { a }", 0, "query", ""},
+        {"  { viewer { id } }", 0, "query", ""},
+        {"query GetUserByIdentifier { a }", 1, "query", "GetUserByIdenti"}, /* bounded */
+        {"data", 0, "operation", ""}, /* a bare word is not evidence of an operation */
+        {"https://api.example.com/graphql", 0, "operation", ""},
+        {"/graphql", 0, "operation", ""},
+        {"", 0, "operation", ""},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        bool named = cbm_service_pattern_graphql_operation(cases[i].doc, &type, name, sizeof(name));
+        if ((int)named != cases[i].named || strcmp(type, cases[i].type) != 0 ||
+            strcmp(name, cases[i].name) != 0) {
+            fprintf(stderr, "  [ET-GQL] case %zu '%s' -> named=%d type=%s name=%s\n", i,
+                    cases[i].doc, (int)named, type, name);
+            ASSERT_TRUE(0);
+        }
+    }
+    ASSERT_FALSE(cbm_service_pattern_graphql_operation(NULL, &type, name, sizeof(name)));
+    ASSERT_STR_EQ(type, "operation");
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  ROUTE REGISTRATION vs the #725 cross-language guard (upstream 124c5e29).
+ *
+ *  The route classifier recognises a registration by its callee
+ *  (`Route::get`, `$router->get`, `app.get`) plus a path-shaped first
+ *  argument. The registry still resolves the callee's bare name first, and in
+ *  a mixed-language repo with imports it binds `get` by suffix_match to a
+ *  same-named definition in ANOTHER language (a JS `get`, a Python `get`).
+ *  The #725 guard rightly refuses that binding — but it dropped the whole
+ *  call, before either resolver reached the route classification, so every
+ *  GET registration vanished while POST (no `post` definition to collide
+ *  with) survived. The guard must keep dropping the false CALLS edge; the
+ *  registration must survive. Each fixture also carries calls the guard must
+ *  still drop.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Index `files` (padded onto the parallel path when `parallel`), then require
+ * the exact Route-name set `routes` AND zero CALLS edges into any definition
+ * named `get`: every `get` in these fixtures lives in a different language
+ * than its would-be callers, so any such edge is the binding #725 refuses. */
+static int et_xlang_routes(const EtFile *files, int nfiles, bool parallel, const char **routes) {
+    EtProj lp;
+    cbm_store_t *store =
+        parallel ? et_index_parallel(&lp, files, nfiles) : et_index_files(&lp, files, nfiles);
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    int wanted = 0;
+    int ok = store != NULL;
+    while (routes[wanted]) {
+        wanted++;
+    }
+    if (!store || cbm_store_find_nodes_by_label(store, lp.project, "Route", &nodes, &node_count) !=
+                      CBM_STORE_OK) {
+        ok = 0;
+    } else if (node_count != wanted) {
+        ok = 0;
+    }
+    for (int wi = 0; wi < wanted; wi++) {
+        int hit = 0;
+        for (int ni = 0; ni < node_count; ni++) {
+            if (nodes[ni].name && strcmp(nodes[ni].name, routes[wi]) == 0) {
+                hit = 1;
+            }
+        }
+        if (!hit) {
+            fprintf(stderr, "  [ET-XLANG] missing Route %s\n", routes[wi]);
+            ok = 0;
+        }
+    }
+    if (!ok) {
+        fprintf(stderr, "  [ET-XLANG] expected=%d actual=%d available:", wanted, node_count);
+        for (int ni = 0; ni < node_count; ni++) {
+            fprintf(stderr, " %s", nodes[ni].name ? nodes[ni].name : "<null>");
+        }
+        fprintf(stderr, "\n");
+    }
+    int false_calls = 0;
+    cbm_node_t *gets = NULL;
+    int get_count = 0;
+    if (store &&
+        cbm_store_find_nodes_by_name(store, lp.project, "get", &gets, &get_count) == CBM_STORE_OK) {
+        for (int gi = 0; gi < get_count; gi++) {
+            cbm_edge_t *in = NULL;
+            int in_count = 0;
+            if (cbm_store_find_edges_by_target_type(store, gets[gi].id, "CALLS", &in, &in_count) ==
+                CBM_STORE_OK) {
+                false_calls += in_count;
+                cbm_store_free_edges(in, in_count);
+            }
+        }
+        cbm_store_free_nodes(gets, get_count);
+    }
+    if (false_calls != 0) {
+        fprintf(stderr, "  [ET-XLANG] %d cross-language CALLS into `get`\n", false_calls);
+        ok = 0;
+    }
+    cbm_store_free_nodes(nodes, node_count);
+    et_cleanup(&lp, store);
+    return ok;
+}
+
+/* Laravel: `$router->get` beside two JS `get` definitions. Controls: POST is
+ * unchanged, and a bare PHP `get('/x')` (no route-registration callee) stays
+ * dropped — no Route, no CALLS into JS. FORK: upstream also asserts the
+ * facade form (`Route::get('/leads')`), which needs upstream 4ecfe4cd's
+ * `::verb` route suffixes; this fork does not classify facade routes at all
+ * (POST included), so the fixture registers through `$router` only. */
+static const EtFile et_xlang_laravel[] = {
+    {"app/Http/Controllers/LeadController.php",
+     "<?php\nnamespace App\\Http\\Controllers;\n\n"
+     "class LeadController\n{\n"
+     "    public function index() { return []; }\n"
+     "    public function store() { return []; }\n}\n"},
+    {"routes/web.php", "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+                       "use App\\Http\\Controllers\\LeadController;\n\n"
+                       "$router->get('/leads', [LeadController::class, 'index']);\n"
+                       "$router->post('/leads/store', [LeadController::class, 'store']);\n"
+                       "$router->get('/reports', [LeadController::class, 'index']);\n\n"
+                       "function report_file() { return get('/files/report'); }\n"},
+    {"resources/js/http.js", "export function get(url) {\n  return url;\n}\n"},
+    {"resources/js/store.js", "export class Store {\n  get(key) {\n    return key;\n  }\n}\n"},
+};
+static const char *et_xlang_laravel_routes[] = {"/leads", "/leads/store", "/reports", NULL};
+
+TEST(routes_laravel_get_survives_xlang_guard) {
+    ASSERT_TRUE(et_xlang_routes(et_xlang_laravel,
+                                (int)(sizeof(et_xlang_laravel) / sizeof(et_xlang_laravel[0])),
+                                false, et_xlang_laravel_routes));
+    PASS();
+}
+
+TEST(routes_laravel_get_survives_xlang_guard_parallel) {
+    ASSERT_TRUE(et_xlang_routes(et_xlang_laravel,
+                                (int)(sizeof(et_xlang_laravel) / sizeof(et_xlang_laravel[0])),
+                                true, et_xlang_laravel_routes));
+    PASS();
+}
+
+/* Express: `app.get` beside two Python `get` definitions. Controls: POST is
+ * unchanged; a member `memo.get(key)` (route suffix, no path) and a bare
+ * `get('/cache/key')` stay dropped — no Route, no CALLS into Python. */
+static const EtFile et_xlang_express[] = {
+    {"web/server.js", "const express = require('express');\n"
+                      "const { health } = require('./handlers');\n\n"
+                      "const app = express();\n\n"
+                      "app.get('/health', health);\n"
+                      "app.post('/items', health);\n\n"
+                      "function readCache(memo, key) {\n"
+                      "  return memo.get(key) || get('/cache/key');\n"
+                      "}\n"
+                      "module.exports = { readCache };\n"},
+    {"web/handlers.js",
+     "function health(req, res) {\n  return res;\n}\nmodule.exports = { health };\n"},
+    {"tools/cache.py", "def get(key):\n    return key\n"},
+    {"tools/store.py", "class Store:\n    def get(self, key):\n        return key\n"},
+};
+static const char *et_xlang_express_routes[] = {"/health", "/items", NULL};
+
+TEST(routes_express_get_survives_xlang_guard) {
+    ASSERT_TRUE(et_xlang_routes(et_xlang_express,
+                                (int)(sizeof(et_xlang_express) / sizeof(et_xlang_express[0])),
+                                false, et_xlang_express_routes));
+    PASS();
+}
+
+TEST(routes_express_get_survives_xlang_guard_parallel) {
+    ASSERT_TRUE(et_xlang_routes(et_xlang_express,
+                                (int)(sizeof(et_xlang_express) / sizeof(et_xlang_express[0])),
+                                true, et_xlang_express_routes));
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
@@ -1589,4 +1968,19 @@ SUITE(edge_types_probe) {
 
     /* OVERRIDE — Go interface method override (parallel path) */
     RUN_TEST(override_go_interface);
+
+    /* Go router-group prefixes (#686) */
+    RUN_TEST(handles_fiber_group_prefix_sequential_issue686);
+    RUN_TEST(handles_fiber_group_prefix_parallel_issue686);
+    RUN_TEST(handles_gin_group_prefix_issue686);
+
+    /* GraphQL Routes keyed by operation name (#598) */
+    RUN_TEST(graphql_route_keyed_by_operation_name_issue598);
+    RUN_TEST(graphql_operation_identity_parser_issue598);
+
+    /* Route registration vs the #725 cross-language guard (both resolvers) */
+    RUN_TEST(routes_laravel_get_survives_xlang_guard);
+    RUN_TEST(routes_laravel_get_survives_xlang_guard_parallel);
+    RUN_TEST(routes_express_get_survives_xlang_guard);
+    RUN_TEST(routes_express_get_survives_xlang_guard_parallel);
 }
