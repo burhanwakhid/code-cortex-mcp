@@ -9661,6 +9661,18 @@ static void search_scan_buffer(std::string &out, const search_scan_patterns_t *p
  * endless pseudo-file (a symlink retargeted after indexing). */
 static constexpr size_t SEARCH_SCAN_FILE_MAX = (size_t)1 << 30;
 
+/* The cap, which test builds can lower (CBM_TEST_SEARCH_SCAN_FILE_MAX=<bytes>)
+ * to exercise it on small fixtures. */
+static size_t search_scan_file_max(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    const char *v = getenv("CBM_TEST_SEARCH_SCAN_FILE_MAX");
+    if (v && v[0]) {
+        return (size_t)strtoull(v, NULL, 10);
+    }
+#endif
+    return SEARCH_SCAN_FILE_MAX;
+}
+
 /* Read a whole file into `buffer` (one spare byte past the data). False when
  * it cannot be opened or read (a directory, a vanished file), when it passes
  * SEARCH_SCAN_FILE_MAX, or when its buffer cannot be allocated -- a failed
@@ -9672,13 +9684,16 @@ static bool search_scan_read_file(const char *path, std::vector<char> &buffer, s
     }
     size_t used = 0;
     bool ok = true;
+    const size_t file_max = search_scan_file_max();
     for (;;) {
         if (buffer.size() - used < (size_t)CBM_SZ_64K + SKIP_ONE) {
-            size_t grow = buffer.empty() ? (size_t)CBM_SZ_64K * PAIR_LEN : buffer.size() * PAIR_LEN;
-            if (used > SEARCH_SCAN_FILE_MAX) {
+            if (used >= file_max) {
                 ok = false;
                 break;
             }
+            /* Never hold more than the cap plus one read's slack. */
+            size_t grow = buffer.empty() ? (size_t)CBM_SZ_64K * PAIR_LEN : buffer.size() * PAIR_LEN;
+            grow = std::min(grow, file_max + (size_t)CBM_SZ_64K + SKIP_ONE);
             try {
                 buffer.resize(grow);
             } catch (const std::bad_alloc &) {

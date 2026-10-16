@@ -602,6 +602,12 @@ TEST(cross_repo_absolute_remote_url_skips_caller_local_floor) {
         cross_repo_exec(&fixture, "mono-lo",
                         "UPDATE edges SET properties = '{\"url_path\":"
                         "\"http://LOCALHOST:3000/api/users\",\"method\":\"GET\"}' "
+                        "WHERE type = 'HTTP_CALLS';") &&
+        cross_repo_seed_http_pair(&fixture, "mono-v6", "pay-v6", "/api/users", "mono") &&
+        cross_repo_seed_local_handler(&fixture, "mono-v6", "mono") &&
+        cross_repo_exec(&fixture, "mono-v6",
+                        "UPDATE edges SET properties = '{\"url_path\":"
+                        "\"http://[::1]:8080/api/users\",\"method\":\"GET\"}' "
                         "WHERE type = 'HTTP_CALLS';");
     if (!setup) {
         cross_repo_fixture_end(&fixture);
@@ -613,6 +619,9 @@ TEST(cross_repo_absolute_remote_url_skips_caller_local_floor) {
     cbm_cross_repo_result_t loop = cbm_cross_repo_match("mono-lo", &loop_target, 1);
     int remote_edges = cross_repo_count_edges(&fixture, "mono-abs", "CROSS_HTTP_CALLS");
     int loop_edges = cross_repo_count_edges(&fixture, "mono-lo", "CROSS_HTTP_CALLS");
+    const char *v6_target = "pay-v6";
+    cbm_cross_repo_result_t v6 = cbm_cross_repo_match("mono-v6", &v6_target, 1);
+    int v6_edges = cross_repo_count_edges(&fixture, "mono-v6", "CROSS_HTTP_CALLS");
     cross_repo_fixture_end(&fixture);
 
     ASSERT_FALSE(remote.failed);
@@ -621,6 +630,9 @@ TEST(cross_repo_absolute_remote_url_skips_caller_local_floor) {
     ASSERT_EQ(remote_edges, 1);
     ASSERT_EQ(loop.http_edges, 0);
     ASSERT_EQ(loop_edges, 0);
+    ASSERT_FALSE(v6.failed);
+    ASSERT_EQ(v6.http_edges, 0); /* [::1] is loopback */
+    ASSERT_EQ(v6_edges, 0);
     PASS();
 }
 

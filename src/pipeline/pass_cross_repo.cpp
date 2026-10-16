@@ -191,7 +191,9 @@ static bool cr_url_names_remote_host(const char *url) {
     if (at && *at == '@') {
         host = at + SKIP_ONE; /* drop userinfo */
     }
-    size_t len = strcspn(host, ":/?#");
+    /* A bracketed IPv6 literal holds colons: the host runs to the bracket. */
+    const char *close = host[0] == '[' ? strchr(host, ']') : NULL;
+    size_t len = close ? (size_t)(close - host) + SKIP_ONE : strcspn(host, ":/?#");
     if (len == 0) {
         return false;
     }

@@ -3373,6 +3373,78 @@ TEST(search_code_full_preserves_utf8_source) {
     PASS();
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* search_code never reads a file past its size cap: with the cap lowered to
+ * 4 KiB, a 300 KiB file is skipped while a small one beside it still matches.
+ * (The real cap is 1 GiB; the reader once grew a buffer to twice that and let
+ * a failed allocation throw out of the tool handler.) */
+TEST(search_code_skips_files_past_the_scan_cap) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_srch_cap_XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(tmp) != NULL);
+    char small_path[900];
+    char big_path[900];
+    snprintf(small_path, sizeof(small_path), "%s/small.txt", tmp);
+    snprintf(big_path, sizeof(big_path), "%s/big.txt", tmp);
+    FILE *fp = cbm_fopen(small_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_TRUE(fputs("needle_cap_marker small\n", fp) >= 0);
+    ASSERT_EQ(fclose(fp), 0);
+    fp = cbm_fopen(big_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_TRUE(fputs("needle_cap_marker big\n", fp) >= 0);
+    std::string filler(1023, 'x');
+    filler += '\n';
+    for (int i = 0; i < 300; i++) {
+        ASSERT_TRUE(fputs(filler.c_str(), fp) >= 0);
+    }
+    ASSERT_EQ(fclose(fp), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *project = "scan-cap";
+    cbm_mcp_server_set_project(srv, project);
+    cbm_store_upsert_project(st, project, tmp);
+    cbm_node_t small_file = {.project = project,
+                             .label = "File",
+                             .name = "small.txt",
+                             .qualified_name = "scan-cap.small.txt",
+                             .file_path = "small.txt"};
+    cbm_node_t big_file = {.project = project,
+                           .label = "File",
+                           .name = "big.txt",
+                           .qualified_name = "scan-cap.big.txt",
+                           .file_path = "big.txt"};
+    ASSERT_GT(cbm_store_upsert_node(st, &small_file), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &big_file), 0);
+
+    const char *req = "{\"jsonrpc\":\"2.0\",\"id\":98,\"method\":\"tools/call\","
+                      "\"params\":{\"name\":\"search_code\",\"arguments\":{"
+                      "\"project\":\"scan-cap\",\"pattern\":\"needle_cap_marker\",\"limit\":5}}}";
+    char *uncapped = cbm_mcp_server_handle(srv, req);
+    cbm_setenv("CBM_TEST_SEARCH_SCAN_FILE_MAX", "4096", 1);
+    char *capped = cbm_mcp_server_handle(srv, req);
+    cbm_unsetenv("CBM_TEST_SEARCH_SCAN_FILE_MAX");
+    bool uncapped_small = uncapped && strstr(uncapped, "needle_cap_marker small");
+    bool uncapped_big = uncapped && strstr(uncapped, "needle_cap_marker big");
+    bool capped_small = capped && strstr(capped, "needle_cap_marker small");
+    bool capped_big = capped && strstr(capped, "needle_cap_marker big");
+    free(uncapped);
+    free(capped);
+    cbm_mcp_server_free(srv);
+    cbm_unlink(small_path);
+    cbm_unlink(big_path);
+    cbm_rmdir(tmp);
+
+    ASSERT_TRUE(uncapped_small);
+    ASSERT_TRUE(uncapped_big); /* control: the big file matches when uncapped */
+    ASSERT_TRUE(capped_small);
+    ASSERT_FALSE(capped_big);
+    PASS();
+}
+#endif
+
 /* A semantic-only search_graph must NOT also return the unfiltered graph. With
  * no structural filter, cbm_store_search matches everything, so appending
  * semantic hits to it produced a response byte-identical to "no filters at all"
@@ -7932,6 +8004,9 @@ SUITE(mcp) {
     RUN_TEST(tool_list_projects_includes_a_project_with_a_miss_graph);
     RUN_TEST(tool_trace_totals_respect_test_filter_tests_root_subtree_issue1294);
     RUN_TEST(search_code_full_preserves_utf8_source);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(search_code_skips_files_past_the_scan_cap);
+#endif
     RUN_TEST(search_graph_semantic_only_skips_structural_scan);
     RUN_TEST(index_response_reports_persisted_coverage_on_reindex);
     RUN_TEST(index_response_reports_parse_unusable_range_end_issue963);
