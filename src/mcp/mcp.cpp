@@ -98,8 +98,7 @@ static size_t trace_hash_request_max = MCP_PATH_HASH_REQUEST_MAX;
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 void cbm_mcp_test_set_trace_hash_limits(size_t per_file_bytes, size_t per_request_bytes) {
-    trace_hash_file_max =
-        per_file_bytes ? per_file_bytes : (size_t)MCP_PATH_HASH_FILE_MAX;
+    trace_hash_file_max = per_file_bytes ? per_file_bytes : (size_t)MCP_PATH_HASH_FILE_MAX;
     trace_hash_request_max =
         per_request_bytes ? per_request_bytes : (size_t)MCP_PATH_HASH_REQUEST_MAX;
 }
@@ -115,7 +114,12 @@ void cbm_mcp_test_set_trace_hash_limits(size_t per_file_bytes, size_t per_reques
 #include <poll.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <langinfo.h>
+#include <locale.h>
 #include <regex.h> /* REG_NOTBOL for cbm_regexec's pass-through exec flags */
+#ifdef __APPLE__
+#include <xlocale.h>
+#endif
 #endif
 #include <yyjson/yyjson.h>
 #include <limits.h>
@@ -9071,8 +9075,10 @@ static bool compile_path_filter(const char *filter, cbm_regex_t *re, int *rc) {
  *     binary and yields no record. A later NUL: BSD grep keeps printing lines,
  *     GNU grep stops line output, so lines stop at the last complete line
  *     before it there;
- *   - matching is bytewise: a line with invalid UTF-8 matches like any other
- *     (grep under a UTF-8 locale skipped such lines);
+ *   - the locale is the environment's (LANG / LC_*), as grep inherited it:
+ *     it decides what \w or [[:alpha:]] match, and under a UTF-8 locale a
+ *     line that is not valid UTF-8 yields no record, as both greps print no
+ *     such line;
  *   - an unreadable listed file or a directory is skipped, as grep -d skip did.
  * The scan stops after `max_records` records: collect_grep_matches stops after
  * the same number, and grep was cut off by the closed pipe at that point too. */
@@ -9088,6 +9094,7 @@ struct search_scan_patterns_t {
     std::vector<cbm_regex_t> span_regexes; /* the same with CBM_REG_NEWLINE, for spans */
     bool any_empty = false;                /* an empty pattern: every line matches */
     bool compiled = false;
+    bool utf8_lines = false; /* UTF-8 locale: a line must be valid UTF-8 to match */
     /* Regex mode, one pattern: a literal every match must contain (the longest
      * one found by search_scan_required_literal), or empty when there is none.
      * Candidate lines are then found with memmem instead of the regex engine. */
@@ -9358,6 +9365,73 @@ static size_t search_scan_next_candidate(const search_scan_patterns_t *patterns,
     return best;
 }
 
+/* RFC 3629 UTF-8: no overlong forms, no surrogates, nothing past U+10FFFF. */
+static bool search_scan_valid_utf8(const unsigned char *s, size_t length) {
+    size_t i = 0;
+    while (i < length) {
+        unsigned char c = s[i];
+        if (c < 0x80) {
+            i++;
+            continue;
+        }
+        size_t need = 0;
+        unsigned char lo = 0x80;
+        unsigned char hi = 0xBF;
+        if (c >= 0xC2 && c <= 0xDF) {
+            need = 1;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            need = 2;
+            lo = c == 0xE0 ? 0xA0 : 0x80;
+            hi = c == 0xED ? 0x9F : 0xBF;
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            need = 3;
+            lo = c == 0xF0 ? 0x90 : 0x80;
+            hi = c == 0xF4 ? 0x8F : 0xBF;
+        } else {
+            return false;
+        }
+        if (i + need >= length) {
+            return false;
+        }
+        if (s[i + 1] < lo || s[i + 1] > hi) {
+            return false;
+        }
+        for (size_t k = 2; k <= need; k++) {
+            if (s[i + k] < 0x80 || s[i + k] > 0xBF) {
+                return false;
+            }
+        }
+        i += need + 1;
+    }
+    return true;
+}
+
+/* The environment's locale for one scan thread, as the grep child inherited
+ * it (process-wide setlocale is never called, so this is per thread). */
+struct search_scan_locale_t {
+    locale_t locale = (locale_t)0;
+    locale_t previous = (locale_t)0;
+    bool utf8 = false;
+};
+
+static void search_scan_locale_enter(search_scan_locale_t *l) {
+    l->locale = newlocale(LC_ALL_MASK, "", (locale_t)0);
+    if (!l->locale) {
+        return; /* an unknown locale name: grep fell back to "C" as well */
+    }
+    l->previous = uselocale(l->locale);
+    const char *codeset = nl_langinfo(CODESET);
+    l->utf8 = codeset && (strcmp(codeset, "UTF-8") == 0 || strcmp(codeset, "utf8") == 0);
+}
+
+static void search_scan_locale_leave(search_scan_locale_t *l) {
+    if (l->locale) {
+        uselocale(l->previous);
+        freelocale(l->locale);
+        l->locale = (locale_t)0;
+    }
+}
+
 /* Append one `grep -Hn` record. */
 static void search_scan_emit(std::string &out, const char *path, size_t line_number,
                              const char *line, size_t line_length) {
@@ -9419,7 +9493,10 @@ static void search_scan_buffer(std::string &out, const search_scan_patterns_t *p
         size_t line_end = newline ? (size_t)(newline - buffer) : length;
         buffer[line_end] = '\0';
         bool matched = search_scan_line_matches(patterns, use_regex, buffer + line_start,
-                                                line_end - line_start);
+                                                line_end - line_start) &&
+                       (!patterns->utf8_lines ||
+                        search_scan_valid_utf8((const unsigned char *)buffer + line_start,
+                                               line_end - line_start));
         if (newline) {
             *newline = '\n';
         }
@@ -9490,10 +9567,14 @@ struct search_scan_shared_t {
 };
 
 static void search_scan_worker(search_scan_shared_t *sh) {
+    search_scan_locale_t locale;
+    search_scan_locale_enter(&locale);
     search_scan_patterns_t patterns;
     if (!search_scan_patterns_parse(&patterns, sh->pattern, sh->use_regex)) {
+        search_scan_locale_leave(&locale);
         return; /* checked by the caller first: cannot happen */
     }
+    patterns.utf8_lines = locale.utf8;
     std::vector<char> buffer;
     const std::vector<const char *> &paths = *sh->paths;
     for (;;) {
@@ -9529,6 +9610,7 @@ static void search_scan_worker(search_scan_shared_t *sh) {
         sh->advanced.notify_all();
     }
     search_scan_patterns_free(&patterns);
+    search_scan_locale_leave(&locale);
 }
 
 /* Join the per-file records in list order, up to max_records records. */
@@ -9570,8 +9652,12 @@ static bool search_scan_in_process(const char *filelist_path, const char *patter
         }
         pos = record_end + SKIP_ONE;
     }
+    search_scan_locale_t locale;
+    search_scan_locale_enter(&locale);
     search_scan_patterns_t patterns;
-    if (!search_scan_patterns_parse(&patterns, pattern, use_regex)) {
+    bool compiles = search_scan_patterns_parse(&patterns, pattern, use_regex);
+    search_scan_locale_leave(&locale);
+    if (!compiles) {
         return true; /* grep -E rejected the pattern: no records */
     }
     if (max_records <= 0 || paths.empty()) {

@@ -24,9 +24,13 @@
 #include <sys/stat.h>
 #ifndef _WIN32
 #include <fcntl.h>
+#include <locale.h> /* newlocale: the in-process search_code scan's UTF-8 case */
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <xlocale.h>
+#endif
 #endif
 
 TEST(mcp_tool_result_validation_rejects_partial_response) {
@@ -6934,6 +6938,11 @@ TEST(search_code_scan_in_process_binary_and_crlf) {
 #ifdef _WIN32
     SKIP_PLATFORM("Windows keeps the Select-String scan");
 #else
+    /* The scan takes its locale from the environment, as grep did: pin "C"
+     * (bytewise) for the cases below, and restore the caller's at the end. */
+    const char *lc_all = getenv("LC_ALL");
+    char *saved_lc_all = lc_all ? strdup(lc_all) : NULL;
+    ASSERT_EQ(setenv("LC_ALL", "C", 1), 0);
     scan_fixture_t fx;
     ASSERT_TRUE(scan_fixture_open(&fx));
     /* A NUL in the first 32 KiB marks the whole file binary: no records. */
@@ -6993,6 +7002,40 @@ TEST(search_code_scan_in_process_binary_and_crlf) {
     ASSERT_NOT_NULL(got);
     ASSERT_STR_EQ(got, "");
     free(got);
+
+    /* Under a UTF-8 locale (the environment's, as grep inherited it) a line
+     * that is not valid UTF-8 yields no record, and \w matches a non-ASCII
+     * letter. Skipped where the host has no UTF-8 locale. */
+    const char *utf8_names[] = {"C.UTF-8", "en_US.UTF-8", "C.utf8", "en_US.utf8"};
+    const char *utf8 = NULL;
+    for (const char *name : utf8_names) {
+        locale_t probe = newlocale(LC_ALL_MASK, name, (locale_t)0);
+        if (probe) {
+            freelocale(probe);
+            utf8 = name;
+            break;
+        }
+    }
+    if (utf8) {
+        ASSERT_EQ(setenv("LC_ALL", utf8, 1), 0);
+        got = scan_fixture_run(&fx, "alpha", false, NULL, 500);
+        ASSERT_NOT_NULL(got);
+        ASSERT_NULL(strstr(got, "latin1.txt:"));
+        free(got);
+        ASSERT_TRUE(scan_fixture_add(&fx, "word.txt", "class H\xc3\xa9llo(x)\n", 15));
+        ASSERT_TRUE(scan_fixture_list(&fx, NULL));
+        got = scan_fixture_run(&fx, "^class \\w+\\(x\\)", true, NULL, 500);
+        ASSERT_NOT_NULL(got);
+        ASSERT_NOT_NULL(strstr(got, "word.txt:1:"));
+        free(got);
+        ASSERT_EQ(setenv("LC_ALL", "C", 1), 0);
+    }
+    if (saved_lc_all) {
+        setenv("LC_ALL", saved_lc_all, 1);
+        free(saved_lc_all);
+    } else {
+        unsetenv("LC_ALL");
+    }
     th_rmtree(fx.dir);
     PASS();
 #endif
