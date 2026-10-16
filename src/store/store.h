@@ -37,8 +37,11 @@ typedef struct cbm_store cbm_store_t;
  * 4 = C-family forward declarations are not Class nodes; a multi-line
  *     definition name is cut at its first line, or folded onto one when it
  *     continues (open bracket, trailing `operator` or `::`); numeric JS/TS
- *     member names are kept (2026-09-26 upstream sync). */
-#define CBM_INDEX_FORMAT_VERSION 4
+ *     member names are kept (2026-09-26 upstream sync).
+ * 5 = C typedef/enumerator nodes and `#macro` QNs, macro-wrapped definition
+ *     names, file/directory stem collisions keep both nodes, vocabulary-keyed
+ *     semantic terms (2026-10-16 upstream sync). */
+#define CBM_INDEX_FORMAT_VERSION 5
 
 /* ── Data structures ────────────────────────────────────────────── */
 
