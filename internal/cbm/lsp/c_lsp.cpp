@@ -3894,13 +3894,22 @@ static void c_resolve_calls_in_node_inner(CLSPContext* ctx, TSNode node) {
     c_process_statement(ctx, node);
 
     // --- Member access: publish which type owns the field ---
-    if (ctx->field_refs && strcmp(kind, "field_expression") == 0) {
+    // FORK (cost bound): in C++ only a member CALL consumes the owner rows
+    // (cbm_call_onto_field_policy); member reads/writes bind by owner in C
+    // alone (cbm_c_member_binds_by_owner). So C types every member access, and
+    // C++ only the callee of a call, below -- no type evaluation for the far
+    // more numerous plain C++ member accesses.
+    if (ctx->field_refs && !ctx->cpp_mode && strcmp(kind, "field_expression") == 0) {
         c_emit_field_reference(ctx, node);
     }
 
     // --- Resolve call expressions ---
     if (strcmp(kind, "call_expression") == 0) {
         TSNode func_node = ts_node_child_by_field_name(node, "function", 8);
+        if (ctx->field_refs && ctx->cpp_mode && !ts_node_is_null(func_node) &&
+            strcmp(ts_node_type(func_node), "field_expression") == 0) {
+            c_emit_field_reference(ctx, func_node);
+        }
         if (!ts_node_is_null(func_node)) {
             const char* fk = ts_node_type(func_node);
 
