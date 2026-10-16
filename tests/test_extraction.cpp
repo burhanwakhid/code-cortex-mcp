@@ -9358,6 +9358,7 @@ TEST(extract_enclosing_sweep_matches_scan_issue1527) {
 
 /* ── Per-file CPU budget over the LSP walks (upstream 7b77fd48) ──────────── */
 
+#ifdef CBM_ENABLE_TEST_SEAMS
 static const char *BUDGET_PY_SRC = "import os\n"
                                    "from typing import List\n"
                                    "\n"
@@ -9488,7 +9489,6 @@ static int count_usages_named(const CBMFileResult *r, const char *name) {
  * reference node may fall back to the root-descending lookup, and the
  * definition-name check that consumes the parent must still hold: `declared`
  * and `r` are declared names, not usages. */
-#ifdef CBM_ENABLE_TEST_SEAMS
 TEST(extract_deep_expression_usages_use_the_walk_parent) {
     enum { TERMS = 2000 };
     char *src = deep_csharp_chain(TERMS);
@@ -9505,7 +9505,6 @@ TEST(extract_deep_expression_usages_use_the_walk_parent) {
     cbm_free_result(r);
     PASS();
 }
-#endif
 
 /* An lsp_skipped file takes no cross-file resolution from the shared
  * dispatcher, while the identical file without the flag does — and the skipped
@@ -9549,6 +9548,7 @@ TEST(lsp_skipped_file_gets_no_cross_file_resolution_but_keeps_defs) {
     cbm_free_result(resolved);
     PASS();
 }
+#endif
 
 #include "result_compact.h"
 /* ── Per-file result compaction ─────────────────────────────────────
@@ -11963,13 +11963,11 @@ SUITE(extraction) {
     RUN_TEST(non_config_language_module_has_no_promoted_description_issue519);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(extract_enclosing_sweep_matches_scan_issue1527);
-#endif
     RUN_TEST(extract_lsp_skipped_when_parse_used_its_budget_share);
     RUN_TEST(extract_walk_truncated_at_its_cpu_budget);
-#ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(extract_deep_expression_usages_use_the_walk_parent);
-#endif
     RUN_TEST(lsp_skipped_file_gets_no_cross_file_resolution_but_keeps_defs);
+#endif
 
     cbm_shutdown();
     /* per-file result compaction into an exact-size arena */

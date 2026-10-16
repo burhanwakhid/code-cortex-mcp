@@ -3984,11 +3984,13 @@ TEST(cypher_parse_error_frees_partial_pattern) {
     PASS();
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
 static uint64_t cypher_frozen_deadline_clock(void) {
     return 1000;
 }
 
 static thread_local unsigned cypher_deadline_clock_reads = 0;
+#endif
 
 /* ══════════════════════════════════════════════════════════════════
  *  LONG OPERATOR CHAINS AND MANY UNION BRANCHES
@@ -4317,6 +4319,7 @@ static char *union_query(int branches, const char *join) {
     return q;
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
 enum { CYPHER_UNION_MANY_BRANCHES = 20000 };
 
 /* UNION ALL keeps every branch's row in branch order. */
@@ -4357,6 +4360,7 @@ TEST(cypher_many_union_branches) {
     }
     PASS();
 }
+#endif
 
 /* 50 branches: UNION ALL yields one row per branch in branch order, UNION
  * keeps the first row of each name, and a UNION with nothing after it is still
@@ -4437,6 +4441,7 @@ TEST(cypher_chain_with_unbound_alias_keeps_seed) {
 
 
 
+#ifdef CBM_ENABLE_TEST_SEAMS
 static uint64_t cypher_expiring_deadline_clock(void) {
     /* Default budget is 30 seconds; expire exactly at the first checkpoint. */
     return cypher_deadline_clock_reads++ == 0 ? 1000 : 31000;
@@ -4459,6 +4464,7 @@ TEST(cypher_exec_deadline_expires_at_positive_budget_boundary) {
     cbm_store_close(s);
     PASS();
 }
+#endif
 
 /* ── ORDER BY, DISTINCT and grouping against a reference ───────────
  * These were bubble sorts and linear duplicate/group scans — seconds to
@@ -4734,6 +4740,7 @@ TEST(cypher_exec_max_rows_above_ceiling_is_clamped) {
 }
 
 
+#ifdef CBM_ENABLE_TEST_SEAMS
 /* ── Streamed execution: chunks of start nodes give the single pass ──
  *
  * execute_single runs the start nodes through the pipeline in chunks rather
@@ -4990,6 +4997,7 @@ TEST(cypher_stream_default_chunk_boundary) {
     cbm_store_close(s);
     PASS();
 }
+#endif
 
     /* Streamed execution: chunked start set == single pass */
 
@@ -5204,17 +5212,23 @@ SUITE(cypher) {
     RUN_TEST(cypher_long_or_chain_evaluates);
     RUN_TEST(cypher_long_and_chain_evaluates);
     RUN_TEST(cypher_mixed_chain_matches_nested_form);
+#ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(cypher_many_union_branches);
+#endif
     RUN_TEST(cypher_fifty_union_branches);
     RUN_TEST(cypher_chain_with_unbound_alias_keeps_seed);
+#ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(cypher_exec_deadline_expires_at_positive_budget_boundary);
+#endif
     RUN_TEST(cypher_order_by_is_the_stable_reference_order);
     RUN_TEST(cypher_distinct_keeps_first_occurrences);
     RUN_TEST(cypher_grouping_keeps_first_seen_groups);
     RUN_TEST(cypher_exec_max_rows_above_ceiling_is_clamped);
+#ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(cypher_stream_chunks_match_single_pass);
     RUN_TEST(cypher_stream_optional_across_chunks);
     RUN_TEST(cypher_stream_limit_and_max_rows_across_chunks);
     RUN_TEST(cypher_stream_default_chunk_boundary);
     RUN_TEST(cypher_stream_scan_failure_fails_query);
+#endif
 }

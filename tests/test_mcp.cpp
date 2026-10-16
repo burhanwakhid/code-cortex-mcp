@@ -7007,6 +7007,7 @@ TEST(tool_trace_path_definition_beats_c_macro_c1) {
 }
 
 
+#ifdef CBM_ENABLE_TEST_SEAMS
 /* ── In-process search_code scan (upstream c9cacdf0, fork seam) ──────
  * The scoped scan used to shell out to `xargs grep -Hn` and now runs in
  * process on POSIX. These cases pin its records to the `grep -Hn` shape,
@@ -7410,6 +7411,7 @@ TEST(search_code_scan_in_process_threads_keep_list_order) {
     PASS();
 #endif
 }
+#endif
 
 
 /* ── search_code `context` bounds (upstream 02bc9f25) ────────────────
@@ -8157,10 +8159,12 @@ SUITE(mcp) {
     RUN_TEST(bm25_label_and_path_filter_survive_the_inner_limit);
     RUN_TEST(bm25_searches_legacy_four_column_fts_without_error_issue518);
     RUN_TEST(tool_trace_call_path_qn_fallback_frees_name_miss);
+#ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(search_code_scan_in_process_writes_grep_records);
     RUN_TEST(search_code_scan_in_process_binary_and_crlf);
     RUN_TEST(search_code_scan_in_process_limits_globs_and_literals);
     RUN_TEST(search_code_scan_in_process_threads_keep_list_order);
+#endif
     RUN_TEST(search_code_context_window_is_bounded);
     RUN_TEST(search_code_context_extreme_values_answer_normally);
     RUN_TEST(search_code_rejects_quote_in_file_pattern);
