@@ -1604,14 +1604,12 @@ static char *pylsp_work_fixture(int n_classes, int *out_len) {
 }
 
 TEST(pylsp_issue1527_large_module_resolves_every_call) {
-    /* #1527 reproduction: a module of 4000 classes plus one function calling
+    /* #1527 reproduction: a module of 8000 classes plus one function calling
      * `ClsN().chain().chain().method()` for each. The per-file step cap
      * stopped resolution after ~3333 statements while the file still reported
      * `indexed`. Every class's method and chain must resolve (rows are per
-     * callee). Upstream uses 8000 classes; this fork's definition walk keeps
-     * at most CBM_WALK_DEFS_STACK_CAP (4096) top-level definitions per module,
-     * a separate extraction limit, so the fixture stays below it. */
-    enum { N_CLASSES = 4000 };
+     * callee). */
+    enum { N_CLASSES = 8000 };
     int len = 0;
     char *src = pylsp_work_fixture(N_CLASSES, &len);
     ASSERT_NOT_NULL(src);
@@ -1622,7 +1620,7 @@ TEST(pylsp_issue1527_large_module_resolves_every_call) {
     ASSERT_EQ(count_resolved_suffix(r, ".method"), N_CLASSES);
     ASSERT_EQ(count_resolved_suffix(r, ".chain"), N_CLASSES);
     /* The last class is resolved exactly, not just some class. */
-    ASSERT_GTE(require_resolved(r, "use", "Cls3999.method"), 0);
+    ASSERT_GTE(require_resolved(r, "use", "Cls7999.method"), 0);
     cbm_free_result(r);
     PASS();
 }
