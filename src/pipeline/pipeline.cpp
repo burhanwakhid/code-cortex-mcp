@@ -82,6 +82,12 @@ void cbm_pipeline_unlock(void) {
 struct cbm_pipeline {
     char *repo_path;
     char *db_path;
+    /* Snapshot of the artifact export failure of THIS run (upstream #1665):
+     * set only when the post-publish export fails, cleared at run start. The
+     * MCP layer reads it to attribute a failed run to artifact export without
+     * consulting cbm_artifact_export_last_error(), a global that can still
+     * hold a PREVIOUS run's error. */
+    char export_error[CBM_SZ_1K];
     bool default_db_path;
     cbm_db_lease_t *index_lease;
     char *project_name;
@@ -1619,6 +1625,9 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         if (arc != 0) {
             const char *err = cbm_artifact_export_last_error();
             cbm_log_error("pipeline.err", "phase", "artifact_export", "err", err ? err : "unknown");
+            /* #1665: snapshot the error of THIS run so the MCP layer names the
+             * artifact phase instead of blaming repo_path. */
+            (void)snprintf(p->export_error, sizeof(p->export_error), "%s", err ? err : "unknown");
             /* A failed persistence export intentionally fails the run; this used to be ignored. */
             return arc;
         }
@@ -1789,10 +1798,15 @@ static void pipeline_refresh_session_brief(cbm_pipeline_t *p, bool full) {
                  itoa_buf((int)elapsed_ms(t)));
 }
 
+const char *cbm_pipeline_export_error(const cbm_pipeline_t *p) {
+    return p ? p->export_error : "";
+}
+
 int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
+    p->export_error[0] = '\0';
     int claim_rc = cbm_pipeline_claim_index(p);
     if (claim_rc != 0) {
         return claim_rc;

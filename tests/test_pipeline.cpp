@@ -10,6 +10,7 @@
 #include "test_helpers.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/artifact.h" /* CBM_ARTIFACT_DIR */
 #include "store/store.h"
 #include "semantic/semantic.h"
 #include "foundation/subprocess.h"
@@ -3506,6 +3507,57 @@ TEST(git_context_unborn_repo_resolves_paths_without_head) {
     PASS();
 }
 
+
+/* Upstream fa229211 (#1665): a persistence artifact export failure must not
+ * be reported as a repo_path problem. Create the artifact directory as a
+ * regular FILE so the export's mkdir fails deterministically (works as root
+ * too), run with persistence enabled, and assert: the run fails, the DB was
+ * published (publish happens before export), the pipeline snapshots the export
+ * error, the MCP response names the artifact phase, and a clean re-run leaves
+ * the snapshot empty. */
+TEST(pipeline_export_error_snapshot_on_artifact_failure) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_export1665_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/main.py", tmp);
+    ASSERT_EQ(th_write_file(path, "def foo():\n    pass\n"), 0);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    char art_block[512];
+    snprintf(art_block, sizeof(art_block), "%s/" CBM_ARTIFACT_DIR, tmp);
+    ASSERT_EQ(th_write_file(art_block, "block\n"), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    int rc = cbm_pipeline_run(p);
+    ASSERT_NEQ(rc, 0);
+    /* The export runs after publish, so the DB must exist despite the failure. */
+    struct stat db_st;
+    ASSERT_EQ(stat(db_path, &db_st), 0);
+    const char *export_error = cbm_pipeline_export_error(p);
+    ASSERT_NOT_NULL(export_error);
+    ASSERT_TRUE(export_error[0] != '\0');
+    ASSERT_NOT_NULL(strstr(export_error, "prepare_artifact_dir"));
+    cbm_pipeline_free(p);
+
+    /* Control: remove the blocker; a fresh run succeeds and leaves no snapshot. */
+    (void)cbm_unlink(art_block);
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    cbm_pipeline_set_persistence(p2, true);
+    rc = cbm_pipeline_run(p2);
+    ASSERT_EQ(rc, 0);
+    const char *export_error2 = cbm_pipeline_export_error(p2);
+    ASSERT_NOT_NULL(export_error2);
+    ASSERT_TRUE(export_error2[0] == '\0');
+    cbm_pipeline_free(p2);
+    rm_rf(tmp);
+    PASS();
+}
 
 /* ── Inherited repository-local git environment (upstream #2003) ─────────
  * A server started from a git hook (or an editor that exports GIT_DIR)
@@ -10405,6 +10457,7 @@ SUITE(pipeline) {
     RUN_TEST(githistory_ignores_inherited_repo_env);
     RUN_TEST(popen_git_strips_repo_env_and_reports_exit_status);
     RUN_TEST(find_git_ignores_relative_path_entries);
+    RUN_TEST(pipeline_export_error_snapshot_on_artifact_failure);
     RUN_TEST(project_name_uniqueness);
     /* Git diff helpers */
     RUN_TEST(gitdiff_parse_range_with_count);

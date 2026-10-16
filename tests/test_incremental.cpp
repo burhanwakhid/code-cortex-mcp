@@ -106,7 +106,18 @@ static int reformat_files(const char *subdir, int max_files) {
 static char *index_repo(void) {
     char args[512];
     snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", g_repodir);
-    return cbm_mcp_handle_tool(g_srv, "index_repository", args);
+    char *resp = cbm_mcp_handle_tool(g_srv, "index_repository", args);
+    /* Fail-closed at the source (upstream 77eb7eb3): every caller asserts
+     * resp != NULL, but an error response used to slip through and cascade
+     * into mysterious count/query failures downstream. Surface the real
+     * cause once, here, and let the non-NULL asserts fail loudly. */
+    if (resp && strstr(resp, "\"isError\":true")) {
+        fprintf(stderr, "  index_repo: index_repository returned an error response:\n  %.400s\n",
+                resp);
+        free(resp);
+        return NULL;
+    }
+    return resp;
 }
 
 /* Timed index: returns response, sets *elapsed_ms and *peak_rss_mb */

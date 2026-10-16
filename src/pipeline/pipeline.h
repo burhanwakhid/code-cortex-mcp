@@ -95,6 +95,11 @@ void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count)
  * not match CBM_INDEX_FORMAT_VERSION (#769). Surfaced by index_repository. */
 bool cbm_pipeline_had_format_migration(const cbm_pipeline_t *p);
 
+/* The artifact export error of the most recent cbm_pipeline_run on p, or ""
+ * when that run did not fail in the post-publish artifact export (upstream
+ * #1665). Owned by p. */
+const char *cbm_pipeline_export_error(const cbm_pipeline_t *p);
+
 void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges);
 
 /* ── Per-file indexing failures (Stage 2 / Track B) ─────────────── */
