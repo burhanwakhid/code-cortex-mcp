@@ -2,6 +2,7 @@
 
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
+#include "foundation/platform.h" /* cbm_is_dir — wide path on Windows */
 #include "foundation/str_util.h"
 
 #include <ctype.h>
@@ -325,8 +326,10 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
         return CBM_NOT_FOUND;
     }
 
-    struct stat st;
-    out->root_exists = (stat(path, &st) == 0);
+    /* cbm_is_dir, not stat(): the Windows narrow stat() reads a UTF-8 path
+     * through the ANSI code page, so an existing Unicode repository root looked
+     * absent and git discovery stopped before git ran (upstream #1240). */
+    out->root_exists = cbm_is_dir(path);
     if (!out->root_exists) {
         return 0;
     }

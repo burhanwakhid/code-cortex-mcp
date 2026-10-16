@@ -6,6 +6,7 @@
 #include "pipeline/artifact.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/platform.h" /* cbm_file_exists */
 
 #include <sys/stat.h>
 #include <stdio.h>
@@ -316,6 +317,81 @@ TEST(store_deep_integrity_detects_page_corruption) {
     PASS();
 }
 
+/* Read a small file through the UTF-8 path layer (wide on Windows), so a
+ * non-ASCII path is never misread by the test's own ANSI CRT call. Returns the
+ * byte count, or 0 when the file cannot be opened or is empty. */
+static size_t read_small_file_utf8(const char *path, char *buf, size_t cap) {
+    buf[0] = '\0';
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        return 0;
+    }
+    size_t rd = fread(buf, 1, cap - 1, fp);
+    (void)fclose(fp);
+    buf[rd] = '\0';
+    return rd;
+}
+
+/* Upstream 76589541 + 402dd7c5 (#1171): a repository (and a cache directory)
+ * under a non-ASCII path must export, report the artifact present, and import
+ * — also onto an existing cache db. On Windows the atomic writer used the ANSI
+ * CRT fopen + MoveFileExA, the existence check the ANSI stat, and
+ * ensure_gitattributes the ANSI open(), so CJK characters outside the active
+ * code page made every step fail (the .gitattributes merge=ours protection
+ * went silently missing). The bytes are escaped UTF-8 for a CJK repo directory
+ * name and a CJK cache directory name (kept ASCII in source). */
+#define ART_CJK_REPO "\xe6\x8c\x81\xe4\xb9\x85\xe5\x8c\x96\xe5\xa4\x8d\xe7\x8e\xb0"
+#define ART_CJK_CACHE "\xe5\xaf\xbc\xe5\x85\xa5"
+TEST(artifact_roundtrip_non_ascii_paths) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    char repo[1024];
+    snprintf(repo, sizeof(repo), "%s/cbm-" ART_CJK_REPO, g_tmpdir);
+    ASSERT_TRUE(cbm_mkdir_p(repo, 0755));
+
+    ASSERT_EQ(cbm_artifact_export(g_db, repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+    char zst[1024];
+    snprintf(zst, sizeof(zst), "%s/" CBM_ARTIFACT_DIR "/" CBM_ARTIFACT_FILENAME, repo);
+    ASSERT_TRUE(cbm_file_exists(zst));
+    ASSERT_TRUE(cbm_artifact_exists(repo));
+
+    char ga[1024];
+    snprintf(ga, sizeof(ga), "%s/" CBM_ARTIFACT_DIR "/.gitattributes", repo);
+    char ga_content[512];
+    ASSERT_TRUE(read_small_file_utf8(ga, ga_content, sizeof(ga_content)) > 0);
+    ASSERT_NOT_NULL(strstr(ga_content, CBM_ARTIFACT_FILENAME " binary merge=ours"));
+
+    /* Create-only-if-absent: a re-export never rewrites an existing
+     * .gitattributes the user may have edited. */
+    static const char user_ga[] = "# user-owned\n";
+    FILE *uga = cbm_fopen(ga, "wb");
+    ASSERT_NOT_NULL(uga);
+    ASSERT_TRUE(fputs(user_ga, uga) >= 0);
+    ASSERT_EQ(fclose(uga), 0);
+    ASSERT_EQ(cbm_artifact_export(g_db, repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+    ASSERT_EQ(read_small_file_utf8(ga, ga_content, sizeof(ga_content)), strlen(user_ga));
+    ASSERT_STR_EQ(ga_content, user_ga);
+
+    char cache_dir[1024];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/" ART_CJK_CACHE, g_tmpdir);
+    ASSERT_TRUE(cbm_mkdir_p(cache_dir, 0755));
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported.db", cache_dir);
+    ASSERT_EQ(cbm_artifact_import(repo, import_db), 0);
+    /* Re-import replaces the existing cache db (the second-session path). */
+    ASSERT_EQ(cbm_artifact_import(repo, import_db), 0);
+
+    cbm_store_t *s = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, "test-proj"), 2);
+    ASSERT_EQ(cbm_store_count_edges(s, "test-proj"), 1);
+    cbm_store_close(s);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
 SUITE(artifact) {
     RUN_TEST(artifact_fast_export_snapshots_live_wal_store);
     RUN_TEST(store_deep_integrity_detects_page_corruption);
@@ -327,4 +403,5 @@ SUITE(artifact) {
     RUN_TEST(artifact_import_missing);
     RUN_TEST(artifact_gitattributes_created);
     RUN_TEST(artifact_null_safety);
+    RUN_TEST(artifact_roundtrip_non_ascii_paths);
 }

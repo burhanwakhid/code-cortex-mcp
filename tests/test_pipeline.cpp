@@ -3472,6 +3472,24 @@ TEST(git_context_linked_worktree) {
  * this pins that the batch does NOT inherit the HEAD lookup's failure: the
  * repo must still resolve as git, with the worktree root and dirs filled in
  * and an empty head_sha. */
+/* Upstream 2ea73059 (#1240): the Windows narrow stat() API interprets UTF-8
+ * paths through the active ANSI code page, which made an existing Unicode
+ * repository root appear absent and stopped git discovery before git was
+ * invoked. Runs on every platform. */
+TEST(git_context_root_exists_non_ascii_directory) {
+    /* UTF-8 for "Japanese language", written as bytes to keep the source ASCII. */
+    char *tmp = th_mktempdir("cbm_gitctx_\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E");
+    ASSERT_NOT_NULL(tmp);
+    cbm_git_context_t ctx = {0};
+    int rc = cbm_git_context_resolve(tmp, &ctx);
+    bool root_exists = ctx.root_exists;
+    cbm_git_context_free(&ctx);
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(root_exists);
+    PASS();
+}
+
 TEST(git_context_unborn_repo_resolves_paths_without_head) {
     if (!git_available()) {
         FAIL("git unavailable");
@@ -10453,6 +10471,7 @@ SUITE(pipeline) {
     RUN_TEST(git_context_non_git_path);
     RUN_TEST(git_context_linked_worktree);
     RUN_TEST(git_context_unborn_repo_resolves_paths_without_head);
+    RUN_TEST(git_context_root_exists_non_ascii_directory);
     RUN_TEST(git_context_ignores_inherited_repo_env);
     RUN_TEST(githistory_ignores_inherited_repo_env);
     RUN_TEST(popen_git_strips_repo_env_and_reports_exit_status);
