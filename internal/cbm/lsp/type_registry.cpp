@@ -634,6 +634,174 @@ const CBMRegisteredFunc* cbm_registry_lookup_symbol(const CBMTypeRegistry* reg,
     return cbm_registry_lookup_func(reg, buf);
 }
 
+/* ── QN order snapshots (upstream 23e29105 / 24eb2645) ─────────────────── */
+
+/* A stable total order, independent of qsort's treatment of equal keys. */
+static int registry_qn_entry_cmp(const void* left, const void* right) {
+    const auto* a = static_cast<const CBMRegistryQNEntry*>(left);
+    const auto* b = static_cast<const CBMRegistryQNEntry*>(right);
+    int cmp = strcmp(a->qualified_name, b->qualified_name);
+    return cmp ? cmp : (a->func_index > b->func_index) - (a->func_index < b->func_index);
+}
+
+static int registry_type_qn_entry_cmp(const void* left, const void* right) {
+    const auto* a = static_cast<const CBMRegistryTypeQNEntry*>(left);
+    const auto* b = static_cast<const CBMRegistryTypeQNEntry*>(right);
+    int cmp = strcmp(a->qualified_name, b->qualified_name);
+    return cmp ? cmp : (a->type_index > b->type_index) - (a->type_index < b->type_index);
+}
+
+void cbm_registry_build_func_qn_order(CBMTypeRegistry* reg, CBMArena* arena) {
+    if (!reg || !arena || reg->read_only) return;
+    /* A failed rebuild must not leave an old snapshot authoritative. */
+    reg->func_qn_sorted = NULL;
+    reg->func_qn_sorted_count = 0;
+    reg->func_qn_sorted_upto = 0;
+    if (reg->func_count <= 0 ||
+        (size_t)reg->func_count > (SIZE_MAX - 7) / sizeof(CBMRegistryQNEntry))
+        return;
+    auto* sorted = static_cast<CBMRegistryQNEntry*>(
+        cbm_arena_alloc(arena, (size_t)reg->func_count * sizeof(CBMRegistryQNEntry)));
+    if (!sorted) return;
+    int count = 0;
+    for (int i = 0; i < reg->func_count; i++) {
+        if (reg->funcs[i].qualified_name) {
+            sorted[count].qualified_name = reg->funcs[i].qualified_name;
+            sorted[count].func_index = i;
+            count++;
+        }
+    }
+    qsort(sorted, (size_t)count, sizeof(*sorted), registry_qn_entry_cmp);
+    reg->func_qn_sorted = sorted;
+    reg->func_qn_sorted_count = count;
+    reg->func_qn_sorted_upto = reg->func_count;
+}
+
+void cbm_registry_build_type_qn_order(CBMTypeRegistry* reg, CBMArena* arena) {
+    if (!reg || !arena || reg->read_only) return;
+    reg->type_qn_sorted = NULL;
+    reg->type_qn_sorted_count = 0;
+    reg->type_qn_sorted_upto = 0;
+    if (!reg->types || reg->type_count <= 0 ||
+        (size_t)reg->type_count > (SIZE_MAX - 7) / sizeof(CBMRegistryTypeQNEntry))
+        return;
+    auto* sorted = static_cast<CBMRegistryTypeQNEntry*>(
+        cbm_arena_alloc(arena, (size_t)reg->type_count * sizeof(CBMRegistryTypeQNEntry)));
+    if (!sorted) return;
+    int count = 0;
+    for (int i = 0; i < reg->type_count; i++) {
+        if (reg->types[i].qualified_name) {
+            sorted[count].qualified_name = reg->types[i].qualified_name;
+            sorted[count].type_index = i;
+            count++;
+        }
+    }
+    qsort(sorted, (size_t)count, sizeof(*sorted), registry_type_qn_entry_cmp);
+    reg->type_qn_sorted = sorted;
+    reg->type_qn_sorted_count = count;
+    reg->type_qn_sorted_upto = reg->type_count;
+}
+
+static bool registry_link_has_func_qn_prefix(const CBMTypeRegistry* reg, const char* prefix,
+                                             size_t length, uint64_t* visits) {
+    int scan_from = 0;
+    if (reg->func_qn_sorted && reg->func_qn_sorted_upto <= reg->func_count) {
+        int lo = 0, hi = reg->func_qn_sorted_count;
+        while (lo < hi) {
+            int mid = lo + (hi - lo) / 2;
+            if (visits) (*visits)++;
+            if (strcmp(reg->func_qn_sorted[mid].qualified_name, prefix) < 0)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo < reg->func_qn_sorted_count) {
+            if (visits) (*visits)++;
+            if (strncmp(reg->func_qn_sorted[lo].qualified_name, prefix, length) == 0) return true;
+        }
+        scan_from = reg->func_qn_sorted_upto;
+    }
+    for (int i = scan_from; i < reg->func_count; i++) {
+        if (visits) (*visits)++;
+        const char* qn = reg->funcs[i].qualified_name;
+        if (qn && strncmp(qn, prefix, length) == 0) return true;
+    }
+    return false;
+}
+
+bool cbm_registry_has_func_qn_prefix(const CBMTypeRegistry* reg, const char* prefix,
+                                     uint64_t* visits) {
+    if (!prefix) return false;
+    size_t length = strlen(prefix);
+    for (const CBMTypeRegistry* link = reg; link; link = link->fallback) {
+        if (registry_link_has_func_qn_prefix(link, prefix, length, visits)) return true;
+    }
+    return false;
+}
+
+static int registry_index_cmp(const void* left, const void* right) {
+    int a = *static_cast<const int*>(left), b = *static_cast<const int*>(right);
+    return (a > b) - (a < b);
+}
+
+void cbm_registry_types_with_qn_prefix(const CBMTypeRegistry* reg, const char* prefix,
+                                       CBMArena* scratch, CBMQNPrefixIter* out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->reg = reg;
+    out->prefix = prefix;
+    if (!reg || !prefix || !reg->types) return;
+    out->prefix_len = strlen(prefix);
+    int total = reg->type_count > 0 ? reg->type_count : 0;
+    out->tail_end = total;
+    int covered = reg->type_qn_sorted_upto;
+    int sorted_count = reg->type_qn_sorted_count;
+    if (!reg->type_qn_sorted || covered < 0 || covered > total || sorted_count < 0 ||
+        sorted_count > covered)
+        return; /* initialized full-registry fallback */
+    int lo = 0, hi = sorted_count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        out->visits++;
+        if (strcmp(reg->type_qn_sorted[mid].qualified_name, prefix) < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    int end = lo;
+    while (end < sorted_count) {
+        out->visits++;
+        if (strncmp(reg->type_qn_sorted[end].qualified_name, prefix, out->prefix_len) != 0) break;
+        end++;
+    }
+    int count = end - lo;
+    if (count == 0) {
+        out->tail_i = covered;
+        return;
+    }
+    if (!scratch || (size_t)count > (SIZE_MAX - 7) / sizeof(int)) return;
+    auto* indices = static_cast<int*>(cbm_arena_alloc(scratch, (size_t)count * sizeof(int)));
+    if (!indices) return;
+    for (int i = 0; i < count; i++) indices[i] = reg->type_qn_sorted[lo + i].type_index;
+    qsort(indices, (size_t)count, sizeof(*indices), registry_index_cmp);
+    /* Publish only a complete block; every earlier return scans from zero. */
+    out->indices = indices;
+    out->count = count;
+    out->tail_i = covered;
+}
+
+int cbm_qn_prefix_iter_next(CBMQNPrefixIter* it) {
+    if (!it || !it->reg || !it->prefix) return -1;
+    if (it->pos < it->count) return it->indices[it->pos++];
+    while (it->tail_i < it->tail_end) {
+        int index = it->tail_i++;
+        const char* qn = it->reg->types[index].qualified_name;
+        it->visits++;
+        if (qn && strncmp(qn, it->prefix, it->prefix_len) == 0) return index;
+    }
+    return -1;
+}
+
 // Count parameters in a FUNC signature.
 static int count_func_params(const CBMRegisteredFunc* f) {
     if (!f || !f->signature || f->signature->kind != CBM_TYPE_FUNC) return -1;

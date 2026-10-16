@@ -72,6 +72,18 @@ typedef struct {
     int slot;          // bucket slot this entry sits in (for resize)
 } CBMRegistryHashEntry;
 
+/* A borrowed immutable QN and stable array index, never a movable pointer. */
+typedef struct {
+    const char *qualified_name;
+    int func_index;
+} CBMRegistryQNEntry;
+
+/* Type identities use their own representation; func_index remains unchanged. */
+typedef struct {
+    const char *qualified_name;
+    int type_index;
+} CBMRegistryTypeQNEntry;
+
 // Cross-file type/function registry.
 typedef struct CBMTypeRegistry {
     CBMRegisteredFunc *funcs;
@@ -148,6 +160,17 @@ typedef struct CBMTypeRegistry {
     // hashed chains answer with the LAST registration (the Tier-2 behavior,
     // left unchanged).
     bool index_first_registered;
+
+    /* Additional prefix index (upstream 23e29105 / 24eb2645); exact lookup
+     * order is unchanged. Covers non-NULL QNs in funcs[0..func_qn_sorted_upto)
+     * (types[0..type_qn_sorted_upto)), ordered by (QN, index). Appended
+     * entries remain visible through a tail scan. */
+    CBMRegistryQNEntry *func_qn_sorted;
+    int func_qn_sorted_count;
+    int func_qn_sorted_upto;
+    CBMRegistryTypeQNEntry *type_qn_sorted;
+    int type_qn_sorted_count;
+    int type_qn_sorted_upto;
 } CBMTypeRegistry;
 
 // Initialize a registry.
@@ -194,6 +217,42 @@ const CBMRegisteredFunc *cbm_registry_lookup_func(const CBMTypeRegistry *reg,
 
 // Look up a symbol (type or function) in a package by short name.
 // package_qn is the package prefix (e.g., "proj.pkg").
+/* Build in an arena that outlives every use (owner arena for shared registries,
+ * walk scratch for per-file registries). QN strings and registered identities
+ * must remain immutable while a snapshot is used. Appends do not invalidate
+ * it. Sealed registries are unchanged. A failed rebuild discards the old order
+ * and queries scan the complete registry instead. */
+void cbm_registry_build_func_qn_order(CBMTypeRegistry *reg, CBMArena *arena);
+void cbm_registry_build_type_qn_order(CBMTypeRegistry *reg, CBMArena *arena);
+
+/* Boolean starts-with over all function/method QNs in the fallback chain.
+ * Does not allocate or mutate. NULL prefix is false. Optional visits
+ * accumulates compared entries, including tail scans; fully indexed links use
+ * a lower bound plus at most one candidate. */
+bool cbm_registry_has_func_qn_prefix(const CBMTypeRegistry *reg, const char *prefix,
+                                     uint64_t *visits);
+
+/* Single-registry literal-prefix query over TYPE QNs. Results keep the
+ * original array order (duplicate QNs included), followed by the captured
+ * unindexed tail. With a missing scratch arena, an invalid snapshot or
+ * optimization OOM the iterator falls back to the full linear scan. visits
+ * counts inspected QNs (search, count, fill and tail passes). */
+typedef struct {
+    const CBMTypeRegistry *reg;
+    const char *prefix;
+    size_t prefix_len;
+    int *indices;
+    int count;
+    int pos;
+    int tail_i;
+    int tail_end;
+    uint64_t visits;
+} CBMQNPrefixIter;
+
+void cbm_registry_types_with_qn_prefix(const CBMTypeRegistry *reg, const char *prefix,
+                                       CBMArena *scratch, CBMQNPrefixIter *out);
+int cbm_qn_prefix_iter_next(CBMQNPrefixIter *it);
+
 const CBMRegisteredFunc *cbm_registry_lookup_symbol(const CBMTypeRegistry *reg,
                                                     const char *package_qn, const char *name);
 

@@ -946,24 +946,14 @@ static const CBMType* py_eval_expr_type_uncached(PyLSPContext* ctx, TSNode node)
             const char* qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mod, attr_name);
             const CBMRegisteredType* rt = cbm_registry_lookup_type(ctx->registry, qn);
             if (rt) return cbm_type_named(ctx->arena, qn);
-            // Submodule: if any registered function/type has qn starting
-            // with "<mod>.<attr>." then mod.attr is itself a module.
-            // Linear scan over registry funcs is O(R) per access; we
-            // skip it for the common case where mod.attr is already
-            // matched as a function/type above. With ~900 stdlib funcs
-            // and many module-attr accesses per file, this can dominate
-            // — keeping the loop tight and bailing early on first match.
+            // Submodule: if any registered function has a qn starting with
+            // "<mod>.<attr>." then mod.attr is itself a module. Answered by a
+            // binary search over the registry's sorted function QNs (upstream
+            // 23e29105) instead of a scan of every registered function per
+            // probe -- O(project funcs) per probe on the shared registry.
             const char* prefix = cbm_arena_sprintf(ctx->arena, "%s.", qn);
-            size_t prefix_len = strlen(prefix);
-            bool is_submodule = false;
-            for (int i = 0; i < ctx->registry->func_count; i++) {
-                const char* fqn = ctx->registry->funcs[i].qualified_name;
-                if (fqn && strncmp(fqn, prefix, prefix_len) == 0) {
-                    is_submodule = true;
-                    break;
-                }
-            }
-            if (is_submodule) return cbm_type_module(ctx->arena, qn);
+            if (prefix && cbm_registry_has_func_qn_prefix(ctx->registry, prefix, NULL))
+                return cbm_type_module(ctx->arena, qn);
             return cbm_type_unknown();
         }
         if (obj_type->kind == CBM_TYPE_NAMED) {
@@ -3546,10 +3536,18 @@ static void py_process_class(PyLSPContext* ctx, TSNode class_node) {
 static void py_bind_module_classes(PyLSPContext* ctx) {
     if (!ctx || !ctx->registry || !ctx->module_qn) return;
     const CBMRegisteredType* types = ctx->registry->types;
-    int n = ctx->registry->type_count;
     size_t prefix_len = strlen(ctx->module_qn);
     bool package_scope = ctx->file_module_qn && strcmp(ctx->file_module_qn, ctx->module_qn) != 0;
-    for (int i = 0; i < n; i++) {
+    /* Only the "<module>." QN range can match (upstream 24eb2645): a sorted
+     * type-QN snapshot turns the scan over every registered type -- the whole
+     * project on the shared registry, per file -- into a range query. The
+     * iterator keeps registration order and falls back to the full scan. */
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    const char* prefix = cbm_arena_sprintf(&scratch, "%s.", ctx->module_qn);
+    CBMQNPrefixIter it;
+    cbm_registry_types_with_qn_prefix(ctx->registry, prefix, &scratch, &it);
+    for (int i; prefix && (i = cbm_qn_prefix_iter_next(&it)) >= 0;) {
         const char* qn = types[i].qualified_name;
         const char* sname = types[i].short_name;
         if (!qn || !sname) continue;
@@ -3559,6 +3557,7 @@ static void py_bind_module_classes(PyLSPContext* ctx) {
         if (package_scope && strchr(qn + prefix_len + 1, '.')) continue;
         py_scope_bind(ctx, sname, cbm_type_named(ctx->arena, qn));
     }
+    cbm_arena_destroy(&scratch);
 }
 
 void py_lsp_process_file(PyLSPContext* ctx, TSNode root) {
@@ -3829,6 +3828,8 @@ void cbm_run_py_lsp(CBMArena* arena, CBMFileResult* result,
      * scratch arena that dies with this call, not in the result arena. */
     CBMArena idx_arena;
     cbm_arena_init(&idx_arena);
+    cbm_registry_build_func_qn_order(&reg, &idx_arena);
+    cbm_registry_build_type_qn_order(&reg, &idx_arena);
     reg.index_first_registered = true;
     cbm_registry_finalize_into(&reg, &idx_arena);
 
@@ -4039,6 +4040,8 @@ CBMLSPStatus cbm_run_py_lsp_cross_status(
 
     /* Finalize registry — O(1) lookups. See go_lsp.c "3c. Finalize"
      * comment for the rationale. */
+    cbm_registry_build_func_qn_order(&reg, arena);
+    cbm_registry_build_type_qn_order(&reg, arena);
     cbm_registry_finalize(&reg);
 
     PyLSPContext ctx;
@@ -4091,7 +4094,10 @@ CBMTypeRegistry* cbm_py_build_cross_registry(
         }
     }
 
-    /* Re-finalize to fold in funcs + pass-2 auto-added receiver types. */
+    /* Re-finalize to fold in funcs + pass-2 auto-added receiver types. The QN
+     * order snapshots are built before the seal (queries never build). */
+    cbm_registry_build_func_qn_order(reg, arena);
+    cbm_registry_build_type_qn_order(reg, arena);
     cbm_registry_finalize(reg);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;

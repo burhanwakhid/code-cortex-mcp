@@ -16254,7 +16254,69 @@ TEST(clsp_issue1527_long_receiver_chain_is_not_nesting) {
     return clsp_long_chain_case(true);
 }
 
+/* Upstream 23e29105 / 24eb2645: sorted QN snapshots answer the Python
+ * submodule probe and the module class-binding range without scanning the
+ * whole registry, with exactly the linear scan's answers -- including
+ * appended (post-snapshot) entries and original registration order. */
+TEST(registry_qn_order_prefix_queries_match_linear_scan) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, &a);
+    const char *fqns[] = {"p.mod.sub.f", "p.mod.g", "p.other.h", "p.modx.k", "p.mod.sub.f"};
+    for (size_t i = 0; i < sizeof(fqns) / sizeof(fqns[0]); i++) {
+        CBMRegisteredFunc f = {};
+        f.qualified_name = fqns[i];
+        f.short_name = "x";
+        cbm_registry_add_func(&reg, f);
+    }
+    const char *tqns[] = {"p.mod.B", "p.other.C", "p.mod.A", "p.mod.Outer.Inner", "p.modx.D"};
+    for (size_t i = 0; i < sizeof(tqns) / sizeof(tqns[0]); i++) {
+        CBMRegisteredType t = {};
+        t.qualified_name = tqns[i];
+        t.short_name = "T";
+        cbm_registry_add_type(&reg, t);
+    }
+    bool unordered = cbm_registry_has_func_qn_prefix(&reg, "p.mod.sub.", NULL) &&
+                     !cbm_registry_has_func_qn_prefix(&reg, "p.none.", NULL);
+    cbm_registry_build_func_qn_order(&reg, &a);
+    cbm_registry_build_type_qn_order(&reg, &a);
+    uint64_t visits = 0;
+    bool ordered = cbm_registry_has_func_qn_prefix(&reg, "p.mod.sub.", &visits) &&
+                   !cbm_registry_has_func_qn_prefix(&reg, "p.none.", &visits) &&
+                   !cbm_registry_has_func_qn_prefix(&reg, "p.mod.sub.f.", &visits) &&
+                   visits <= 12;
+    /* An appended function stays visible through the tail scan. */
+    CBMRegisteredFunc late = {};
+    late.qualified_name = "p.late.z";
+    late.short_name = "z";
+    cbm_registry_add_func(&reg, late);
+    bool tail = cbm_registry_has_func_qn_prefix(&reg, "p.late.", NULL);
+    /* Type range: registration order, nested included, sibling prefix excluded. */
+    CBMRegisteredType late_type = {};
+    late_type.qualified_name = "p.mod.Late";
+    late_type.short_name = "Late";
+    cbm_registry_add_type(&reg, late_type);
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    CBMQNPrefixIter it;
+    cbm_registry_types_with_qn_prefix(&reg, "p.mod.", &scratch, &it);
+    int got[8];
+    int n = 0;
+    for (int i; n < 8 && (i = cbm_qn_prefix_iter_next(&it)) >= 0;)
+        got[n++] = i;
+    bool range = n == 4 && got[0] == 0 && got[1] == 2 && got[2] == 3 && got[3] == 5;
+    cbm_arena_destroy(&scratch);
+    cbm_arena_destroy(&a);
+    ASSERT_TRUE(unordered);
+    ASSERT_TRUE(ordered);
+    ASSERT_TRUE(tail);
+    ASSERT_TRUE(range);
+    PASS();
+}
+
 SUITE(c_lsp) {
+    RUN_TEST(registry_qn_order_prefix_queries_match_linear_scan);
     RUN_TEST(clsp_issue1527_long_fluent_chain_resolves_every_link);
     RUN_TEST(registry_issue1527_index_preserves_registration_order);
     RUN_TEST(scope_issue1527_recovery_sizes_from_all_bindings);
