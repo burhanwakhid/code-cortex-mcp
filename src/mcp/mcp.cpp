@@ -3255,7 +3255,15 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
 static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *obj,
                                           const char *properties_json);
 static yyjson_doc *enrich_node_properties_ex(yyjson_mut_doc *doc, yyjson_mut_val *obj,
-                                             const char *properties_json, bool skip_metrics);
+                                             const char *properties_json, bool skip_metrics,
+                                             size_t docstring_cap);
+
+/* A search listing carries at most this much of each docstring. The graph
+ * stores the whole doc comment (upstream dab9187c dropped the 500-byte
+ * extraction cut), but fifty rows of full comments doubled a min_degree
+ * listing on redis (66 KB -> 122 KB); the single-symbol tools still return
+ * the whole text. */
+enum { MCP_SEARCH_DOCSTRING_CAP = 500 };
 
 /* Emit the cbm_store_search results as a JSON "results" array on the doc.
  * Property docs created via enrich_node_properties are collected in
@@ -3291,7 +3299,8 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
             enrich_connected(doc, item, store, sr->node.id, relationship);
         }
         yyjson_doc *pdoc =
-            enrich_node_properties_ex(doc, item, sr->node.properties_json, !include_metrics);
+            enrich_node_properties_ex(doc, item, sr->node.properties_json, !include_metrics,
+                                      MCP_SEARCH_DOCSTRING_CAP);
         if (pdoc && pdocs) {
             pdocs[pdoc_count++] = pdoc;
         }
@@ -7682,15 +7691,32 @@ static bool node_property_is_metric(const char *k) {
 }
 
 static yyjson_doc *enrich_node_properties_ex(yyjson_mut_doc *doc, yyjson_mut_val *obj,
-                                             const char *properties_json, bool skip_metrics);
+                                             const char *properties_json, bool skip_metrics,
+                                             size_t docstring_cap);
 
 static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *obj,
                                           const char *properties_json) {
-    return enrich_node_properties_ex(doc, obj, properties_json, false);
+    return enrich_node_properties_ex(doc, obj, properties_json, false, 0);
 }
 
+/* Length of s cut to at most cap bytes, backed off to a UTF-8 lead byte so the
+ * cut never splits a character. */
+static size_t utf8_prefix_len(const char *s, size_t len, size_t cap) {
+    if (len <= cap) {
+        return len;
+    }
+    size_t n = cap;
+    while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) {
+        n--;
+    }
+    return n;
+}
+
+/* docstring_cap > 0 cuts a longer "docstring" to that many bytes and adds
+ * "docstring_truncated": true; 0 keeps it whole. */
 static yyjson_doc *enrich_node_properties_ex(yyjson_mut_doc *doc, yyjson_mut_val *obj,
-                                             const char *properties_json, bool skip_metrics) {
+                                             const char *properties_json, bool skip_metrics,
+                                             size_t docstring_cap) {
     if (!properties_json || properties_json[0] == '\0') {
         return NULL;
     }
@@ -7715,7 +7741,13 @@ static yyjson_doc *enrich_node_properties_ex(yyjson_mut_doc *doc, yyjson_mut_val
         if (skip_metrics && node_property_is_metric(k)) {
             continue;
         }
-        if (yyjson_is_str(val)) {
+        if (yyjson_is_str(val) && docstring_cap > 0 && strcmp(k, "docstring") == 0 &&
+            yyjson_get_len(val) > docstring_cap) {
+            const char *ds = yyjson_get_str(val);
+            yyjson_mut_obj_add_strn(doc, obj, k, ds,
+                                    utf8_prefix_len(ds, yyjson_get_len(val), docstring_cap));
+            yyjson_mut_obj_add_bool(doc, obj, "docstring_truncated", true);
+        } else if (yyjson_is_str(val)) {
             yyjson_mut_obj_add_str(doc, obj, k, yyjson_get_str(val));
         } else if (yyjson_is_bool(val)) {
             yyjson_mut_obj_add_bool(doc, obj, k, yyjson_get_bool(val));

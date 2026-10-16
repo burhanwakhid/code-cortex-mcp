@@ -614,6 +614,61 @@ TEST(tool_search_graph_includes_node_properties) {
     PASS();
 }
 
+/* A search listing cuts each docstring to 500 bytes on a UTF-8 boundary and
+ * flags it; get_code_snippet still returns the whole comment. Byte 500 here is
+ * the second byte of a two-byte character, so the cut backs off to 499. */
+TEST(tool_search_graph_caps_long_docstrings) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    std::string doc(499, 'a');
+    doc += "\xc3\xa9"; /* U+00E9 at bytes 499-500 */
+    doc += std::string(300, 'b');
+    doc += "TAIL_MARK";
+    std::string props = "{\"docstring\":\"" + doc + "\"}";
+    cbm_node_t n = {0};
+    n.project = "test-project";
+    n.label = "Function";
+    n.name = "LongDocumented";
+    n.qualified_name = "test-project.cmd.server.main.LongDocumented";
+    n.file_path = "main.go";
+    n.start_line = 3;
+    n.end_line = 5;
+    n.properties_json = props.c_str();
+    ASSERT_GT(cbm_store_upsert_node(cbm_mcp_server_store(srv), &n), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"test-project\",\"name_pattern\":\"LongDocumented\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    std::string cut = "\"docstring\":\"" + std::string(499, 'a') + "\"";
+    ASSERT_NOT_NULL(strstr(inner, cut.c_str()));
+    ASSERT_NOT_NULL(strstr(inner, "\"docstring_truncated\":true"));
+    ASSERT_NULL(strstr(inner, "TAIL_MARK"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":44,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"get_code_snippet\",\"arguments\":{\"project\":\"test-project\","
+        "\"qualified_name\":\"test-project.cmd.server.main.LongDocumented\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "TAIL_MARK"));
+    ASSERT_NULL(strstr(inner, "docstring_truncated"));
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 TEST(tool_query_graph_basic) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
 
@@ -7895,6 +7950,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_cycles_detects_scc);
     RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
     RUN_TEST(tool_search_graph_includes_node_properties);
+    RUN_TEST(tool_search_graph_caps_long_docstrings);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_index_status_includes_git_metadata);
