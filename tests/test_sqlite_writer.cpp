@@ -537,6 +537,96 @@ TEST(sw_multi_page) {
     PASS();
 }
 
+/* Write n nodes of project "p" whose names are key_size bytes long, then run
+ * the upstream #1783 coverage-shadow wipe shape: a DELETE for a project key
+ * that sorts after every written row ("p::missed" > "p"), so each
+ * (project, ...) index is searched down its rightmost path. Also runs
+ * PRAGMA integrity_check. Returns the DELETE's result code (-1 on a setup
+ * failure, -2 when integrity_check is not "ok") and the message in err_out. */
+static int sw_write_long_names_and_wipe(int n, int key_size, char *err_out, size_t err_sz) {
+    char path[256];
+    if (make_temp_db(path, sizeof(path)) != 0) {
+        return -1;
+    }
+    auto *nodes = static_cast<CBMDumpNode *>(calloc((size_t)n, sizeof(CBMDumpNode)));
+    auto *names = static_cast<char *>(calloc((size_t)n, (size_t)key_size + 1));
+    auto *qns = static_cast<char *>(calloc((size_t)n, (size_t)key_size + 3));
+    int rc = -1;
+    if (nodes && names && qns) {
+        for (int i = 0; i < n; i++) {
+            char *name = names + ((size_t)i * ((size_t)key_size + 1));
+            char *qn = qns + ((size_t)i * ((size_t)key_size + 3));
+            int prefix = snprintf(name, (size_t)key_size + 1, "n%06d_", i);
+            memset(name + prefix, 'x', (size_t)key_size - (size_t)prefix);
+            name[key_size] = '\0';
+            snprintf(qn, (size_t)key_size + 3, "p.%s", name);
+            nodes[i] = (CBMDumpNode){
+                .id = i + 1,
+                .project = "p",
+                .label = "Function",
+                .name = name,
+                .qualified_name = qn,
+                .file_path = "large.c",
+                .start_line = i + 1,
+                .end_line = i + 1,
+                .properties = "{}",
+            };
+        }
+        int wrc = cbm_write_db(path, "p", "/r", "2026-08-26T00:00:00Z", nodes, n, NULL, 0, NULL, 0,
+                               NULL, 0);
+        rc = wrc == 0 ? SQLITE_OK : -1;
+    }
+    free(nodes);
+    free(names);
+    free(qns);
+    sqlite3 *db = NULL;
+    if (rc == SQLITE_OK && sqlite3_open(path, &db) == SQLITE_OK) {
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &stmt, NULL) == SQLITE_OK &&
+            sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *ic = (const char *)sqlite3_column_text(stmt, 0);
+            if (!ic || strcmp(ic, "ok") != 0) {
+                snprintf(err_out, err_sz, "integrity_check: %s", ic ? ic : "(null)");
+                rc = -2;
+            }
+        }
+        sqlite3_finalize(stmt);
+        /* INDEXED BY pins the seek to the long-key index; left alone the
+         * planner picks the short-key idx_nodes_label (one leaf page). */
+        static const char *wipe =
+            "DELETE FROM nodes INDEXED BY idx_nodes_name WHERE project = 'p::missed'";
+        if (rc == SQLITE_OK) {
+            char *error = NULL;
+            rc = sqlite3_exec(db, wipe, NULL, NULL, &error);
+            snprintf(err_out, err_sz, "%s", error ? error : "none");
+            sqlite3_free(error);
+        }
+    }
+    sqlite3_close(db);
+    unlink(path);
+    return rc;
+}
+
+/* Upstream #1783 (DeusData/codebase-memory-mcp@e7324bb6): an index whose
+ * interior level spans several pages must never end that level with a page
+ * holding zero cells (only a right-child pointer). SQLite rejects such a page
+ * as SQLITE_CORRUPT the moment a cursor descends into it, and a key sorting
+ * after every row descends exactly there. With 12000-byte keys the sweep
+ * covers one and two interior levels; before the fix rows 31-35, 61-65 and
+ * 91-95 failed. */
+TEST(sw_interior_level_never_ends_with_empty_page) {
+    enum { KEY_SIZE = 12000, MIN_ROWS = 2, MAX_ROWS = 120 };
+    for (int rows = MIN_ROWS; rows <= MAX_ROWS; rows++) {
+        char err[256] = "";
+        int rc = sw_write_long_names_and_wipe(rows, KEY_SIZE, err, sizeof(err));
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "  rows=%d wipe rc=%d err=%s\n", rows, rc, err);
+        }
+        ASSERT_EQ(rc, SQLITE_OK);
+    }
+    PASS();
+}
+
 /* ── Oversized node: properties JSON > 65KB triggers overflow pages ─ */
 
 TEST(sw_oversized_node) {
@@ -858,6 +948,7 @@ SUITE(sqlite_writer) {
     RUN_TEST(sw_long_index_keys_overflow);
     RUN_TEST(sw_empty);
     RUN_TEST(sw_multi_page);
+    RUN_TEST(sw_interior_level_never_ends_with_empty_page);
     RUN_TEST(sw_oversized_node);
     RUN_TEST(sw_stream_open_does_not_truncate_destination);
     RUN_TEST(sw_publish_removes_destination_sidecars);
