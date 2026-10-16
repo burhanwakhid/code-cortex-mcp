@@ -70,6 +70,7 @@ enum {
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <new>
 #include <vector>
 #include "cypher/cypher.h"
 #include "pipeline/pipeline.h"
@@ -9655,8 +9656,15 @@ static void search_scan_buffer(std::string &out, const search_scan_patterns_t *p
     }
 }
 
+/* A file larger than this is not scanned: it is past any source file the
+ * indexer keeps, and the reader must stay bounded when a path turns into an
+ * endless pseudo-file (a symlink retargeted after indexing). */
+static constexpr size_t SEARCH_SCAN_FILE_MAX = (size_t)1 << 30;
+
 /* Read a whole file into `buffer` (one spare byte past the data). False when
- * it cannot be opened or read (a directory, a vanished file). */
+ * it cannot be opened or read (a directory, a vanished file), when it passes
+ * SEARCH_SCAN_FILE_MAX, or when its buffer cannot be allocated -- a failed
+ * resize must not escape as std::bad_alloc and terminate the server. */
 static bool search_scan_read_file(const char *path, std::vector<char> &buffer, size_t *length) {
     FILE *fp = fopen(path, "rb");
     if (!fp) {
@@ -9666,8 +9674,17 @@ static bool search_scan_read_file(const char *path, std::vector<char> &buffer, s
     bool ok = true;
     for (;;) {
         if (buffer.size() - used < (size_t)CBM_SZ_64K + SKIP_ONE) {
-            buffer.resize(buffer.empty() ? (size_t)CBM_SZ_64K * PAIR_LEN
-                                         : buffer.size() * PAIR_LEN);
+            size_t grow = buffer.empty() ? (size_t)CBM_SZ_64K * PAIR_LEN : buffer.size() * PAIR_LEN;
+            if (used > SEARCH_SCAN_FILE_MAX) {
+                ok = false;
+                break;
+            }
+            try {
+                buffer.resize(grow);
+            } catch (const std::bad_alloc &) {
+                ok = false;
+                break;
+            }
         }
         size_t want = buffer.size() - used - SKIP_ONE;
         size_t got = fread(buffer.data() + used, 1, want, fp);
