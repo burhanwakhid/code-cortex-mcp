@@ -933,6 +933,49 @@ TEST(registry_tie_ignores_nesting_depth) {
     PASS();
 }
 
+/* A constructor is named after its type, so a bare type name (`: public
+ * Logger`, `Slice key;`) ties between the class and its constructor. Before
+ * 51364158 the class won as the shallower QN; ranking every Method above a
+ * Class sent the name to the constructor, and resolve_as_class then dropped
+ * the base (rocksdb: INHERITS 1794 -> 1650, OVERRIDE 2740 -> 2610, USAGE of
+ * classes -9k). A constructor ranks below the type; a real callable still
+ * wins over a type, and a constructor in another language (`java...Snapshot.
+ * Snapshot`) or out of line (`StatisticsImpl::StatisticsImpl`, whose QN sorts
+ * first) does not outrank the class either. */
+TEST(registry_tie_prefers_class_over_its_constructor) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "Logger", "proj.include.rocksdb.env.Logger", "Class");
+    cbm_registry_add(r, "Logger", "proj.include.rocksdb.env.Logger.Logger", "Method");
+    cbm_registry_add(r, "Snapshot", "proj.include.rocksdb.snapshot.Snapshot", "Class");
+    cbm_registry_add(r, "Snapshot", "proj.java.src.main.java.org.rocksdb.Snapshot.Snapshot",
+                     "Method");
+    cbm_registry_add(r, "Slice", "proj.include.rocksdb.slice.Slice", "Class");
+    cbm_registry_add(r, "Slice", "proj.include.rocksdb.slice.Slice.Slice", "OverloadSet");
+    cbm_registry_add(r, "Slice", "proj.util.slice.Slice.Slice", "Method");
+    /* Out of line, the constructor's QN sorts before the class's. */
+    cbm_registry_add(r, "StatisticsImpl",
+                     "proj.monitoring.statistics.StatisticsImpl.StatisticsImpl", "Method");
+    cbm_registry_add(r, "StatisticsImpl", "proj.monitoring.statistics_impl.StatisticsImpl",
+                     "Class");
+    /* Not a constructor: a function that merely shares a type's name still wins. */
+    cbm_registry_add(r, "Key", "proj.db.forward_iterator_bench.Key", "Class");
+    cbm_registry_add(r, "Key", "proj.db.range_del_aggregator_bench.Key", "Function");
+
+    const char *caller = "proj.logging.auto_roll_logger";
+    ASSERT_STR_EQ(cbm_registry_resolve(r, "Logger", caller, NULL, NULL, 0).qualified_name,
+                  "proj.include.rocksdb.env.Logger");
+    ASSERT_STR_EQ(cbm_registry_resolve(r, "Snapshot", caller, NULL, NULL, 0).qualified_name,
+                  "proj.include.rocksdb.snapshot.Snapshot");
+    ASSERT_STR_EQ(cbm_registry_resolve(r, "Slice", caller, NULL, NULL, 0).qualified_name,
+                  "proj.include.rocksdb.slice.Slice");
+    ASSERT_STR_EQ(cbm_registry_resolve(r, "StatisticsImpl", caller, NULL, NULL, 0).qualified_name,
+                  "proj.monitoring.statistics_impl.StatisticsImpl");
+    ASSERT_STR_EQ(cbm_registry_resolve(r, "Key", caller, NULL, NULL, 0).qualified_name,
+                  "proj.db.range_del_aggregator_bench.Key");
+    cbm_registry_free(r);
+    PASS();
+}
+
 /* .NET reference assemblies (`src/libraries/<Asm>/ref/<Asm>.cs`) declare every
  * public member of an assembly with a `throw null` body in one shallow file.
  * A call that ties between such a stub and the implementation must reach the
@@ -1590,6 +1633,7 @@ SUITE(registry) {
     RUN_TEST(registry_tie_break_is_independent_of_registration_order);
     RUN_TEST(registry_tie_prefers_callable_over_property);
     RUN_TEST(registry_tie_ignores_nesting_depth);
+    RUN_TEST(registry_tie_prefers_class_over_its_constructor);
     RUN_TEST(registry_tie_prefers_csharp_implementation_over_ref_stub);
     RUN_TEST(python_builtin_member_table_matches_builtin_type_methods);
     RUN_TEST(weak_member_unique_name_exempt_is_python_self_rooted_unique_and_specific_only);

@@ -170,27 +170,55 @@ static int candidate_score(const char *candidate_qn, const char *module_qn) {
 
 /* How plainly a candidate is something a call can target, lower = better: a
  * function or method; then any other definition (a class for a constructor
- * call, a macro, a type); then a candidate whose label is unknown; last a
- * variable or field, which a call reaches only when it holds a function. */
+ * call, a macro, a type); then a constructor; then a candidate whose label is
+ * unknown; last a variable or field, which a call reaches only when it holds a
+ * function. */
 enum {
     REG_RANK_CALLABLE = 0,
     REG_RANK_OTHER_DEF = 1,
-    REG_RANK_UNKNOWN = 2,
-    REG_RANK_DATA = 3,
+    REG_RANK_CONSTRUCTOR = 2,
+    REG_RANK_UNKNOWN = 3,
+    REG_RANK_DATA = 4,
 };
+
+/* True when the QN's last segment repeats the one before it (`ns.Status.Status`,
+ * `java...Logger.Logger`): a constructor named after its type, in line or out
+ * of line (`monitoring.statistics.StatisticsImpl.StatisticsImpl` from
+ * `StatisticsImpl::StatisticsImpl` in statistics.cc). */
+static bool constructor_qn(const char *qn) {
+    const char *last = strrchr(qn, '.');
+    if (!last || last == qn) {
+        return false;
+    }
+    const char *prev = last;
+    while (prev > qn && prev[-1] != '.') {
+        prev--;
+    }
+    size_t prev_len = (size_t)(last - prev);
+    return prev_len > 0 && strlen(last + 1) == prev_len && memcmp(prev, last + 1, prev_len) == 0;
+}
 
 static int callable_rank(const cbm_registry_t *r, const char *qn) {
     const char *label = r ? (const char *)cbm_ht_get(r->exact, qn) : NULL;
     if (!label) {
         return REG_RANK_UNKNOWN;
     }
-    if (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0) {
-        return REG_RANK_CALLABLE;
-    }
     if (strcmp(label, "Variable") == 0 || strcmp(label, "Field") == 0) {
         return REG_RANK_DATA;
     }
-    return REG_RANK_OTHER_DEF;
+    bool callable = strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0;
+    /* A constructor shares its type's name, so a bare `Status` (a base class,
+     * a declaration, `Status(...)`) ties between the class and `Status.Status`.
+     * The name means the type: ranking the constructor as a callable lost
+     * rocksdb 145 INHERITS and ~9k class USAGE edges to constructors. It
+     * ranks below every other definition, the QN order cannot pick it over
+     * its own type either in line or out of line, and a real same-named
+     * function (`BytewiseComparator()`) still wins. */
+    if ((callable || strcmp(label, "OverloadSet") == 0 || strcmp(label, "Declaration") == 0) &&
+        constructor_qn(qn)) {
+        return REG_RANK_CONSTRUCTOR;
+    }
+    return callable ? REG_RANK_CALLABLE : REG_RANK_OTHER_DEF;
 }
 
 /* A .NET reference assembly (`src/libraries/<Asm>/ref/<Asm>.cs`) declares an
@@ -208,7 +236,8 @@ static bool csharp_reference_stub(const cbm_registry_t *r, const char *qn) {
  * between include/linux and tools/virtio). The rule, a pure function of the
  * candidate set (O9):
  *   1. the more plainly callable candidate (`dev_name` the function over the
- *      struct fields; Kotlin `where(...)` the method over the property);
+ *      struct fields; Kotlin `where(...)` the method over the property); a
+ *      constructor ranks after its type (callable_rank);
  *   2. for C#, an implementation over a reference-assembly stub;
  *   3. the lexicographically smaller QN (include/linux over tools/virtio).
  * Nesting depth is deliberately not a criterion (upstream 51364158): "least
