@@ -235,6 +235,10 @@ template <class A> void fields(A &a, CBMChannel &v) {
     auto &[channel_name, transport, enclosing_func_qn, direction] = v;
     a(channel_name, transport, enclosing_func_qn, direction);
 }
+template <class A> void fields(A &a, CBMFieldType &v) {
+    auto &[class_qn, field_name, type_text] = v;
+    a(class_qn, field_name, type_text);
+}
 template <class A> void fields(A &a, CBMImplTrait &v) {
     auto &[trait_name, struct_name] = v;
     a(trait_name, struct_name);
@@ -248,10 +252,10 @@ template <class A> void fields(A &a, CBMFileResult &v) {
     auto &[arena, defs, overloads, overload_count, calls, deferred_cpp_operator_count,
            pending_cpp_operator_count, cpp_operator_tracker, imports, usages, throws, rw, type_refs,
            env_accesses, type_assigns, impl_traits, resolved_calls, string_refs, infra_bindings,
-           channels, module_qn, namespace_name, php_vendor_names, php_vendor_qns, php_vendor_count,
-           exports, constants, global_vars, macros, has_error, error_msg, parse_incomplete,
-           parse_unusable, error_ranges, error_region_count, is_test_file, imports_count,
-           cached_tree, lsp_skipped, walk_truncated, lsp_skip_reason, tree_nodes,
+           channels, field_types, module_qn, namespace_name, php_vendor_names, php_vendor_qns,
+           php_vendor_count, exports, constants, global_vars, macros, has_error, error_msg,
+           parse_incomplete, parse_unusable, error_ranges, error_region_count, is_test_file,
+           imports_count, cached_tree, lsp_skipped, walk_truncated, lsp_skip_reason, tree_nodes,
            walk_nodes_visited, cached_lang, source, source_len] = v;
     /* PHP vendor evidence (#1186) is recorded after extraction, on the retained
      * summary, and copied onto the loaded record by the resolve worker: never
@@ -279,6 +283,7 @@ template <class A> void fields(A &a, CBMFileResult &v) {
     a.records(string_refs);
     a.records(infra_bindings);
     a.records(channels);
+    a.records(field_types);
     a.array(overloads, overload_count);
     a(source_len);
     if (source_len < 0)
@@ -307,7 +312,7 @@ uint64_t checksum(std::span<const std::byte> bytes) {
     }
     return hash;
 }
-constexpr uint64_t magic = 0x3150414e534d4243ULL; // CBMSNAP1, native scalar representation.
+constexpr uint64_t magic = 0x3250414e534d4243ULL; // CBMSNAP2, native scalar representation.
 } // namespace
 
 bool encode_result_snapshot(const CBMFileResult &result, std::vector<std::byte> &output,
@@ -398,6 +403,7 @@ CBMFileResult *make_registry_summary(const CBMFileResult &result, size_t max_byt
         summary.namespace_name = result.namespace_name;
         summary.imports = result.imports;
         summary.channels = result.channels;
+        summary.field_types = result.field_types; /* Python cross-file field fold (#1277) */
         summary.env_accesses = result.env_accesses;
         summary.infra_bindings = result.infra_bindings;
         summary.string_refs = result.string_refs;

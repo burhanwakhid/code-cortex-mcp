@@ -475,20 +475,23 @@ static const CBMType* py_lookup_field_depth(PyLSPContext* ctx, const char* type_
 
     const CBMRegisteredType* rt = cbm_registry_lookup_type(ctx->registry, type_qn);
     if (!rt) return NULL;
+    /* Per-file overlay: `self.x = ...` fields discovered during resolve against the
+     * sealed shared registry live here (not on rt). Checked FIRST at this level: in
+     * the mutable path such a discovery overwrites the registered field in place,
+     * so a same-file refinement must also win over a declared field that reached
+     * the shared registry through CBMLSPDef.field_defs (#1277), while still
+     * preserving the derived-shadows-base precedence before recursing into
+     * alias/base classes. */
+    {
+        const CBMType* ov = py_overlay_lookup_field(ctx, type_qn, field_name);
+        if (ov) return ov;
+    }
     if (rt->field_names && rt->field_types) {
         for (int i = 0; rt->field_names[i]; i++) {
             if (strcmp(rt->field_names[i], field_name) == 0) {
                 return rt->field_types[i];
             }
         }
-    }
-    /* Per-file overlay: `self.x = ...` fields discovered during resolve against the
-     * sealed shared registry live here (not on rt). Checked at the same point the
-     * direct field scan would have found them in the mutable path — preserving the
-     * derived-shadows-base precedence before recursing into alias/base classes. */
-    {
-        const CBMType* ov = py_overlay_lookup_field(ctx, type_qn, field_name);
-        if (ov) return ov;
     }
     if (rt->alias_of) {
         const CBMType* a = py_lookup_field_depth(ctx, rt->alias_of, field_name, depth + 1);
@@ -3454,6 +3457,42 @@ static const char** py_split_pipe(CBMArena* arena, const char* text) {
     return out;
 }
 
+/* Split a class def's field_defs ("name:QN|name:QN", built by the Python
+ * field fold in pass_lsp_cross.cpp) into the parallel NULL-terminated arrays a
+ * CBMRegisteredType carries. The types are already project QNs, so each one
+ * becomes a NAMED type verbatim. Without this, `obj.field.method()` on a class
+ * from another file lost the field's type (#1277); same-file classes get their
+ * fields from the per-file walk instead. Pure string work: no registry lookup
+ * happens here, so it is safe inside the type-registration pass. */
+static void py_split_field_defs(CBMArena* arena, const char* field_defs, const char*** names_out,
+                                const CBMType*** types_out) {
+    *names_out = NULL;
+    *types_out = NULL;
+    const char** pairs = py_split_pipe(arena, field_defs);
+    if (!pairs) return;
+    int n = 0;
+    while (pairs[n]) n++;
+    const char** names =
+        (const char**)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const char*));
+    const CBMType** types =
+        (const CBMType**)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const CBMType*));
+    if (!names || !types) return;
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        char* colon = (char*)strchr(pairs[i], ':');
+        if (!colon || colon == pairs[i] || !colon[1]) continue;
+        *colon = '\0'; /* pairs[i] is this call's own arena copy */
+        names[kept] = pairs[i];
+        types[kept] = cbm_type_named(arena, colon + 1);
+        kept++;
+    }
+    if (kept == 0) return;
+    names[kept] = NULL;
+    types[kept] = NULL;
+    *names_out = names;
+    *types_out = types;
+}
+
 /* Build a registry from CBMLSPDef[] supplied by the caller — covers both
  * the source file's own defs and cross-file referenced defs. */
 static bool py_def_is_type(const CBMLSPDef* d) {
@@ -3477,6 +3516,7 @@ static void py_register_def_type(CBMArena* arena, CBMTypeRegistry* reg, CBMLSPDe
     if (d->method_names_str && d->method_names_str[0]) {
         rt.method_names = py_split_pipe(arena, d->method_names_str);
     }
+    py_split_field_defs(arena, d->field_defs, &rt.field_names, &rt.field_types);
     cbm_registry_add_type(reg, rt);
 }
 

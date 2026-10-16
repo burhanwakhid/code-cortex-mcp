@@ -278,7 +278,8 @@ void cbm_pipeline_mem_profile(const char *phase, const cbm_gbuf_t *gbuf,
                        ((size_t)r->resolved_calls.cap * sizeof(*r->resolved_calls.items)) +
                        ((size_t)r->string_refs.cap * sizeof(*r->string_refs.items)) +
                        ((size_t)r->infra_bindings.cap * sizeof(*r->infra_bindings.items)) +
-                       ((size_t)r->channels.cap * sizeof(*r->channels.items));
+                       ((size_t)r->channels.cap * sizeof(*r->channels.items)) +
+                       ((size_t)r->field_types.cap * sizeof(*r->field_types.items));
         }
         size_t strings = arena_used > (records + sources) ? arena_used - records - sources : 0;
         cbm_log_info("mem.profile.results", "phase", phase, "files", n_buf(live),
@@ -1906,8 +1907,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (file_count > 0 && (size_t)file_count <= SIZE_MAX / PL_SOURCE_DIGEST_STRIDE) {
         file_digests.assign((size_t)file_count * PL_SOURCE_DIGEST_STRIDE, '\0');
     } else if (file_count > 0) {
-        cbm_log_error("pipeline.err", "phase", "source_digest_alloc", "reason",
-                      "size_overflow");
+        cbm_log_error("pipeline.err", "phase", "source_digest_alloc", "reason", "size_overflow");
     }
     for (int i = 0; i < file_count; i++) {
         auto &version = file_versions[(size_t)i];
