@@ -25,6 +25,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
+#ifdef _WIN32
+#include <io.h>
+#endif
 #include <zlib.h>
 
 #ifdef CBM_ENABLE_TEST_SEAMS
@@ -4378,8 +4382,35 @@ static int uninstall_fx_run(int argc, const char *const *args) {
         argv[i] = (char *)args[i];
     }
     cbm_set_auto_answer_for_test(0);
-    /* stdin is never a terminal under the runner, so nothing can block. */
+    /* --dry-run sets no auto-answer, so a terminal stdin would reach the
+     * "Delete these indexes?" prompt and block the suite. Point fd 0 at the
+     * null device for the call; uninstall then sees no terminal and keeps. */
+    fflush(stdout);
+#ifdef _WIN32
+    int saved_stdin = _dup(0);
+    int null_fd = _open("NUL", _O_RDONLY);
+    if (null_fd >= 0) {
+        (void)_dup2(null_fd, 0);
+        (void)_close(null_fd);
+    }
+#else
+    int saved_stdin = dup(0);
+    int null_fd = open("/dev/null", O_RDONLY);
+    if (null_fd >= 0) {
+        (void)dup2(null_fd, 0);
+        (void)close(null_fd);
+    }
+#endif
     int rc = cbm_cmd_uninstall(argc, argv);
+    if (saved_stdin >= 0) {
+#ifdef _WIN32
+        (void)_dup2(saved_stdin, 0);
+        (void)_close(saved_stdin);
+#else
+        (void)dup2(saved_stdin, 0);
+        (void)close(saved_stdin);
+#endif
+    }
     cbm_set_auto_answer_for_test(0);
     return rc;
 }
