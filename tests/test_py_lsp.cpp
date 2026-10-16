@@ -10,6 +10,9 @@
 #include "test_framework.h"
 #include "cbm.h"
 #include "lsp/py_lsp.h"
+#include "lsp/lsp_work.h"
+#include "result_compact.h" /* cbm_result_compact */
+#include "../src/pipeline/pass_lsp_cross.h"
 
 /* ── Helpers — same shape as test_go_lsp.c ──────────────────────── */
 
@@ -1509,7 +1512,429 @@ TEST(pylsp_golden_same_module_func) {
 
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+/* ── #1527: no per-file eval budget; cost bounded at the root ─────────── */
+
+/* Resolved rows whose callee QN ends with `suffix` (e.g. ".compile"). The
+ * fork dedups resolved rows per (caller, callee), so the fixtures below give
+ * every statement its own class: one row per class proves that statement
+ * resolved. */
+static int count_resolved_suffix(const CBMFileResult *r, const char *suffix) {
+    size_t sl = strlen(suffix);
+    int n = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        size_t ql = rc->callee_qn ? strlen(rc->callee_qn) : 0;
+        if (ql >= sl && strcmp(rc->callee_qn + ql - sl, suffix) == 0 &&
+            !(rc->strategy && strcmp(rc->strategy, "lsp_unresolved") == 0)) {
+            n++;
+        }
+    }
+    return n;
+}
+
+TEST(pylsp_issue1527_chain_statements_resolve_completely) {
+    /* #1527 replaces the old step budget (10000 evaluations per file): the
+     * #710 chain shape -- 90 statements x 30-link chains, re-evaluated across
+     * the bind + emit phases -- must finish quickly AND resolve every
+     * statement's chain and final call, not only the first statements. */
+    enum { CHAIN_STMTS = 90, CHAIN_LINKS = 30 };
+    size_t sz = 4096 + (size_t)CHAIN_STMTS * (256 + (size_t)CHAIN_LINKS * 8);
+    char *src = (char *)malloc(sz);
+    ASSERT_NOT_NULL(src);
+    size_t pos = (size_t)snprintf(src, sz, "from typing import Self\n");
+    for (int s = 0; s < CHAIN_STMTS; s++) {
+        pos += (size_t)snprintf(src + pos, sz - pos,
+                                "class G%d:\n"
+                                "    def add(self, x) -> Self:\n"
+                                "        return self\n"
+                                "    def compile(self):\n"
+                                "        return 1\n",
+                                s);
+    }
+    pos += (size_t)snprintf(src + pos, sz - pos, "def run():\n");
+    for (int s = 0; s < CHAIN_STMTS; s++) {
+        pos += (size_t)snprintf(src + pos, sz - pos, "    v%d = G%d()", s, s);
+        for (int l = 0; l < CHAIN_LINKS; l++)
+            pos += (size_t)snprintf(src + pos, sz - pos, ".add(%d)", l);
+        pos += (size_t)snprintf(src + pos, sz - pos, "\n    v%d.compile()\n", s);
+    }
+    ASSERT(pos < sz);
+    CBMFileResult *r = extract_py(src);
+    free(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->lsp_skipped);
+    ASSERT_EQ(count_resolved_suffix(r, ".compile"), CHAIN_STMTS);
+    ASSERT_EQ(count_resolved_suffix(r, ".add"), CHAIN_STMTS);
+    ASSERT_GTE(require_resolved(r, "run", "G89.compile"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+static char *pylsp_work_fixture(int n_classes, int *out_len) {
+    int approx = n_classes * 256 + 1024;
+    char *buf = (char *)malloc((size_t)approx);
+    if (!buf)
+        return NULL;
+    int pos = 0;
+    pos += snprintf(buf + pos, (size_t)(approx - pos), "from typing import Self\n");
+    for (int i = 0; i < n_classes; i++) {
+        int n = snprintf(buf + pos, (size_t)(approx - pos),
+                         "class Cls%d:\n"
+                         "    def method(self) -> int:\n"
+                         "        return %d\n"
+                         "    def chain(self) -> Self:\n"
+                         "        return self\n",
+                         i, i);
+        if (n < 0 || pos + n >= approx)
+            break;
+        pos += n;
+    }
+    int n = snprintf(buf + pos, (size_t)(approx - pos), "def use():\n");
+    pos += n;
+    for (int i = 0; i < n_classes; i++) {
+        int m = snprintf(buf + pos, (size_t)(approx - pos),
+                         "    Cls%d().chain().chain().method()\n", i);
+        if (m < 0 || pos + m >= approx)
+            break;
+        pos += m;
+    }
+    *out_len = pos;
+    return buf;
+}
+
+TEST(pylsp_issue1527_large_module_resolves_every_call) {
+    /* #1527 reproduction: a module of 4000 classes plus one function calling
+     * `ClsN().chain().chain().method()` for each. The per-file step cap
+     * stopped resolution after ~3333 statements while the file still reported
+     * `indexed`. Every class's method and chain must resolve (rows are per
+     * callee). Upstream uses 8000 classes; this fork's definition walk keeps
+     * at most CBM_WALK_DEFS_STACK_CAP (4096) top-level definitions per module,
+     * a separate extraction limit, so the fixture stays below it. */
+    enum { N_CLASSES = 4000 };
+    int len = 0;
+    char *src = pylsp_work_fixture(N_CLASSES, &len);
+    ASSERT_NOT_NULL(src);
+    CBMFileResult *r =
+        cbm_extract_file(src, len, CBM_LANG_PYTHON, "test", "scale.py", 0, NULL, NULL);
+    free(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_resolved_suffix(r, ".method"), N_CLASSES);
+    ASSERT_EQ(count_resolved_suffix(r, ".chain"), N_CLASSES);
+    /* The last class is resolved exactly, not just some class. */
+    ASSERT_GTE(require_resolved(r, "use", "Cls3999.method"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Deterministic complexity gate (#1527, no clock). The resolver primitives
+ * count every candidate they examine -- scope-frame probes, registry lookup
+ * probes -- plus every real (non-memoized) expression evaluation, into a
+ * seam-build work counter. 4x the input must cost about 4x the work: a
+ * linear-scan lookup or a lost memo lands at ~16x (quadratic) or worse. Also
+ * asserts every class resolved, so the work is not "linear" because
+ * resolution stopped early. */
+static uint64_t pylsp_work_for(int n_classes, int *out_methods) {
+    int slen = 0;
+    char *src = pylsp_work_fixture(n_classes, &slen);
+    if (!src)
+        return 0;
+    (void)cbm_lsp_work_take();
+    CBMFileResult *r =
+        cbm_extract_file(src, slen, CBM_LANG_PYTHON, "test", "scale.py", 0, NULL, NULL);
+    uint64_t work = cbm_lsp_work_take();
+    *out_methods = r ? count_resolved_suffix(r, ".method") : -1;
+    if (r)
+        cbm_free_result(r);
+    free(src);
+    return work;
+}
+
+TEST(pylsp_scale_work_is_linear) {
+    int r1 = 0, r4 = 0;
+    uint64_t w1 = pylsp_work_for(1000, &r1);
+    uint64_t w4 = pylsp_work_for(4000, &r4);
+    double ratio = w1 ? (double)w4 / (double)w1 : 0.0;
+    printf("    work: 1000=%llu (methods=%d)  4000=%llu (methods=%d)  ratio=%.2fx "
+           "(linear ~4x, quadratic ~16x)\n",
+           (unsigned long long)w1, r1, (unsigned long long)w4, r4, ratio);
+    ASSERT_EQ(r1, 1000);
+    ASSERT_EQ(r4, 4000);
+    ASSERT_GT(w1, 0);
+    ASSERT(ratio < 5.0);
+    PASS();
+}
+
+TEST(pylsp_issue1527_memo_allocation_failure_is_reported) {
+    int len = 0;
+    char *src = pylsp_work_fixture(200, &len);
+    ASSERT_NOT_NULL(src);
+    bool failures_reported = true;
+    for (int fail_after = 0; fail_after <= 1; fail_after++) {
+        cbm_py_lsp_test_memo_fail_after(fail_after);
+        CBMFileResult *r = extract_py(src);
+        cbm_py_lsp_test_memo_fail_after(-1);
+        failures_reported = failures_reported && r && !r->has_error && r->lsp_skipped &&
+                            r->lsp_skip_reason == CBM_LSP_SKIP_EVAL_MEMO &&
+                            r->resolved_calls.count == 0;
+        if (r) {
+            cbm_result_compact(r);
+            failures_reported = failures_reported && r->lsp_skipped &&
+                                r->lsp_skip_reason == CBM_LSP_SKIP_EVAL_MEMO;
+            cbm_free_result(r);
+        }
+    }
+    CBMFileResult *fresh = extract_py(src);
+    bool recovered = fresh && !fresh->lsp_skipped && fresh->resolved_calls.count > 0;
+    if (fresh)
+        cbm_free_result(fresh);
+    free(src);
+    ASSERT_TRUE(failures_reported);
+    ASSERT_TRUE(recovered);
+    PASS();
+}
+
+extern "C" const TSLanguage *tree_sitter_python(void);
+
+TEST(pylsp_issue1527_memo_and_depth_failures_stop_work) {
+    const char *src = "x\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ts_parser_set_language(parser, tree_sitter_python());
+    TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+    if (!tree) {
+        ts_parser_delete(parser);
+        FAIL("failed to parse memo fixture");
+    }
+    TSNode node = ts_node_named_child(ts_node_named_child(ts_tree_root_node(tree), 0), 0);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, &arena);
+    CBMResolvedCallArray out = {};
+    PyLSPContext ctx;
+    py_lsp_init(&ctx, &arena, src, (int)strlen(src), &reg, "test", &out);
+    const CBMType *known = cbm_type_named(&arena, "test.Known");
+    cbm_scope_bind(ctx.current_scope, "x", known);
+    ctx.eval_depth = 256;
+    bool depth_unknown = cbm_type_is_unknown(cbm_py_lsp_test_eval(&ctx, node)) &&
+                         ctx.eval_failure == CBM_LSP_DEPTH_EXCEEDED;
+    ctx.eval_depth = 0;
+    (void)cbm_lsp_work_take();
+    bool depth_stopped = cbm_type_is_unknown(cbm_py_lsp_test_eval(&ctx, node));
+    depth_stopped = depth_stopped && cbm_lsp_work_take() == 0;
+    /* A fresh walk can resolve this shallow expression; the failed one cannot. */
+    py_lsp_init(&ctx, &arena, src, (int)strlen(src), &reg, "test", &out);
+    cbm_scope_bind(ctx.current_scope, "x", known);
+    bool depth_recovered = cbm_py_lsp_test_eval(&ctx, node) == known && !ctx.eval_failure;
+    bool stopped = true;
+    for (int capacity_failure = 0; capacity_failure < 2; capacity_failure++) {
+        py_lsp_init(&ctx, &arena, src, (int)strlen(src), &reg, "test", &out);
+        cbm_scope_bind(ctx.current_scope, "x", known);
+        ctx.test_memo_allocations_left = 0;
+        /* Pin the maximum-capacity refusal without allocating a huge table.
+         * A NULL table bypasses lookup; insertion must report failed growth. */
+        if (capacity_failure)
+            ctx.type_cache_cap = 1 << 26;
+        stopped =
+            stopped && cbm_type_is_unknown(cbm_py_lsp_test_eval(&ctx, node)) && ctx.eval_failure;
+        (void)cbm_lsp_work_take();
+        for (int i = 0; i < 20; i++)
+            stopped = cbm_type_is_unknown(cbm_py_lsp_test_eval(&ctx, node)) && stopped;
+        stopped = stopped && cbm_lsp_work_take() == 0;
+    }
+    cbm_arena_destroy(&arena);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    ASSERT_TRUE(depth_unknown);
+    ASSERT_TRUE(depth_stopped);
+    ASSERT_TRUE(depth_recovered);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
+/* A failed cross walk drops only its own rows and restores any earlier row
+ * its dedup touched; completed rows before the walk are kept. */
+TEST(pylsp_issue1527_cross_memo_failure_preserves_completed_rows) {
+    char src[4096];
+    size_t pos = (size_t)snprintf(src, sizeof(src), "def run(s: S):\n    s + s\n");
+    for (int i = 0; i < 200; i++)
+        pos += (size_t)snprintf(src + pos, sizeof(src) - pos, "    s.m()\n");
+    CBMLSPDef defs[3] = {};
+    defs[0].qualified_name = "test.S";
+    defs[0].short_name = "S";
+    defs[0].label = "Class";
+    defs[0].lang = CBM_LANG_PYTHON;
+    defs[1].qualified_name = "test.S.m";
+    defs[1].short_name = "m";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.S";
+    defs[1].return_types = "int";
+    defs[1].lang = CBM_LANG_PYTHON;
+    defs[2].qualified_name = "test.S.__add__";
+    defs[2].short_name = "__add__";
+    defs[2].label = "Method";
+    defs[2].receiver_type = "test.S";
+    defs[2].return_types = "S";
+    defs[2].lang = CBM_LANG_PYTHON;
+    bool correct = true;
+    for (int mode = 0; mode < 3; mode++) {
+        CBMArena arena, shared;
+        cbm_arena_init(&arena);
+        cbm_arena_init(&shared);
+        CBMResolvedCall prior = {};
+        prior.caller_qn = "test.run";
+        prior.callee_qn = "test.S.m";
+        prior.strategy = "prior.strategy";
+        prior.confidence = 0.1f;
+        prior.reason = "prior.reason";
+        CBMResolvedCallArray out = {&prior, 1, 1};
+        CBMTypeRegistry *base = mode == 1 ? cbm_py_build_cross_registry(&shared, defs, 3) : NULL;
+        CBMBatchPyLSPFile file = {};
+        file.source = src;
+        file.source_len = (int)strlen(src);
+        file.module_qn = "test";
+        file.defs = defs;
+        file.def_count = 3;
+        /* The first type-cache allocation succeeds; growing past it fails
+         * after rows were emitted (200 calls exceed the initial capacity). */
+        cbm_py_lsp_test_memo_fail_after(1);
+        bool complete =
+            mode == 0   ? cbm_run_py_lsp_cross(&arena, src, (int)strlen(src), "test", defs, 3, NULL,
+                                               NULL, 0, NULL, &out)
+            : mode == 1 ? cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test",
+                                                             base, NULL, NULL, 0, NULL, &out)
+                        : cbm_batch_py_lsp_cross(&arena, &file, 1, &out);
+        cbm_py_lsp_test_memo_fail_after(-1);
+        correct = correct && !complete && out.count == (mode == 2 ? 0 : 1) &&
+                  prior.confidence == 0.1f && strcmp(prior.strategy, "prior.strategy") == 0 &&
+                  strcmp(prior.reason, "prior.reason") == 0;
+        /* The walk may have grown (moved) the array: the restored row is
+         * out.items[0], which must carry the prior values again. */
+        if (mode != 2)
+            correct = correct && out.items[0].confidence == 0.1f &&
+                      strcmp(out.items[0].strategy, "prior.strategy") == 0 &&
+                      strcmp(out.items[0].reason, "prior.reason") == 0;
+        if (mode == 2)
+            out = CBMResolvedCallArray{};
+        complete = mode == 0 ? cbm_run_py_lsp_cross(&arena, src, (int)strlen(src), "test", defs, 3,
+                                                    NULL, NULL, 0, NULL, &out)
+                   : mode == 1 ? cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src),
+                                                                    "test", base, NULL, NULL, 0,
+                                                                    NULL, &out)
+                               : cbm_batch_py_lsp_cross(&arena, &file, 1, &out);
+        /* A complete walk does refine the prior row through its dedup. */
+        correct = correct && complete && out.count >= 1 &&
+                  (mode == 2 || out.items[0].confidence > 0.1f);
+        cbm_arena_destroy(&arena);
+        cbm_arena_destroy(&shared);
+    }
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pylsp_issue1527_cross_memo_failure_fallback_reports_error) {
+    const char *src = "def run(s: S):\n    s.m()\n";
+    CBMLSPDef defs[2] = {};
+    defs[0].qualified_name = "test.S";
+    defs[0].short_name = "S";
+    defs[0].label = "Class";
+    defs[0].lang = CBM_LANG_PYTHON;
+    defs[1].qualified_name = "test.S.m";
+    defs[1].short_name = "m";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.S";
+    defs[1].return_types = "int";
+    defs[1].lang = CBM_LANG_PYTHON;
+    CBMFileResult result = {};
+    cbm_arena_init(&result.arena);
+    cbm_py_lsp_test_memo_fail_after(0);
+    cbm_pxc_run_one(CBM_LANG_PYTHON, &result, src, (int)strlen(src), "test", defs, 2, NULL, NULL,
+                    0);
+    cbm_py_lsp_test_memo_fail_after(-1);
+    bool reported = result.lsp_skipped && result.lsp_skip_reason == CBM_LSP_SKIP_EVAL_MEMO &&
+                    result.resolved_calls.count == 0;
+    cbm_arena_destroy(&result.arena);
+    ASSERT_TRUE(reported);
+    PASS();
+}
+
+TEST(pylsp_issue1527_depth_failure_reports_all_entry_points) {
+    const char *src = "class S:\n    def m(self):\n        return 1\ndef run(s: S):\n    s.m()\n";
+    CBMLSPDef defs[2] = {};
+    defs[0].qualified_name = "test.S";
+    defs[0].short_name = "S";
+    defs[0].label = "Class";
+    defs[0].lang = CBM_LANG_PYTHON;
+    defs[1].qualified_name = "test.S.m";
+    defs[1].short_name = "m";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.S";
+    defs[1].return_types = "int";
+    defs[1].lang = CBM_LANG_PYTHON;
+    cbm_py_lsp_test_depth_fail(true);
+    CBMFileResult *raw = extract_py(src);
+    bool correct = raw && raw->lsp_skipped && raw->lsp_skip_reason == CBM_LSP_SKIP_EVAL_DEPTH &&
+                   raw->resolved_calls.count == 0;
+    if (raw)
+        cbm_free_result(raw);
+    for (int mode = 0; mode < 3; mode++) {
+        CBMArena arena, shared;
+        cbm_arena_init(&arena);
+        cbm_arena_init(&shared);
+        CBMTypeRegistry *base = mode == 1 ? cbm_py_build_cross_registry(&shared, defs, 2) : NULL;
+        CBMResolvedCallArray out = {};
+        CBMBatchPyLSPFile file = {};
+        file.source = src;
+        file.source_len = (int)strlen(src);
+        file.module_qn = "test";
+        file.defs = defs;
+        file.def_count = 2;
+        if (mode == 2) {
+            correct = !cbm_batch_py_lsp_cross(&arena, &file, 1, &out) && correct;
+        } else {
+            CBMLSPStatus status =
+                mode == 0 ? cbm_run_py_lsp_cross_status(&arena, src, (int)strlen(src), "test", defs,
+                                                        2, NULL, NULL, 0, NULL, &out)
+                          : cbm_run_py_lsp_cross_with_registry_status(&arena, src, (int)strlen(src),
+                                                                      "test", base, NULL, NULL, 0,
+                                                                      NULL, &out);
+            correct = correct && status == CBM_LSP_DEPTH_EXCEEDED;
+        }
+        correct = correct && out.count == 0;
+        cbm_arena_destroy(&arena);
+        cbm_arena_destroy(&shared);
+    }
+    CBMFileResult fallback = {};
+    cbm_arena_init(&fallback.arena);
+    cbm_pxc_run_one(CBM_LANG_PYTHON, &fallback, src, (int)strlen(src), "test", defs, 2, NULL, NULL,
+                    0);
+    correct = correct && fallback.lsp_skipped &&
+              fallback.lsp_skip_reason == CBM_LSP_SKIP_EVAL_DEPTH &&
+              fallback.resolved_calls.count == 0;
+    cbm_arena_destroy(&fallback.arena);
+    cbm_py_lsp_test_depth_fail(false);
+    CBMFileResult *fresh = extract_py(src);
+    bool recovered = fresh && !fresh->lsp_skipped && fresh->resolved_calls.count > 0;
+    if (fresh)
+        cbm_free_result(fresh);
+    ASSERT_TRUE(correct);
+    ASSERT_TRUE(recovered);
+    PASS();
+}
+#endif /* CBM_ENABLE_TEST_SEAMS */
+
 SUITE(py_lsp) {
+    RUN_TEST(pylsp_issue1527_chain_statements_resolve_completely);
+    RUN_TEST(pylsp_issue1527_large_module_resolves_every_call);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(pylsp_scale_work_is_linear);
+    RUN_TEST(pylsp_issue1527_memo_allocation_failure_is_reported);
+    RUN_TEST(pylsp_issue1527_memo_and_depth_failures_stop_work);
+    RUN_TEST(pylsp_issue1527_cross_memo_failure_preserves_completed_rows);
+    RUN_TEST(pylsp_issue1527_cross_memo_failure_fallback_reports_error);
+    RUN_TEST(pylsp_issue1527_depth_failure_reports_all_entry_points);
+#endif
     /* Phase 2 — smoke */
     RUN_TEST(pylsp_smoke_empty);
     RUN_TEST(pylsp_smoke_one_function);

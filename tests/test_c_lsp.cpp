@@ -22,6 +22,9 @@
 #include "cbm.h"
 #include "../internal/cbm/lsp/c_lsp.h"
 #include "../internal/cbm/lsp/type_registry.h"
+#include "../internal/cbm/lsp/lsp_work.h"
+#include "result_compact.h" /* cbm_result_compact */
+#include "../src/pipeline/pass_lsp_cross.h"
 #include "../src/pipeline/lsp_resolve.h"
 
 TEST(clsp_primitive_completion_requires_known_sites_and_local_calls) {
@@ -15743,7 +15746,448 @@ TEST(clsp_type_short_index_matches_linear_scan_and_degrades) {
 
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+/* ── #1527: no per-file eval budget; cost fixed at the root ────────────── */
+
+/* Resolved rows that name a real target (not an lsp_unresolved marker) whose
+ * callee QN contains sub. */
+static int count_real_resolved(const CBMFileResult *r, const char *sub) {
+    int n = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->callee_qn && strstr(rc->callee_qn, sub) && rc->confidence > 0.0f &&
+            !(rc->strategy && strcmp(rc->strategy, "lsp_unresolved") == 0))
+            n++;
+    }
+    return n;
+}
+
+/* A versionbits-style fluent chain (the #323 hang): every link returns
+ * Tester&, and the evaluator re-evaluates a call's receiver for template
+ * substitution, so without a memo an N-link chain costs 2^N evaluations. The
+ * per-file step cap that used to contain it is gone; the per-evaluation memo
+ * must keep the work polynomial AND every link must resolve. */
+static char *clsp_chain_source(int links, int stmts) {
+    size_t sz = 512 + (size_t)stmts * (32 + (size_t)links * 40);
+    char *src = (char *)malloc(sz);
+    if (!src)
+        return NULL;
+    size_t pos = (size_t)snprintf(src, sz,
+                                  "struct Tester {\n"
+                                  "  Tester& Mine(int h, int t, int v);\n"
+                                  "  Tester& TestDefined();\n"
+                                  "  Tester& TestStateSinceHeight(int h);\n"
+                                  "  Tester& Reset();\n"
+                                  "};\n"
+                                  "void run() {\n"
+                                  "  Tester t;\n");
+    for (int s = 0; s < stmts; s++) {
+        pos += (size_t)snprintf(src + pos, sz - pos, "  t.Reset()");
+        for (int l = 0; l < links; l++) {
+            if (l % 3 == 0)
+                pos += (size_t)snprintf(src + pos, sz - pos, ".Mine(%d, %d, 0x100)", l, l);
+            else if (l % 3 == 1)
+                pos += (size_t)snprintf(src + pos, sz - pos, ".TestDefined()");
+            else
+                pos += (size_t)snprintf(src + pos, sz - pos, ".TestStateSinceHeight(%d)", l);
+        }
+        pos += (size_t)snprintf(src + pos, sz - pos, ";\n");
+    }
+    snprintf(src + pos, sz - pos, "}\n");
+    return src;
+}
+
+/* Chains of 30 links: with the old 10000-step cap and no memo the chain cost
+ * 2^N evaluations and later links went unresolved; now every link resolves. */
+TEST(clsp_issue1527_long_fluent_chain_resolves_every_link) {
+    enum { LINKS = 30, STMTS = 3 };
+    char *src = clsp_chain_source(LINKS, STMTS);
+    ASSERT_NOT_NULL(src);
+    CBMFileResult *r = extract_cpp(src);
+    free(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->lsp_skipped);
+    /* Every method of the chain resolves (rows dedup per caller/callee). */
+    ASSERT_GT(count_real_resolved(r, ".Tester.Reset"), 0);
+    ASSERT_GT(count_real_resolved(r, ".Tester.Mine"), 0);
+    ASSERT_GT(count_real_resolved(r, ".Tester.TestDefined"), 0);
+    ASSERT_GT(count_real_resolved(r, ".Tester.TestStateSinceHeight"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1527: with index_first_registered, an indexed registry answers a duplicated
+ * name with its FIRST registration -- the answer the linear scan gave; the
+ * Tier-2 default stays last-registered. */
+TEST(registry_issue1527_index_preserves_registration_order) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, &a);
+    CBMRegisteredType t = {};
+    t.qualified_name = "test.S";
+    t.short_name = "S";
+    cbm_registry_add_type(&reg, t);
+    cbm_registry_add_type(&reg, t);
+    CBMRegisteredFunc f = {};
+    f.qualified_name = "test.S.m";
+    f.short_name = "m";
+    f.receiver_type = "test.S";
+    cbm_registry_add_func(&reg, f);
+    cbm_registry_add_func(&reg, f);
+    bool linear_first = cbm_registry_lookup_type(&reg, "test.S") == &reg.types[0] &&
+                        cbm_registry_lookup_func(&reg, "test.S.m") == &reg.funcs[0] &&
+                        cbm_registry_lookup_method(&reg, "test.S", "m") == &reg.funcs[0];
+    reg.index_first_registered = true;
+    cbm_registry_finalize(&reg);
+    bool indexed_first = cbm_registry_lookup_type(&reg, "test.S") == &reg.types[0] &&
+                         cbm_registry_lookup_func(&reg, "test.S.m") == &reg.funcs[0] &&
+                         cbm_registry_lookup_method(&reg, "test.S", "m") == &reg.funcs[0];
+    reg.index_first_registered = false;
+    cbm_registry_finalize(&reg);
+    bool default_last = cbm_registry_lookup_type(&reg, "test.S") == &reg.types[1] &&
+                        cbm_registry_lookup_func(&reg, "test.S.m") == &reg.funcs[1] &&
+                        cbm_registry_lookup_method(&reg, "test.S", "m") == &reg.funcs[1];
+    f.qualified_name = "test.S.tail";
+    f.short_name = "tail";
+    cbm_registry_add_func(&reg, f);
+    bool tail = cbm_registry_lookup_func(&reg, "test.S.tail") == &reg.funcs[2] &&
+                cbm_registry_lookup_method(&reg, "test.S", "tail") == &reg.funcs[2];
+    cbm_arena_destroy(&a);
+    ASSERT_TRUE(linear_first);
+    ASSERT_TRUE(indexed_first);
+    ASSERT_TRUE(default_last);
+    ASSERT_TRUE(tail);
+    PASS();
+}
+
+/* A reachable post-allocation-failure state, pinned without memory pressure:
+ * a frame that lost its index rebuilds it sized from ALL its bindings. */
+TEST(scope_issue1527_recovery_sizes_from_all_bindings) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMScope *scope = cbm_scope_push(&a, NULL);
+    char names[64][24];
+    bool setup_ok = scope != NULL;
+    const CBMType *old_t = cbm_type_named(&a, "test.Old");
+    const CBMType *new_t = cbm_type_named(&a, "test.New");
+    const CBMType *child_t = cbm_type_named(&a, "test.Child");
+    for (int i = 0; i < 63 && setup_ok; i++) {
+        snprintf(names[i], sizeof(names[i]), "binding_%d", i);
+        setup_ok = cbm_scope_bind_checked(scope, names[i], old_t);
+    }
+    const CBMVarBinding *stable = setup_ok ? cbm_scope_lookup_local(scope, names[7]) : NULL;
+    if (setup_ok)
+        memset(&scope->index, 0, sizeof(scope->index));
+    snprintf(names[63], sizeof(names[63]), "binding_63");
+    bool bound = setup_ok && cbm_scope_bind_checked(scope, names[63], old_t);
+    bool spare = bound && scope->binding_count == 64 && scope->index.cap >= 128;
+    bool preserved = false;
+    if (spare) {
+        preserved = cbm_scope_lookup_local(scope, "absent") == NULL;
+        for (int i = 0; i < 64; i++)
+            preserved = preserved && cbm_scope_lookup_local(scope, names[i]) != NULL;
+        preserved = preserved && cbm_scope_bind_checked(scope, names[7], new_t) &&
+                    cbm_scope_lookup_local(scope, names[7]) == stable && stable->type == new_t &&
+                    scope->binding_count == 64;
+        CBMScope *child = cbm_scope_push(&a, scope);
+        preserved = preserved && child && cbm_scope_bind_checked(child, names[7], child_t);
+        const CBMVarBinding *shadow = child ? cbm_scope_lookup_binding(child, names[7]) : NULL;
+        preserved = preserved && shadow && shadow->type == child_t && stable->type == new_t;
+    }
+    cbm_arena_destroy(&a);
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(bound);
+    ASSERT_TRUE(spare);
+    ASSERT_TRUE(preserved);
+    PASS();
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+TEST(clsp_issue1527_fluent_chain_work_is_polynomial) {
+    enum { LINKS = 14, STMTS = 3 };
+    char *src = clsp_chain_source(LINKS, STMTS);
+    ASSERT_NOT_NULL(src);
+    (void)cbm_lsp_work_take();
+    CBMFileResult *r = extract_cpp(src);
+    uint64_t work = cbm_lsp_work_take();
+    free(src);
+    ASSERT_NOT_NULL(r);
+    printf("    chain %dx%d: work=%llu\n", LINKS, STMTS, (unsigned long long)work);
+    ASSERT_FALSE(r->lsp_skipped);
+    /* Memoized: ~LINKS^2 evaluations per statement (each call node starts a
+     * fresh outermost evaluation of its receiver chain) plus the registry
+     * probes. Unmemoized: ~2^LINKS per call node, ~100k in total. */
+    ASSERT(work < 40000);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Deterministic complexity gate for the C/C++ resolver (no clock): 4x the
+ * definitions and calls must cost ~4x the counted work. Methods are DEFINED
+ * out of class, so they are registered before the registry is indexed. */
+static uint64_t clsp_member_calls_work(int n, int *out_real) {
+    size_t sz = (size_t)n * 128 + 512;
+    char *src = (char *)malloc(sz);
+    if (!src)
+        return 0;
+    size_t pos = (size_t)snprintf(src, sz, "struct S {\n");
+    for (int i = 0; i < n; i++)
+        pos += (size_t)snprintf(src + pos, sz - pos, "  S& m%d();\n", i);
+    pos += (size_t)snprintf(src + pos, sz - pos, "};\n");
+    for (int i = 0; i < n; i++)
+        pos += (size_t)snprintf(src + pos, sz - pos, "S& S::m%d() { return *this; }\n", i);
+    pos += (size_t)snprintf(src + pos, sz - pos, "void use() {\n  S s;\n");
+    for (int i = 0; i < n; i++)
+        pos += (size_t)snprintf(src + pos, sz - pos, "  s.m%d().m%d();\n", i, (i + 1) % n);
+    snprintf(src + pos, sz - pos, "}\n");
+    (void)cbm_lsp_work_take();
+    CBMFileResult *r = extract_cpp(src);
+    uint64_t work = cbm_lsp_work_take();
+    free(src);
+    *out_real = r ? count_real_resolved(r, ".S.m") : -1;
+    if (r)
+        cbm_free_result(r);
+    return work;
+}
+
+TEST(clsp_issue1527_scale_work_is_linear) {
+    int real1 = 0, real4 = 0;
+    uint64_t w1 = clsp_member_calls_work(1000, &real1);
+    uint64_t w4 = clsp_member_calls_work(4000, &real4);
+    double ratio = w1 ? (double)w4 / (double)w1 : 0.0;
+    printf("    work: 1000=%llu (real=%d)  4000=%llu (real=%d)  ratio=%.2fx\n",
+           (unsigned long long)w1, real1, (unsigned long long)w4, real4, ratio);
+    ASSERT(real1 >= 1000);
+    ASSERT(real4 >= 4000);
+    ASSERT_GT(w1, 0);
+    ASSERT(ratio < 5.0);
+    PASS();
+}
+
+/* Initial allocation, second allocation, and later growth fail independently
+ * of the arena. The failure must be explicit, not an uncached exponential walk. */
+TEST(clsp_issue1527_memo_allocation_failure_is_reported) {
+    char *src = clsp_chain_source(40, 1);
+    ASSERT_NOT_NULL(src);
+    bool failures_reported = true;
+    for (int successful_allocations = 0; successful_allocations <= 2; successful_allocations++) {
+        cbm_c_lsp_test_memo_fail_after(successful_allocations);
+        CBMFileResult *r = extract_cpp(src);
+        cbm_c_lsp_test_memo_fail_after(-1);
+        failures_reported = failures_reported && r && r->lsp_skipped &&
+                            r->lsp_skip_reason == CBM_LSP_SKIP_EVAL_MEMO &&
+                            r->resolved_calls.count == 0;
+        if (r) {
+            /* The skip reason also survives result compaction. */
+            cbm_result_compact(r);
+            failures_reported = failures_reported && r->lsp_skip_reason == CBM_LSP_SKIP_EVAL_MEMO;
+            cbm_free_result(r);
+        }
+    }
+    CBMFileResult *fresh = extract_cpp(src);
+    bool recovered = fresh && !fresh->lsp_skipped && count_real_resolved(fresh, ".Tester.") > 0;
+    if (fresh)
+        cbm_free_result(fresh);
+    free(src);
+    ASSERT_TRUE(failures_reported);
+    ASSERT_TRUE(recovered);
+    PASS();
+}
+
+extern "C" const TSLanguage *tree_sitter_cpp(void);
+
+TEST(clsp_issue1527_memo_and_depth_failures_are_sticky) {
+    const char *src = "void f() { x; }";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ts_parser_set_language(parser, tree_sitter_cpp());
+    TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+    if (!tree) {
+        ts_parser_delete(parser);
+        FAIL("failed to parse memo fixture");
+    }
+    TSNode fn = ts_node_named_child(ts_tree_root_node(tree), 0);
+    TSNode body = ts_node_child_by_field_name(fn, "body", 4);
+    TSNode expr = ts_node_named_child(ts_node_named_child(body, 0), 0);
+    bool identifier = !ts_node_is_null(expr) && strcmp(ts_node_type(expr), "identifier") == 0;
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, &a);
+    CBMResolvedCallArray out = {};
+    CLSPContext ctx;
+    c_lsp_init(&ctx, &a, src, (int)strlen(src), &reg, "test", true, &out);
+    const CBMType *first = cbm_type_named(&a, "test.First");
+    const CBMType *second = cbm_type_named(&a, "test.Second");
+    cbm_scope_bind(ctx.current_scope, "x", first);
+    ctx.eval_depth = 257;
+    bool depth_unknown = cbm_type_is_unknown(c_eval_expr_type(&ctx, expr)) &&
+                         ctx.eval_failure == CBM_LSP_DEPTH_EXCEEDED;
+    ctx.eval_depth = 0;
+    (void)cbm_lsp_work_take();
+    bool depth_stopped = cbm_type_is_unknown(c_eval_expr_type(&ctx, expr));
+    depth_stopped = depth_stopped && cbm_lsp_work_take() == 0;
+    /* A depth-truncated walk is incomplete; only a fresh walk may resume. */
+    c_lsp_init(&ctx, &a, src, (int)strlen(src), &reg, "test", true, &out);
+    cbm_scope_bind(ctx.current_scope, "x", first);
+    bool shallow_ok = c_eval_expr_type(&ctx, expr) == first && !ctx.eval_failure;
+    cbm_scope_bind(ctx.current_scope, "x", second);
+    bool rebound = c_eval_expr_type(&ctx, expr) == second;
+    /* Force a new memo's allocation to fail; old slots remain arena-owned. */
+    ctx.eval_memo_cap = ctx.eval_memo_count = 0;
+    ctx.eval_memo = NULL;
+    ctx.eval_memo_used = NULL;
+    ctx.test_memo_allocations_left = 0;
+    bool failed = cbm_type_is_unknown(c_eval_expr_type(&ctx, expr)) && ctx.eval_failure;
+    (void)cbm_lsp_work_take();
+    bool stopped = true;
+    for (int i = 0; i < 20; i++)
+        stopped = stopped && cbm_type_is_unknown(c_eval_expr_type(&ctx, expr));
+    uint64_t later_work = cbm_lsp_work_take();
+    cbm_arena_destroy(&a);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    ASSERT_TRUE(identifier);
+    ASSERT_TRUE(depth_unknown);
+    ASSERT_TRUE(depth_stopped);
+    ASSERT_TRUE(shallow_ok);
+    ASSERT_TRUE(rebound);
+    ASSERT_TRUE(failed);
+    ASSERT_TRUE(stopped);
+    ASSERT_EQ(later_work, 0);
+    PASS();
+}
+
+TEST(clsp_issue1527_cross_file_memo_failures_propagate) {
+    const char *src = "struct S { int m() { return 1; } }; void run() { S s; s.m(); }";
+    CBMLSPDef defs[2] = {};
+    defs[0].qualified_name = "test.S";
+    defs[0].short_name = "S";
+    defs[0].label = "Class";
+    defs[0].lang = CBM_LANG_CPP;
+    defs[1].qualified_name = "test.S.m";
+    defs[1].short_name = "m";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.S";
+    defs[1].return_types = "int";
+    defs[1].lang = CBM_LANG_CPP;
+    bool failed[3] = {false, false, false}, recovered[3] = {false, false, false};
+    bool shared_ready = true;
+    for (int mode = 0; mode < 3; mode++) {
+        CBMArena a;
+        cbm_arena_init(&a);
+        CBMTypeRegistry *shared = cbm_c_build_cross_registry(&a, defs, 2);
+        shared_ready = shared_ready && shared;
+        CBMResolvedCallArray out = {};
+        CBMBatchCLSPFile file = {};
+        file.source = src;
+        file.source_len = (int)strlen(src);
+        file.module_qn = "test";
+        file.cpp_mode = true;
+        file.defs = defs;
+        file.def_count = 2;
+        cbm_c_lsp_test_memo_fail_after(0);
+        bool ok = mode == 0 ? cbm_run_c_lsp_cross(&a, src, (int)strlen(src), "test", true, defs, 2,
+                                                  NULL, NULL, 0, NULL, &out)
+                  : mode == 1
+                      ? cbm_run_c_lsp_cross_with_registry(&a, src, (int)strlen(src), "test", true,
+                                                          shared, NULL, NULL, 0, NULL, &out)
+                      : cbm_batch_c_lsp_cross(&a, &file, 1, &out);
+        cbm_c_lsp_test_memo_fail_after(-1);
+        failed[mode] = !ok && out.count == 0;
+        ok = mode == 0 ? cbm_run_c_lsp_cross(&a, src, (int)strlen(src), "test", true, defs, 2, NULL,
+                                             NULL, 0, NULL, &out)
+             : mode == 1 ? cbm_run_c_lsp_cross_with_registry(&a, src, (int)strlen(src), "test",
+                                                             true, shared, NULL, NULL, 0, NULL, &out)
+                         : cbm_batch_c_lsp_cross(&a, &file, 1, &out);
+        recovered[mode] = ok && out.count > 0;
+        cbm_arena_destroy(&a);
+    }
+    ASSERT_TRUE(shared_ready);
+    for (int i = 0; i < 3; i++) {
+        ASSERT_TRUE(failed[i]);
+        ASSERT_TRUE(recovered[i]);
+    }
+    PASS();
+}
+
+TEST(clsp_issue1527_depth_failure_reports_all_entry_points) {
+    const char *src = "struct S { int m() { return 1; } }; void run() { S s; s.m(); }";
+    CBMLSPDef defs[2] = {};
+    defs[0].qualified_name = "test.S";
+    defs[0].short_name = "S";
+    defs[0].label = "Class";
+    defs[0].lang = CBM_LANG_CPP;
+    defs[1].qualified_name = "test.S.m";
+    defs[1].short_name = "m";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.S";
+    defs[1].return_types = "int";
+    defs[1].lang = CBM_LANG_CPP;
+    cbm_c_lsp_test_depth_fail(true);
+    CBMFileResult *raw = extract_cpp(src);
+    bool correct = raw && raw->lsp_skipped && raw->lsp_skip_reason == CBM_LSP_SKIP_EVAL_DEPTH &&
+                   raw->resolved_calls.count == 0;
+    if (raw)
+        cbm_free_result(raw);
+    for (int mode = 0; mode < 3; mode++) {
+        CBMArena arena, shared;
+        cbm_arena_init(&arena);
+        cbm_arena_init(&shared);
+        CBMTypeRegistry *base = mode == 1 ? cbm_c_build_cross_registry(&shared, defs, 2) : NULL;
+        CBMResolvedCallArray out = {};
+        CBMBatchCLSPFile file = {};
+        file.source = src;
+        file.source_len = (int)strlen(src);
+        file.module_qn = "test";
+        file.cpp_mode = true;
+        file.defs = defs;
+        file.def_count = 2;
+        if (mode == 2) {
+            correct = !cbm_batch_c_lsp_cross(&arena, &file, 1, &out) && correct;
+        } else {
+            CBMLSPStatus status =
+                mode == 0 ? cbm_run_c_lsp_cross_status(&arena, src, (int)strlen(src), "test", true,
+                                                       defs, 2, NULL, NULL, 0, NULL, &out)
+                          : cbm_run_c_lsp_cross_with_registry_status(&arena, src, (int)strlen(src),
+                                                                     "test", true, base, NULL,
+                                                                     NULL, 0, NULL, &out);
+            correct = correct && status == CBM_LSP_DEPTH_EXCEEDED;
+        }
+        correct = correct && out.count == 0;
+        cbm_arena_destroy(&arena);
+        cbm_arena_destroy(&shared);
+    }
+    CBMFileResult fallback = {};
+    cbm_arena_init(&fallback.arena);
+    cbm_pxc_run_one(CBM_LANG_CPP, &fallback, src, (int)strlen(src), "test", defs, 2, NULL, NULL, 0);
+    correct = correct && fallback.lsp_skipped &&
+              fallback.lsp_skip_reason == CBM_LSP_SKIP_EVAL_DEPTH &&
+              fallback.resolved_calls.count == 0;
+    cbm_arena_destroy(&fallback.arena);
+    cbm_c_lsp_test_depth_fail(false);
+    CBMFileResult *fresh = extract_cpp(src);
+    bool recovered = fresh && !fresh->lsp_skipped && fresh->resolved_calls.count > 0;
+    if (fresh)
+        cbm_free_result(fresh);
+    ASSERT_TRUE(correct);
+    ASSERT_TRUE(recovered);
+    PASS();
+}
+#endif /* CBM_ENABLE_TEST_SEAMS */
+
 SUITE(c_lsp) {
+    RUN_TEST(clsp_issue1527_long_fluent_chain_resolves_every_link);
+    RUN_TEST(registry_issue1527_index_preserves_registration_order);
+    RUN_TEST(scope_issue1527_recovery_sizes_from_all_bindings);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(clsp_issue1527_fluent_chain_work_is_polynomial);
+    RUN_TEST(clsp_issue1527_scale_work_is_linear);
+    RUN_TEST(clsp_issue1527_memo_allocation_failure_is_reported);
+    RUN_TEST(clsp_issue1527_memo_and_depth_failures_are_sticky);
+    RUN_TEST(clsp_issue1527_cross_file_memo_failures_propagate);
+    RUN_TEST(clsp_issue1527_depth_failure_reports_all_entry_points);
+#endif
     RUN_TEST(clsp_extracted_overloads_keep_body_ownership);
     RUN_TEST(clsp_overload_lookup_preserves_distinct_graph_identities);
     RUN_TEST(clsp_batch_preserves_operator_source_metadata);

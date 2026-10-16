@@ -1188,14 +1188,21 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
          * imports — the existing pipeline doesn't carry C-style include
          * resolution as a separate map, so pass NULL/0 and let the LSP
          * fall back to its own #include scan. */
-        cbm_run_c_lsp_cross(&scratch, source, source_len, module_qn, cpp_mode, defs, def_count,
-                            NULL, NULL, 0, tree, &out);
+        CBMLSPStatus status =
+            cbm_run_c_lsp_cross_status(&scratch, source, source_len, module_qn, cpp_mode, defs,
+                                       def_count, NULL, NULL, 0, tree, &out);
+        if (status != CBM_LSP_COMPLETE)
+            cbm_c_lsp_record_failure(r, status);
         break;
     }
-    case CBM_LANG_PYTHON:
-        cbm_run_py_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
-                             imp_qns, imp_count, tree, &out);
+    case CBM_LANG_PYTHON: {
+        CBMLSPStatus status =
+            cbm_run_py_lsp_cross_status(&scratch, source, source_len, module_qn, defs, def_count,
+                                        imp_names, imp_qns, imp_count, tree, &out);
+        if (status != CBM_LSP_COMPLETE)
+            cbm_py_lsp_record_failure(r, status);
         break;
+    }
     case CBM_LANG_PHP:
         /* #1186: the IMPORTS writer recorded the file's vendor `use` targets. */
         cbm_run_php_lsp_cross_ex(&scratch, source, source_len, module_qn, defs, def_count,
@@ -1371,18 +1378,23 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                                                result->cached_tree, &result->resolved_calls);
             used_prebuilt = true;
             break;
-        case CBM_LANG_PYTHON:
-            cbm_run_py_lsp_cross_with_registry(&result->arena, source, source_len, def_module,
-                                               prebuilt, imp_keys, imp_vals, imp_count,
-                                               result->cached_tree, &result->resolved_calls);
+        case CBM_LANG_PYTHON: {
+            CBMLSPStatus status = cbm_run_py_lsp_cross_with_registry_status(
+                &result->arena, source, source_len, def_module, prebuilt, imp_keys, imp_vals,
+                imp_count, result->cached_tree, &result->resolved_calls);
+            if (status != CBM_LSP_COMPLETE)
+                cbm_py_lsp_record_failure(result, status);
             used_prebuilt = true;
             break;
+        }
         case CBM_LANG_C:
         case CBM_LANG_CPP:
-        case CBM_LANG_CUDA:
-            cbm_run_c_lsp_cross_with_registry(
+        case CBM_LANG_CUDA: {
+            CBMLSPStatus status = cbm_run_c_lsp_cross_with_registry_status(
                 &result->arena, source, source_len, def_module, (lang != CBM_LANG_C), prebuilt,
                 imp_keys, imp_vals, imp_count, result->cached_tree, &result->resolved_calls);
+            if (status != CBM_LSP_COMPLETE)
+                cbm_c_lsp_record_failure(result, status);
             // Snapshot-backed workers load the original call records after
             // registry construction, so apply the same ambiguity guard here.
             if (cbm_registry_lookup_type(prebuilt,
@@ -1393,6 +1405,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             }
             used_prebuilt = true;
             break;
+        }
         case CBM_LANG_CSHARP:
             cbm_run_cs_lsp_cross_with_registry(&result->arena, source, source_len, def_module,
                                                prebuilt, imp_vals, imp_count, result->cached_tree,
@@ -1649,10 +1662,19 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
          * file, not to a stale extraction marker (the innocent-quarantine
          * failure mode). */
         cbm_index_mark_start(files[i].rel_path);
+        bool was_skipped = cache[i]->lsp_skipped;
         cbm_pxc_dispatch_file(lang, cache[i], source, source_len, files[i].rel_path, def_modules[i],
                               &cross_registries, module_def_index, all_defs, def_count, imp_keys,
                               imp_vals, imp_count, NULL, NULL);
         cbm_index_mark_done(files[i].rel_path);
+        /* A cross walk that stopped on a memo or depth failure (#1527) dropped
+         * its output: report the file as lsp_skipped (same entry as the
+         * parallel driver, pass_parallel.cpp). */
+        if (!was_skipped && cache[i]->lsp_skipped && ctx->pipeline) {
+            cbm_pipeline_add_file_error(ctx->pipeline, files[i].rel_path,
+                                        cbm_lsp_skip_reason_name(cache[i]->lsp_skip_reason),
+                                        "lsp_skipped");
+        }
         per_lang_calls++;
         processed++;
 

@@ -9111,6 +9111,50 @@ TEST(non_config_language_module_has_no_promoted_description_issue519) {
     PASS();
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1527: the call-context metrics find each call's innermost enclosing
+ * Function/Method with a line sweep instead of scanning every def per call.
+ * The sweep must give the scan's exact answer -- smallest span, ties to the
+ * lowest def index -- on nested, overlapping, same-line, malformed
+ * (end < start) and unnamed/non-callable ranges. Fixed-seed generator:
+ * deterministic, many shapes. */
+static uint32_t enc_rand(uint32_t *state) {
+    *state = (*state * 1103515245u) + 12345u;
+    return (*state >> 16) & 0x7fffu;
+}
+
+TEST(extract_enclosing_sweep_matches_scan_issue1527) {
+    static const char *const labels[] = {"Function", "Method", "Class", "Variable"};
+    uint32_t seed = 1527;
+    for (int round = 0; round < 40; round++) {
+        CBMArena a;
+        cbm_arena_init(&a);
+        CBMFileResult r = {};
+        int ndefs = round == 0 ? 0 : (int)(enc_rand(&seed) % 300);
+        int ncalls = (int)(enc_rand(&seed) % 1500) + 1;
+        int max_line = (int)(enc_rand(&seed) % 400) + 5;
+        for (int i = 0; i < ndefs; i++) {
+            CBMDefinition d = {};
+            d.name = (enc_rand(&seed) % 10) == 0 ? NULL : "f";
+            d.label = labels[enc_rand(&seed) % 4];
+            d.start_line = 1 + (enc_rand(&seed) % (uint32_t)max_line);
+            int len = (int)(enc_rand(&seed) % 60) - 3; /* a few malformed end < start */
+            d.end_line = (uint32_t)((int)d.start_line + len > 0 ? (int)d.start_line + len : 0);
+            cbm_defs_push(&r.defs, &a, d);
+        }
+        for (int i = 0; i < ncalls; i++) {
+            CBMCall c = {};
+            c.callee_name = "g";
+            c.start_line = (int)(enc_rand(&seed) % (uint32_t)(max_line + 10)) - 2;
+            cbm_calls_push(&r.calls, &a, c);
+        }
+        ASSERT_EQ(cbm_test_enclosing_sweep_mismatches(&r), 0);
+        cbm_arena_destroy(&a);
+    }
+    PASS();
+}
+#endif
+
 /* ── Per-file CPU budget over the LSP walks (upstream 7b77fd48) ──────────── */
 
 static const char *BUDGET_PY_SRC = "import os\n"
@@ -10169,6 +10213,9 @@ SUITE(extraction) {
     RUN_TEST(json_toplevel_description_promoted_to_module_issue519);
     RUN_TEST(config_description_only_at_top_level_issue519);
     RUN_TEST(non_config_language_module_has_no_promoted_description_issue519);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(extract_enclosing_sweep_matches_scan_issue1527);
+#endif
     RUN_TEST(extract_lsp_skipped_when_parse_used_its_budget_share);
     RUN_TEST(extract_walk_truncated_at_its_cpu_budget);
 #ifdef CBM_ENABLE_TEST_SEAMS

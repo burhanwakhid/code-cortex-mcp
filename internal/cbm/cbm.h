@@ -390,6 +390,15 @@ typedef struct {
     int cap;
 } CBMResolvedCallArray;
 
+/* LSP refinement status (#1527): existing parser/no-op exits are separate
+ * from these explicit evaluator failures. A failed walk drops its own output
+ * and the file is reported as lsp_skipped (CBM_LSP_SKIP_EVAL_*). */
+typedef enum {
+    CBM_LSP_COMPLETE = 0,
+    CBM_LSP_MEMO_FAILED,
+    CBM_LSP_DEPTH_EXCEEDED,
+} CBMLSPStatus;
+
 // Growable arrays used during extraction.
 typedef struct {
     CBMDefinition *items;
@@ -477,6 +486,8 @@ typedef enum {
     CBM_LSP_SKIP_WALK_BUDGET = 3,  // the unified walk stopped at its budget (walk_truncated)
     CBM_LSP_SKIP_TEST_SEAM = 4,    // CBM_TEST_LSP_SKIP_ON named the file
     CBM_LSP_SKIP_TREE_DEPTH = 5,   // the tree is too deep for the recursive resolvers
+    CBM_LSP_SKIP_EVAL_DEPTH = 6,   // an LSP walk stopped at the expression nesting limit
+    CBM_LSP_SKIP_EVAL_MEMO = 7,    // an LSP walk stopped on an evaluation-memo failure
 } CBMLspSkipReason;
 
 // Stable lower_snake name of a CBMLspSkipReason, as the coverage report and the
@@ -788,6 +799,12 @@ void cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw);
 void cbm_typerefs_push(CBMTypeRefArray *arr, CBMArena *a, CBMTypeRef tr);
 void cbm_envaccess_push(CBMEnvAccessArray *arr, CBMArena *a, CBMEnvAccess ea);
 void cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta);
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1527 seam: how many of result's calls get a different innermost enclosing
+ * Function/Method from the call-context sweep than from the reference
+ * per-call scan (0 = identical), or -1 when the sweep could not allocate. */
+int cbm_test_enclosing_sweep_mismatches(const CBMFileResult *result);
+#endif
 void cbm_fieldtype_push(CBMFieldTypeArray *arr, CBMArena *a, CBMFieldType ft);
 void cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr);
 void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib);

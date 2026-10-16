@@ -2108,6 +2108,144 @@ static void teardown_usages_repo(void) {
     g_usages_tmpdir[0] = '\0';
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1527: a memo or depth failure of a per-file ("raw") or cross-file
+ * ("cross") LSP walk, injected after successful extraction, must reach the
+ * public per-file error list on both production drivers as exactly one
+ * lsp_skipped entry naming the rule. */
+static int pipeline_lsp_failure_case(bool parallel, const char *stage, bool python, bool depth) {
+    const char *src = "struct S { int m() { return 1; } };\n"
+                      "void run() { S s; s.m(); }\n";
+    if (python)
+        src = "class S:\n    def m(self):\n        return 1\ndef run():\n    s = S()\n    s.m()\n";
+    const char *filename = python ? "memo.py" : "memo.cpp";
+    const char *extra_name = NULL;
+    const char *extra_src = NULL;
+    /* The cross stage needs a call the per-file LSP cannot resolve on its own
+     * (upstream c944c80c): S lives in a second file. */
+    if (strcmp(stage, "cross") == 0) {
+        src = python ? "from memo_def import S\ndef run():\n    s = S()\n    s.m()\n"
+                     : "void run() { S s; s.m(); }\n";
+        extra_name = python ? "memo_def.py" : "memo_def.cpp";
+        extra_src = python ? "class S:\n    def m(self):\n        return 1\n"
+                           : "struct S { int m() { return 1; } };\n";
+    }
+    if (setup_usages_repo(filename, src, extra_name, extra_src) != 0)
+        FAIL("failed to create memo fixture");
+    char path[512];
+    if (parallel) {
+        for (int i = 0; i < 51; i++) {
+            snprintf(path, sizeof(path), "%s/memo_pad_%02d.%s", g_usages_tmpdir, i,
+                     python ? "py" : "cpp");
+            if (th_write_file(path, python ? "# inert parallel routing fixture\n"
+                                           : "// inert parallel routing fixture\n") != 0) {
+                teardown_usages_repo();
+                FAIL("failed to create parallel routing fixture");
+            }
+        }
+    }
+    const char *keys[] = {
+        "CBM_WORKERS", "CBM_INDEX_SINGLE_THREAD",
+        depth ? (python ? "CBM_TEST_PY_LSP_DEPTH_FAIL_STAGE" : "CBM_TEST_C_LSP_DEPTH_FAIL_STAGE")
+              : (python ? "CBM_TEST_PY_LSP_MEMO_FAIL_STAGE" : "CBM_TEST_C_LSP_MEMO_FAIL_STAGE")};
+    char *saved[3] = {NULL, NULL, NULL};
+    bool env_saved = true;
+    for (int i = 0; i < 3; i++) {
+        const char *old = getenv(keys[i]);
+        saved[i] = old ? strdup(old) : NULL;
+        env_saved = env_saved && (!old || saved[i]);
+    }
+    if (!env_saved) {
+        for (int i = 0; i < 3; i++)
+            free(saved[i]);
+        teardown_usages_repo();
+        FAIL("failed to save memo fixture environment");
+    }
+    int set_rc = cbm_setenv(keys[0], parallel ? "4" : "1", 1);
+    set_rc |= parallel ? cbm_unsetenv(keys[1]) : cbm_setenv(keys[1], "1", 1);
+    set_rc |= cbm_setenv(keys[2], stage, 1);
+    snprintf(path, sizeof(path), "%s/memo.db", g_usages_tmpdir);
+    cbm_pipeline_t *p = set_rc == 0 ? cbm_pipeline_new(g_usages_tmpdir, path, CBM_MODE_FULL) : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_file_error_t *errors = NULL;
+    int error_count = 0;
+    if (p)
+        cbm_pipeline_get_file_errors(p, &errors, &error_count);
+    int memo_errors = 0;
+    const char *rule = depth ? "eval_depth" : "eval_memo";
+    bool precise = true;
+    for (int i = 0; i < error_count; i++) {
+        if (errors[i].path && strcmp(errors[i].path, filename) == 0) {
+            memo_errors++;
+            precise = precise && errors[i].phase && strcmp(errors[i].phase, "lsp_skipped") == 0 &&
+                      errors[i].reason && strncmp(errors[i].reason, rule, strlen(rule)) == 0;
+        }
+    }
+    cbm_pipeline_free(p);
+    int restore_rc = 0;
+    for (int i = 0; i < 3; i++) {
+        restore_rc |= saved[i] ? cbm_setenv(keys[i], saved[i], 1) : cbm_unsetenv(keys[i]);
+        free(saved[i]);
+    }
+    teardown_usages_repo();
+    ASSERT_EQ(set_rc, 0);
+    ASSERT_EQ(restore_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(memo_errors, 1);
+    ASSERT_TRUE(precise);
+    PASS();
+}
+
+TEST(pipeline_issue1527_cross_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "cross", false, false);
+}
+TEST(pipeline_issue1527_cross_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "cross", false, false);
+}
+TEST(pipeline_issue1527_raw_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "raw", false, false);
+}
+TEST(pipeline_issue1527_raw_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "raw", false, false);
+}
+TEST(pipeline_issue1527_python_raw_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "raw", true, false);
+}
+TEST(pipeline_issue1527_python_raw_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "raw", true, false);
+}
+TEST(pipeline_issue1527_python_cross_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "cross", true, false);
+}
+TEST(pipeline_issue1527_python_cross_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "cross", true, false);
+}
+TEST(pipeline_issue1527_c_raw_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "raw", false, true);
+}
+TEST(pipeline_issue1527_c_cross_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "cross", false, true);
+}
+TEST(pipeline_issue1527_c_raw_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "raw", false, true);
+}
+TEST(pipeline_issue1527_c_cross_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "cross", false, true);
+}
+TEST(pipeline_issue1527_python_raw_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "raw", true, true);
+}
+TEST(pipeline_issue1527_python_cross_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "cross", true, true);
+}
+TEST(pipeline_issue1527_python_raw_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "raw", true, true);
+}
+TEST(pipeline_issue1527_python_cross_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "cross", true, true);
+}
+#endif /* CBM_ENABLE_TEST_SEAMS */
+
 /* #1277: typed instance fields of a Python class imported from another file.
  * Counts CALLS edges caller -> callee (QN suffixes) whose properties name an
  * LSP strategy. */
@@ -10893,6 +11031,24 @@ SUITE(pipeline) {
     RUN_TEST(implements_creates_override);
     RUN_TEST(implements_no_match);
     /* Usages pass (full pipeline integration) */
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(pipeline_issue1527_python_raw_memo_failure_sequential);
+    RUN_TEST(pipeline_issue1527_python_raw_memo_failure_parallel);
+    RUN_TEST(pipeline_issue1527_python_cross_memo_failure_sequential);
+    RUN_TEST(pipeline_issue1527_python_cross_memo_failure_parallel);
+    RUN_TEST(pipeline_issue1527_c_raw_depth_failure_sequential);
+    RUN_TEST(pipeline_issue1527_c_cross_depth_failure_sequential);
+    RUN_TEST(pipeline_issue1527_c_raw_depth_failure_parallel);
+    RUN_TEST(pipeline_issue1527_c_cross_depth_failure_parallel);
+    RUN_TEST(pipeline_issue1527_python_raw_depth_failure_sequential);
+    RUN_TEST(pipeline_issue1527_python_cross_depth_failure_sequential);
+    RUN_TEST(pipeline_issue1527_python_raw_depth_failure_parallel);
+    RUN_TEST(pipeline_issue1527_python_cross_depth_failure_parallel);
+    RUN_TEST(pipeline_issue1527_cross_memo_failure_sequential);
+    RUN_TEST(pipeline_issue1527_cross_memo_failure_parallel);
+    RUN_TEST(pipeline_issue1527_raw_memo_failure_sequential);
+    RUN_TEST(pipeline_issue1527_raw_memo_failure_parallel);
+#endif
     RUN_TEST(override_explicit_walks_to_nearest_declaring_ancestor);
     RUN_TEST(override_python_through_intermediate_class);
     RUN_TEST(python_crossfile_typed_field_calls_issue1277);
