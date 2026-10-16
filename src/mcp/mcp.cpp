@@ -9736,7 +9736,7 @@ static bool search_scan_read_file(const char *path, std::vector<char> &buffer, s
         size_t got = fread(buffer.data() + used, 1, want, fp);
         used += got;
         if (got < want) {
-            ok = !ferror(fp);
+            ok = !ferror(fp) && used <= file_max; /* EOF inside the read slack */
             break;
         }
     }

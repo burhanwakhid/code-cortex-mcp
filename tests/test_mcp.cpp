@@ -3399,6 +3399,15 @@ TEST(search_code_skips_files_past_the_scan_cap) {
         ASSERT_TRUE(fputs(filler.c_str(), fp) >= 0);
     }
     ASSERT_EQ(fclose(fp), 0);
+    /* Just past the cap, inside the last read's slack: still skipped. */
+    char edge_path[900];
+    snprintf(edge_path, sizeof(edge_path), "%s/edge.txt", tmp);
+    fp = cbm_fopen(edge_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_TRUE(fputs("needle_cap_marker edge\n", fp) >= 0);
+    std::string edge_fill(4200, 'y');
+    ASSERT_TRUE(fputs(edge_fill.c_str(), fp) >= 0);
+    ASSERT_EQ(fclose(fp), 0);
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -3418,6 +3427,12 @@ TEST(search_code_skips_files_past_the_scan_cap) {
                            .file_path = "big.txt"};
     ASSERT_GT(cbm_store_upsert_node(st, &small_file), 0);
     ASSERT_GT(cbm_store_upsert_node(st, &big_file), 0);
+    cbm_node_t edge_file = {.project = project,
+                            .label = "File",
+                            .name = "edge.txt",
+                            .qualified_name = "scan-cap.edge.txt",
+                            .file_path = "edge.txt"};
+    ASSERT_GT(cbm_store_upsert_node(st, &edge_file), 0);
 
     const char *req = "{\"jsonrpc\":\"2.0\",\"id\":98,\"method\":\"tools/call\","
                       "\"params\":{\"name\":\"search_code\",\"arguments\":{"
@@ -3430,17 +3445,22 @@ TEST(search_code_skips_files_past_the_scan_cap) {
     bool uncapped_big = uncapped && strstr(uncapped, "needle_cap_marker big");
     bool capped_small = capped && strstr(capped, "needle_cap_marker small");
     bool capped_big = capped && strstr(capped, "needle_cap_marker big");
+    bool uncapped_edge = uncapped && strstr(uncapped, "needle_cap_marker edge");
+    bool capped_edge = capped && strstr(capped, "needle_cap_marker edge");
     free(uncapped);
     free(capped);
     cbm_mcp_server_free(srv);
     cbm_unlink(small_path);
     cbm_unlink(big_path);
+    cbm_unlink(edge_path);
     cbm_rmdir(tmp);
 
     ASSERT_TRUE(uncapped_small);
     ASSERT_TRUE(uncapped_big); /* control: the big file matches when uncapped */
     ASSERT_TRUE(capped_small);
     ASSERT_FALSE(capped_big);
+    ASSERT_TRUE(uncapped_edge);
+    ASSERT_FALSE(capped_edge);
     PASS();
 }
 #endif
