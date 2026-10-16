@@ -602,7 +602,7 @@ static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *change
         if (cache) {
             cbm_clock_gettime(CLOCK_MONOTONIC, &t);
             cbm_parallel_extract(ctx, changed_files, ci, cache, &shared_ids, worker_count);
-            cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
+            cbm_pipeline_sync_next_id(ctx->gbuf, &shared_ids);
             cbm_log_info("pass.timing", "pass", "incr_extract", "elapsed_ms",
                          itoa_buf((int)elapsed_ms(t)));
 
@@ -621,7 +621,7 @@ static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *change
             cbm_parallel_resolve(ctx, changed_files, ci, cache, &shared_ids, worker_count, NULL, 0,
                                  NULL, NULL /* module_def_index */,
                                  NULL /* cross_registries — incremental skips Tier 2 prebuild */);
-            cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
+            cbm_pipeline_sync_next_id(ctx->gbuf, &shared_ids);
             cbm_log_info("pass.timing", "pass", "incr_resolve", "elapsed_ms",
                          itoa_buf((int)elapsed_ms(t)));
 

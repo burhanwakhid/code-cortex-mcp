@@ -752,6 +752,21 @@ int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t 
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count);
 
+/* Sync the main buffer's id counter after a parallel extract or resolve.
+ * Merged worker nodes keep their shared ids, and merged edges take fresh ids
+ * from the main counter after the highest of them, so the main counter can
+ * end above the shared one: the sync only ever raises it. */
+void cbm_pipeline_sync_next_id(cbm_gbuf_t *gb, cbm_atomic_int64 *shared_ids);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Runs on the syncing thread right before each cbm_pipeline_sync_next_id. */
+void cbm_pipeline_set_id_sync_hook_for_tests(void (*hook)(cbm_gbuf_t *, void *), void *ctx);
+/* Sees the complete graph buffer just before the full route dumps it (the
+ * dump releases the buffer's indexes). Thread-local, like the sync hook. */
+void cbm_pipeline_set_before_dump_hook_for_tests(void (*hook)(const cbm_gbuf_t *, void *),
+                                                 void *ctx);
+#endif
+
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* One-shot callback after classification, for concurrent source-edit tests. */
 void cbm_pipeline_test_after_classify(void (*callback)(void *), void *data);

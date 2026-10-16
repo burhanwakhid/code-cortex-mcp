@@ -854,6 +854,39 @@ void cbm_gbuf_set_next_id(cbm_gbuf_t *gb, int64_t next_id) {
     gb->next_id = next_id;
 }
 
+void cbm_gbuf_raise_next_id(cbm_gbuf_t *gb, int64_t next_id) {
+    if (gb && next_id > gb->next_id) {
+        gb->next_id = next_id;
+    }
+}
+
+static int gb_id_cmp(const void *a, const void *b) {
+    int64_t x = *(const int64_t *)a;
+    int64_t y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
+int cbm_gbuf_duplicate_edge_ids(const cbm_gbuf_t *gb) {
+    if (!gb || gb->edges.count < PAIR_LEN) {
+        return 0;
+    }
+    int n = gb->edges.count;
+    auto *ids = static_cast<int64_t *>(malloc((size_t)n * sizeof(int64_t)));
+    if (!ids) {
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < n; i++) {
+        ids[i] = gb->edges.items[i]->id;
+    }
+    qsort(ids, (size_t)n, sizeof(*ids), gb_id_cmp);
+    int dups = 0;
+    for (int i = 1; i < n; i++) {
+        dups += ids[i] == ids[i - SKIP_ONE];
+    }
+    free(ids);
+    return dups;
+}
+
 /* ── Node operations ─────────────────────────────────────────────── */
 
 /* Canonical winner for a qualified-name collision, as a pure function of the

@@ -1251,7 +1251,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         free(cache);
         return rc != 0 ? rc : CBM_NOT_FOUND;
     }
-    cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
+    cbm_pipeline_sync_next_id(p->gbuf, &shared_ids);
     /* extract -> registry handoff: return the extract phase's freed-but-retained
      * allocator pages to the OS before registry_build allocates. On a 2x Linux
      * index the extract peak holds ~13 GB of reclaimable pages (peak_mb 20.7 vs
@@ -1365,7 +1365,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         }
         free(def_modules);
     }
-    cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
+    cbm_pipeline_sync_next_id(p->gbuf, &shared_ids);
     cbm_pipeline_extract_infra_routes(p->gbuf, files, cache, file_count);
     cbm_pipeline_process_infra_bindings(p->gbuf, files, cache, file_count);
     for (int i = 0; i < file_count; i++) {
@@ -1468,6 +1468,12 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
 }
 
 /* Get platform-specific mtime in nanoseconds. */
+/* Test seams (set only under CBM_ENABLE_TEST_SEAMS; see pipeline_internal.h). */
+static thread_local void (*g_id_sync_hook)(cbm_gbuf_t *, void *);
+static thread_local void *g_id_sync_hook_ctx;
+static thread_local void (*g_before_dump_hook)(const cbm_gbuf_t *, void *);
+static thread_local void *g_before_dump_hook_ctx;
+
 static int64_t stat_mtime_ns(const struct stat *fst) {
 #ifdef __APPLE__
     return ((int64_t)fst->st_mtimespec.tv_sec * PL_NSEC_PER_SEC) +
@@ -1504,6 +1510,9 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
      * release_gbuf_indexes(), which frees node_by_qn (graph_buffer.c), after
      * which cbm_gbuf_node_count() returns 0. Reading these post-dump left
      * committed_nodes at 0, so the #334 plausibility gate never fired. */
+    if (g_before_dump_hook) {
+        g_before_dump_hook(p->gbuf, g_before_dump_hook_ctx);
+    }
     p->committed_nodes = cbm_gbuf_node_count(p->gbuf);
     p->committed_edges = cbm_gbuf_edge_count(p->gbuf);
     cbm_pipeline_mem_profile("pre_dump", p->gbuf, NULL, 0);
@@ -1699,6 +1708,30 @@ static int run_tests_and_history(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         return CBM_NOT_FOUND;
     }
     return rc;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_pipeline_set_id_sync_hook_for_tests(void (*hook)(cbm_gbuf_t *, void *), void *ctx) {
+    g_id_sync_hook = hook;
+    g_id_sync_hook_ctx = ctx;
+}
+
+void cbm_pipeline_set_before_dump_hook_for_tests(void (*hook)(const cbm_gbuf_t *, void *),
+                                                 void *ctx) {
+    g_before_dump_hook = hook;
+    g_before_dump_hook_ctx = ctx;
+}
+#endif
+
+void cbm_pipeline_sync_next_id(cbm_gbuf_t *gb, cbm_atomic_int64 *shared_ids) {
+    if (g_id_sync_hook) {
+        g_id_sync_hook(gb, g_id_sync_hook_ctx);
+    }
+    /* Raise only: merged worker nodes keep their shared ids, and merged edges
+     * take fresh ids from the main counter after the highest of them, so the
+     * main counter can end above the shared one. Lowering it to the shared
+     * value handed the merged edges' ids out a second time. */
+    cbm_gbuf_raise_next_id(gb, atomic_load(shared_ids));
 }
 
 #ifdef CBM_ENABLE_TEST_SEAMS
