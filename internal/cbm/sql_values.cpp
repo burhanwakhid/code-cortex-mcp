@@ -319,7 +319,7 @@ static void sqlv_push(sqlv_ranges_t *r, TSRange range) {
         return;
     }
     if (r->count == r->cap) {
-        uint32_t cap = r->cap ? r->cap * SQLV_GROWTH : SQLV_INITIAL_CAP;
+        uint32_t cap = r->cap ? r->cap * (uint32_t)SQLV_GROWTH : (uint32_t)SQLV_INITIAL_CAP;
         TSRange *grown = (TSRange *)realloc(r->items, (size_t)cap * sizeof(TSRange));
         if (!grown) {
             r->failed = true;
