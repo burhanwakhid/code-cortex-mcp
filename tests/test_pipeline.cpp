@@ -8743,6 +8743,126 @@ TEST(pipeline_go_rw_usage_never_cross_into_c_parallel) {
     PASS();
 }
 
+/* Issue #1354: a method call on an instance built with `new ImportedClass()`
+ * produced no CALLS edge (only the constructor edge), while the identical
+ * shape in the class's own file resolved via lsp_ts_method. End to end: both
+ * cross-file shapes must now carry the type-aware lsp_ts_method edge, also
+ * for a file named after its class, and the same-file control keeps it. */
+static const char *const k_ts_1354_names[] = {"lib/toast.service.ts", "app/variants.ts",
+                                              "lib/NotifierService.ts", "app/notify.ts"};
+static const char *const k_ts_1354_bodies[] = {
+    "export class ToastService {\n"
+    "  openSuccessUniqueXyz(msg: string): void {\n"
+    "    console.log(msg);\n"
+    "  }\n"
+    "}\n"
+    "\n"
+    "export function sameFileControl(): void {\n"
+    "  const t = new ToastService();\n"
+    "  t.openSuccessUniqueXyz('same-file control');\n"
+    "}\n",
+    "import { ToastService } from '../lib/toast.service';\n"
+    "\n"
+    "export function crossNewLocal(): void {\n"
+    "  const t = new ToastService();\n"
+    "  t.openSuccessUniqueXyz('cross-file');\n"
+    "}\n"
+    "\n"
+    "export function crossNewChain(): void {\n"
+    "  new ToastService().openSuccessUniqueXyz('chained');\n"
+    "}\n",
+    "export class NotifierService {\n"
+    "  notifyUniqueAbc(): void {}\n"
+    "}\n",
+    "import { NotifierService } from '../lib/NotifierService';\n"
+    "\n"
+    "export function crossSameNameNew(): void {\n"
+    "  const n = new NotifierService();\n"
+    "  n.notifyUniqueAbc();\n"
+    "}\n"
+    "\n"
+    "export function crossSameNameTyped(n: NotifierService): void {\n"
+    "  n.notifyUniqueAbc();\n"
+    "}\n"};
+
+/* Count of `src -> tgt` edges of `type` whose properties carry `strategy`. */
+static int named_edge_strategy_count(cbm_store_t *s, const char *project, const char *type,
+                                     const char *src, const char *tgt, const char *strategy) {
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"strategy\":\"%s\"", strategy);
+    cbm_node_t *sources = NULL;
+    int nsrc = 0;
+    cbm_store_find_nodes_by_name(s, project, src, &sources, &nsrc);
+    cbm_node_t *targets = NULL;
+    int ntgt = 0;
+    cbm_store_find_nodes_by_name(s, project, tgt, &targets, &ntgt);
+    int hits = 0;
+    for (int i = 0; i < nsrc; i++) {
+        cbm_edge_t *edges = NULL;
+        int ne = 0;
+        cbm_store_find_edges_by_source_type(s, sources[i].id, type, &edges, &ne);
+        for (int e = 0; e < ne; e++) {
+            for (int t = 0; t < ntgt; t++) {
+                if (edges[e].target_id == targets[t].id && edges[e].properties_json &&
+                    strstr(edges[e].properties_json, needle)) {
+                    hits++;
+                }
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ne);
+        }
+    }
+    cbm_store_free_nodes(sources, nsrc);
+    cbm_store_free_nodes(targets, ntgt);
+    return hits;
+}
+
+/* 0 = every probed call carries its lsp_ts_method edge. */
+static int ts_1354_probe(int pad) {
+    char db[512];
+    cbm_pipeline_t *p =
+        index_fixture_with_padding(k_ts_1354_names, k_ts_1354_bodies, 4, pad, db, sizeof(db));
+    if (!p) {
+        teardown_lang_repo();
+        return -9;
+    }
+    cbm_store_t *s = cbm_store_open_path(db);
+    const char *proj = cbm_pipeline_project_name(p);
+    int rc = -8;
+    if (s) {
+        static const char *const probes[][2] = {{"sameFileControl", "openSuccessUniqueXyz"},
+                                                {"crossNewLocal", "openSuccessUniqueXyz"},
+                                                {"crossNewChain", "openSuccessUniqueXyz"},
+                                                {"crossSameNameNew", "notifyUniqueAbc"},
+                                                {"crossSameNameTyped", "notifyUniqueAbc"}};
+        rc = 0;
+        for (int i = 0; i < 5; i++) {
+            int n = named_edge_strategy_count(s, proj, "CALLS", probes[i][0], probes[i][1],
+                                              "lsp_ts_method");
+            printf("  ts #1354 probe pad=%d: %s -> %s lsp_ts_method=%d\n", pad, probes[i][0],
+                   probes[i][1], n);
+            if (n != 1 && rc == 0) {
+                rc = -(i + 1);
+            }
+        }
+        cbm_store_close(s);
+    }
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    return rc;
+}
+
+TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354) {
+    ASSERT_EQ(ts_1354_probe(0), 0);
+    PASS();
+}
+
+TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354_parallel) {
+    ASSERT_EQ(ts_1354_probe(52), 0);
+    PASS();
+}
+
 /* #2053 Rust std-receiver probes (sequential and parallel twins). The Rust LSP
  * types `root: &Path` and dispatches `root.join(..)` to std's Path::join — a
  * symbol with no graph node. Before the fix the pipeline then fell back to the
@@ -10050,6 +10170,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method);
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel);
+    RUN_TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354);
+    RUN_TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);

@@ -1196,6 +1196,62 @@ static const CBMType* simplify_type(TSLSPContext* ctx, const CBMType* t) {
     return t;
 }
 
+/* Full QN of an imported symbol. An import value is normally the module QN
+ * (symbol = module + "." + name), but may already be the symbol QN. When the
+ * module QN ends in ".name" the spelling is ambiguous: `Foo.ts` exporting
+ * `Foo` (module `x.Foo`, symbol `x.Foo.Foo`) looks exactly like an
+ * already-qualified value. Treating it as the symbol typed every imported
+ * same-name class as its module (#1354), so the registry decides: a
+ * registered `module.name` wins, else the value is the symbol. Two hashed
+ * lookups on a finalized/sealed registry, only in the ambiguous case. */
+static const char* ts_import_symbol_qn(TSLSPContext* ctx, const char* module_qn,
+                                       const char* name) {
+    if (!ctx || !module_qn || !name) return NULL;
+    size_t module_len = strlen(module_qn);
+    size_t name_len = strlen(name);
+    if (module_len > name_len + 1 && module_qn[module_len - name_len - 1] == '.' &&
+        strcmp(module_qn + module_len - name_len, name) == 0) {
+        const char* appended = cbm_arena_sprintf(ctx->arena, "%s.%s", module_qn, name);
+        if (appended && (cbm_registry_lookup_type(ctx->registry, appended) ||
+                         cbm_registry_lookup_func(ctx->registry, appended))) {
+            return appended;
+        }
+        return module_qn;
+    }
+    return cbm_arena_sprintf(ctx->arena, "%s.%s", module_qn, name);
+}
+
+/* Type of `new C()` for a bare class name, in TS scoping order: a class
+ * declared in this module, else the class an unambiguous import binding
+ * names, else the historical current-module spelling. Without the import
+ * step (#1354) `new ImportedClass()` was typed as a phantom current-module
+ * class, so every method call on the instance missed the registry and the
+ * cross-file edge was lost while the same code in the class's own file
+ * resolved. One hashed type lookup; the registry is only read. */
+static const CBMType* ts_new_bare_class_type(TSLSPContext* ctx, const char* cname) {
+    if (!ctx->module_qn) return cbm_type_named(ctx->arena, cname);
+    const char* local_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cname);
+    if (!local_qn) return cbm_type_named(ctx->arena, cname);
+    if (cbm_registry_lookup_type(ctx->registry, local_qn))
+        return cbm_type_named(ctx->arena, local_qn);
+    const char* import_module = NULL;
+    for (int i = 0; i < ctx->import_count; i++) {
+        const char* lname = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
+        const char* mqn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
+        if (!lname || !mqn || strcmp(lname, cname) != 0) continue;
+        if (import_module && strcmp(import_module, mqn) != 0) {
+            import_module = NULL; /* ambiguous binding: keep the old spelling */
+            break;
+        }
+        import_module = mqn;
+    }
+    if (import_module) {
+        const char* sym = ts_import_symbol_qn(ctx, import_module, cname);
+        if (sym) return cbm_type_named(ctx->arena, sym);
+    }
+    return cbm_type_named(ctx->arena, local_qn);
+}
+
 static const CBMType* type_of_identifier(TSLSPContext* ctx, const char* name) {
     if (!ctx || !name) return cbm_type_unknown();
 
@@ -1212,17 +1268,10 @@ static const CBMType* type_of_identifier(TSLSPContext* ctx, const char* name) {
         const char* mqn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
         if (!local || !mqn || strcmp(local, name) != 0) continue;
 
-        // Construct the full symbol QN: if mqn already ends in ".name" use it; else
-        // append ".name". This matches `resolve_type_with_imports`' convention.
-        size_t mqn_len = strlen(mqn);
-        size_t name_len = strlen(name);
-        const char* full_qn;
-        if (mqn_len > name_len + 1 && mqn[mqn_len - name_len - 1] == '.' &&
-            strcmp(mqn + mqn_len - name_len, name) == 0) {
-            full_qn = mqn;
-        } else {
-            full_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, name);
-        }
+        // Construct the full symbol QN (ts_import_symbol_qn: the registry decides
+        // the ambiguous `x.Foo` spelling, #1354).
+        const char* full_qn = ts_import_symbol_qn(ctx, mqn, name);
+        if (!full_qn) full_qn = mqn;
 
         // Try the symbol lookup precedence: registered func, then registered type.
         const CBMRegisteredFunc* f = cbm_registry_lookup_func(ctx->registry, full_qn);
@@ -1658,13 +1707,8 @@ const CBMType* ts_eval_expr_type(TSLSPContext* ctx, TSNode node) {
         if (!ts_node_is_null(ctor)) {
             char* cname = node_text(ctx, ctor);
             if (cname) {
-                // Bare class name → qualify against module.
-                if (strchr(cname, '.') == NULL && ctx->module_qn) {
-                    const char* qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cname);
-                    result = cbm_type_named(ctx->arena, qn);
-                } else {
-                    result = cbm_type_named(ctx->arena, cname);
-                }
+                result = strchr(cname, '.') == NULL ? ts_new_bare_class_type(ctx, cname)
+                                                    : cbm_type_named(ctx->arena, cname);
             }
         }
     } else if (strcmp(kind, "call_expression") == 0) {
@@ -1884,16 +1928,8 @@ static const CBMType* resolve_type_with_imports(TSLSPContext* ctx, const CBMType
             const char* mqn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
             if (!lname || !mqn) continue;
             if (strcmp(lname, bare) != 0) continue;
-            // Heuristic: if mqn already ends in ".bare" use as-is; otherwise append.
-            size_t mqn_len = strlen(mqn);
-            size_t bare_len = strlen(bare);
-            if (mqn_len > bare_len + 1 &&
-                mqn[mqn_len - bare_len - 1] == '.' &&
-                strcmp(mqn + mqn_len - bare_len, bare) == 0) {
-                return cbm_type_named(ctx->arena, mqn);
-            }
-            return cbm_type_named(ctx->arena,
-                                  cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, bare));
+            const char* sym = ts_import_symbol_qn(ctx, mqn, bare);
+            return cbm_type_named(ctx->arena, sym ? sym : mqn);
         }
         return t;
     }
