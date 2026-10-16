@@ -298,6 +298,7 @@ set(CBM_FOUNDATION_CXX_SRCS
     src/foundation/compat.cpp
     src/foundation/compat_thread.cpp
     src/foundation/compat_fs.cpp
+    src/foundation/git_env.cpp
     src/foundation/compat_regex.cpp
     src/foundation/mem.cpp
     src/foundation/diagnostics.cpp

@@ -248,7 +248,7 @@ static bool git_head_hash(const char *repo_path, char *buf, size_t bufsz) {
                           git_context.c) */
         return false;
     }
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         buf[0] = '\0';
         return false;
@@ -413,7 +413,7 @@ static void ensure_gitattributes(const char *repo_path) {
     if (n < 0 || (size_t)n >= sizeof(cmd)) {
         return; /* truncated command → skip (parity with git_context.c) */
     }
-    FILE *p = cbm_popen(cmd, "r");
+    FILE *p = cbm_popen_git(cmd);
     if (p) {
         (void)cbm_pclose(p);
     }

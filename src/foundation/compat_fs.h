@@ -45,7 +45,26 @@ void cbm_closedir(cbm_dir_t *d);
 /* ── Portable popen/pclose ────────────────────────────────────── */
 
 FILE *cbm_popen(const char *cmd, const char *mode);
+
+/* Read-mode cbm_popen for a `git ...` command line: the child environment
+ * omits git's repository-local variables (foundation/git_env.h), so an
+ * inherited GIT_DIR/GIT_WORK_TREE/... can never override `git -C <repo>`.
+ * Our own environment is untouched. Close with cbm_pclose. */
+FILE *cbm_popen_git(const char *cmd);
+
+/* Like cbm_popen_git, but with no shell at all: runs the git found by
+ * cbm_find_git with `args` (NULL-terminated, NOT including argv[0]) as its
+ * arguments, stdin and stderr on the null device. NULL when git is not found
+ * or cannot be spawned. Close with cbm_pclose. */
+FILE *cbm_popen_git_argv(const char *const *args);
+
+/* Close a stream from cbm_popen / cbm_popen_git / cbm_popen_git_argv. Returns
+ * the pclose()-style wait status on POSIX, the exit code on Windows. */
 int cbm_pclose(FILE *f);
+
+/* Absolute path of the git executable, searched in the absolute PATH entries
+ * only (never the current directory). False when none is found. */
+bool cbm_find_git(char *out, size_t out_sz);
 
 /* ── File operations ──────────────────────────────────────────── */
 

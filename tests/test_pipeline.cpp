@@ -35,6 +35,10 @@
 #include "graph_buffer/graph_buffer.h"
 #include "yyjson/yyjson.h"
 #include "service_patterns.h"     // cbm_service_pattern_is_http_route_literal
+#include "foundation/git_env.h" // cbm_git_repo_env_vars (#2003)
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 #include "foundation/compat_fs.h" // cbm_opendir (complexity cycle-order fixture copy)
 #include <algorithm>
 #include <vector>
@@ -3502,6 +3506,316 @@ TEST(git_context_unborn_repo_resolves_paths_without_head) {
     PASS();
 }
 
+
+/* ── Inherited repository-local git environment (upstream #2003) ─────────
+ * A server started from a git hook (or an editor that exports GIT_DIR)
+ * inherits GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/..., which override
+ * `git -C <dir>`. Our own git children must not see them (per spawn). The
+ * tests set the hook set explicitly and restore the caller's values before
+ * asserting, so a failure never leaks the decoy environment. */
+#ifndef _WIN32
+typedef struct {
+    char *saved[CBM_GIT_REPO_ENV_VAR_COUNT];
+    bool present[CBM_GIT_REPO_ENV_VAR_COUNT];
+} git_env_snapshot_t;
+
+static void git_env_snapshot(git_env_snapshot_t *snap) {
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT; i++) {
+        const char *v = getenv(cbm_git_repo_env_vars[i]);
+        snap->present[i] = v != NULL;
+        snap->saved[i] = v ? strdup(v) : NULL;
+    }
+}
+
+static void git_env_hook_enter(git_env_snapshot_t *snap, const char *decoy) {
+    git_env_snapshot(snap);
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "%s/.git", decoy);
+    setenv("GIT_DIR", buf, 1);
+    setenv("GIT_COMMON_DIR", buf, 1);
+    setenv("GIT_WORK_TREE", decoy, 1);
+    snprintf(buf, sizeof(buf), "%s/.git/index", decoy);
+    setenv("GIT_INDEX_FILE", buf, 1);
+    snprintf(buf, sizeof(buf), "%s/.git/objects", decoy);
+    setenv("GIT_OBJECT_DIRECTORY", buf, 1);
+    setenv("GIT_PREFIX", "", 1);
+}
+
+static void git_env_hook_leave(git_env_snapshot_t *snap) {
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT; i++) {
+        if (snap->present[i]) {
+            setenv(cbm_git_repo_env_vars[i], snap->saved[i], 1);
+        } else {
+            unsetenv(cbm_git_repo_env_vars[i]);
+        }
+        free(snap->saved[i]);
+        snap->saved[i] = NULL;
+    }
+}
+
+/* First output line of `git -C dir <args>`, run with the test's clean env. */
+static void git_env_read_line(const char *dir, const char *args, char *out, size_t out_sz) {
+    char cmd[1024];
+    out[0] = '\0';
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" %s 2>/dev/null", dir, args);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        return;
+    }
+    if (fgets(out, (int)out_sz, fp)) {
+        out[strcspn(out, "\r\n")] = '\0';
+    }
+    pclose(fp);
+}
+
+static int git_env_run(const char *dir, const char *args) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" -c user.name=\"CBM Test\" -c user.email=\"cbm@example.invalid\" "
+             "%s >/dev/null 2>&1",
+             dir, args);
+    return run_cmd(cmd);
+}
+
+/* root/decoy: a repo on branch decoy-branch with three coupled a.go+b.go
+ * commits; root/fixture: a repo on branch fixture-branch with one commit;
+ * root/plain: not a repo. */
+static int make_env_isolation_tree(const char *root) {
+    char decoy[512], fixture[512], plain[512], path[600];
+    snprintf(decoy, sizeof(decoy), "%s/decoy", root);
+    snprintf(fixture, sizeof(fixture), "%s/fixture", root);
+    snprintf(plain, sizeof(plain), "%s/plain", root);
+    if (th_mkdir_p(decoy) != 0 || th_mkdir_p(fixture) != 0 || th_mkdir_p(plain) != 0) {
+        return -1;
+    }
+    if (git_env_run(decoy, "init -q") != 0 || git_env_run(fixture, "init -q") != 0 ||
+        git_env_run(decoy, "checkout -q -b decoy-branch") != 0 ||
+        git_env_run(fixture, "checkout -q -b fixture-branch") != 0) {
+        return -1;
+    }
+    snprintf(path, sizeof(path), "%s/main.go", fixture);
+    th_write_file(path, "package main\n");
+    if (git_env_run(fixture, "add main.go") != 0 ||
+        git_env_run(fixture, "commit -q -m fixture") != 0) {
+        return -1;
+    }
+    for (int i = 0; i < 3; i++) {
+        char content[32];
+        snprintf(content, sizeof(content), "package a // %d\n", i);
+        snprintf(path, sizeof(path), "%s/a.go", decoy);
+        th_write_file(path, content);
+        snprintf(path, sizeof(path), "%s/b.go", decoy);
+        th_write_file(path, content);
+        if (git_env_run(decoy, "add a.go b.go") != 0 ||
+            git_env_run(decoy, "commit -q -m decoy") != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+#endif /* _WIN32 */
+
+TEST(git_context_ignores_inherited_repo_env) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX environment manipulation");
+#else
+    if (!git_available()) {
+        FAIL("git unavailable");
+    }
+    char *raw = th_mktempdir("cbm_gitenv");
+    ASSERT_NOT_NULL(raw);
+    char root[256];
+    snprintf(root, sizeof(root), "%s", raw);
+    ASSERT_EQ(make_env_isolation_tree(root), 0);
+    char decoy[512], fixture[512], plain[512];
+    snprintf(decoy, sizeof(decoy), "%s/decoy", root);
+    snprintf(fixture, sizeof(fixture), "%s/fixture", root);
+    snprintf(plain, sizeof(plain), "%s/plain", root);
+
+    char decoy_head[128], fixture_head[128];
+    git_env_read_line(decoy, "rev-parse HEAD", decoy_head, sizeof(decoy_head));
+    git_env_read_line(fixture, "rev-parse HEAD", fixture_head, sizeof(fixture_head));
+
+    git_env_snapshot_t snap;
+    git_env_hook_enter(&snap, decoy);
+    cbm_git_context_t plain_ctx = {0};
+    int plain_rc = cbm_git_context_resolve(plain, &plain_ctx);
+    cbm_git_context_t fix_ctx = {0};
+    int fix_rc = cbm_git_context_resolve(fixture, &fix_ctx);
+    git_env_hook_leave(&snap);
+
+    bool plain_is_git = plain_ctx.is_git;
+    bool fix_is_git = fix_ctx.is_git;
+    char fix_head[128], fix_branch[128];
+    snprintf(fix_head, sizeof(fix_head), "%s", fix_ctx.head_sha ? fix_ctx.head_sha : "");
+    snprintf(fix_branch, sizeof(fix_branch), "%s", fix_ctx.branch ? fix_ctx.branch : "");
+    cbm_git_context_free(&plain_ctx);
+    cbm_git_context_free(&fix_ctx);
+
+    char decoy_head_after[128];
+    git_env_read_line(decoy, "rev-parse HEAD", decoy_head_after, sizeof(decoy_head_after));
+    th_rmtree(root);
+
+    ASSERT_EQ(plain_rc, 0);
+    ASSERT_FALSE(plain_is_git); /* a plain dir is not the decoy's repo */
+    ASSERT_EQ(fix_rc, 0);
+    ASSERT_TRUE(fix_is_git);
+    ASSERT_STR_EQ(fix_head, fixture_head); /* the fixture's HEAD, not the decoy's */
+    ASSERT_STR_EQ(fix_branch, "fixture-branch");
+    ASSERT_STR_EQ(decoy_head_after, decoy_head); /* the decoy is untouched */
+    PASS();
+#endif
+}
+
+TEST(githistory_ignores_inherited_repo_env) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX environment manipulation");
+#else
+    if (!git_available()) {
+        FAIL("git unavailable");
+    }
+    char *raw = th_mktempdir("cbm_gitenv_hist");
+    ASSERT_NOT_NULL(raw);
+    char root[256];
+    snprintf(root, sizeof(root), "%s", raw);
+    ASSERT_EQ(make_env_isolation_tree(root), 0);
+    char decoy[512], plain[512];
+    snprintf(decoy, sizeof(decoy), "%s/decoy", root);
+    snprintf(plain, sizeof(plain), "%s/plain", root);
+
+    git_env_snapshot_t snap;
+    git_env_hook_enter(&snap, decoy);
+    cbm_githistory_result_t result = {};
+    (void)cbm_pipeline_githistory_compute(plain, &result);
+    git_env_hook_leave(&snap);
+
+    int commits = result.commit_count;
+    int couplings = result.count;
+    free(result.couplings);
+    free(result.file_temporal);
+    th_rmtree(root);
+
+    /* A non-git directory has no history: the decoy's commits must not be
+     * attributed to it. */
+    ASSERT_EQ(commits, 0);
+    ASSERT_EQ(couplings, 0);
+    PASS();
+#endif
+}
+
+/* cbm_popen_git / cbm_popen_git_argv drop every variable of
+ * `git rev-parse --local-env-vars` from the CHILD only: the parent keeps its
+ * environment, unrelated variables pass through, and cbm_pclose keeps
+ * pclose() status semantics. */
+TEST(popen_git_strips_repo_env_and_reports_exit_status) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh spawn");
+#else
+    char script[2048];
+    size_t n = (size_t)snprintf(script, sizeof(script),
+                                "echo probe; [ \"$CBM_GITENV_KEEP\" = kept ] || exit 4;");
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT && n < sizeof(script); i++) {
+        n += (size_t)snprintf(script + n, sizeof(script) - n, " [ -z \"${%s+x}\" ] || exit 3;",
+                              cbm_git_repo_env_vars[i]);
+    }
+    ASSERT_TRUE(n + 8 < sizeof(script));
+    snprintf(script + n, sizeof(script) - n, " exit 0");
+
+    git_env_snapshot_t snap;
+    git_env_snapshot(&snap);
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT; i++) {
+        setenv(cbm_git_repo_env_vars[i], "/cbm-decoy-repo", 1);
+    }
+    setenv("CBM_GITENV_KEEP", "kept", 1);
+
+    FILE *fp = cbm_popen_git(script);
+    char line[64] = {0};
+    bool got_line = fp && fgets(line, sizeof(line), fp) != NULL;
+    int status = fp ? cbm_pclose(fp) : -1;
+    FILE *fail = cbm_popen_git("exit 7");
+    int fail_status = fail ? cbm_pclose(fail) : -1;
+    /* Without the scrub the same probe sees the variables (exit 3). */
+    FILE *plain = cbm_popen(script, "r");
+    char drain[64];
+    while (plain && fgets(drain, sizeof(drain), plain)) {
+    }
+    int plain_status = plain ? cbm_pclose(plain) : -1;
+    /* No shell at all: the args reach git verbatim, one argv entry each. */
+    const char *args[] = {"--version", NULL};
+    FILE *argv_fp = cbm_popen_git_argv(args);
+    char version[128] = {0};
+    bool got_version = argv_fp && fgets(version, sizeof(version), argv_fp) != NULL;
+    int argv_status = argv_fp ? cbm_pclose(argv_fp) : -1;
+    const char *parent_git_dir = getenv("GIT_DIR");
+    bool parent_kept = parent_git_dir && strcmp(parent_git_dir, "/cbm-decoy-repo") == 0;
+    git_env_hook_leave(&snap);
+    unsetenv("CBM_GITENV_KEEP");
+
+    ASSERT_TRUE(got_line);
+    ASSERT_STR_EQ(line, "probe\n");
+    ASSERT_TRUE(status >= 0 && WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    ASSERT_TRUE(fail_status >= 0 && WIFEXITED(fail_status));
+    ASSERT_EQ(WEXITSTATUS(fail_status), 7); /* pclose() semantics: raw wait status */
+    ASSERT_TRUE(plain_status >= 0 && WIFEXITED(plain_status));
+    ASSERT_EQ(WEXITSTATUS(plain_status), 3);
+    if (git_available()) {
+        ASSERT_TRUE(got_version);
+        ASSERT_TRUE(strncmp(version, "git version", 11) == 0);
+        ASSERT_TRUE(argv_status >= 0 && WIFEXITED(argv_status));
+        ASSERT_EQ(WEXITSTATUS(argv_status), 0);
+    }
+    ASSERT_TRUE(parent_kept); /* the parent environment is never modified */
+    PASS();
+#endif
+}
+
+/* cbm_find_git only searches absolute PATH entries: a relative entry that
+ * holds a planted "git" must never be chosen. */
+TEST(find_git_ignores_relative_path_entries) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX PATH layout");
+#else
+    char *raw = th_mktempdir("cbm_findgit");
+    ASSERT_NOT_NULL(raw);
+    char root[256];
+    snprintf(root, sizeof(root), "%s", raw);
+    char cwd[1024];
+    ASSERT_NOT_NULL(getcwd(cwd, sizeof(cwd)));
+    char planted[512];
+    snprintf(planted, sizeof(planted), "%s/bin/git", root);
+    char bin[300];
+    snprintf(bin, sizeof(bin), "%s/bin", root);
+    ASSERT_EQ(th_mkdir_p(bin), 0);
+    ASSERT_EQ(th_write_file(planted, "#!/bin/sh\nexit 0\n"), 0);
+    th_make_executable(planted);
+
+    const char *old = getenv("PATH");
+    char *saved = old ? strdup(old) : NULL;
+    ASSERT_EQ(chdir(root), 0);
+    setenv("PATH", "bin:.:", 1);
+    char found[1024];
+    bool relative_found = cbm_find_git(found, sizeof(found));
+    char abs_path[600];
+    snprintf(abs_path, sizeof(abs_path), "/nonexistent-cbm:%s", bin);
+    setenv("PATH", abs_path, 1);
+    char found_abs[1024];
+    bool abs_found = cbm_find_git(found_abs, sizeof(found_abs));
+    if (saved) {
+        setenv("PATH", saved, 1);
+        free(saved);
+    } else {
+        unsetenv("PATH");
+    }
+    ASSERT_EQ(chdir(cwd), 0);
+    th_rmtree(root);
+
+    ASSERT_FALSE(relative_found);
+    ASSERT_TRUE(abs_found);
+    ASSERT_STR_EQ(found_abs, planted);
+    PASS();
+#endif
+}
 TEST(project_name_uniqueness) {
     /* Port of TestProjectNameUniqueness */
     char *a = cbm_project_name_from_path("/tmp/bench/zig/lib/std");
@@ -10087,6 +10401,10 @@ SUITE(pipeline) {
     RUN_TEST(git_context_non_git_path);
     RUN_TEST(git_context_linked_worktree);
     RUN_TEST(git_context_unborn_repo_resolves_paths_without_head);
+    RUN_TEST(git_context_ignores_inherited_repo_env);
+    RUN_TEST(githistory_ignores_inherited_repo_env);
+    RUN_TEST(popen_git_strips_repo_env_and_reports_exit_status);
+    RUN_TEST(find_git_ignores_relative_path_entries);
     RUN_TEST(project_name_uniqueness);
     /* Git diff helpers */
     RUN_TEST(gitdiff_parse_range_with_count);

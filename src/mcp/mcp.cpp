@@ -9451,7 +9451,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
              root_path, base_branch, root_path, root_path);
 #endif
 
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         char errmsg[CBM_SZ_256];
         snprintf(errmsg, sizeof(errmsg),
@@ -9528,7 +9528,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
                  "git -C '%s' diff --unified=0 2>/dev/null; }",
                  root_path, base_branch, root_path);
 #endif
-        FILE *hfp = cbm_popen(hunk_cmd, "r");
+        FILE *hfp = cbm_popen_git(hunk_cmd);
         if (hfp) {
             /* Slurp the diff into one growable buffer — cbm_parse_hunks takes
              * the whole text. Capped so a pathological diff cannot balloon the
@@ -9649,7 +9649,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         snprintf(mbcmd, sizeof(mbcmd), "git -C '%s' merge-base '%s' HEAD 2>/dev/null", root_path,
                  base_branch);
 #endif
-        FILE *mbfp = cbm_popen(mbcmd, "r");
+        FILE *mbfp = cbm_popen_git(mbcmd);
         if (mbfp) {
             if (fgets(merge_base, sizeof(merge_base), mbfp)) {
                 size_t l = strlen(merge_base);

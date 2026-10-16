@@ -75,7 +75,7 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
         return CBM_NOT_FOUND;
     }
 
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return CBM_NOT_FOUND;
     }
@@ -125,7 +125,7 @@ static int git_capture_lines(const char *repo_path, const char *git_args, char *
         return 0;
     }
 
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return 0;
     }

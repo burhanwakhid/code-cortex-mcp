@@ -7,6 +7,7 @@
 #include "foundation/constants.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_fs_internal.h"
+#include "foundation/git_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -196,8 +197,11 @@ static wchar_t *cbm_resolve_comspec(void) {
 }
 
 /* On failure returns NULL with *stage naming the failing step and *gle the
- * GetLastError value captured at that step (0 when errno is the signal). */
-static FILE *cbm_popen_isolated(const char *cmd, const char **stage, DWORD *gle) {
+ * GetLastError value captured at that step (0 when errno is the signal).
+ * app/wcmdline: the image and its command line (NULL => "cmdline" failure);
+ * env: a CREATE_UNICODE_ENVIRONMENT block for the child, or NULL to inherit. */
+static FILE *cbm_popen_isolated_w(const wchar_t *app, wchar_t *wcmdline, const wchar_t *env,
+                                  const char **stage, DWORD *gle) {
     *stage = "";
     *gle = 0;
     InitOnceExecuteOnce(&g_popen_once, cbm_popen_init, NULL, NULL);
@@ -251,21 +255,6 @@ static FILE *cbm_popen_isolated(const char *cmd, const char **stage, DWORD *gle)
     si.StartupInfo.hStdError = nul;
     si.lpAttributeList = attr;
 
-    /* Run through cmd.exe /c so command quoting and `2>NUL` behave as under
-     * _popen. The command line is heap-composed (no fixed-size truncation)
-     * and widened via UTF-8 so non-ASCII repo paths survive intact. */
-    wchar_t *app = cbm_resolve_comspec();
-    wchar_t *wcmdline = NULL;
-    if (app) {
-        size_t u8len = strlen(cmd) + sizeof("cmd.exe /c ");
-        char *u8 = (char *)malloc(u8len);
-        if (u8) {
-            snprintf(u8, u8len, "cmd.exe /c %s", cmd);
-            wcmdline = cbm_utf8_to_wide(u8);
-            free(u8);
-        }
-    }
-
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
     BOOL created = FALSE;
@@ -276,16 +265,18 @@ static FILE *cbm_popen_isolated(const char *cmd, const char **stage, DWORD *gle)
         *stage = "cmdline";
         *gle = ERROR_NOT_ENOUGH_MEMORY;
     } else {
-        created = CreateProcessW(app, wcmdline, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT,
-                                 NULL, NULL, &si.StartupInfo, &pi);
+        DWORD flags = EXTENDED_STARTUPINFO_PRESENT;
+        if (env) {
+            flags |= CREATE_UNICODE_ENVIRONMENT;
+        }
+        created = CreateProcessW(app, wcmdline, NULL, NULL, TRUE, flags, (LPVOID)env, NULL,
+                                 &si.StartupInfo, &pi);
         if (!created) {
             *stage = "spawn";
             *gle = GetLastError();
         }
     }
 
-    free(app);
-    free(wcmdline);
     if (attr) {
         if (attr_init) {
             DeleteProcThreadAttributeList(attr);
@@ -332,27 +323,108 @@ static FILE *cbm_popen_isolated(const char *cmd, const char **stage, DWORD *gle)
     return NULL;
 }
 
+/* Run `cmd` through cmd.exe /c so command quoting and `2>NUL` behave as
+ * under _popen. The command line is heap-composed (no fixed-size truncation)
+ * and widened via UTF-8 so non-ASCII repo paths survive intact. */
+static FILE *cbm_popen_isolated(const char *cmd, const wchar_t *env, const char **stage,
+                                DWORD *gle) {
+    wchar_t *app = cbm_resolve_comspec();
+    wchar_t *wcmdline = NULL;
+    if (app) {
+        size_t u8len = strlen(cmd) + sizeof("cmd.exe /c ");
+        char *u8 = (char *)malloc(u8len);
+        if (u8) {
+            snprintf(u8, u8len, "cmd.exe /c %s", cmd);
+            wcmdline = cbm_utf8_to_wide(u8);
+            free(u8);
+        }
+    }
+    FILE *fp = cbm_popen_isolated_w(app, wcmdline, env, stage, gle);
+    free(app);
+    free(wcmdline);
+    return fp;
+}
+
+static void cbm_popen_log_failure(const char *stage, DWORD gle) {
+    char glebuf[CBM_SZ_16];
+    char errnobuf[CBM_SZ_16];
+    snprintf(glebuf, sizeof(glebuf), "%lu", (unsigned long)gle);
+    snprintf(errnobuf, sizeof(errnobuf), "%d", errno);
+    cbm_log_warn("compat.popen_isolated_failed", "stage", stage, "gle", glebuf, "errno", errnobuf);
+}
+
+static FILE *cbm_popen_read_isolated(const char *cmd, const wchar_t *env) {
+    const char *stage = "";
+    DWORD gle = 0;
+    FILE *fp = cbm_popen_isolated(cmd, env, &stage, &gle);
+    g_popen_last_isolated = (fp != NULL);
+    if (!fp) {
+        cbm_popen_log_failure(stage, gle);
+    }
+    return fp;
+}
+
 FILE *cbm_popen(const char *cmd, const char *mode) {
     /* Our git shell-outs are all read-mode; they MUST use the isolated
      * spawn. On failure, log and fail the call — never fall back to
      * _popen, whose full handle inheritance re-arms the UI hang (#798). */
     if (mode && mode[0] == 'r' && mode[1] == '\0') {
-        const char *stage = "";
-        DWORD gle = 0;
-        FILE *fp = cbm_popen_isolated(cmd, &stage, &gle);
-        g_popen_last_isolated = (fp != NULL);
-        if (!fp) {
-            char glebuf[CBM_SZ_16];
-            char errnobuf[CBM_SZ_16];
-            snprintf(glebuf, sizeof(glebuf), "%lu", (unsigned long)gle);
-            snprintf(errnobuf, sizeof(errnobuf), "%d", errno);
-            cbm_log_warn("compat.popen_isolated_failed", "stage", stage, "gle", glebuf, "errno",
-                         errnobuf);
-        }
-        return fp;
+        return cbm_popen_read_isolated(cmd, NULL);
     }
     g_popen_last_isolated = 0;
     return _popen(cmd, mode);
+}
+
+FILE *cbm_popen_git(const char *cmd) {
+    if (!cmd) {
+        return NULL;
+    }
+    /* Fail closed: without the scrubbed block the child would inherit a
+     * caller's GIT_DIR and read the wrong repository (#2003). */
+    wchar_t *env = cbm_git_child_env_block();
+    if (!env) {
+        cbm_log_warn("compat.popen_git_env_failed", "stage", "env_block");
+        return NULL;
+    }
+    FILE *fp = cbm_popen_read_isolated(cmd, env);
+    cbm_git_child_env_free(env); /* CreateProcessW copies the block into the child */
+    return fp;
+}
+
+FILE *cbm_popen_git_argv(const char *const *args) {
+    if (!args) {
+        return NULL;
+    }
+    char git[CBM_SZ_4K];
+    if (!cbm_find_git(git, sizeof(git))) {
+        return NULL;
+    }
+    enum { GIT_ARGV_MAX = 64 };
+    const char *argv[GIT_ARGV_MAX];
+    size_t n = 0;
+    argv[n++] = "git";
+    for (const char *const *a = args; *a; a++) {
+        if (n + SKIP_ONE >= GIT_ARGV_MAX) {
+            return NULL;
+        }
+        argv[n++] = *a;
+    }
+    argv[n] = NULL;
+    wchar_t *env = cbm_git_child_env_block();
+    wchar_t *app = env ? cbm_utf8_to_wide(git) : NULL;
+    /* No shell: the image is the resolved absolute git.exe and every argument
+     * is quoted by the CRT convention, so a path never reaches cmd.exe. */
+    wchar_t *wcmdline = app ? cbm_build_cmdline(argv) : NULL;
+    const char *stage = "";
+    DWORD gle = 0;
+    FILE *fp = env ? cbm_popen_isolated_w(app, wcmdline, env, &stage, &gle) : NULL;
+    if (!fp) {
+        cbm_popen_log_failure(env ? stage : "env_block", gle);
+    }
+    free(wcmdline);
+    free(app);
+    cbm_git_child_env_free(env);
+    return fp;
 }
 
 int cbm_pclose(FILE *f) {
@@ -600,6 +672,8 @@ int cbm_exec_no_shell(const char *const *argv) {
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <spawn.h>
 #include <sys/file.h>
 #include <errno.h>
 #include <sys/stat.h>
@@ -667,8 +741,150 @@ FILE *cbm_popen(const char *cmd, const char *mode) {
     return popen(cmd, mode);
 }
 
+/* Streams opened by cbm_popen_git / cbm_popen_git_argv: popen() cannot take an
+ * environment, so those children are spawned here and reaped by cbm_pclose
+ * through this list. */
+typedef struct cbm_popen_git_entry {
+    FILE *fp;
+    pid_t pid;
+    struct cbm_popen_git_entry *next;
+} cbm_popen_git_entry_t;
+
+static cbm_popen_git_entry_t *g_popen_git_list = NULL;
+static pthread_mutex_t g_popen_git_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool cbm_fd_set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+    return flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+
+/* Spawn `path argv` with stdout on a pipe, stdin on /dev/null (never the MCP
+ * transport), stderr inherited (or /dev/null when quiet_stderr), and `envp`
+ * as the environment. Returns the pid and the parent's read end, or -1. */
+static pid_t cbm_popen_spawn(const char *path, char *const argv[], char **envp, bool quiet_stderr,
+                             int *read_fd) {
+    int fds[2];
+    if (pipe(fds) != 0) {
+        return -1;
+    }
+    if (!cbm_fd_set_cloexec(fds[0]) || !cbm_fd_set_cloexec(fds[1])) {
+        (void)close(fds[0]);
+        (void)close(fds[1]);
+        return -1;
+    }
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        (void)close(fds[0]);
+        (void)close(fds[1]);
+        return -1;
+    }
+    /* dup2 clears close-on-exec on the child's stdout; both pipe ends
+     * themselves stay close-on-exec, so no other child ever holds them. */
+    bool configured =
+        posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0) == 0 &&
+        posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO) == 0 &&
+        (!quiet_stderr ||
+         posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) == 0);
+    pid_t pid = -1;
+    int rc = configured ? posix_spawn(&pid, path, &actions, NULL, argv, envp) : -1;
+    (void)posix_spawn_file_actions_destroy(&actions);
+    (void)close(fds[1]);
+    if (rc != 0 || pid <= 0) {
+        (void)close(fds[0]);
+        return -1;
+    }
+    *read_fd = fds[0];
+    return pid;
+}
+
+static int cbm_popen_git_wait(pid_t pid) {
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            return -1;
+        }
+    }
+    return status;
+}
+
+static FILE *cbm_popen_git_spawn(const char *path, char *const argv[], bool quiet_stderr) {
+    /* Fail closed: without the scrubbed environment the child would inherit
+     * a caller's GIT_DIR and read the wrong repository (#2003). */
+    char **envp = cbm_git_child_envp();
+    if (!envp) {
+        return NULL;
+    }
+    int read_fd = -1;
+    pid_t pid = cbm_popen_spawn(path, argv, envp, quiet_stderr, &read_fd);
+    cbm_git_child_env_free(envp); /* posix_spawn copied it into the child */
+    if (pid < 0) {
+        return NULL;
+    }
+    cbm_popen_git_entry_t *entry = (cbm_popen_git_entry_t *)malloc(sizeof(*entry));
+    FILE *fp = entry ? fdopen(read_fd, "r") : NULL;
+    if (!fp) {
+        free(entry);
+        (void)close(read_fd);
+        (void)cbm_popen_git_wait(pid);
+        return NULL;
+    }
+    entry->fp = fp;
+    entry->pid = pid;
+    pthread_mutex_lock(&g_popen_git_lock);
+    entry->next = g_popen_git_list;
+    g_popen_git_list = entry;
+    pthread_mutex_unlock(&g_popen_git_lock);
+    return fp;
+}
+
+FILE *cbm_popen_git(const char *cmd) {
+    if (!cmd) {
+        return NULL;
+    }
+    char *const argv[] = {(char *)"sh", (char *)"-c", (char *)cmd, NULL};
+    return cbm_popen_git_spawn("/bin/sh", argv, false);
+}
+
+FILE *cbm_popen_git_argv(const char *const *args) {
+    if (!args) {
+        return NULL;
+    }
+    char git[CBM_SZ_4K];
+    if (!cbm_find_git(git, sizeof(git))) {
+        return NULL;
+    }
+    enum { GIT_ARGV_MAX = 64 };
+    char *argv[GIT_ARGV_MAX];
+    size_t n = 0;
+    argv[n++] = (char *)"git";
+    for (const char *const *a = args; *a; a++) {
+        if (n + SKIP_ONE >= GIT_ARGV_MAX) {
+            return NULL;
+        }
+        argv[n++] = (char *)*a;
+    }
+    argv[n] = NULL;
+    return cbm_popen_git_spawn(git, argv, true);
+}
+
 int cbm_pclose(FILE *f) {
-    return pclose(f);
+    cbm_popen_git_entry_t *found = NULL;
+    pthread_mutex_lock(&g_popen_git_lock);
+    for (cbm_popen_git_entry_t **link = &g_popen_git_list; *link; link = &(*link)->next) {
+        if ((*link)->fp == f) {
+            found = *link;
+            *link = found->next;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_popen_git_lock);
+    if (!found) {
+        return pclose(f); /* opened by popen() */
+    }
+    pid_t pid = found->pid;
+    free(found);
+    (void)fclose(f);
+    return cbm_popen_git_wait(pid); /* the raw wait status, as pclose() */
 }
 
 FILE *cbm_fopen(const char *path, const char *mode) {
@@ -737,6 +953,63 @@ int cbm_exec_no_shell(const char *const *argv) {
 }
 
 #endif /* _WIN32 */
+
+/* Absolute path of git from the ABSOLUTE entries of PATH only: an empty or
+ * relative entry ("", ".", "bin") would resolve against the current
+ * directory, where a repository being indexed could plant its own "git". */
+bool cbm_find_git(char *out, size_t out_sz) {
+    if (!out || out_sz == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    const char *path = getenv("PATH");
+    if (!path) {
+        return false;
+    }
+#ifdef _WIN32
+    const char sep = ';';
+    const char *const names[] = {"git.exe", NULL};
+#else
+    const char sep = ':';
+    const char *const names[] = {"git", NULL};
+#endif
+    const char *p = path;
+    while (*p) {
+        const char *end = strchr(p, sep);
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+#ifdef _WIN32
+        bool absolute =
+            (len >= 3 && p[1] == ':' && (p[2] == '\\' || p[2] == '/')) ||
+            (len >= 2 && (p[0] == '\\' || p[0] == '/') && (p[1] == '\\' || p[1] == '/'));
+#else
+        bool absolute = len > 0 && p[0] == '/';
+#endif
+        while (absolute && len > 1 && (p[len - 1] == '/' || p[len - 1] == '\\')) {
+            len--;
+        }
+        for (int i = 0; absolute && names[i]; i++) {
+            int n = snprintf(out, out_sz, "%.*s/%s", (int)len, p, names[i]);
+            if (n <= 0 || (size_t)n >= out_sz) {
+                continue;
+            }
+#ifdef _WIN32
+            if (cbm_is_regular_file(out)) {
+                return true;
+            }
+#else
+            if (cbm_is_regular_file(out) && access(out, X_OK) == 0) {
+                return true;
+            }
+#endif
+        }
+        if (!end) {
+            break;
+        }
+        p = end + 1;
+    }
+    out[0] = '\0';
+    return false;
+}
 
 /* rename() with overwrite semantics on every platform: POSIX rename already
  * replaces atomically; Windows rename fails with EEXIST when the target

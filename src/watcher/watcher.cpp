@@ -156,7 +156,7 @@ int cbm_watcher_poll_interval_ms(int file_count) {
 static bool is_git_repo(const char *root_path) {
     char cmd[CBM_SZ_1K];
     snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse --git-dir 2>%s", root_path, WATCHER_NULDEV);
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return false;
     }
@@ -171,7 +171,7 @@ static bool is_git_repo(const char *root_path) {
 static int git_head(const char *root_path, char *out, size_t out_size) {
     char cmd[CBM_SZ_1K];
     snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse HEAD 2>%s", root_path, WATCHER_NULDEV);
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return CBM_NOT_FOUND;
     }
@@ -206,7 +206,7 @@ static bool git_is_dirty(const char *root_path) {
              "git --no-optional-locks -C \"%s\" status --porcelain "
              "--untracked-files=normal -- . \":(exclude)" CBM_ARTIFACT_DIR "\" 2>%s",
              root_path, WATCHER_NULDEV);
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return false;
     }
@@ -239,7 +239,7 @@ static bool git_is_dirty(const char *root_path) {
              "'git status --porcelain --untracked-files=normal 2>/dev/null' "
              "2>/dev/null",
              root_path);
-    fp = cbm_popen(cmd, "r");
+    fp = cbm_popen_git(cmd);
     if (!fp) {
         return false;
     }
@@ -261,7 +261,7 @@ static bool git_is_dirty(const char *root_path) {
 static int git_file_count(const char *root_path) {
     char cmd[CBM_SZ_1K];
     snprintf(cmd, sizeof(cmd), "git -C \"%s\" ls-files 2>%s", root_path, WATCHER_NULDEV);
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return 0;
     }
