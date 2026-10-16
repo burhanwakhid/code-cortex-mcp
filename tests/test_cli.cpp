@@ -14,9 +14,11 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
+#include <foundation/sha256.h>
 #include <foundation/yaml.h>
 #include <yyjson/yyjson.h>
 #include <string>
+#include <vector>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -4588,6 +4590,138 @@ TEST(cli_build_args_json_array_flag_checks_item_type) {
     PASS();
 }
 
+/* Hash `len` bytes fed in `chunk`-sized pieces (0 = one update) to hex. */
+static void sha256_chunked_hex(const uint8_t *data, size_t len, size_t chunk,
+                               char out[CBM_SHA256_HEX_LEN + 1]) {
+    static const char hex[] = "0123456789abcdef";
+    cbm_sha256_ctx ctx;
+    cbm_sha256_init(&ctx);
+    size_t step = chunk == 0 ? len : chunk;
+    for (size_t off = 0; off < len; off += step) {
+        cbm_sha256_update(&ctx, data + off, len - off < step ? len - off : step);
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&ctx, digest);
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Restores the probed backend however the test exits (ASSERT_* returns early). */
+struct Sha256ForcePortable {
+    explicit Sha256ForcePortable(bool force) {
+        cbm_sha256_force_portable_for_testing(force);
+    }
+    ~Sha256ForcePortable() {
+        cbm_sha256_force_portable_for_testing(false);
+    }
+    Sha256ForcePortable(const Sha256ForcePortable &) = delete;
+    Sha256ForcePortable &operator=(const Sha256ForcePortable &) = delete;
+};
+#endif
+
+/* FIPS 180-4 / NIST known answers: empty, "abc", the 448-bit two-block
+ * message, and one million 'a'. With test seams, each runs on the probed
+ * (hardware when available) backend and again on the portable transform. */
+TEST(cli_sha256_matches_fips_vectors) {
+    struct Vector {
+        std::string input;
+        const char *hex;
+    };
+    const Vector vectors[] = {
+        {"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        {"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
+        {"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+         "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"},
+        {std::string(1000000, 'a'),
+         "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"},
+    };
+    char got[CBM_SHA256_HEX_LEN + 1];
+    for (int pass = 0; pass < 2; pass++) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+        Sha256ForcePortable force(pass == 1);
+#else
+        if (pass == 1) {
+            break;
+        }
+#endif
+        for (const Vector &v : vectors) {
+            cbm_sha256_hex(v.input.data(), v.input.size(), got);
+            ASSERT_STR_EQ(got, v.hex);
+            /* Byte-at-a-time and odd chunking must give the same digest. */
+            const auto *bytes = reinterpret_cast<const uint8_t *>(v.input.data());
+            sha256_chunked_hex(bytes, v.input.size(), 1, got);
+            ASSERT_STR_EQ(got, v.hex);
+            sha256_chunked_hex(bytes, v.input.size(), 63, got);
+            ASSERT_STR_EQ(got, v.hex);
+        }
+    }
+    PASS();
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Upstream #2441: block compression runs on ARMv8 SHA2 / x86 SHA-NI when the
+ * CPU has them. The hardware path must agree with the portable transform bit
+ * for bit at every length around the block and padding boundaries, for every
+ * way the input is split across update calls, at random lengths, and on the
+ * NIST million-'a' vector that runs 15,625 blocks through it. */
+TEST(cli_sha256_hardware_matches_portable_issue2441) {
+    constexpr size_t MAX_LEN = (size_t{1} << 20) + 13;
+    std::vector<uint8_t> data(MAX_LEN);
+    uint32_t x = 0x2441u;
+    for (size_t i = 0; i < MAX_LEN; i++) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        data[i] = static_cast<uint8_t>(x);
+    }
+    std::vector<size_t> lengths;
+    for (size_t n = 0; n < 300; n++) {
+        lengths.push_back(n);
+    }
+    for (size_t n : {size_t{4096}, size_t{65535}, size_t{65536}, size_t{65537}, MAX_LEN}) {
+        lengths.push_back(n);
+    }
+    for (int i = 0; i < 64; i++) { /* random lengths from the same xorshift stream */
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        lengths.push_back(x % MAX_LEN);
+    }
+    static const size_t chunks[] = {0, 1, 3, 55, 63, 64, 65, 1000};
+    char hw[CBM_SHA256_HEX_LEN + 1];
+    char portable[CBM_SHA256_HEX_LEN + 1];
+    for (size_t len : lengths) {
+        for (size_t chunk : chunks) {
+            if (len > 70000 && chunk != 0 && chunk < 64) {
+                continue; /* byte-sized updates over 64 KiB add time, not coverage */
+            }
+            {
+                Sha256ForcePortable force(false);
+                sha256_chunked_hex(data.data(), len, chunk, hw);
+            }
+            {
+                Sha256ForcePortable force(true);
+                sha256_chunked_hex(data.data(), len, chunk, portable);
+            }
+            ASSERT_STR_EQ(hw, portable);
+        }
+    }
+    memset(data.data(), 'a', 1000000);
+    sha256_chunked_hex(data.data(), 1000000, 0, hw);
+    ASSERT_STR_EQ(hw, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* Every Apple arm64 CPU has the SHA2 extension: a portable answer here
+     * means the probe or dispatch broke, and startup is slow again. */
+    ASSERT_STR_EQ(cbm_sha256_backend_name_for_testing(), "arm-sha2");
+#endif
+    PASS();
+}
+#endif
+
 SUITE(cli) {
     RUN_TEST(cli_remove_indexes_respects_lease);
     RUN_TEST(cli_index_enumeration_skips_internal_cache_dbs);
@@ -4598,6 +4732,10 @@ SUITE(cli) {
     RUN_TEST(cli_stdin_kind_classifies_file_and_pipe);
     RUN_TEST(cli_build_args_json_array_flag_accepts_json_literal);
     RUN_TEST(cli_build_args_json_array_flag_checks_item_type);
+    RUN_TEST(cli_sha256_matches_fips_vectors);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(cli_sha256_hardware_matches_portable_issue2441);
+#endif
 
     /* Version (2 tests — selfupdate_test.go) */
     RUN_TEST(cli_compare_versions);

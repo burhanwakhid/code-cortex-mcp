@@ -36,6 +36,14 @@ void cbm_sha256_final(cbm_sha256_ctx *c, uint8_t out[CBM_SHA256_DIGEST_LEN]);
  * CBM_SHA256_HEX_LEN + 1 bytes (hex chars + NUL). */
 void cbm_sha256_hex(const void *data, size_t len, char out[CBM_SHA256_HEX_LEN + 1]);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* The block backend in use: "arm-sha2", "x86-sha-ni" or "portable". */
+const char *cbm_sha256_backend_name_for_testing(void);
+/* Force the portable transform (true) or return to the probed backend (false),
+ * so a test can hash the same input both ways. Process-wide. */
+void cbm_sha256_force_portable_for_testing(bool force);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
