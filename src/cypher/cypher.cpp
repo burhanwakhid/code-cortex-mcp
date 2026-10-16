@@ -7,6 +7,7 @@
  */
 #include "cypher/cypher.h"
 #include "store/store.h"
+#include "foundation/hash_table.h"
 #include "foundation/limits.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
@@ -479,6 +480,15 @@ static const cbm_token_t *expect(parser_t *p, cbm_token_type_t type) {
     return NULL;
 }
 
+/* Free the first n entries of a property array and the array itself. */
+static void free_prop_entries(cbm_prop_filter_t *arr, int n) {
+    for (int i = 0; i < n; i++) {
+        safe_str_free(&arr[i].key);
+        safe_str_free(&arr[i].value);
+    }
+    free(arr);
+}
+
 /* Parse inline properties: {key: "value", ...} */
 static int parse_props(parser_t *p, cbm_prop_filter_t **out, int *count) {
     *out = NULL;
@@ -495,18 +505,19 @@ static int parse_props(parser_t *p, cbm_prop_filter_t **out, int *count) {
     }
 
     while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
+        /* Every failure frees the entries already parsed, not only the array. */
         const cbm_token_t *key = expect(p, TOK_IDENT);
         if (!key) {
-            free(arr);
+            free_prop_entries(arr, n);
             return CBM_NOT_FOUND;
         }
         if (!expect(p, TOK_COLON)) {
-            free(arr);
+            free_prop_entries(arr, n);
             return CBM_NOT_FOUND;
         }
         const cbm_token_t *val = expect(p, TOK_STRING);
         if (!val) {
-            free(arr);
+            free_prop_entries(arr, n);
             return CBM_NOT_FOUND;
         }
 
@@ -514,11 +525,7 @@ static int parse_props(parser_t *p, cbm_prop_filter_t **out, int *count) {
             int new_cap = cap * PAIR_LEN;
             void *tmp = (void *)realloc(arr, new_cap * sizeof(cbm_prop_filter_t));
             if (!tmp) {
-                for (int i = 0; i < n; i++) {
-                    safe_str_free(&arr[i].key);
-                    safe_str_free(&arr[i].value);
-                }
-                free(arr);
+                free_prop_entries(arr, n);
                 return CBM_NOT_FOUND;
             }
             arr = (cbm_prop_filter_t *)tmp;
@@ -533,7 +540,7 @@ static int parse_props(parser_t *p, cbm_prop_filter_t **out, int *count) {
                 safe_str_free(&arr[i].key);
                 safe_str_free(&arr[i].value);
             }
-            free(arr);
+            free_prop_entries(arr, n);
             return CBM_NOT_FOUND;
         }
         arr[n].key = new_key;
@@ -1732,6 +1739,11 @@ static int parse_return(parser_t *p, cbm_return_clause_t **out) {
 }
 
 /* Parse a single MATCH pattern into pat */
+static void free_pattern(cbm_pattern_t *pat);
+
+/* Parse a single MATCH pattern into pat. On failure pat is freed and zeroed:
+ * the caller counts a pattern only after it parsed, so a partial one would
+ * otherwise leak (a named path "p = (...)" failed this way on every query). */
 static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
     memset(pat, 0, sizeof(*pat));
     int node_cap = CYP_INIT_CAP4;
@@ -1739,8 +1751,11 @@ static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
     pat->nodes = (__typeof__(pat->nodes))malloc(node_cap * sizeof(cbm_node_pattern_t));
     pat->rels = (__typeof__(pat->rels))calloc(rel_cap, sizeof(cbm_rel_pattern_t));
 
+    /* A failed parse_node / parse_rel leaves its element zeroed except for
+     * what it allocated, so counting that element frees its partial state. */
     if (parse_node(p, &pat->nodes[0]) < 0) {
-        return CBM_NOT_FOUND;
+        pat->node_count = SKIP_ONE;
+        goto fail;
     }
     pat->node_count = SKIP_ONE;
 
@@ -1751,7 +1766,8 @@ static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
                 (__typeof__(pat->rels))safe_realloc(pat->rels, rel_cap * sizeof(cbm_rel_pattern_t));
         }
         if (parse_rel(p, &pat->rels[pat->rel_count]) < 0) {
-            return CBM_NOT_FOUND;
+            pat->rel_count++;
+            goto fail;
         }
         pat->rel_count++;
 
@@ -1761,11 +1777,17 @@ static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
                 pat->nodes, node_cap * sizeof(cbm_node_pattern_t));
         }
         if (parse_node(p, &pat->nodes[pat->node_count]) < 0) {
-            return CBM_NOT_FOUND;
+            pat->node_count++;
+            goto fail;
         }
         pat->node_count++;
     }
     return 0;
+
+fail:
+    free_pattern(pat);
+    memset(pat, 0, sizeof(*pat));
+    return CBM_NOT_FOUND;
 }
 
 /* Parse UNWIND [...] AS var clause into query */
@@ -2656,6 +2678,107 @@ static void rb_add_row(result_builder_t *rb, const char **values) {
         row[i] = values[i] ? heap_strdup(values[i]) : heap_strdup("");
     }
     rb->rows[rb->row_count++] = row;
+}
+
+/* ── DISTINCT while projecting (#1364) ─────────────────────────────
+ *
+ * RETURN DISTINCT used to project up to the row cap and only then drop
+ * duplicates, so a value first seen past the cap never reached the result: on
+ * a 150k-edge index `RETURN DISTINCT type(r)` lost its one HAS_BRANCH edge.
+ * The projection loops now de-duplicate as they go, so the cap counts DISTINCT
+ * rows. Memory stays bounded by the cap: only admitted rows are remembered. */
+typedef struct {
+    CBMHashTable *seen; /* row key -> the same heap key; NULL = not DISTINCT */
+} rb_distinct_t;
+
+static void rb_distinct_init(rb_distinct_t *d, bool distinct) {
+    d->seen = distinct ? cbm_ht_create(CBM_SZ_64) : NULL;
+}
+
+static void rb_distinct_free_key(const char *key, void *value, void *userdata) {
+    (void)key;
+    (void)userdata;
+    free(value);
+}
+
+static void rb_distinct_free(rb_distinct_t *d) {
+    if (d->seen) {
+        cbm_ht_foreach(d->seen, rb_distinct_free_key, NULL);
+        cbm_ht_free(d->seen);
+        d->seen = NULL;
+    }
+}
+
+/* Length-prefixed row key ("<len>:<value>" per column), so no value content
+ * can make two different rows collide. NULL projects as "" (as rb_add_row). */
+static char *rb_distinct_row_key(const char **vals, int n) {
+    size_t total = SKIP_ONE;
+    for (int i = 0; i < n; i++) {
+        total += (vals[i] ? strlen(vals[i]) : 0) + CBM_SZ_32;
+    }
+    char *key = (char *)malloc(total);
+    if (!key) {
+        return NULL;
+    }
+    size_t pos = 0;
+    for (int i = 0; i < n; i++) {
+        const char *v = vals[i] ? vals[i] : "";
+        size_t len = strlen(v);
+        int w = snprintf(key + pos, total - pos, "%zu:", len);
+        if (w <= 0 || (size_t)w + len >= total - pos) {
+            free(key);
+            return NULL; /* cannot happen: `total` reserved this */
+        }
+        pos += (size_t)w;
+        memcpy(key + pos, v, len);
+        pos += len;
+    }
+    key[pos] = '\0';
+    return key;
+}
+
+/* Admission for one projected row. Returns false for a row DISTINCT already
+ * holds. On true, *key_out is the key to hand to rb_distinct_keep (NULL when
+ * not DISTINCT, or when the key allocation failed — the row is then admitted
+ * without de-duplication rather than dropped; the post-pass still runs). */
+static bool rb_distinct_is_new(const rb_distinct_t *d, const char **vals, int n, char **key_out) {
+    *key_out = NULL;
+    if (!d->seen) {
+        return true;
+    }
+    char *key = rb_distinct_row_key(vals, n);
+    if (!key) {
+        return true;
+    }
+    if (cbm_ht_has(d->seen, key)) {
+        free(key);
+        return false;
+    }
+    *key_out = key;
+    return true;
+}
+
+static void rb_distinct_keep(rb_distinct_t *d, char *key) {
+    if (key) {
+        cbm_ht_set(d->seen, key, key);
+    }
+}
+
+/* Add one projected row under a row cap, de-duplicating when DISTINCT.
+ * Returns false once a NEW row arrives with the cap already full: the caller
+ * stops there. A duplicate past the cap is neither kept nor counted. */
+static bool rb_add_row_capped(result_builder_t *rb, rb_distinct_t *d, const char **vals, int cap) {
+    char *key = NULL;
+    if (!rb_distinct_is_new(d, vals, rb->col_count, &key)) {
+        return true;
+    }
+    if (rb->row_count >= cap) {
+        free(key);
+        return false;
+    }
+    rb_distinct_keep(d, key);
+    rb_add_row(rb, vals);
+    return true;
 }
 
 /* ── Main execution ─────────────────────────────────────────────── */
@@ -3610,15 +3733,39 @@ static void distinct_list_add(char ***list, int *count, const char *val) {
     (*list)[idx] = heap_strdup(val);
 }
 
-/* Sort bindings by a virtual variable using bubble sort */
+/* Resolve one WITH ORDER BY key on a projected binding. The key is either a
+ * projected name (`c`, or an unaliased `f.name`) or a property of a carried
+ * node (`g.start_line` after `WITH f AS g`, #2208): an exact projected name
+ * wins, otherwise `var.prop` is split and resolved on the carried node. */
+static const char *order_key_value(binding_t *b, const char *key) {
+    const char *dot = strchr(key, '.');
+    if (!dot) {
+        return binding_get_virtual(b, key, NULL);
+    }
+    for (int i = 0; i < b->var_count; i++) {
+        if (strcmp(b->var_names[i], key) == 0) {
+            return binding_get_virtual(b, key, NULL);
+        }
+    }
+    char var[CBM_SZ_256];
+    size_t vlen = (size_t)(dot - key);
+    if (vlen >= sizeof(var)) {
+        return "";
+    }
+    memcpy(var, key, vlen);
+    var[vlen] = '\0';
+    return binding_get_virtual(b, var, dot + SKIP_ONE);
+}
+
+/* Sort bindings by the ORDER BY key list using bubble sort; later keys break
+ * ties, direction is per key. */
 static void sort_bindings(binding_t *vbindings, int count, const cbm_return_clause_t *wc) {
     for (int i = 0; i < count - SKIP_ONE; i++) {
         for (int j = 0; j < count - i - SKIP_ONE; j++) {
             int cmp = 0;
             for (int k = 0; k < wc->order_key_count && cmp == 0; k++) {
-                const char *va = binding_get_virtual(&vbindings[j], wc->order_keys[k], NULL);
-                const char *vb2 =
-                    binding_get_virtual(&vbindings[j + SKIP_ONE], wc->order_keys[k], NULL);
+                const char *va = order_key_value(&vbindings[j], wc->order_keys[k]);
+                const char *vb2 = order_key_value(&vbindings[j + SKIP_ONE], wc->order_keys[k]);
                 char *ea = NULL;
                 char *eb = NULL;
                 double da = strtod(va, &ea);
@@ -3835,11 +3982,14 @@ static void with_agg_format(const char *func, with_agg_t *agg, int ci, char *buf
     }
 }
 
-/* Add a virtual variable binding for one WITH item */
+/* Add a scalar virtual variable binding for one WITH item. The value lives in
+ * .name; the owned alias string (var_names points at it) lives in .project,
+ * which no property accessor exposes. It used to live in .qualified_name, so
+ * alias.qualified_name / keys(alias) returned the variable name as data (#2208). */
 static void with_add_vbinding_var(binding_t *vb, const char *alias, const char *val) {
-    cbm_node_t vn = {.name = heap_strdup(val), .qualified_name = heap_strdup(alias)};
+    cbm_node_t vn = {.project = heap_strdup(alias), .name = heap_strdup(val)};
     if (vb->var_count < CYP_BUF_16) {
-        vb->var_names[vb->var_count] = vn.qualified_name;
+        vb->var_names[vb->var_count] = vn.project;
         vb->var_nodes[vb->var_count] = vn;
         vb->var_count++;
     }
@@ -4213,14 +4363,19 @@ static void execute_return_star_after_with(cbm_query_t *q, binding_t *bindings, 
         cols[i] = resolve_item_alias(&wc->items[i], name_bufs[i], sizeof(name_bufs[i]));
     }
     rb_set_columns(rb, cols, col_n);
-    for (int bi = 0; bi < bind_count && rb->row_count < max_rows; bi++) {
+    rb_distinct_t seen;
+    rb_distinct_init(&seen, q->ret && q->ret->distinct);
+    for (int bi = 0; bi < bind_count; bi++) {
         const char *vals[CYP_MAX_VARS];
         for (int i = 0; i < col_n; i++) {
             cbm_node_t *vn = binding_get(&bindings[bi], cols[i]);
             vals[i] = vn && vn->name ? vn->name : "";
         }
-        rb_add_row(rb, vals);
+        if (!rb_add_row_capped(rb, &seen, vals, max_rows)) {
+            break;
+        }
     }
+    rb_distinct_free(&seen);
 }
 
 static void execute_return_star(cbm_query_t *q, binding_t *bindings, int bind_count, int max_rows,
@@ -4234,11 +4389,22 @@ static void execute_return_star(cbm_query_t *q, binding_t *bindings, int bind_co
     const char *vars[CYP_MAX_VARS + CYP_MAX_EDGE_VARS];
     int vc = pattern_vars_distinct_names(&pv, vars);
     build_star_columns(rb, vars, vc);
-    for (int bi = 0; bi < bind_count && rb->row_count < max_rows; bi++) {
+    int projection_cap = max_rows;
+    const cbm_return_clause_t *ret = q->ret;
+    if (ret && ret->limit > 0 && ret->limit <= max_rows && ret->order_key_count == 0 &&
+        ret->skip <= 0) {
+        projection_cap = ret->limit; /* DISTINCT: the cap counts distinct rows (#1364) */
+    }
+    rb_distinct_t seen;
+    rb_distinct_init(&seen, ret && ret->distinct);
+    for (int bi = 0; bi < bind_count; bi++) {
         const char *vals[CBM_SZ_128];
         project_star_row(&bindings[bi], vars, vc, vals);
-        rb_add_row(rb, vals);
+        if (!rb_add_row_capped(rb, &seen, vals, projection_cap)) {
+            break;
+        }
     }
+    rb_distinct_free(&seen);
 }
 
 /* Format an aggregate value into buf based on function name */
@@ -4504,18 +4670,23 @@ static void build_return_columns(result_builder_t *rb, cbm_return_clause_t *ret)
 static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings, int bind_count,
                                   int max_rows, result_builder_t *rb) {
     int proj_cap = max_rows;
-    if (ret->limit > 0 && !ret->distinct && ret->order_key_count == 0 && ret->skip <= 0) {
-        proj_cap = ret->limit;
+    if (ret->limit > 0 && ret->order_key_count == 0 && ret->skip <= 0) {
+        proj_cap = ret->limit; /* DISTINCT: the cap counts distinct rows (#1364) */
     }
-    for (int bi = 0; bi < bind_count && rb->row_count < proj_cap; bi++) {
+    rb_distinct_t seen;
+    rb_distinct_init(&seen, ret->distinct);
+    for (int bi = 0; bi < bind_count; bi++) {
         const char *vals[CBM_SZ_32];
         char func_bufs[CBM_SZ_32][CBM_SZ_512];
         for (int ci = 0; ci < ret->count; ci++) {
             vals[ci] =
                 project_item(&bindings[bi], &ret->items[ci], func_bufs[ci], sizeof(func_bufs[ci]));
         }
-        rb_add_row(rb, vals);
+        if (!rb_add_row_capped(rb, &seen, vals, proj_cap)) {
+            break;
+        }
     }
+    rb_distinct_free(&seen);
 }
 
 /* Build default 3-column headers (name, qualified_name, label) per variable */
@@ -4705,7 +4876,9 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
         }
     }
 
-    if (ret->distinct) {
+    /* The simple and star projections de-duplicate while projecting (#1364);
+     * only aggregate rows still need the post-pass. */
+    if (ret->distinct && has_agg && !ret->star) {
         rb_apply_distinct(rb);
     }
     rb_apply_order_by(rb, ret);
