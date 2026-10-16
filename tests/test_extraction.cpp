@@ -18,6 +18,13 @@
 #include "lang_specs.h" /* cbm_lang_spec, cbm_ts_language */
 #include "sql_values.h" /* #1735 value-row scanner */
 #include <cstdarg>
+/* Deep-nesting probes: extraction on a worker-sized stack, crash-isolated. */
+#include "pipeline/worker_pool.h"            /* CBM_WORKER_STACK_SIZE */
+#include "../src/foundation/compat_thread.h" /* cbm_thread_create */
+#if !defined(_WIN32)
+#include <sys/wait.h> /* fork/waitpid */
+#include <unistd.h>
+#endif
 #include <sqlite3.h>
 #include <cctype>
 #include <cstdio>
@@ -6096,6 +6103,132 @@ TEST(sql_values_scanner_keeps_positions_of_kept_text_issue1735) {
     PASS();
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * Deep nesting: the syntax-tree walkers must not spend stack per level
+ * (upstream 4d582ad0)
+ *
+ * Extraction runs on pipeline worker threads whose stack is
+ * CBM_WORKER_STACK_SIZE (src/pipeline/worker_pool.h), not on the test runner's
+ * main thread. Each probe below therefore runs extraction on a thread of
+ * exactly that size, so a walker that recurses once per nesting level runs out
+ * of stack at the depth it would in the pipeline. On POSIX the thread lives in
+ * a forked child and an overflow surfaces as the child's killing signal
+ * instead of taking the runner with it; Windows runs it in-process. A probe
+ * returns 0 when every expectation held and prints what did not.
+ *
+ * DEEP_NEST_LEVELS: a walker frame holds at least a saved frame pointer and
+ * return address plus the 32-byte TSNode it passes down, 48 bytes, so 200,000
+ * frames need 9.6 MB — past the 8 MB worker stack even at that floor.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+enum { DEEP_NEST_LEVELS = 200000 };
+
+typedef int (*deep_probe_fn)(void);
+
+typedef struct {
+    deep_probe_fn fn;
+    int rc;
+} deep_probe_job_t;
+
+static void *deep_probe_thread_main(void *arg) {
+    deep_probe_job_t *job = (deep_probe_job_t *)arg;
+    job->rc = job->fn();
+    return NULL;
+}
+
+/* 0 when the probe passed, its own code otherwise, 2 if no thread came up. */
+static int deep_probe_on_worker_stack(deep_probe_fn fn) {
+    deep_probe_job_t job = {fn, 3};
+    cbm_thread_t thread;
+    if (cbm_thread_create(&thread, CBM_WORKER_STACK_SIZE, deep_probe_thread_main, &job) != 0) {
+        return 2;
+    }
+    (void)cbm_thread_join(&thread);
+    return job.rc;
+}
+
+/* 1 when the probe passed; otherwise `why` says what happened. */
+static int deep_probe_passed(deep_probe_fn fn, char *why, size_t why_len) {
+#if defined(_WIN32)
+    int rc = deep_probe_on_worker_stack(fn);
+    if (rc != 0) {
+        snprintf(why, why_len, "probe returned %d", rc);
+    }
+    return rc == 0;
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) {
+        snprintf(why, why_len, "fork failed");
+        return 0;
+    }
+    if (pid == 0) {
+        int rc = deep_probe_on_worker_stack(fn);
+        fflush(NULL);
+        _exit(rc);
+    }
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) {
+        snprintf(why, why_len,
+                 "extraction killed by signal %d on a worker-sized stack: a walker recursed once "
+                 "per nesting level",
+                 WTERMSIG(status));
+        return 0;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        snprintf(why, why_len, "probe returned %d", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return 0;
+    }
+    return 1;
+#endif
+}
+
+/* One invalid token at the bottom of DEEP_NEST_LEVELS parentheses. Every
+ * enclosing parenthesized_expression then carries ts_node_has_error without
+ * being an ERROR node, which is the chain cbm_collect_error_regions (cbm.cpp)
+ * descends. Expected: one region, on the line of the nest only, with the
+ * neighbouring definition intact and the file still usable. */
+static int deep_error_regions_probe(void) {
+    std::string src = "def ok():\n    return 1\nx = ";
+    src.append(DEEP_NEST_LEVELS, '(');
+    src += "1 2";
+    src.append(DEEP_NEST_LEVELS, ')');
+    src += "\ny = ok()\n";
+    CBMFileResult *r = extract(src.c_str(), CBM_LANG_PYTHON, "t", "deep_error.py");
+    int rc = 0;
+    if (!r) {
+        printf("    deep error regions: extraction failed\n");
+        return 1;
+    }
+    if (!r->parse_incomplete || r->error_region_count != 1 || !r->error_ranges ||
+        strcmp(r->error_ranges, "3-3") != 0) {
+        printf("    deep error regions: incomplete=%d count=%d ranges=%s, expected one "
+               "region 3-3\n",
+               r->parse_incomplete ? 1 : 0, r->error_region_count,
+               r->error_ranges ? r->error_ranges : "(none)");
+        rc = 1;
+    }
+    if (r->parse_unusable) {
+        printf("    deep error regions: one line of five must not make the file unusable\n");
+        rc = 1;
+    }
+    if (!find_def(r, "ok")) {
+        printf("    deep error regions: the definition next to the nest was lost\n");
+        rc = 1;
+    }
+    cbm_free_result(r);
+    return rc;
+}
+
+TEST(extract_deep_error_regions_complete) {
+    char why[160];
+    if (!deep_probe_passed(deep_error_regions_probe, why, sizeof(why))) {
+        FAIL(why);
+    }
+    PASS();
+}
+
 /* ── #2176: binary `.res` resources must not hang the indexer ──────────
  * tree-sitter lexes an unparseable stretch by retrying at every byte with
  * every external token marked valid. The ReScript scanner then ran its
@@ -9864,6 +9997,7 @@ SUITE(extraction) {
     RUN_TEST(sql_dump_tuple_with_subquery_or_call_is_still_parsed_issue1735);
     RUN_TEST(sql_dump_parse_does_not_grow_with_the_row_count_issue1735);
     RUN_TEST(sql_dump_of_many_megabytes_is_indexed_not_timed_out_issue1735);
+    RUN_TEST(extract_deep_error_regions_complete);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(macro_check_reads_no_source_for_regions_outside_functions_issue1735);
     RUN_TEST(macro_check_locates_lines_with_one_table_issue1735);

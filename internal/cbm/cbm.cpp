@@ -1265,21 +1265,53 @@ static bool cbm_is_eof_terminator_miss(TSNode n, const char *source, int source_
 
 /* Walks to the end even after the cap is full, so `dropped` is the real number
  * of ranges lost rather than a lower bound. Cheap: the walk never descends into
- * an ERROR subtree, so it only visits the spine of nodes containing an error. */
+ * an ERROR subtree, so it only visits the spine of nodes containing an error.
+ *
+ * Visits, in source order, every ERROR or MISSING node that is top-most in its
+ * chain. The descent follows the nesting of the construct that failed — every
+ * ancestor of the failing node carries ts_node_has_error — so the recursive
+ * child-index walk this replaced used one stack frame per nesting level of the
+ * indexed file, and a deep enough nest ran the worker thread out of stack. The
+ * cursor keeps that path on the heap; it stops on exactly the visible children
+ * ts_node_child enumerates, in the same order (upstream 4d582ad0). */
 template <typename Visit>
 static void cbm_walk_error_nodes(TSNode n, const char *source, int source_len, const Visit &visit) {
-    uint32_t k = ts_node_child_count(n);
-    for (uint32_t i = 0; i < k; i++) {
-        TSNode c = ts_node_child(n, i);
+    TSTreeCursor cursor = ts_tree_cursor_new(n);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    int depth = 0; /* 0 while on a direct child of n */
+    for (;;) {
+        TSNode c = ts_tree_cursor_current_node(&cursor);
+        bool descend = false;
         if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
-            if (cbm_is_eof_terminator_miss(c, source, source_len)) {
-                continue; /* absent final newline only — nothing was dropped */
+            /* An absent final newline only means nothing was dropped. Anything
+             * else is the top-most region; do not descend. */
+            if (!cbm_is_eof_terminator_miss(c, source, source_len)) {
+                visit(c);
             }
-            visit(c); /* top-most region; do not descend */
         } else if (ts_node_has_error(c)) {
-            cbm_walk_error_nodes(c, source, source_len, visit);
+            descend = true;
+        }
+        if (descend && ts_tree_cursor_goto_first_child(&cursor)) {
+            depth++;
+            continue;
+        }
+        bool done = false;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (depth == 0) {
+                done = true;
+                break;
+            }
+            (void)ts_tree_cursor_goto_parent(&cursor);
+            depth--;
+        }
+        if (done) {
+            break;
         }
     }
+    ts_tree_cursor_delete(&cursor);
 }
 
 static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, const char *source,

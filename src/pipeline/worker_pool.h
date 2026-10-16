@@ -11,6 +11,11 @@
 #define CBM_WORKER_POOL_H
 
 #include <stdbool.h>
+#include <stddef.h> /* size_t */
+
+/* 8 MB stack per worker — matches main thread default. Exposed so tests can
+ * run extraction on a thread of exactly the pipeline's stack size. */
+#define CBM_WORKER_STACK_SIZE ((size_t)8 * 1024 * 1024)
 
 #ifdef __cplusplus
 extern "C" {

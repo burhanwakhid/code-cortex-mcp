@@ -18,10 +18,6 @@ enum { WP_TRUE = 1, WP_MIN = 1, WP_STEP = 1 };
 #include "foundation/cbm_atomic.h"
 #include <stdlib.h>
 
-/* 8 MB stack per worker — matches main thread default.
- * Required for deep AST recursion (tree-sitter + walk_defs). */
-#define CBM_WORKER_STACK_SIZE ((size_t)8 * CBM_SZ_1K * CBM_SZ_1K)
-
 /* ── Serial fallback ─────────────────────────────────────────────── */
 
 static void run_serial(int count, cbm_parallel_fn fn, void *ctx) {
