@@ -6713,6 +6713,68 @@ TEST(bm25_searches_legacy_four_column_fts_without_error_issue518) {
     PASS();
 }
 
+/* Leak regression: trace_path by a qualified name resolves only through the
+ * qualified_name fallback. The bare-name lookup that precedes it returns a
+ * heap array even for zero rows (find_nodes_generic allocates its initial
+ * capacity up front), and the fallback used to overwrite that pointer —
+ * leaking ~1 KB per call for the daemon's lifetime. The sanitizer lanes
+ * (LSan: default-on under Linux ASan, `make -f Makefile.cbm test-lsan` on
+ * macOS) report the leak at exit; the assertions pin that this test really
+ * takes the fallback path. */
+TEST(tool_trace_call_path_qn_fallback_frees_name_miss) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "qnfb-proj";
+    const char *qn = "qnfb-proj.src.qnfb_entry";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/qnfb");
+    cbm_node_t entry = {.project = proj,
+                        .label = "Function",
+                        .name = "qnfb_entry",
+                        .qualified_name = qn,
+                        .file_path = "src/qnfb.c",
+                        .start_line = 1,
+                        .end_line = 10};
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "qnfb_callee",
+                         .qualified_name = "qnfb-proj.src.qnfb_callee",
+                         .file_path = "src/qnfb.c",
+                         .start_line = 20,
+                         .end_line = 30};
+    int64_t id_entry = cbm_store_upsert_node(st, &entry);
+    int64_t id_callee = cbm_store_upsert_node(st, &callee);
+    ASSERT_GT(id_entry, 0);
+    ASSERT_GT(id_callee, 0);
+    cbm_edge_t e = {
+        .project = proj, .source_id = id_entry, .target_id = id_callee, .type = "CALLS"};
+    cbm_store_insert_edge(st, &e);
+
+    /* Precondition: the qualified name is NOT a bare name, so the handler's
+     * first lookup misses and the fallback is the only way to resolve it. */
+    cbm_node_t *by_name = NULL;
+    int by_name_count = -1;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(st, proj, qn, &by_name, &by_name_count), CBM_STORE_OK);
+    ASSERT_EQ(by_name_count, 0);
+    cbm_store_free_nodes(by_name, by_name_count);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":"
+             "\"qnfb-proj.src.qnfb_entry\",\"project\":\"qnfb-proj\",\"direction\":\"outbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "function not found"));
+    /* resolved through the fallback -> its outbound CALLS edge shows */
+    ASSERT_NOT_NULL(strstr(inner, "qnfb_callee"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+
 SUITE(mcp) {
     RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
     RUN_TEST(autoindex_limit_admits_under_limit_issue713);
@@ -6944,4 +7006,5 @@ SUITE(mcp) {
     RUN_TEST(bm25_case_insensitive_exact_name_survives_the_inner_limit);
     RUN_TEST(bm25_label_and_path_filter_survive_the_inner_limit);
     RUN_TEST(bm25_searches_legacy_four_column_fts_without_error_issue518);
+    RUN_TEST(tool_trace_call_path_qn_fallback_frees_name_miss);
 }
