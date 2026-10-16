@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include <set>
 #include "../src/foundation/cbm_atomic.h"
 #include "foundation/compat_thread.h"
 #include <fcntl.h>
@@ -661,6 +662,146 @@ TEST(store_bulk_persistence) {
 }
 
 /* ── Integration: structure pass on temp repo ────────────────────── */
+
+/* #1735: every node and edge of a stored index, one sorted line each. */
+static void sql_graph_listing_append(sqlite3 *db, const char *sql, const char *project,
+                                     std::string &buf) {
+    sqlite3_stmt *stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return;
+    }
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *row = (const char *)sqlite3_column_text(stmt, 0);
+        buf += row ? row : "";
+        buf += '\n';
+    }
+    sqlite3_finalize(stmt);
+}
+
+static bool sql_index_and_list(const std::string &repo, const char *db_name, std::string &out) {
+    std::string db_path = repo + "/" + db_name;
+    cbm_pipeline_t *p = cbm_pipeline_new(repo.c_str(), db_path.c_str(), CBM_MODE_FULL);
+    if (!p) {
+        return false;
+    }
+    bool ok = cbm_pipeline_run(p) == 0;
+    std::string project = cbm_pipeline_project_name(p);
+    cbm_pipeline_free(p);
+    if (!ok) {
+        return false;
+    }
+    sqlite3 *db = nullptr;
+    if (sqlite3_open_v2(db_path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+        sqlite3_close(db);
+        return false;
+    }
+    sql_graph_listing_append(db,
+                             "SELECT label||'|'||name||'|'||qualified_name||'|'||file_path||'|'||"
+                             "start_line||'|'||end_line||'|'||properties FROM nodes "
+                             "WHERE project=?1 ORDER BY 1",
+                             project.c_str(), out);
+    sql_graph_listing_append(db,
+                             "SELECT e.type||'|'||s.qualified_name||'|'||t.qualified_name||'|'||"
+                             "e.properties FROM edges e JOIN nodes s ON s.id=e.source_id "
+                             "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 ORDER BY 1",
+                             project.c_str(), out);
+    sqlite3_close(db);
+    return true;
+}
+
+/* True if every line of `sub` is a line of `super`. */
+static bool sql_listing_lines_within(const std::string &sub, const std::string &super) {
+    std::set<std::string> have;
+    size_t at = 0;
+    while (at < super.size()) {
+        size_t nl = super.find('\n', at);
+        have.insert(super.substr(at, nl - at));
+        at = nl == std::string::npos ? super.size() : nl + 1;
+    }
+    at = 0;
+    while (at < sub.size()) {
+        size_t nl = sub.find('\n', at);
+        std::string line = sub.substr(at, nl - at);
+        if (!have.count(line)) {
+            fprintf(stderr, "  missing from the cut index: %s\n", line.c_str());
+            return false;
+        }
+        at = nl == std::string::npos ? sub.size() : nl + 1;
+    }
+    return true;
+}
+
+/* A small dump: two tables, a view, three INSERTs of 200 rows, each with one
+ * subquery row and one function-call row among literal rows. */
+static std::string sql_dump_small(bool mysql_esc) {
+    std::string src = "CREATE TABLE city (ID int, Name char(35), Population int);\n"
+                      "CREATE TABLE country (Code char(3), Name char(52));\n"
+                      "CREATE VIEW big_cities AS SELECT Name FROM city "
+                      "WHERE Population > 1000000;\n";
+    char one[128];
+    for (int s = 0; s < 3; s++) {
+        src += "INSERT INTO `city` VALUES ";
+        for (int r = 0; r < 200; r++) {
+            if (r) {
+                src += ',';
+            }
+            int id = s * 1000 + r;
+            if (r == 100) {
+                src += "((SELECT MAX(Code) FROM country),'x',1)";
+            } else if (r == 101) {
+                snprintf(one, sizeof(one), "(%d,UPPER('y'),2)", id);
+                src += one;
+            } else if (r % 3) {
+                snprintf(one, sizeof(one),
+                         mysql_esc ? "(%d,'O\\'Brien',DEFAULT)" : "(%d,'O''Brien',DEFAULT)", id);
+                src += one;
+            } else {
+                snprintf(one, sizeof(one), "(%d,_binary 'ab',NULL)", id);
+                src += one;
+            }
+        }
+        src += ";\n";
+    }
+    return src;
+}
+
+/* #1735 (upstream c0a06b3d): leaving a dump's literal INSERT rows out of the
+ * parse must not change the graph. The same repository is indexed twice --
+ * once as shipped and once with the full parse (test seam) -- and the stored
+ * nodes and edges compared. Standard '' escapes: identical. MySQL \' escapes,
+ * which the grammar misreads: the cut index must hold everything the full one
+ * has (and may hold more -- rows the full parse's error recovery lost). */
+TEST(pipeline_sql_dump_graph_matches_the_full_parse_issue1735) {
+    for (int esc = 0; esc < 2; esc++) {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_sql_dump_XXXXXX");
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        std::string repo = std::string(tmp) + "/repo";
+        ASSERT_EQ(th_write_file((repo + "/dump.sql").c_str(), sql_dump_small(esc == 1).c_str()), 0);
+        std::string cut, full;
+        bool cut_ok = sql_index_and_list(repo, "../cut.db", cut);
+        cbm_setenv("CBM_TEST_SQL_FULL_PARSE_ON", "dump.sql", 1);
+        bool full_ok = sql_index_and_list(repo, "../full.db", full);
+        cbm_unsetenv("CBM_TEST_SQL_FULL_PARSE_ON");
+        th_rmtree(tmp);
+        ASSERT_TRUE(cut_ok);
+        ASSERT_TRUE(full_ok);
+        /* Not vacuous: the tables, the view and its lineage are there. */
+        ASSERT_NOT_NULL(strstr(cut.c_str(), "Table|city|"));
+        ASSERT_NOT_NULL(strstr(cut.c_str(), "View|big_cities|"));
+        ASSERT_NOT_NULL(strstr(cut.c_str(), "USAGE|"));
+        if (esc == 0) {
+            if (cut != full) {
+                fprintf(stderr, "--- cut ---\n%s--- full ---\n%s", cut.c_str(), full.c_str());
+            }
+            ASSERT_TRUE(cut == full);
+        } else {
+            ASSERT_TRUE(sql_listing_lines_within(full, cut));
+        }
+    }
+    PASS();
+}
 
 TEST(pipeline_structure_nodes) {
     if (setup_test_repo() != 0) {
@@ -9887,6 +10028,7 @@ SUITE(pipeline) {
     RUN_TEST(store_file_persistence);
     RUN_TEST(store_bulk_persistence);
     /* Integration: structure pass */
+    RUN_TEST(pipeline_sql_dump_graph_matches_the_full_parse_issue1735);
     RUN_TEST(pipeline_structure_nodes);
     RUN_TEST(pipeline_structure_edges);
     RUN_TEST(pipeline_branch_root_structure);
