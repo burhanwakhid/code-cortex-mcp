@@ -671,7 +671,8 @@ int cbm_git_head_read(const char *root, cbm_git_head_t *out) {
                (top[len - 1] == '/' || top[len - 1] == '\\')) {
             top[--len] = '\0';
         }
-        bool at_root = (len == 1 && top[0] == '/') || (len == 3 && top[1] == ':');
+        bool at_root = (len == 1 && (top[0] == '/' || top[0] == '\\')) ||
+                       (len == 3 && top[1] == ':');
         int n = snprintf(path, sizeof(path), "%s%s.git", top, at_root ? "" : "/");
 #ifdef CBM_ENABLE_TEST_SEAMS
         if (g_head_probe_cb && n > 0 && (size_t)n < sizeof(path)) {
@@ -701,6 +702,12 @@ int cbm_git_head_read(const char *root, cbm_git_head_t *out) {
             top[3] = '\0';
         } else {
             *slash = '\0';
+        }
+        if (strlen(top) >= len) {
+            /* No progress: a root this walk does not recognize (a UNC
+             * path's \\server reduced to a lone backslash). Stop rather
+             * than probe it forever. */
+            return CBM_NOT_FOUND;
         }
     }
     if (S_ISDIR(st.st_mode)) {
