@@ -35,8 +35,10 @@ typedef struct {
  * that is missing or unusable (pre-#768 schema), or a target list that
  * resolves to nothing but `project`, sets `failed` before any CROSS_* edge is
  * deleted; a "*" wildcard skips unusable stores. A target whose reader gate
- * is held exclusive (a cache sweep moving it) is skipped; when no target can
- * be opened, `failed` is set and the existing CROSS_* edges are kept.
+ * is held exclusive (a cache sweep moving it) is skipped and keeps its
+ * existing CROSS_* edges; edges toward projects the run did not target are
+ * removed. When no target can be opened, `failed` is set and nothing is
+ * written.
  * Returns result with edge counts. */
 cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **target_projects,
                                              int target_count);

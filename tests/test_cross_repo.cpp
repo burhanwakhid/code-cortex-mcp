@@ -353,6 +353,46 @@ TEST(cross_repo_busy_targets_keep_edges) {
     PASS();
 }
 
+/* One of two targets busy: the open one is rebuilt, the busy one keeps the
+ * edges it had, and the run succeeds. A later run that no longer targets a
+ * project drops the edges toward it. */
+TEST(cross_repo_busy_target_keeps_only_its_edges) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_http_pair(&fixture, "two-source", "two-a", "/two-a", "a") &&
+        cross_repo_seed_http_pair(&fixture, "two-source", "two-b", "/two-b", "b");
+    char b_db[512];
+    if (!setup || !cross_repo_project_path(&fixture, "two-b", b_db, sizeof(b_db))) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed two-target fixture");
+    }
+
+    const char *both[] = {"two-a", "two-b"};
+    cbm_cross_repo_result_t initial = cbm_cross_repo_match("two-source", both, 2);
+    int before = cross_repo_count_edges(&fixture, "two-source", "CROSS_HTTP_CALLS");
+    cbm_db_lease_t *gate = NULL;
+    int grc = cbm_db_read_gate_acquire(b_db, true, &gate);
+    cbm_cross_repo_result_t partial = cbm_cross_repo_match("two-source", both, 2);
+    cbm_db_lease_release(gate);
+    int after_partial = cross_repo_count_edges(&fixture, "two-source", "CROSS_HTTP_CALLS");
+    const char *only_a[] = {"two-a"};
+    cbm_cross_repo_result_t narrowed = cbm_cross_repo_match("two-source", only_a, 1);
+    int after_narrow = cross_repo_count_edges(&fixture, "two-source", "CROSS_HTTP_CALLS");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(initial.failed);
+    ASSERT_EQ(initial.projects_scanned, 2);
+    ASSERT_EQ(before, 2);
+    ASSERT_EQ(grc, 0);
+    ASSERT_FALSE(partial.failed);
+    ASSERT_EQ(partial.projects_scanned, 1);
+    ASSERT_EQ(after_partial, 2);
+    ASSERT_FALSE(narrowed.failed);
+    ASSERT_EQ(after_narrow, 1);
+    PASS();
+}
+
 /* #1133: ["*"] in a cache that holds only the source project resolves to zero
  * targets: same contract as an explicit self-only list. */
 TEST(cross_repo_wildcard_with_no_other_project_fails_issue1133) {
@@ -732,6 +772,7 @@ TEST(cross_repo_caller_without_local_handler_keeps_cross_http_issue1459) {
 SUITE(cross_repo) {
     RUN_TEST(cross_repo_self_only_target_fails_and_keeps_edges_issue1133);
     RUN_TEST(cross_repo_busy_targets_keep_edges);
+    RUN_TEST(cross_repo_busy_target_keeps_only_its_edges);
     RUN_TEST(cross_repo_wildcard_with_no_other_project_fails_issue1133);
     RUN_TEST(cross_repo_missing_named_target_fails_before_cleanup);
     RUN_TEST(cross_repo_wildcard_skips_pre768_store_issue2133);

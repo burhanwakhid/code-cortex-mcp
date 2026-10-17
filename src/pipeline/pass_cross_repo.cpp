@@ -136,13 +136,72 @@ static void build_cross_props(char *buf, size_t bufsz, const char *target_projec
 }
 
 /* Delete all CROSS_* edges for a project from a store. */
-static void delete_cross_edges(cbm_store_t *store, const char *project) {
-    cbm_store_delete_edges_by_type(store, project, "CROSS_HTTP_CALLS");
-    cbm_store_delete_edges_by_type(store, project, "CROSS_ASYNC_CALLS");
-    cbm_store_delete_edges_by_type(store, project, "CROSS_CHANNEL");
-    cbm_store_delete_edges_by_type(store, project, "CROSS_GRPC_CALLS");
-    cbm_store_delete_edges_by_type(store, project, "CROSS_GRAPHQL_CALLS");
-    cbm_store_delete_edges_by_type(store, project, "CROSS_TRPC_CALLS");
+/* The project a source-side CROSS_* edge points at: every edge the pass
+ * writes into a project's store records the other project as
+ * target_project. NULL for a blob that is not JSON or lacks the key (a
+ * truncated edge is stored as "{}"). */
+#define CR_EDGE_TARGET_SQL                                                                   \
+    "CASE WHEN json_valid(properties) THEN json_extract(properties, '$.target_project') END"
+#define CR_CROSS_TYPES_SQL                                                                   \
+    "type IN ('CROSS_HTTP_CALLS','CROSS_ASYNC_CALLS','CROSS_CHANNEL','CROSS_GRPC_CALLS',"     \
+    "'CROSS_GRAPHQL_CALLS','CROSS_TRPC_CALLS')"
+
+/* Delete project's CROSS_* edges that point at target. */
+static void delete_cross_edges_to(cbm_store_t *store, const char *project, const char *target) {
+    sqlite3 *db = cbm_store_get_db(store);
+    sqlite3_stmt *st = NULL;
+    if (!db || sqlite3_prepare_v2(db,
+                                  "DELETE FROM edges WHERE project = ?1 AND " CR_CROSS_TYPES_SQL
+                                  " AND " CR_EDGE_TARGET_SQL " = ?2",
+                                  CBM_NOT_FOUND, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        /* Never fall back to the full clean: it would take the edges just
+         * rebuilt for earlier targets. Stale edges stay until the next run. */
+        cbm_log_warn("cross_repo.clean_failed", "project", project, "target", target);
+        return;
+    }
+    sqlite3_bind_text(st, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, target, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    (void)sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+/* Delete project's CROSS_* edges pointing anywhere but the projects in keep
+ * (and those whose target is unknown). */
+static void delete_cross_edges_except(cbm_store_t *store, const char *project,
+                                      const std::vector<std::string> &keep) {
+    sqlite3 *db = cbm_store_get_db(store);
+    sqlite3_stmt *st = NULL;
+    if (!db || sqlite3_prepare_v2(db,
+                                  "SELECT DISTINCT " CR_EDGE_TARGET_SQL
+                                  " FROM edges WHERE project = ?1 AND " CR_CROSS_TYPES_SQL,
+                                  CBM_NOT_FOUND, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return;
+    }
+    sqlite3_bind_text(st, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    std::vector<std::string> gone;
+    bool unknown = false;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(st, 0);
+        if (!t) {
+            unknown = true;
+        } else if (std::find(keep.begin(), keep.end(), t) == keep.end()) {
+            gone.emplace_back(t);
+        }
+    }
+    sqlite3_finalize(st);
+    for (const std::string &t : gone) {
+        delete_cross_edges_to(store, project, t.c_str());
+    }
+    if (unknown && sqlite3_prepare_v2(db,
+                                      "DELETE FROM edges WHERE project = ?1 AND " CR_CROSS_TYPES_SQL
+                                      " AND " CR_EDGE_TARGET_SQL " IS NULL",
+                                      CBM_NOT_FOUND, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+        (void)sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
 }
 
 /* Insert a CROSS_* edge into a store. Idempotent by construction: the edges
@@ -1060,11 +1119,16 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
     cr_note_used(src_path);
 
     /* Match against each validated target. The source's existing CROSS_*
-     * edges are cleaned only once a target has opened: when every target is
-     * busy or gone (a cache sweep moving them), the pass fails and the
-     * previous edges stay, rather than reporting success with none. */
+     * edges toward a target are cleaned only once that target has opened, so
+     * a target that is busy or gone (a cache sweep moving it) keeps its
+     * previous edges instead of losing them unrebuilt. After the loop, edges
+     * toward projects this run did not target go, as a full clean would
+     * have taken them. When no target opens, nothing is written and the
+     * pass fails. */
+    std::vector<std::string> kept_targets;
     bool cleaned = false;
     for (const char *tgt : targets) {
+        kept_targets.emplace_back(tgt);
         char tgt_path[CR_PATH_BUF];
         cr_db_path(tgt, tgt_path, sizeof(tgt_path));
 
@@ -1089,10 +1153,8 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
             continue;
         }
         cr_note_used(tgt_path);
-        if (!cleaned) {
-            delete_cross_edges(src_store, project);
-            cleaned = true;
-        }
+        delete_cross_edges_to(src_store, project, tgt);
+        cleaned = true;
 
         result.http_edges += match_http_routes(src_store, project, tgt_store, tgt);
         /* Reverse direction: when this pass runs from the provider side, the
@@ -1119,7 +1181,9 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
         cbm_db_lease_release(gate);
     }
 
-    if (!cleaned) {
+    if (cleaned) {
+        delete_cross_edges_except(src_store, project, kept_targets);
+    } else {
         result.failed = true; /* no target could be opened: nothing written */
     }
     cbm_store_close(src_store);
