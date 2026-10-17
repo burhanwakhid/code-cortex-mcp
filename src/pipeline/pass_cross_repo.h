@@ -21,7 +21,8 @@ typedef struct {
     int trpc_edges;    /* CROSS_TRPC_CALLS edges created */
     int projects_scanned;
     double elapsed_ms;
-    bool failed;     /* source/target validation or the source open failed; no write happened */
+    bool failed;     /* source/target validation, the source open, or every target open
+                      * (busy or gone) failed; no write happened */
     bool no_targets; /* failed: nothing but the source project resolved (upstream #1133) */
 } cbm_cross_repo_result_t;
 
@@ -33,7 +34,9 @@ typedef struct {
  * `project` and every named target must already be indexed. A named target
  * that is missing or unusable (pre-#768 schema), or a target list that
  * resolves to nothing but `project`, sets `failed` before any CROSS_* edge is
- * deleted; a "*" wildcard skips unusable stores.
+ * deleted; a "*" wildcard skips unusable stores. A target whose reader gate
+ * is held exclusive (a cache sweep moving it) is skipped; when no target can
+ * be opened, `failed` is set and the existing CROSS_* edges are kept.
  * Returns result with edge counts. */
 cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **target_projects,
                                              int target_count);

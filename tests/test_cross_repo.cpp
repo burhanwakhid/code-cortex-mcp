@@ -8,6 +8,7 @@
 #include "test_helpers.h"
 
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h" /* cbm_db_read_gate_acquire */
 #include "pipeline/pass_cross_repo.h"
 #include "store/store.h"
 
@@ -314,6 +315,40 @@ TEST(cross_repo_self_only_target_fails_and_keeps_edges_issue1133) {
     ASSERT_TRUE(result.failed);
     ASSERT_TRUE(result.no_targets);
     ASSERT_EQ(result.projects_scanned, 0);
+    ASSERT_EQ(after, before);
+    PASS();
+}
+
+/* Every target busy (its reader gate held exclusive, as a cache sweep moving
+ * it holds it): the pass fails and the source's CROSS_* edges stay. They used
+ * to be deleted before any target opened, and the run reported success with
+ * projects_scanned 0. */
+TEST(cross_repo_busy_targets_keep_edges) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_http_pair(&fixture, "busy-source", "busy-target", "/busy", "busy");
+    char tgt_db[512];
+    if (!setup || !cross_repo_project_path(&fixture, "busy-target", tgt_db, sizeof(tgt_db))) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed busy-target fixture");
+    }
+
+    const char *target = "busy-target";
+    cbm_cross_repo_result_t initial = cbm_cross_repo_match("busy-source", &target, 1);
+    int before = cross_repo_count_edges(&fixture, "busy-source", "CROSS_HTTP_CALLS");
+    cbm_db_lease_t *gate = NULL;
+    int grc = cbm_db_read_gate_acquire(tgt_db, true, &gate);
+    cbm_cross_repo_result_t busy = cbm_cross_repo_match("busy-source", &target, 1);
+    cbm_db_lease_release(gate);
+    int after = cross_repo_count_edges(&fixture, "busy-source", "CROSS_HTTP_CALLS");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(initial.failed);
+    ASSERT_TRUE(before > 0);
+    ASSERT_EQ(grc, 0);
+    ASSERT_TRUE(busy.failed);
+    ASSERT_EQ(busy.projects_scanned, 0);
     ASSERT_EQ(after, before);
     PASS();
 }
@@ -696,6 +731,7 @@ TEST(cross_repo_caller_without_local_handler_keeps_cross_http_issue1459) {
 
 SUITE(cross_repo) {
     RUN_TEST(cross_repo_self_only_target_fails_and_keeps_edges_issue1133);
+    RUN_TEST(cross_repo_busy_targets_keep_edges);
     RUN_TEST(cross_repo_wildcard_with_no_other_project_fails_issue1133);
     RUN_TEST(cross_repo_missing_named_target_fails_before_cleanup);
     RUN_TEST(cross_repo_wildcard_skips_pre768_store_issue2133);

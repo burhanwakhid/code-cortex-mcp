@@ -6723,7 +6723,8 @@ static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
                   "other than the source matched target_projects. Index the other service first "
                   "(run list_projects to see what is indexed); existing cross-repo edges were "
                   "left unchanged."
-                : "cross-repo source or target project is missing, invalid, or not indexed; "
+                : "cross-repo source or target project is missing, invalid, not indexed, or busy "
+                  "(a cache sweep moving it); "
                   "existing cross-repo edges were left unchanged.",
             true);
     }

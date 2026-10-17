@@ -1059,10 +1059,11 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
 
     cr_note_used(src_path);
 
-    /* Clean existing CROSS_* edges for this project */
-    delete_cross_edges(src_store, project);
-
-    /* Match against each validated target */
+    /* Match against each validated target. The source's existing CROSS_*
+     * edges are cleaned only once a target has opened: when every target is
+     * busy or gone (a cache sweep moving them), the pass fails and the
+     * previous edges stay, rather than reporting success with none. */
+    bool cleaned = false;
     for (const char *tgt : targets) {
         char tgt_path[CR_PATH_BUF];
         cr_db_path(tgt, tgt_path, sizeof(tgt_path));
@@ -1079,6 +1080,7 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
         cbm_db_lease_t *gate = NULL;
         int grc = cbm_db_read_gate_acquire(tgt_path, false, &gate);
         if (grc == CBM_INDEX_BUSY) {
+            cbm_log_info("cross_repo.skip", "project", tgt, "reason", "target_gate_busy");
             continue;
         }
         cbm_store_t *tgt_store = cbm_store_open_path_existing(tgt_path);
@@ -1087,6 +1089,10 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
             continue;
         }
         cr_note_used(tgt_path);
+        if (!cleaned) {
+            delete_cross_edges(src_store, project);
+            cleaned = true;
+        }
 
         result.http_edges += match_http_routes(src_store, project, tgt_store, tgt);
         /* Reverse direction: when this pass runs from the provider side, the
@@ -1113,6 +1119,9 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
         cbm_db_lease_release(gate);
     }
 
+    if (!cleaned) {
+        result.failed = true; /* no target could be opened: nothing written */
+    }
     cbm_store_close(src_store);
     cbm_db_lease_release(src_gate);
 
