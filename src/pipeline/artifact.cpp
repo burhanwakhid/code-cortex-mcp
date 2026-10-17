@@ -308,42 +308,35 @@ static int read_metadata_version(const char *repo_path) {
     return version;
 }
 
-/* Read original_size from artifact.json. Returns 0 on error. */
-/* A string field of artifact.json; "" when absent. */
-static std::string read_metadata_string(const char *repo_path, const char *key) {
+/* The fields an import needs, all from ONE read of artifact.json: read
+ * separately, an export publishing between the reads could pair one
+ * generation's schema version and size with the next one's fingerprint. */
+typedef struct {
+    int version;          /* CBM_NOT_FOUND when unreadable */
+    size_t original_size; /* 0 when absent */
+    std::string payload_fp;
+} import_meta_t;
+
+static import_meta_t read_import_meta(const char *repo_path) {
+    import_meta_t m = {CBM_NOT_FOUND, 0, ""};
     char meta_path[CBM_SZ_4K];
     artifact_path(meta_path, sizeof(meta_path), repo_path, CBM_ARTIFACT_META);
     size_t len = 0;
     char *json = read_file_alloc(meta_path, &len);
     yyjson_doc *doc = json ? yyjson_read(json, len, 0) : NULL;
     free(json);
-    const char *v = doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), key)) : NULL;
-    std::string out = v ? v : "";
-    yyjson_doc_free(doc);
-    return out;
-}
-
-static size_t read_metadata_original_size(const char *repo_path) {
-    char meta_path[CBM_SZ_4K];
-    artifact_path(meta_path, sizeof(meta_path), repo_path, CBM_ARTIFACT_META);
-
-    size_t len = 0;
-    char *json = read_file_alloc(meta_path, &len);
-    if (!json) {
-        return 0;
-    }
-
-    yyjson_doc *doc = yyjson_read(json, len, 0);
-    free(json);
     if (!doc) {
-        return 0;
+        return m;
     }
-
     yyjson_val *root = yyjson_doc_get_root(doc);
-    yyjson_val *val = yyjson_obj_get(root, "original_size");
-    size_t result = val ? (size_t)yyjson_get_uint(val) : 0;
+    yyjson_val *ver = yyjson_obj_get(root, "schema_version");
+    m.version = ver ? yyjson_get_int(ver) : CBM_NOT_FOUND;
+    yyjson_val *size = yyjson_obj_get(root, "original_size");
+    m.original_size = size ? (size_t)yyjson_get_uint(size) : 0;
+    const char *fp = yyjson_get_str(yyjson_obj_get(root, "payload_fp"));
+    m.payload_fp = fp ? fp : "";
     yyjson_doc_free(doc);
-    return result;
+    return m;
 }
 
 /* The graph's generation: the index format it was written under (PRAGMA
@@ -930,46 +923,54 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
         return CBM_NOT_FOUND;
     }
 
-    /* Check schema version compatibility */
-    int version = read_metadata_version(repo_path);
-    if (version < 0 || version > CBM_ARTIFACT_SCHEMA_VERSION) {
-        cbm_log_info("artifact.import", "skip", "schema_version_mismatch", "artifact_ver",
-                     itoa_buf(version), "current_ver", itoa_buf(CBM_ARTIFACT_SCHEMA_VERSION));
-        return CBM_NOT_FOUND;
-    }
-
-    /* Get original_size for decompression buffer */
-    size_t original_size = read_metadata_original_size(repo_path);
-    if (original_size == 0) {
-        cbm_log_error("artifact.import", "err", "missing_original_size");
-        return CBM_NOT_FOUND;
-    }
-
-    /* Read compressed artifact */
+    /* The metadata and the payload must be one publication's: every field
+     * comes from one read of artifact.json, and the payload read after it
+     * must carry the fingerprint that read names. An import that meets an
+     * export between the two reads sees a mismatch and reads both again; a
+     * few attempts outlast one publication. Metadata from before the
+     * fingerprint has none and is not checked. */
+    enum { IMPORT_ATTEMPTS = 3 };
     char zst_path[CBM_SZ_4K];
     artifact_path(zst_path, sizeof(zst_path), repo_path, CBM_ARTIFACT_FILENAME);
-
+    import_meta_t meta;
     size_t clen = 0;
-    char *compressed = read_file_alloc(zst_path, &clen);
-    if (!compressed) {
-        cbm_log_error("artifact.import", "err", "read_artifact");
-        return CBM_NOT_FOUND;
-    }
-
-    /* The payload must be the one artifact.json describes: an import that
-     * met an export between publishing the payload and the metadata would
-     * otherwise take old compatibility metadata for a newer payload.
-     * Metadata from before the fingerprint has none and is not checked. */
-    std::string want_fp = read_metadata_string(repo_path, "payload_fp");
-    if (!want_fp.empty()) {
-        char got_fp[CBM_SHA256_HEX_LEN + 1];
-        payload_fingerprint_bytes(compressed, clen, got_fp);
-        if (want_fp != got_fp) {
-            free(compressed);
-            cbm_log_error("artifact.import", "err", "payload_metadata_mismatch");
+    char *compressed = NULL;
+    for (int attempt = 0; attempt < IMPORT_ATTEMPTS; attempt++) {
+        meta = read_import_meta(repo_path);
+        if (meta.version < 0 || meta.version > CBM_ARTIFACT_SCHEMA_VERSION) {
+            cbm_log_info("artifact.import", "skip", "schema_version_mismatch", "artifact_ver",
+                         itoa_buf(meta.version), "current_ver",
+                         itoa_buf(CBM_ARTIFACT_SCHEMA_VERSION));
             return CBM_NOT_FOUND;
         }
+        if (meta.original_size == 0) {
+            cbm_log_error("artifact.import", "err", "missing_original_size");
+            return CBM_NOT_FOUND;
+        }
+        compressed = read_file_alloc(zst_path, &clen);
+        if (!compressed) {
+            cbm_log_error("artifact.import", "err", "read_artifact");
+            return CBM_NOT_FOUND;
+        }
+        if (meta.payload_fp.empty()) {
+            break;
+        }
+        char got_fp[CBM_SHA256_HEX_LEN + 1];
+        payload_fingerprint_bytes(compressed, clen, got_fp);
+        if (meta.payload_fp == got_fp) {
+            break;
+        }
+        free(compressed);
+        compressed = NULL;
+        cbm_log_info("artifact.import", "retry", "payload_metadata_mismatch", "attempt",
+                     itoa_buf(attempt + 1));
+        cbm_usleep(100000); /* let the publication in progress finish */
     }
+    if (!compressed) {
+        cbm_log_error("artifact.import", "err", "payload_metadata_mismatch");
+        return CBM_NOT_FOUND;
+    }
+    size_t original_size = meta.original_size;
 
     /* Decompress */
     /* Size the destination from the zstd frame's own content-size header, not
