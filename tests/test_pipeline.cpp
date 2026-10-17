@@ -4609,13 +4609,19 @@ TEST(git_context_linked_worktree) {
  * repository root appear absent and stopped git discovery before git was
  * invoked. Runs on every platform. */
 TEST(git_context_root_exists_non_ascii_directory) {
-    /* UTF-8 for "Japanese language", written as bytes to keep the source ASCII. */
-    char *tmp = th_mktempdir("cbm_gitctx_\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E");
+    char *tmp = th_mktempdir("cbm_gitctx_unicode");
     ASSERT_NOT_NULL(tmp);
+    /* UTF-8 for "Japanese language", written as bytes to keep the source ASCII.
+     * Created with cbm_mkdir_p, which is UTF-8 aware on Windows; the temp-dir
+     * helper's narrow _mkdir would store an ANSI-mangled name instead. */
+    char root[1024];
+    snprintf(root, sizeof(root), "%s/\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E", tmp);
+    ASSERT_TRUE(cbm_mkdir_p(root, 0755));
     cbm_git_context_t ctx = {0};
-    int rc = cbm_git_context_resolve(tmp, &ctx);
+    int rc = cbm_git_context_resolve(root, &ctx);
     bool root_exists = ctx.root_exists;
     cbm_git_context_free(&ctx);
+    cbm_rmdir(root);
     th_rmtree(tmp);
     ASSERT_EQ(rc, 0);
     ASSERT_TRUE(root_exists);

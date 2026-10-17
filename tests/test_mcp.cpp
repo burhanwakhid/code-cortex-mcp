@@ -3373,11 +3373,12 @@ TEST(search_code_full_preserves_utf8_source) {
     PASS();
 }
 
-#ifdef CBM_ENABLE_TEST_SEAMS
+/* POSIX only: Windows always scans with the grep subprocess, which has no cap. */
+#if defined(CBM_ENABLE_TEST_SEAMS) && !defined(_WIN32)
 /* search_code never reads a file past its size cap: with the cap lowered to
  * 4 KiB, a 300 KiB file is skipped while a small one beside it still matches.
- * (The real cap is 1 GiB; the reader once grew a buffer to twice that and let
- * a failed allocation throw out of the tool handler.) */
+ * (The real cap is 64 MiB; the reader once grew a buffer past it and let a
+ * failed allocation throw out of the tool handler.) */
 TEST(search_code_skips_files_past_the_scan_cap) {
     char tmp[512];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_srch_cap_XXXXXX");
@@ -8113,7 +8114,7 @@ SUITE(mcp) {
     RUN_TEST(tool_list_projects_includes_a_project_with_a_miss_graph);
     RUN_TEST(tool_trace_totals_respect_test_filter_tests_root_subtree_issue1294);
     RUN_TEST(search_code_full_preserves_utf8_source);
-#ifdef CBM_ENABLE_TEST_SEAMS
+#if defined(CBM_ENABLE_TEST_SEAMS) && !defined(_WIN32)
     RUN_TEST(search_code_skips_files_past_the_scan_cap);
 #endif
     RUN_TEST(search_graph_semantic_only_skips_structural_scan);

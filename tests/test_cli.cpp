@@ -4354,7 +4354,12 @@ static bool uninstall_fx_setup(uninstall_fx_t *fx) {
     cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
     snprintf(fx->index_db, sizeof(fx->index_db), "%s/proj.db", cache_dir);
     snprintf(fx->config_db, sizeof(fx->config_db), "%s/" CBM_CONFIG_DB_FILENAME, cache_dir);
+#ifdef _WIN32
+    /* uninstall removes the .exe on Windows */
+    snprintf(fx->bin, sizeof(fx->bin), "%s/.local/bin/code-cortex-mcp.exe", fx->root);
+#else
     snprintf(fx->bin, sizeof(fx->bin), "%s/.local/bin/code-cortex-mcp", fx->root);
+#endif
     return th_write_file(fx->index_db, "index") == 0 &&
            th_write_file(fx->config_db, "settings") == 0 &&
            th_write_file(fx->bin, "binary") == 0;

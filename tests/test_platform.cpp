@@ -596,7 +596,7 @@ TEST(regex_compile_accepts_ordinary_intervals) {
     static const char *const patterns[] = {
         "[a-z]{1,64}",
         ".{0,255}",
-        "(\\w{1,100}){1,20}",
+        "([[:alnum:]_]{1,100}){1,20}",
         "(foo|bar|baz){2,5}",
         "^[A-Za-z_][A-Za-z0-9_]{0,255}$",
         "[0-9]{4}-[0-9]{2}-[0-9]{2}",
