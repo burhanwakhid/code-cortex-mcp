@@ -3270,7 +3270,7 @@ TEST(cli_prompt_evidence_block_reads_matches_from_disk) {
         FAIL("cbm_mkdtemp failed");
     char sub[512];
     snprintf(sub, sizeof(sub), "%s/lib", root);
-    ASSERT_EQ(mkdir(sub, 0755), 0);
+    ASSERT_EQ(cbm_mkdir(sub), 0);
     const char *names[] = {"def.c", "api.h",     "a.c",    "b_test.c",  "doc.md",
                            "str.c", "comment.c", "near.c", "lib/gone.c"};
     const char *bodies[] = {
@@ -3377,7 +3377,7 @@ TEST(cli_prompt_aliases_and_module_imports) {
         FAIL("cbm_mkdtemp failed");
     char sub[512];
     snprintf(sub, sizeof(sub), "%s/pkg", root);
-    ASSERT_EQ(mkdir(sub, 0755), 0);
+    ASSERT_EQ(cbm_mkdir(sub), 0);
     const char *names[] = {"pkg/mod.py", "a.py", "b.py", "c.h", "d.cpp", "e.py"};
     const char *bodies[] = {"def target_fn(x):\n    return x\n",
                             "from pkg.mod import target_fn as tf\nprint(tf(1))\n",
@@ -3469,7 +3469,7 @@ TEST(cli_prompt_text_files_follow_gitignore) {
     for (const char *d : {"src", "build", "sub", ".git"}) {
         char path[512];
         snprintf(path, sizeof(path), "%s/%s", root, d);
-        ASSERT_EQ(mkdir(path, 0755), 0);
+        ASSERT_EQ(cbm_mkdir(path), 0);
     }
     const char *files[][2] = {{".gitignore", "build/\n*.log\n"},
                               {"src/a.c", "int a;\n"},
