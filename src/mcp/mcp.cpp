@@ -1513,8 +1513,10 @@ static void store_meta_note_project(const char *path, const char *project, const
 
 /* Whether <project>.db was indexed from dir: the root recorded in the memo at
  * the file's current generation, else read from the database once (and
- * memoized, as resolve_store does). True when the file is absent or records
- * no root. */
+ * memoized, as resolve_store does). True when the file is absent or holds no
+ * row for project. False when the database exists but cannot be read: an
+ * owner that cannot be learned may be another checkout's, whose index a
+ * watcher here would overwrite -- fail closed. */
 static bool project_db_owned_by(const char *project, const char *dir, cbm_store_meta_db_t *meta) {
     char path[CBM_SZ_1K];
     project_db_path(project, path, sizeof(path));
@@ -1529,11 +1531,14 @@ static bool project_db_owned_by(const char *project, const char *dir, cbm_store_
     }
     cbm_store_t *s = cbm_store_open_path_query(path);
     cbm_project_t proj = {0};
-    bool owned = true;
-    if (s && cbm_store_get_project(s, project, &proj) == CBM_STORE_OK) {
+    int prc = s ? cbm_store_get_project(s, project, &proj) : CBM_STORE_ERR;
+    bool owned = prc == CBM_STORE_NOT_FOUND;
+    if (prc == CBM_STORE_OK) {
         owned = cbm_root_matches(proj.root_path, dir);
         store_meta_note_project(path, project, proj.root_path);
         cbm_project_free_fields(&proj);
+    } else if (prc != CBM_STORE_NOT_FOUND) {
+        cbm_log_info("project.owner_unreadable", "project", project, "path", path);
     }
     cbm_store_close(s);
     return owned;
@@ -4273,18 +4278,26 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
      * database the other indexed is not its to delete -- the ownership
      * check every read applies -- and only that path's slots go. Given a
      * bare name, the slots of the root the database records go with it;
-     * every root's only when nothing records one (no database left). */
+     * every root's only when nothing records one (no database left). A
+     * database whose owner cannot be read (it will not open, or its
+     * projects table will not answer) is kept from a path argument as a
+     * foreign one is: it may be the other directory's. A bare name still
+     * deletes it -- the way to remove a corrupt index. */
     char owner[CBM_SZ_4K] = "";
+    bool owner_unknown = false;
     if (cbm_file_exists(path)) {
         cbm_store_t *os = cbm_store_open_path_query(path);
         cbm_project_t proj = {0};
-        if (os && cbm_store_get_project(os, name, &proj) == CBM_STORE_OK) {
+        int prc = os ? cbm_store_get_project(os, name, &proj) : CBM_STORE_ERR;
+        if (prc == CBM_STORE_OK) {
             snprintf(owner, sizeof(owner), "%s", proj.root_path ? proj.root_path : "");
             cbm_project_free_fields(&proj);
         }
+        owner_unknown = prc != CBM_STORE_OK && prc != CBM_STORE_NOT_FOUND;
         cbm_store_close(os);
     }
-    bool foreign = g_expected_root[0] && owner[0] && !cbm_root_matches(owner, g_expected_root);
+    bool foreign = g_expected_root[0] &&
+                   (owner_unknown || (owner[0] && !cbm_root_matches(owner, g_expected_root)));
     const char *slot_root = g_expected_root[0] ? g_expected_root : owner;
 
     /* Close store if it's the project being deleted */
@@ -4343,7 +4356,12 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "project", name);
     yyjson_mut_obj_add_str(doc, root, "status", status);
-    if (foreign) {
+    if (foreign && owner_unknown) {
+        yyjson_mut_obj_add_str(doc, root, "note",
+                               "the database under this name could not be read to learn which "
+                               "directory it was indexed from, so it is kept; delete it by "
+                               "project name to remove it anyway");
+    } else if (foreign) {
         yyjson_mut_obj_add_strcpy(doc, root, "kept_database_of", owner);
         yyjson_mut_obj_add_str(doc, root, "note",
                                "the database under this name was indexed from another directory "

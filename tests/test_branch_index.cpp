@@ -418,6 +418,18 @@ TEST(branch_git_head_read_non_ascii_path) {
 /* The file reader caps a line at 4 KiB: an over-long HEAD is not found
  * (no unbounded allocation), and an over-long packed-refs line is skipped
  * without hiding the branch's ref after it. */
+/* A UNC path with no .git anywhere above it ends the walk: reduced to its
+ * \\server stub and then a lone backslash, it used to be cut to itself and
+ * probed forever. The walk treats backslashes as separators everywhere, so
+ * the shape is exercised on every platform. */
+TEST(branch_git_head_read_unc_without_git_ends) {
+    cbm_git_head_t h;
+    ASSERT_NEQ(cbm_git_head_read("\\\\cbm-nohost\\share\\repo", &h), 0);
+    ASSERT_NEQ(cbm_git_head_read("\\\\cbm-nohost", &h), 0);
+    ASSERT_NEQ(cbm_git_head_read("\\", &h), 0);
+    PASS();
+}
+
 TEST(branch_git_head_read_caps_line_length) {
     char *tmp = th_mktempdir("cbm_bi_longline");
     ASSERT_NOT_NULL(tmp);
@@ -2520,6 +2532,42 @@ TEST(branch_delete_project_keeps_other_roots) {
     PASS();
 }
 
+/* delete_project by path keeps a database whose owner cannot be read: with
+ * colliding derived names it may be another directory's. By bare name it
+ * still goes -- the way to remove a corrupt index. */
+TEST(branch_delete_by_path_keeps_unreadable_owner) {
+    char *repo = bi_make_repo("cbm_bi_delunk");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    char db[1024];
+    bi_db_path(db, sizeof(db));
+    cbm_remove_db_sidecars(db);
+    ASSERT_EQ(th_write_file(db, "this is not an sqlite database, its owner is unknowable"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = bi_delete_by_path(srv, repo);
+    ASSERT_NOT_NULL(resp);
+    bool kept_note = strstr(resp, "could not be read") != NULL;
+    free(resp);
+    bool kept = cbm_file_exists(db);
+    char args[1200];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\"}", g_bi_project);
+    resp = cbm_mcp_handle_tool(srv, "delete_project", args);
+    free(resp);
+    bool gone = !cbm_file_exists(db);
+    cbm_mcp_server_free(srv);
+
+    ASSERT_TRUE(kept_note);
+    ASSERT_TRUE(kept);
+    ASSERT_TRUE(gone);
+    bi_cleanup(repo);
+    PASS();
+}
+
 /* Root normalization is a pure string function, so Windows spellings are
  * checked on every platform; the comparison and the slot key build on it. */
 TEST(branch_root_normalize_and_key) {
@@ -4123,6 +4171,7 @@ SUITE(branch_index) {
     RUN_TEST(branch_slugs_never_collide);
     RUN_TEST(branch_git_head_slug_reads_head_file);
     RUN_TEST(branch_git_head_read_non_ascii_path);
+    RUN_TEST(branch_git_head_read_unc_without_git_ends);
     RUN_TEST(branch_git_head_read_caps_line_length);
     RUN_TEST(branch_switch_parks_and_restores);
     RUN_TEST(branch_restore_keeps_recreated_empty_file);
@@ -4172,6 +4221,7 @@ SUITE(branch_index) {
 #endif
     RUN_TEST(branch_slots_reject_other_roots);
     RUN_TEST(branch_delete_project_keeps_other_roots);
+    RUN_TEST(branch_delete_by_path_keeps_unreadable_owner);
     RUN_TEST(branch_root_normalize_and_key);
     RUN_TEST(branch_legacy_slot_adopted);
     RUN_TEST(branch_legacy_slot_link_not_adopted);
