@@ -1812,6 +1812,41 @@ TEST(branch_stamp_only_switch_reexports_artifact) {
     PASS();
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* A run that exports the artifact itself does not read the payload it just
+ * wrote back from disk to check it is current; a later run, which did not
+ * export, does check. */
+TEST(artifact_export_run_skips_rehash) {
+    char *repo = bi_make_repo("cbm_bi_artrehash");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    snprintf(g_bi_project, sizeof(g_bi_project), "%s", cbm_pipeline_project_name(p));
+    snprintf(g_bi_root, sizeof(g_bi_root), "%s", cbm_pipeline_repo_path(p));
+    int before = cbm_artifact_test_payload_file_hashes();
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    int after_export = cbm_artifact_test_payload_file_hashes();
+    cbm_pipeline_free(p);
+    ASSERT_TRUE(cbm_artifact_exists(repo));
+    ASSERT_EQ(after_export, before);
+
+    int64_t mtime = bi_artifact_mtime(repo);
+    bi_run_t r = bi_index(repo, -1);
+    ASSERT_EQ(r.rc, 0);
+    ASSERT_EQ(r.reparsed, 0);
+    ASSERT_GT(cbm_artifact_test_payload_file_hashes(), after_export);
+    ASSERT_EQ(bi_artifact_mtime(repo), mtime); /* current: not exported again */
+
+    bi_cleanup(repo);
+    PASS();
+}
+#endif
+
 /* Whole file into buf (NUL-terminated, truncated to n-1); false when absent. */
 static bool bi_read_text(const char *path, char *buf, size_t n) {
     FILE *f = fopen(path, "rb");
@@ -4060,6 +4095,9 @@ SUITE(branch_index) {
     RUN_TEST(branch_restore_keeps_concurrent_adr_write);
 #endif
     RUN_TEST(branch_stamp_only_switch_reexports_artifact);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(artifact_export_run_skips_rehash);
+#endif
     RUN_TEST(branch_committed_artifact_stays_current);
     RUN_TEST(branch_artifact_stale_after_adr_update);
     RUN_TEST(branch_artifact_payload_mismatch_is_not_current);

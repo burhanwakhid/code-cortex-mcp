@@ -163,6 +163,10 @@ struct cbm_pipeline {
      * the run (or with none): a restore, a dump, a stamp. Read at the end of
      * cbm_pipeline_run, which exports iff it is set. */
     bool artifact_stale;
+    /* An export of this run succeeded and nothing changed the database
+     * after it. The end-of-run check then trusts it instead of re-hashing
+     * the whole payload it just wrote (cbm_artifact_is_current). */
+    bool artifact_exported;
     /* The full rebuild's dump committed the database. A requested artifact
      * export after it can still fail the run, but the run did build the
      * database, so the on-indexed callback still runs. */
@@ -594,6 +598,7 @@ void cbm_pipeline_set_files_reparsed(cbm_pipeline_t *p, int count) {
 void cbm_pipeline_set_artifact_stale(cbm_pipeline_t *p, bool stale) {
     if (p) {
         p->artifact_stale = stale;
+        p->artifact_exported = !stale;
     }
 }
 
@@ -1889,7 +1894,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     p->saved_adr = NULL;
 
     /* Export persistent artifact if enabled */
-    p->artifact_stale = true;
+    cbm_pipeline_set_artifact_stale(p, true);
     if (p->persistence) {
         CBM_PROF_START(t_art);
         int arc = cbm_artifact_export(db_path, p->repo_path, p->project_name, CBM_ARTIFACT_BEST);
@@ -1903,7 +1908,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
             /* A failed persistence export intentionally fails the run; this used to be ignored. */
             return arc;
         }
-        p->artifact_stale = false;
+        cbm_pipeline_set_artifact_stale(p, false);
     }
 
     return 0;
@@ -2312,6 +2317,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     // export. MCP may already own this lease before artifact bootstrap.
     pipeline_lease_scope lease_scope{p};
 
+    p->artifact_exported = false;
     pipeline_refresh_checkout(p);
     pipeline_check_foreign_db(p);
     if (!p->foreign_db) {
@@ -2331,7 +2337,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
          * that added the artifact, another clone), the graph the artifact
          * holds is still this one, and re-exporting it would dirty the tree
          * after every commit. */
-        (void)cbm_pipeline_stamp_branch(p, db_path);
+        bool stamped = cbm_pipeline_stamp_branch(p, db_path);
         /* Export iff the artifact is behind the live database: a restore
          * with nothing re-extracted, a stamp-only switch, a full rebuild
          * without the persistence flag while an artifact exists, an earlier
@@ -2344,9 +2350,15 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
          * across runs, so a failed export is repaired by any later run --
          * the artifact's metadata no longer matches the live database, or
          * the run asked for an artifact that does not exist yet. */
+        /* An export this run made, with no stamp written after it, is
+         * current by construction: skip re-hashing the payload it just
+         * wrote. A stamp that wrote may have renamed the branch, so the
+         * metadata check decides then. */
         bool exists = cbm_artifact_exists(p->repo_path);
+        bool trusted = p->artifact_exported && !stamped && exists;
         bool behind = p->artifact_stale || (p->persistence && !exists) ||
-                      (exists && !cbm_artifact_is_current(db_path, p->repo_path, p->project_name));
+                      (exists && !trusted &&
+                       !cbm_artifact_is_current(db_path, p->repo_path, p->project_name));
         if (behind && (p->persistence || exists)) {
             int arc = cbm_artifact_export(db_path, p->repo_path, p->project_name,
                                           p->persistence ? CBM_ARTIFACT_BEST : CBM_ARTIFACT_FAST);

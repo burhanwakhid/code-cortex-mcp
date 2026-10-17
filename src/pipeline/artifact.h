@@ -84,6 +84,9 @@ bool cbm_artifact_repo_path_is_shell_safe(const char *repo_path);
 /* Callback run by cbm_artifact_export after the payload is written and
  * before the metadata is read from the live database. NULL clears. */
 void cbm_artifact_test_after_payload(void (*callback)(void *data), void *data);
+/* How many times a payload file has been hashed from disk (the freshness
+ * check's full read) since the process started. */
+int cbm_artifact_test_payload_file_hashes(void);
 #endif
 
 #ifdef __cplusplus

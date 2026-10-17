@@ -397,9 +397,20 @@ static void payload_fingerprint_bytes(const char *data, size_t size,
     cbm_sha256_hex(data, size, out);
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static std::atomic<int> g_payload_file_hashes{0};
+
+int cbm_artifact_test_payload_file_hashes(void) {
+    return g_payload_file_hashes.load();
+}
+#endif
+
 /* The fingerprint of the payload file, streamed (freshness check). */
 static bool payload_fingerprint(const char *path, char out[CBM_SHA256_HEX_LEN + 1]) {
     out[0] = '\0';
+#ifdef CBM_ENABLE_TEST_SEAMS
+    g_payload_file_hashes++;
+#endif
     FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return false;
