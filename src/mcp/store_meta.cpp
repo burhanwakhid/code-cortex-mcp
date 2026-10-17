@@ -118,7 +118,8 @@ cbm_store_meta_db_t *cbm_store_meta_open_readonly(void) {
         return NULL;
     }
     sqlite3 *db = NULL;
-    if (cbm_store_sqlite_open(path, &db, SQLITE_OPEN_READONLY) != SQLITE_OK) {
+    /* Read-only callers are previews: never leave a -wal or -shm behind. */
+    if (cbm_store_sqlite_open_inspect(path, &db) != SQLITE_OK) {
         sqlite3_close(db);
         return NULL;
     }

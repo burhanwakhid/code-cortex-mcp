@@ -446,7 +446,7 @@ static void cfg_load_read_only(cbm_cache_expiry_cfg_t *out) {
         return;
     }
     sqlite3 *db = NULL;
-    if (cbm_store_sqlite_open(path.c_str(), &db, SQLITE_OPEN_READONLY) != SQLITE_OK) {
+    if (cbm_store_sqlite_open_inspect(path.c_str(), &db) != SQLITE_OK) {
         sqlite3_close(db);
         return;
     }
@@ -870,7 +870,8 @@ static std::string learn_root(const char *path, const char *project, bool dry_ru
     }
     std::string root;
     sqlite3 *db = NULL;
-    if (cbm_store_sqlite_open(path, &db, SQLITE_OPEN_READONLY) == SQLITE_OK) {
+    if ((dry_run ? cbm_store_sqlite_open_inspect(path, &db)
+                 : cbm_store_sqlite_open(path, &db, SQLITE_OPEN_READONLY)) == SQLITE_OK) {
         sqlite3_busy_timeout(db, CE_BUSY_MS);
         const char *sqls[] = {"SELECT root_path FROM projects WHERE name = ?1;",
                               "SELECT root_path FROM projects LIMIT 1;"};
@@ -919,7 +920,8 @@ static std::string learn_project(const char *path, const std::string &stem, bool
     int rows = 0;
     sqlite3 *db = NULL;
     *is_index = false;
-    if (cbm_store_sqlite_open(path, &db, SQLITE_OPEN_READONLY) == SQLITE_OK) {
+    if ((dry_run ? cbm_store_sqlite_open_inspect(path, &db)
+                 : cbm_store_sqlite_open(path, &db, SQLITE_OPEN_READONLY)) == SQLITE_OK) {
         sqlite3_busy_timeout(db, CE_BUSY_MS);
         sqlite3_stmt *st = NULL;
         if (sqlite3_prepare_v2(db, "SELECT name FROM projects WHERE instr(name, '::') = 0 LIMIT 2;",

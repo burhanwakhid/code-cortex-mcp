@@ -84,6 +84,8 @@ enum {
 
 #include <sqlite3.h>
 #include <atomic>
+#include <ctype.h>
+#include <string>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -884,6 +886,60 @@ int cbm_store_sqlite_open(const char *path, sqlite3 **db, int flags) {
 #else
     return sqlite3_open_v2(path, db, flags, NULL);
 #endif
+}
+
+/* Whether path is an SQLite file in WAL mode: its header's read and write
+ * format versions (bytes 18 and 19) are 2. */
+static bool sqlite_file_is_wal(const char *path) {
+    enum { HDR_LEN = 20, WAL_VERSION = 2 };
+    unsigned char hdr[HDR_LEN];
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    bool got = fread(hdr, 1, sizeof(hdr), f) == sizeof(hdr);
+    fclose(f);
+    return got && memcmp(hdr, "SQLite format 3", 16) == 0 && hdr[18] == WAL_VERSION &&
+           hdr[19] == WAL_VERSION;
+}
+
+/* "file:" URI for path, every byte outside the unreserved set escaped. */
+static std::string sqlite_file_uri(const char *path) {
+    static const char hex[] = "0123456789ABCDEF";
+    std::string uri = "file:";
+#ifdef _WIN32
+    if (isalpha((unsigned char)path[0]) && path[1] == ':') {
+        uri += '/'; /* file:/C:/... */
+    }
+#endif
+    for (const unsigned char *c = (const unsigned char *)path; *c; c++) {
+        unsigned char ch = *c;
+#ifdef _WIN32
+        if (ch == '\\') {
+            ch = '/';
+        }
+#endif
+        if (isalnum(ch) || strchr("/-._~:", ch)) {
+            uri += (char)ch;
+        } else {
+            uri += '%';
+            uri += hex[ch >> 4];
+            uri += hex[ch & 0xF];
+        }
+    }
+    return uri + "?immutable=1";
+}
+
+int cbm_store_sqlite_open_inspect(const char *path, sqlite3 **db) {
+    if (path && sqlite_file_is_wal(path)) {
+        std::string wal = std::string(path) + "-wal";
+        std::string shm = std::string(path) + "-shm";
+        if (!cbm_file_exists(wal.c_str()) || !cbm_file_exists(shm.c_str())) {
+            return sqlite3_open_v2(sqlite_file_uri(path).c_str(), db,
+                                   SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL);
+        }
+    }
+    return cbm_store_sqlite_open(path, db, SQLITE_OPEN_READONLY);
 }
 
 /* SQLite authorizer: deny dangerous operations that could be exploited via

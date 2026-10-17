@@ -27,6 +27,7 @@
 #include <errno.h>
 #include <new>
 #include <thread>
+#include <algorithm>
 #include <vector>
 #include <string>
 #include <thread>
@@ -1206,6 +1207,57 @@ TEST(cache_dry_run_changes_nothing) {
     ASSERT_EQ(lu, -1); /* no state written */
     ASSERT_TRUE(cbm_cache_expiry_due(&cfg, now)); /* and no sweep recorded */
     ce_teardown(&e);
+    PASS();
+}
+
+/* Names a dry run reported, for the creates-no-sidecars test. */
+static void ce_collect_names(const cbm_cache_expiry_item_t *it, void *ud) {
+    if (it->name) {
+        ((std::vector<std::string> *)ud)->push_back(it->name);
+    }
+}
+
+/* A dry run reads WAL databases that were closed cleanly (no -wal, no -shm)
+ * without creating either: an ordinary read-only open would leave both
+ * behind. It still learns what they hold -- a renamed file is reported
+ * under the project inside it. */
+TEST(cache_dry_run_creates_no_sidecars) {
+    ce_env_t e;
+    ASSERT_TRUE(ce_setup(&e, "cbm_ce_drywal"));
+    char root[700];
+    char db[800];
+    snprintf(root, sizeof(root), "%s/repo", e.base);
+    cbm_mkdir_p(root, 0755);
+    int64_t now = (int64_t)time(NULL);
+    /* No memo row: the sweep must open the file to learn its project. */
+    ce_make_db_as(&e, "renamed-file", "inner-proj", "/x-cbm-nowhere/r", db, sizeof(db));
+    ASSERT_TRUE(cbm_cache_usage_set(db, now - 100 * CE_DAY, NULL));
+    char wal[900];
+    char shm[900];
+    snprintf(wal, sizeof(wal), "%s-wal", db);
+    snprintf(shm, sizeof(shm), "%s-shm", db);
+    bool clean_before = !cbm_file_exists(wal) && !cbm_file_exists(shm);
+    cbm_cache_expiry_cfg_t cfg;
+    ce_cfg(&cfg);
+    std::vector<std::string> names;
+    cbm_cache_sweep_opts_t o = {};
+    o.now = now;
+    o.dry_run = true;
+    o.report = ce_collect_names;
+    o.report_ud = &names;
+    cbm_cache_sweep_result_t r;
+    int rc = cbm_cache_expiry_sweep(&cfg, &o, &r);
+    bool wal_after = cbm_file_exists(wal);
+    bool shm_after = cbm_file_exists(shm);
+    ce_teardown(&e);
+    ASSERT_TRUE(clean_before);
+    ASSERT_EQ(rc, 0);
+    ASSERT_FALSE(wal_after);
+    ASSERT_FALSE(shm_after);
+    bool learned = std::any_of(names.begin(), names.end(), [](const std::string &n) {
+        return n.rfind("inner-proj ", 0) == 0; /* "inner-proj (renamed-file.db)" */
+    });
+    ASSERT_TRUE(learned);
     PASS();
 }
 
@@ -3616,6 +3668,7 @@ SUITE(cache_expiry) {
     RUN_TEST(cache_skips_leased_project);
     RUN_TEST(cache_skips_database_with_open_reader);
     RUN_TEST(cache_dry_run_changes_nothing);
+    RUN_TEST(cache_dry_run_creates_no_sidecars);
     RUN_TEST(cache_dry_run_reports_root_gone_due);
     RUN_TEST(cache_dry_run_leaves_memo_schema);
     RUN_TEST(cache_dry_run_counts_project_slots_once);

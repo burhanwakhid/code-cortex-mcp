@@ -353,6 +353,14 @@ struct sqlite3 *cbm_store_get_db(cbm_store_t *s);
  * adds. Every open of a cache database goes through this. */
 int cbm_store_sqlite_open(const char *path, struct sqlite3 **db, int flags);
 
+/* A read-only open for previews that must leave the cache as it was. A
+ * read-only connection to a WAL database still creates its -shm (and can
+ * create its -wal) when they are absent, as after a clean close; such a
+ * database is opened immutable instead, which reads the main file alone --
+ * exact when there is no -wal. Anything else opens as cbm_store_sqlite_open
+ * with SQLITE_OPEN_READONLY. */
+int cbm_store_sqlite_open_inspect(const char *path, struct sqlite3 **db);
+
 /* Get the last error message (static string, valid until next call). */
 const char *cbm_store_error(cbm_store_t *s);
 
