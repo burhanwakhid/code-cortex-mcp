@@ -933,8 +933,7 @@ static std::string sqlite_file_uri(const char *path) {
 int cbm_store_sqlite_open_inspect(const char *path, sqlite3 **db) {
     if (path && sqlite_file_is_wal(path)) {
         std::string wal = std::string(path) + "-wal";
-        std::string shm = std::string(path) + "-shm";
-        if (!cbm_file_exists(wal.c_str()) || !cbm_file_exists(shm.c_str())) {
+        if (!cbm_file_exists(wal.c_str())) {
             return sqlite3_open_v2(sqlite_file_uri(path).c_str(), db,
                                    SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL);
         }

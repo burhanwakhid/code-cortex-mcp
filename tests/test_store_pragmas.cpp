@@ -11,6 +11,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <store/store.h>
+#include <foundation/platform.h> /* cbm_file_exists */
 #include "sqlite3.h" /* vendored/sqlite3: read pragmas back on the store's own handle */
 #include <stdio.h>
 #include <stdlib.h>
@@ -340,6 +341,91 @@ static int role_pragma_int(cbm_store_t *s, const char *sql) {
     return value;
 }
 
+/* Copy src to dst byte for byte; false on any failure. */
+static bool sp_copy_file(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    if (!in) {
+        return false;
+    }
+    FILE *out = fopen(dst, "wb");
+    if (!out) {
+        fclose(in);
+        return false;
+    }
+    char buf[8192];
+    size_t n;
+    bool ok = true;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        ok = ok && fwrite(buf, 1, n, out) == n;
+    }
+    fclose(in);
+    return fclose(out) == 0 && ok;
+}
+
+/* Rows in t of the database at path, through the inspect open; -1 on error. */
+static int sp_inspect_rows(const char *path) {
+    sqlite3 *db = NULL;
+    int rows = -1;
+    if (cbm_store_sqlite_open_inspect(path, &db) == SQLITE_OK) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT count(*) FROM t", -1, &st, NULL) == SQLITE_OK &&
+            sqlite3_step(st) == SQLITE_ROW) {
+            rows = sqlite3_column_int(st, 0);
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return rows;
+}
+
+/* The preview open: a WAL database with no -wal is read without creating
+ * any sidecar; one whose committed rows live only in its -wal (no -shm, as
+ * after a crash or a sidecar cleanup) is still read with those rows --
+ * immutable mode would have ignored them. */
+TEST(store_inspect_open_reads_wal_frames) {
+    char *td = th_mktempdir("cbm_inspect");
+    ASSERT_NOT_NULL(td);
+    char live[512];
+    char clean[512];
+    char walonly[512];
+    char p[600];
+    snprintf(live, sizeof(live), "%s/live.db", td);
+    snprintf(clean, sizeof(clean), "%s/clean.db", td);
+    snprintf(walonly, sizeof(walonly), "%s/walonly.db", td);
+
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(live, &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(db,
+                           "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;"
+                           "CREATE TABLE t(x); INSERT INTO t VALUES(1); PRAGMA wal_checkpoint;"
+                           "INSERT INTO t VALUES(2);",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    /* Row 2 is committed in live.db-wal only. */
+    snprintf(p, sizeof(p), "%s-wal", live);
+    char walcopy[600];
+    snprintf(walcopy, sizeof(walcopy), "%s-wal", walonly);
+    bool copied = sp_copy_file(live, walonly) && sp_copy_file(p, walcopy);
+    sqlite3_close(db); /* checkpoints and removes live's sidecars */
+    bool clean_copy = sp_copy_file(live, clean);
+
+    int clean_rows = sp_inspect_rows(clean);
+    snprintf(p, sizeof(p), "%s-wal", clean);
+    bool clean_wal = cbm_file_exists(p);
+    snprintf(p, sizeof(p), "%s-shm", clean);
+    bool clean_shm = cbm_file_exists(p);
+    int walonly_rows = sp_inspect_rows(walonly);
+    th_rmtree(td);
+
+    ASSERT_TRUE(copied);
+    ASSERT_TRUE(clean_copy);
+    ASSERT_EQ(clean_rows, 2);
+    ASSERT_FALSE(clean_wal);
+    ASSERT_FALSE(clean_shm);
+    ASSERT_EQ(walonly_rows, 2);
+    PASS();
+}
+
 TEST(store_role_pragmas_issue1419) {
     enum {
         SYNC_OFF = 0,
@@ -396,6 +482,7 @@ SUITE(store_pragmas) {
     RUN_TEST(store_open_with_mmap_disabled);
     RUN_TEST(store_read_batch_snapshot_renews);
     RUN_TEST(store_role_pragmas_issue1419);
+    RUN_TEST(store_inspect_open_reads_wal_frames);
     RUN_TEST(journal_size_limit_default_and_env);
     RUN_TEST(journal_size_limit_trims_wal_after_checkpoint);
 }
