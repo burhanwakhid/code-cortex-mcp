@@ -3423,9 +3423,9 @@ static int remove_indexes_in_dir(const char *cache_dir) {
         return 0;
     }
     /* This cache's trash holds its expired databases; a legacy cache
-     * directory (migration) has none. The usage and memo rows need no
-     * forgetting here: they live in _config.db, which this scan removes
-     * with the other *.db files. */
+     * directory (migration) has none. The usage and memo rows live in
+     * _config.db, an internal store this scan keeps, so each removed
+     * database's rows are forgotten by hand. */
     const char *current = cbm_resolve_cache_dir();
     bool own_cache = current && strcmp(cache_dir, current) == 0;
 
@@ -3457,6 +3457,9 @@ static int remove_indexes_in_dir(const char *cache_dir) {
             if (gone) {
                 cbm_unlink(tmp_path);
                 count++;
+                if (own_cache) {
+                    cbm_cache_usage_forget(path);
+                }
             }
             /* Remove the SQLite sidecars (-wal/-shm/-journal) of both the live
              * and the temporary generation (#2054). Idempotent and
