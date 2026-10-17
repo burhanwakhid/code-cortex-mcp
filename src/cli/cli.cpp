@@ -3468,7 +3468,9 @@ static int remove_indexes_in_dir(const char *cache_dir) {
             /* Parked per-branch databases of the same project (branch_slots.h)
              * live under branches/<project>/, outside this scan. */
             char project[CLI_BUF_1K];
-            snprintf(project, sizeof(project), "%.*s", (int)(len - DB_EXT_LEN), ent->name);
+            /* cbm_is_project_index_db guaranteed the ".db" suffix. */
+            snprintf(project, sizeof(project), "%.*s", (int)(strlen(ent->name) - (sizeof(".db") - 1)),
+                     ent->name);
             /* Only with the main file gone: a project whose database could
              * not be removed keeps its parked branches too. */
             if (gone || !cbm_file_exists(target)) {
