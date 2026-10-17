@@ -2191,32 +2191,33 @@ void cbm_pipeline_test_fail_stamp(bool fail) {
 }
 #endif
 
-bool cbm_pipeline_stamp_branch_store(cbm_pipeline_t *p, cbm_store_t *s) {
-    if (!p || !p->branch_qn || !s) {
-        return false;
+int cbm_pipeline_stamp_branch_store(cbm_pipeline_t *p, cbm_store_t *s) {
+    if (!p || !p->branch_qn) {
+        return 0;
     }
-#ifdef CBM_ENABLE_TEST_SEAMS
-    if (g_fail_stamp) {
-        cbm_log_warn("pipeline.err", "phase", "branch_stamp", "project", p->project_name, "err",
-                     "test_seam");
-        return false;
+    if (!s) {
+        return -1;
     }
-#endif
     char *props = cbm_git_context_props_json_dup(&p->git_ctx);
     const char *props_json = props ? props : "{}";
     const char *name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
-    bool wrote = false;
+    int rc = 0;
     if (cbm_store_get_branch(s, p->project_name, NULL, 0, NULL, 0) == CBM_STORE_OK &&
         !cbm_store_branch_is(s, p->project_name, p->branch_qn, name, props_json)) {
-        wrote = cbm_store_set_branch(s, p->project_name, p->branch_qn, name, props_json) ==
-                CBM_STORE_OK;
+        bool skip = false;
+#ifdef CBM_ENABLE_TEST_SEAMS
+        skip = g_fail_stamp; /* as if the write had failed */
+#endif
+        bool wrote = !skip && cbm_store_set_branch(s, p->project_name, p->branch_qn, name,
+                                                   props_json) == CBM_STORE_OK;
+        rc = wrote ? 1 : -1;
         if (!wrote) {
             cbm_log_warn("pipeline.err", "phase", "branch_stamp", "project", p->project_name, "err",
                          cbm_store_error(s));
         }
     }
     free(props);
-    return wrote;
+    return rc;
 }
 
 int cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
@@ -2240,9 +2241,9 @@ int cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
     if (!s) {
         cbm_log_warn("pipeline.err", "phase", "branch_stamp", "project", p->project_name);
     }
-    bool wrote = cbm_pipeline_stamp_branch_store(p, s);
+    int rc = cbm_pipeline_stamp_branch_store(p, s);
     cbm_store_close(s);
-    return wrote ? 1 : -1;
+    return rc;
 }
 
 static int pipeline_run_claimed(cbm_pipeline_t *p);
@@ -2392,8 +2393,23 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         if (stamp_marker_path(db_path, marker, sizeof(marker))) {
             if (stamp_rc < 0) {
                 FILE *mf = cbm_fopen(marker, "wb");
-                if (!mf || fclose(mf) != 0) {
-                    cbm_log_error("pipeline.err", "phase", "stamp_marker", "path", marker);
+                bool marked = mf != NULL;
+                if (mf && fclose(mf) != 0) {
+                    marked = false;
+                }
+                if (!marked) {
+                    /* Without the marker nothing would stop the park, and the
+                     * failure that stopped the stamp (a full disk, a
+                     * read-only cache) may stop this too. A mislabeled graph
+                     * must not outlive the run: remove the database (under
+                     * the lease); the next run rebuilds it. Unlinking frees
+                     * space, so it works where the write did not. */
+                    cbm_log_error("pipeline.err", "phase", "stamp_marker", "path", marker,
+                                  "action", "remove_db");
+                    (void)cbm_unlink(marker);
+                    if (cbm_unlink(db_path) == 0) {
+                        cbm_remove_db_sidecars(db_path);
+                    }
                 }
             } else if (cbm_file_exists(marker)) {
                 (void)cbm_unlink(marker); /* the label is right again */

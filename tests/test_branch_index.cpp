@@ -16,6 +16,7 @@
 #include <cli/cli.h>
 #include <foundation/compat_fs.h>
 #include <git/git_context.h>
+#include <foundation/git_env.h>
 #include <mcp/mcp.h>
 #include <pipeline/artifact.h>
 #include <pipeline/branch_slots.h>
@@ -429,6 +430,38 @@ TEST(branch_git_head_read_unc_without_git_ends) {
     ASSERT_NEQ(cbm_git_head_read("\\", &h), 0);
     PASS();
 }
+
+#ifdef _WIN32
+/* Every git child on Windows runs with core.longpaths on: the scrubbed
+ * environment block carries it as its only GIT_CONFIG_* set, whatever the
+ * parent exported (a parent's GIT_CONFIG_COUNT and items are dropped). */
+TEST(branch_git_child_env_has_longpaths) {
+    bi_git_env_t saved;
+    bi_git_env_save(&saved, true);
+    cbm_setenv("GIT_CONFIG_COUNT", "1", 1);
+    cbm_setenv("GIT_CONFIG_KEY_0", "user.name", 1);
+    cbm_setenv("GIT_CONFIG_VALUE_0", "parent", 1);
+    wchar_t *block = cbm_git_child_env_block();
+    int counts = 0;
+    bool key = false;
+    bool value = false;
+    bool parent_item = false;
+    for (const wchar_t *e = block; e && *e; e += wcslen(e) + 1) {
+        counts += wcsncmp(e, L"GIT_CONFIG_COUNT=", 17) == 0;
+        key = key || wcscmp(e, L"GIT_CONFIG_KEY_0=core.longpaths") == 0;
+        value = value || wcscmp(e, L"GIT_CONFIG_VALUE_0=true") == 0;
+        parent_item = parent_item || wcscmp(e, L"GIT_CONFIG_KEY_0=user.name") == 0 ||
+                      wcscmp(e, L"GIT_CONFIG_VALUE_0=parent") == 0;
+    }
+    cbm_git_child_env_free(block);
+    bi_git_env_restore(&saved);
+    ASSERT_EQ(counts, 1);
+    ASSERT_TRUE(key);
+    ASSERT_TRUE(value);
+    ASSERT_FALSE(parent_item);
+    PASS();
+}
+#endif
 
 TEST(branch_git_head_read_caps_line_length) {
     char *tmp = th_mktempdir("cbm_bi_longline");
@@ -3338,6 +3371,72 @@ TEST(branch_failed_stamp_fails_run_and_blocks_park) {
 }
 #endif
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+#ifndef _WIN32
+/* A failed stamp whose marker cannot be written either removes the database:
+ * nothing may be left that the next run could park under the stale label.
+ * The squatter is a dangling symlink at the marker's name: it does not
+ * exist for the park check, and it cannot be opened for writing. */
+TEST(branch_failed_stamp_without_marker_removes_db) {
+    char *repo = bi_make_repo("cbm_bi_stampnomark");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    char db[1024];
+    char marker[1100];
+    snprintf(marker, sizeof(marker), "%s.stamp-pending", bi_db_path(db, sizeof(db)));
+    ASSERT_EQ(symlink("/x-cbm-nowhere/stamp-pending", marker), 0);
+    ASSERT_FALSE(cbm_file_exists(marker));
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    cbm_pipeline_test_fail_stamp(true);
+    bi_run_t failed = bi_index(repo, -1);
+    cbm_pipeline_test_fail_stamp(false);
+    bool db_left = cbm_file_exists(db);
+    (void)unlink(marker);
+
+    ASSERT_NEQ(failed.rc, 0);
+    ASSERT_FALSE(db_left);
+    bi_cleanup(repo);
+    PASS();
+}
+#endif
+
+/* An incremental run whose own stamp fails does not refresh an existing
+ * artifact: the copy would carry the new graph under the old branch. */
+TEST(branch_failed_stamp_skips_incremental_export) {
+    char *repo = bi_make_repo("cbm_bi_stampart");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    snprintf(g_bi_project, sizeof(g_bi_project), "%s", cbm_pipeline_project_name(p));
+    snprintf(g_bi_root, sizeof(g_bi_root), "%s", cbm_pipeline_repo_path(p));
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    ASSERT_TRUE(cbm_artifact_exists(repo));
+    int64_t before = bi_artifact_mtime(repo);
+
+    cbm_usleep(1100000);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    cbm_pipeline_test_fail_stamp(true);
+    bi_run_t failed = bi_index(repo, -1);
+    cbm_pipeline_test_fail_stamp(false);
+    int64_t after = bi_artifact_mtime(repo);
+
+    ASSERT_NEQ(failed.rc, 0);
+    ASSERT_EQ(after, before);
+    bi_cleanup(repo);
+    PASS();
+}
+#endif
+
 /* A parked slot is one compressed file, smaller than the database; restoring
  * it brings back exactly the graph that was parked, and leaves no scratch
  * file behind. */
@@ -4172,6 +4271,9 @@ SUITE(branch_index) {
     RUN_TEST(branch_git_head_slug_reads_head_file);
     RUN_TEST(branch_git_head_read_non_ascii_path);
     RUN_TEST(branch_git_head_read_unc_without_git_ends);
+#ifdef _WIN32
+    RUN_TEST(branch_git_child_env_has_longpaths);
+#endif
     RUN_TEST(branch_git_head_read_caps_line_length);
     RUN_TEST(branch_switch_parks_and_restores);
     RUN_TEST(branch_restore_keeps_recreated_empty_file);
@@ -4242,6 +4344,10 @@ SUITE(branch_index) {
     RUN_TEST(branch_compressed_slot_round_trip);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(branch_failed_stamp_fails_run_and_blocks_park);
+#ifndef _WIN32
+    RUN_TEST(branch_failed_stamp_without_marker_removes_db);
+#endif
+    RUN_TEST(branch_failed_stamp_skips_incremental_export);
 #endif
     RUN_TEST(branch_legacy_uncompressed_slot_restores);
     RUN_TEST(branch_restore_removes_stale_legacy_twin);

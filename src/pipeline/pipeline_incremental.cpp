@@ -830,6 +830,7 @@ static void dump_and_persist(cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const char *db
     cbm_log_info("incremental.dump", "rc", itoa_buf(dump_rc), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
 
+    bool stamp_failed = false;
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
         /* #769: this path DELETES and re-dumps the DB, so the format stamp has
@@ -866,16 +867,19 @@ static void dump_and_persist(cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const char *db
          * the FTS rebuild, so the stamp finds the Branch node's entry and
          * replaces it (cbm_store_set_branch). */
         if (dump_rc == 0 && !atomic_load(cbm_pipeline_cancelled_ptr(p))) {
-            cbm_pipeline_stamp_branch_store(p, hash_store);
+            stamp_failed = cbm_pipeline_stamp_branch_store(p, hash_store) < 0;
         }
 
         cbm_store_close(hash_store);
     }
     free(saved_adr);
 
-    /* Auto-update artifact if one already exists (persistence was enabled previously) */
+    /* Auto-update artifact if one already exists (persistence was enabled
+     * previously). Not after a failed stamp: the copy would carry the new
+     * graph under the old branch; the end-of-run stamp retries, and exports
+     * only once it holds. */
     cbm_pipeline_set_artifact_stale(p, true);
-    if (repo_path && cbm_artifact_exists(repo_path) &&
+    if (!stamp_failed && repo_path && cbm_artifact_exists(repo_path) &&
         cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST) == 0) {
         cbm_pipeline_set_artifact_stale(p, false);
     }

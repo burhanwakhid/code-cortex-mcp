@@ -824,8 +824,9 @@ void cbm_pipeline_test_fail_stamp(bool fail);
  * db_path when it names another (pipeline.cpp). 1 wrote, 0 nothing to
  * write, -1 a write was needed and failed. */
 int cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path);
-/* The same on a store the caller has open read-write. True when it wrote. */
-bool cbm_pipeline_stamp_branch_store(cbm_pipeline_t *p, cbm_store_t *s);
+/* The same on a store the caller has open read-write (NULL: -1), with the
+ * same returns. */
+int cbm_pipeline_stamp_branch_store(cbm_pipeline_t *p, cbm_store_t *s);
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
