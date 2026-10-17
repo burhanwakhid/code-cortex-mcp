@@ -4256,6 +4256,15 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     }
     // Keep path as requested. Canonicalization chooses the lock identity only;
     // deleting a cache symlink must unlink that entry, not its backing database.
+    /* The reader gate is not taken here, unlike the expiry sweep's move: a
+     * server in another process holds it shared for as long as it caches
+     * the store (until idle eviction), so an explicit delete would fail for
+     * as long as any session had the project open. It does not need it:
+     * every tool call starts with cbm_mcp_server_revalidate_store, which
+     * finds the file gone and drops the cached handle, so no later call is
+     * answered from the deleted inode -- only one already in flight
+     * finishes on it. The sweep moves the file into the trash instead, where
+     * a restore must not race a reader, hence its gate. */
 
     /* Which checkout the database is: the root it records, read under both
      * gates. Two directories can derive one project name (/x/a-b/repo,
