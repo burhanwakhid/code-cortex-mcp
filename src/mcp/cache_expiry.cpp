@@ -1010,13 +1010,14 @@ static int remove_project(const char *db_path, const char *project, const char *
         }
         (void)cbm_unlink(shm);
     } else if (exists) {
+        /* The sidecars go only with the main file: a database that stays
+         * may hold committed frames in its -wal alone. */
         if (cbm_unlink(db_path) != 0) {
-            rc = -1;
+            rc = -1; /* errno: the caller reports the main file's error */
+        } else {
+            (void)cbm_unlink(wal);
+            (void)cbm_unlink(shm);
         }
-        int err = errno;
-        (void)cbm_unlink(wal);
-        (void)cbm_unlink(shm);
-        errno = err; /* the caller reports the main file's error */
     }
     if (rc == -1) {
         return rc; /* the project still exists, and its parked branches with it */
