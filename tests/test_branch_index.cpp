@@ -3231,6 +3231,65 @@ static int64_t bi_fsize(const char *path) {
     return stat(path, &st) == 0 ? (int64_t)st.st_size : -1;
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* The whole file, or "" when it cannot be read. */
+static std::string bi_file_bytes(const char *path) {
+    std::string out;
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return out;
+    }
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        out.append(buf, n);
+    }
+    fclose(f);
+    return out;
+}
+
+/* A switch whose closing branch stamp cannot be written fails the run, and
+ * the database -- now feature's graph under main's name -- is never parked
+ * as main by the next run on a third branch: main's slot keeps main's graph. */
+TEST(branch_failed_stamp_fails_run_and_blocks_park) {
+    char *repo = bi_make_repo("cbm_bi_stampfail");
+    ASSERT_NOT_NULL(repo);
+    char saved[256];
+    snprintf(saved, sizeof(saved), "%s", repo);
+    repo = saved;
+
+    ASSERT_EQ(bi_index(repo, -1).rc, 0);
+    ASSERT_EQ(bi_git(repo, "checkout -q feature"), 0);
+    cbm_pipeline_test_fail_stamp(true);
+    bi_run_t failed = bi_index(repo, -1);
+    cbm_pipeline_test_fail_stamp(false);
+    char db[1024];
+    char marker[1100];
+    snprintf(marker, sizeof(marker), "%s.stamp-pending", bi_db_path(db, sizeof(db)));
+    bool marked = cbm_file_exists(marker);
+    char slot[1300];
+    bi_slot_file("main", ".db.zst", slot, sizeof(slot));
+    std::string main_slot = bi_file_bytes(slot);
+
+    ASSERT_EQ(bi_git(repo, "checkout -q -b other"), 0);
+    bi_run_t next = bi_index(repo, -1);
+    std::string main_after = bi_file_bytes(slot);
+    bool marker_left = cbm_file_exists(marker);
+    int only_feature = bi_count("only_feature");
+
+    ASSERT_NEQ(failed.rc, 0);
+    ASSERT_TRUE(marked);
+    ASSERT_FALSE(main_slot.empty());
+    ASSERT_EQ(next.rc, 0);
+    ASSERT_TRUE(main_after == main_slot);
+    ASSERT_FALSE(marker_left);
+    ASSERT_EQ(only_feature, 1); /* other is feature's tree */
+
+    bi_cleanup(repo);
+    PASS();
+}
+#endif
+
 /* A parked slot is one compressed file, smaller than the database; restoring
  * it brings back exactly the graph that was parked, and leaves no scratch
  * file behind. */
@@ -4131,6 +4190,9 @@ SUITE(branch_index) {
     RUN_TEST(branch_session_start_notes_moved_checkout);
 #endif
     RUN_TEST(branch_compressed_slot_round_trip);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(branch_failed_stamp_fails_run_and_blocks_park);
+#endif
     RUN_TEST(branch_legacy_uncompressed_slot_restores);
     RUN_TEST(branch_restore_removes_stale_legacy_twin);
     RUN_TEST(branch_corrupt_slot_seeds);

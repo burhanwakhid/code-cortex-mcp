@@ -8059,7 +8059,13 @@ static char *index_repository_in_process(cbm_mcp_server_t *srv, const char *args
          * export error of THIS run, so its presence names the phase exactly —
          * the graph database was already published when the export ran. */
         const char *export_error = cbm_pipeline_export_error(p);
-        if (export_error && export_error[0]) {
+        if (cbm_pipeline_branch_stamp_failed(p)) {
+            yyjson_mut_obj_add_str(doc, root, "hint",
+                                   "Index database was built, but recording its git branch "
+                                   "failed (database busy or cache not writable). Re-run "
+                                   "index_repository; the database is not parked under another "
+                                   "branch meanwhile.");
+        } else if (export_error && export_error[0]) {
             char hint[CBM_SZ_2K];
             (void)snprintf(
                 hint, sizeof(hint),

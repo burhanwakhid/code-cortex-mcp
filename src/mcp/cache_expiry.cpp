@@ -44,7 +44,9 @@ static const char *const CE_SIDECAR_SUFFIXES[] = {
     ".db.tmp-wal",    ".db.tmp-shm",    ".db.tmp-journal",   ".db.import_tmp",
     ".db.import_tmp-wal", ".db.import_tmp-shm", ".db.import_tmp-journal",
     /* write_file_atomic adds its own ".tmp" to the import's temp name */
-    ".db.import_tmp.tmp"};
+    ".db.import_tmp.tmp",
+    /* a failed branch stamp's marker (pipeline.cpp) */
+    ".db.stamp-pending"};
 
 /* ── Small helpers ──────────────────────────────────────────────── */
 

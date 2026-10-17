@@ -109,6 +109,10 @@ bool cbm_pipeline_had_format_migration(const cbm_pipeline_t *p);
  * #1665). Owned by p. */
 const char *cbm_pipeline_export_error(const cbm_pipeline_t *p);
 
+/* The run failed because the database's branch could not be recorded after
+ * it was built (busy or read-only cache). */
+bool cbm_pipeline_branch_stamp_failed(const cbm_pipeline_t *p);
+
 void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges);
 
 /* Per-branch databases (pipeline/branch_slots.h): how many parked branch

@@ -1,5 +1,6 @@
 #include "pipeline/result_store.h"
 #include <algorithm>
+#include <atomic>
 #include <iterator>
 #include <vector>
 /*
@@ -92,6 +93,10 @@ struct cbm_pipeline {
      * consulting cbm_artifact_export_last_error(), a global that can still
      * hold a PREVIOUS run's error. */
     char export_error[CBM_SZ_1K];
+    /* The end-of-run branch stamp was needed and could not be written: the
+     * database holds this checkout's graph under another branch's name, and
+     * the run fails rather than let the next one park it as that branch. */
+    bool stamp_failed;
     bool default_db_path;
     cbm_db_lease_t *index_lease;
     char *project_name;
@@ -2130,11 +2135,23 @@ const char *cbm_pipeline_export_error(const cbm_pipeline_t *p) {
     return p ? p->export_error : "";
 }
 
+bool cbm_pipeline_branch_stamp_failed(const cbm_pipeline_t *p) {
+    return p && p->stamp_failed;
+}
+
 /* Park/restore the cache database when the checkout's branch differs from
  * the one it was built for (branch_slots.h). Runs under the index lease,
  * before routing, so the incremental pass sees the restored or seeded graph.
  * Only the default cache database takes part: an explicit db_path is a file
  * the caller owns, and outside git there is no branch to key on. */
+/* <db>.stamp-pending: an end-of-run branch stamp was needed and failed, so
+ * the database holds a graph under another branch's name. While it exists
+ * the database is never parked: its label cannot be trusted. */
+static bool stamp_marker_path(const char *db_path, char *out, size_t out_sz) {
+    int n = snprintf(out, out_sz, "%s.stamp-pending", db_path ? db_path : "");
+    return db_path && n > 0 && (size_t)n < out_sz;
+}
+
 static void pipeline_branch_switch(cbm_pipeline_t *p) {
     p->branch_action = CBM_BRANCH_SWITCH_NONE;
     free(p->branch_from);
@@ -2143,6 +2160,14 @@ static void pipeline_branch_switch(cbm_pipeline_t *p) {
         return;
     }
     p->artifact_stale = false;
+    char marker[CBM_SZ_4K];
+    if (stamp_marker_path(p->db_path, marker, sizeof(marker)) && cbm_file_exists(marker)) {
+        /* The run indexes this checkout over the live database and its
+         * stamp names it; nothing is parked under the stale label. */
+        cbm_log_warn("branch.park_skipped", "project", p->project_name, "reason",
+                     "stamp_pending");
+        return;
+    }
     p->branch_action = cbm_branch_slots_switch(
         p->db_path, p->project_name, cbm_branch_slug_from_qn(p->branch_qn, p->project_name),
         p->repo_path, p->branch_keep, p->branch_budget, &p->branch_from);
@@ -2159,10 +2184,24 @@ static void pipeline_branch_switch(cbm_pipeline_t *p) {
  * last ran a full rebuild. Written only when the node or an edge differs, so
  * a no-op run on an unmoved HEAD leaves the file untouched and a torn earlier
  * stamp is repaired. s is open read-write. True when it wrote. */
+#ifdef CBM_ENABLE_TEST_SEAMS
+static std::atomic<bool> g_fail_stamp{false};
+void cbm_pipeline_test_fail_stamp(bool fail) {
+    g_fail_stamp = fail;
+}
+#endif
+
 bool cbm_pipeline_stamp_branch_store(cbm_pipeline_t *p, cbm_store_t *s) {
     if (!p || !p->branch_qn || !s) {
         return false;
     }
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_fail_stamp) {
+        cbm_log_warn("pipeline.err", "phase", "branch_stamp", "project", p->project_name, "err",
+                     "test_seam");
+        return false;
+    }
+#endif
     char *props = cbm_git_context_props_json_dup(&p->git_ctx);
     const char *props_json = props ? props : "{}";
     const char *name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
@@ -2180,9 +2219,9 @@ bool cbm_pipeline_stamp_branch_store(cbm_pipeline_t *p, cbm_store_t *s) {
     return wrote;
 }
 
-bool cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
+int cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
     if (!p || !p->branch_qn || !db_path) {
-        return false;
+        return 0;
     }
     /* Check on a read-only connection first: opening read-write is itself a
      * write (WAL setup), which a no-op run must not do. */
@@ -2194,16 +2233,16 @@ bool cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
                   !cbm_store_branch_is(s, p->project_name, p->branch_qn, name, props_json);
     cbm_store_close(s);
     free(props);
-    bool wrote = false;
-    if (needed) {
-        s = cbm_store_open_path(db_path);
-        if (!s) {
-            cbm_log_warn("pipeline.err", "phase", "branch_stamp", "project", p->project_name);
-        }
-        wrote = cbm_pipeline_stamp_branch_store(p, s);
-        cbm_store_close(s);
+    if (!needed) {
+        return 0;
     }
-    return wrote;
+    s = cbm_store_open_path(db_path);
+    if (!s) {
+        cbm_log_warn("pipeline.err", "phase", "branch_stamp", "project", p->project_name);
+    }
+    bool wrote = cbm_pipeline_stamp_branch_store(p, s);
+    cbm_store_close(s);
+    return wrote ? 1 : -1;
 }
 
 static int pipeline_run_claimed(cbm_pipeline_t *p);
@@ -2309,6 +2348,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         return CBM_NOT_FOUND;
     }
     p->export_error[0] = '\0';
+    p->stamp_failed = false;
     int claim_rc = cbm_pipeline_claim_index(p);
     if (claim_rc != 0) {
         return claim_rc;
@@ -2337,7 +2377,28 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
          * that added the artifact, another clone), the graph the artifact
          * holds is still this one, and re-exporting it would dirty the tree
          * after every commit. */
-        bool stamped = cbm_pipeline_stamp_branch(p, db_path);
+        int stamp_rc = cbm_pipeline_stamp_branch(p, db_path);
+        bool stamped = stamp_rc != 0;
+        if (stamp_rc < 0) {
+            /* The database holds this checkout's graph under the branch it
+             * names; left so, the next run on another branch would park it
+             * as that branch's slot. Fail the run (nothing is exported) and
+             * leave the marker that stops the park until a stamp succeeds. */
+            cbm_log_error("pipeline.err", "phase", "branch_stamp", "project", p->project_name);
+            p->stamp_failed = true;
+            rc = CBM_NOT_FOUND;
+        }
+        char marker[CBM_SZ_4K];
+        if (stamp_marker_path(db_path, marker, sizeof(marker))) {
+            if (stamp_rc < 0) {
+                FILE *mf = cbm_fopen(marker, "wb");
+                if (!mf || fclose(mf) != 0) {
+                    cbm_log_error("pipeline.err", "phase", "stamp_marker", "path", marker);
+                }
+            } else if (cbm_file_exists(marker)) {
+                (void)cbm_unlink(marker); /* the label is right again */
+            }
+        }
         /* Export iff the artifact is behind the live database: a restore
          * with nothing re-extracted, a stamp-only switch, a full rebuild
          * without the persistence flag while an artifact exists, an earlier
@@ -2359,7 +2420,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         bool behind = p->artifact_stale || (p->persistence && !exists) ||
                       (exists && !trusted &&
                        !cbm_artifact_is_current(db_path, p->repo_path, p->project_name));
-        if (behind && (p->persistence || exists)) {
+        if (rc == 0 && behind && (p->persistence || exists)) {
             int arc = cbm_artifact_export(db_path, p->repo_path, p->project_name,
                                           p->persistence ? CBM_ARTIFACT_BEST : CBM_ARTIFACT_FAST);
             if (arc != 0) {
