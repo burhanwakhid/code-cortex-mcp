@@ -4652,8 +4652,7 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
         if (!dry_run) {
             cbm_mkdir_p(sd, CLI_OCTAL_PERM);
         }
-        install_generic_agent_config("Junie", binary_path, cp, NULL, dry_run,
-                                     cbm_upsert_junie_mcp);
+        install_generic_agent_config("Junie", binary_path, cp, NULL, dry_run, cbm_upsert_junie_mcp);
     }
 }
 
@@ -4674,9 +4673,9 @@ static int cbm_install_agent_configs(const char *home, const char *binary_path, 
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 extern "C" int cbm_install_codex_agent_config_for_testing(const char *home,
-                                                           const char *binary_path);
+                                                          const char *binary_path);
 extern "C" int cbm_install_codex_agent_config_for_testing(const char *home,
-                                                           const char *binary_path) {
+                                                          const char *binary_path) {
     cbm_detected_agents_t agents;
     memset(&agents, 0, sizeof(agents));
     agents.codex = true;

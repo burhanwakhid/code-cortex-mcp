@@ -2929,8 +2929,7 @@ int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash
 int cbm_store_get_file_hash(cbm_store_t *s, const char *project, const char *rel_path,
                             char *sha256_out, size_t sha256_out_size, int64_t *mtime_ns,
                             int64_t *size) {
-    if (!s || !project || !rel_path || !sha256_out || sha256_out_size == 0 || !mtime_ns ||
-        !size) {
+    if (!s || !project || !rel_path || !sha256_out || sha256_out_size == 0 || !mtime_ns || !size) {
         return CBM_STORE_ERR;
     }
     sha256_out[0] = '\0';

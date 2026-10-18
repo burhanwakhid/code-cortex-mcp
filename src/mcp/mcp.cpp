@@ -5772,8 +5772,7 @@ static int64_t trace_stat_mtime_ns(const struct stat *st) {
 #elif defined(_WIN32)
     return (int64_t)st->st_mtime * (int64_t)CBM_NSEC_PER_SEC;
 #else
-    return ((int64_t)st->st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-           (int64_t)st->st_mtim.tv_nsec;
+    return ((int64_t)st->st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
 #endif
 }
 
@@ -5862,8 +5861,8 @@ static bool trace_fd_same_file(const trace_fd_stat_t &before, const trace_fd_sta
 }
 
 static trace_file_freshness_t trace_check_path_file(cbm_store_t *store, const char *project,
-                                                     const char *project_root, const char *file,
-                                                     trace_hash_budget_t *budget) {
+                                                    const char *project_root, const char *file,
+                                                    trace_hash_budget_t *budget) {
     trace_file_freshness_t out = {file ? file : "", "unknown", "no_file_path"};
     if (!trace_relative_file_safe(file)) {
         out.reason = file && file[0] ? "outside_root" : "no_file_path";
@@ -6179,10 +6178,9 @@ static int trace_direct_path_to_json(cbm_store_t *store, const char *project, co
         std::vector<trace_file_freshness_t> checks;
         bool all_match = true;
         for (const auto &file : files) {
-            checks.push_back(trace_check_path_file(store, project,
-                                                   project_root.empty() ? nullptr
-                                                                        : project_root.c_str(),
-                                                   file.c_str(), &budget));
+            checks.push_back(trace_check_path_file(
+                store, project, project_root.empty() ? nullptr : project_root.c_str(), file.c_str(),
+                &budget));
             all_match = all_match && strcmp(checks.back().state, "match") == 0;
         }
         yyjson_mut_val *freshness = yyjson_mut_obj(doc);
