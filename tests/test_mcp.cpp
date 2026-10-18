@@ -1989,7 +1989,7 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     /* Write sample source file */
     char src_path[512];
     snprintf(src_path, sizeof(src_path), "%s/main.go", proj_dir);
-    FILE *fp = fopen(src_path, "w");
+    FILE *fp = fopen(src_path, "wb"); /* binary: its hash is stored from sample_source */
     if (!fp)
         return NULL;
     const char *sample_source = "package main\n"

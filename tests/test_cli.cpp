@@ -2038,7 +2038,13 @@ TEST(cli_codex_native_prompt_hook_toml) {
     ASSERT_NOT_NULL(strstr(data, "timeout = 2"));
     ASSERT_NOT_NULL(strstr(data, "additionalContextLimit = 3000"));
     ASSERT_NOT_NULL(strstr(data, "echo user-owned"));
+#ifdef _WIN32
+    /* Windows double-quotes the path (TOML-escaped as \"); POSIX shells get
+     * single quotes with ' escaped as '\''. */
+    ASSERT_NOT_NULL(strstr(data, "\\\"/tmp/O'Brien $bin/code-cortex-mcp\\\" hook-augment"));
+#else
     ASSERT_NOT_NULL(strstr(data, "O'\\\\''Brien $bin"));
+#endif
     const char *owned = strstr(data, "--code-cortex-user-prompt-submit");
     ASSERT_NOT_NULL(owned);
     ASSERT_NULL(strstr(owned + 1, "--code-cortex-user-prompt-submit"));

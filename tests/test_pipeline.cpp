@@ -8661,7 +8661,7 @@ TEST(incremental_detects_changed_file) {
     /* Modify helper.go — add a new function */
     char path[512];
     snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
-    FILE *f = fopen(path, "w");
+    FILE *f = fopen(path, "wb"); /* binary: the hash below is of these exact bytes */
     ASSERT_NOT_NULL(f);
     const char *changed_source = "package main\n\n"
                                  "func Helper() string {\n\treturn \"hello\"\n}\n\n"
