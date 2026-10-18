@@ -1445,13 +1445,13 @@ static int db_lock_probe(const char *db_path, const char *suffix) {
     }
 #ifdef _WIN32
     wchar_t *wide = cbm_utf8_to_wide_path(lock_path);
-    HANDLE h = wide ? CreateFileW(wide, GENERIC_READ | GENERIC_WRITE,
-                                  FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-                                  FILE_ATTRIBUTE_NORMAL, NULL)
-                    : INVALID_HANDLE_VALUE;
+    HANDLE h =
+        wide ? CreateFileW(wide, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL)
+             : INVALID_HANDLE_VALUE;
     if (h == INVALID_HANDLE_VALUE && wide) {
-        h = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        h = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL, NULL);
     }
     free(wide);
     if (h == INVALID_HANDLE_VALUE) {

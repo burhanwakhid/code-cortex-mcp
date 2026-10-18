@@ -882,6 +882,8 @@ bool cbm_root_canonical(const char *root, char *out, size_t out_sz) {
     }
     std::replace(full.begin(), full.end(), '\\', '/');
     std::string head(full);
+    /* Grows across iterations: every cut segment, outermost first. */
+    // cppcheck-suppress variableScope
     std::string tail;
     for (;;) {
         size_t cut = head.find_last_of('/');
@@ -928,6 +930,8 @@ bool cbm_root_canonical(const char *root, char *out, size_t out_sz) {
         abs_path.pop_back();
     }
     std::string head = abs_path;
+    /* Grows across iterations: every cut segment, outermost first. */
+    // cppcheck-suppress variableScope
     std::string tail;
     for (;;) {
         size_t cut = head.find_last_of('/');

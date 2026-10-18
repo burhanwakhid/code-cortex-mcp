@@ -3472,8 +3472,8 @@ static int remove_indexes_in_dir(const char *cache_dir) {
              * live under branches/<project>/, outside this scan. */
             char project[CLI_BUF_1K];
             /* cbm_is_project_index_db guaranteed the ".db" suffix. */
-            snprintf(project, sizeof(project), "%.*s", (int)(strlen(ent->name) - (sizeof(".db") - 1)),
-                     ent->name);
+            snprintf(project, sizeof(project), "%.*s",
+                     (int)(strlen(ent->name) - (sizeof(".db") - 1)), ent->name);
             /* Only with the main file gone: a project whose database could
              * not be removed keeps its parked branches too. */
             if (gone || !cbm_file_exists(target)) {
@@ -3670,17 +3670,17 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
 /* One line per item of a cache sweep. */
 static void cache_report(const cbm_cache_expiry_item_t *it, void *ud) {
     bool dry = *(bool *)ud;
-    const char *verb = it->kind == CBM_EXPIRE_PENDING ? "watch"
-                       : it->skipped                  ? "kept"
-                       : it->removed                  ? (it->kind == CBM_EXPIRE_ROOT_GONE ||
-                                         it->kind == CBM_EXPIRE_UNUSED
-                                                             ? "trashed"
-                                                             : "removed")
-                       : dry                          ? "would remove"
-                                                      : "kept";
+    const char *verb =
+        it->kind == CBM_EXPIRE_PENDING ? "watch"
+        : it->skipped                  ? "kept"
+        : it->removed
+            ? (it->kind == CBM_EXPIRE_ROOT_GONE || it->kind == CBM_EXPIRE_UNUSED ? "trashed"
+                                                                                 : "removed")
+        : dry ? "would remove"
+              : "kept";
     printf("  %-12s %-11s %-40s %8.1f MB  %s%s%s%s\n", verb, cbm_cache_expiry_kind_str(it->kind),
-           it->name, (double)it->bytes / (1024.0 * 1024.0), it->reason,
-           it->skipped ? " [" : "", it->skipped ? it->skipped : "", it->skipped ? "]" : "");
+           it->name, (double)it->bytes / (1024.0 * 1024.0), it->reason, it->skipped ? " [" : "",
+           it->skipped ? it->skipped : "", it->skipped ? "]" : "");
 }
 
 static void cache_usage(FILE *out) {
@@ -3762,9 +3762,8 @@ int cbm_cmd_cache(int argc, char **argv) {
         }
         printf("%s: %d index(es), %d parked branch(es), %d orphan file(s), %d trash "
                "entr%s; %.1f MB; %d kept\n",
-               dry ? "Would remove" : "Removed", res.projects, res.slots, res.sidecars,
-               res.purged, res.purged == 1 ? "y" : "ies", (double)res.bytes / (1024.0 * 1024.0),
-               res.skipped);
+               dry ? "Would remove" : "Removed", res.projects, res.slots, res.sidecars, res.purged,
+               res.purged == 1 ? "y" : "ies", (double)res.bytes / (1024.0 * 1024.0), res.skipped);
         if (!dry && res.projects > 0) {
             printf("Trashed indexes are deleted by the next sweep a day or more later; "
                    "`code-cortex-mcp cache restore <project>` puts one back.\n");

@@ -108,7 +108,6 @@ int64_t cbm_zstd_decompress_stream_ex(FILE *in, FILE *out, uint64_t max_out, boo
     uint64_t total = 0;
     bool ok = dctx && ibuf && obuf;
     bool bad_data = false; /* the input itself is at fault, not I/O or memory */
-    size_t last_ret = 1;
     bool frame_done = false;
     while (ok) {
         size_t got = fread(ibuf, 1, in_cap, in);
@@ -124,7 +123,7 @@ int64_t cbm_zstd_decompress_stream_ex(FILE *in, FILE *out, uint64_t max_out, boo
         ZSTD_inBuffer input = {ibuf, got, 0};
         for (;;) {
             ZSTD_outBuffer output = {obuf, out_cap, 0};
-            last_ret = ZSTD_decompressStream(dctx, &output, &input);
+            size_t last_ret = ZSTD_decompressStream(dctx, &output, &input);
             if (ZSTD_isError(last_ret)) {
                 ok = false;
                 bad_data = ZSTD_getErrorCode(last_ret) != ZSTD_error_memory_allocation;

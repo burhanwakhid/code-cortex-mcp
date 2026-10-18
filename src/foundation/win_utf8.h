@@ -54,11 +54,12 @@ static inline wchar_t *cbm_utf8_to_wide_path(const char *utf8) {
         free(full);
         return w; /* the plain path: it fails as it would have */
     }
-    bool is_drive = got >= 3 &&
-                    ((full[0] >= L'A' && full[0] <= L'Z') || (full[0] >= L'a' && full[0] <= L'z')) &&
-                    full[1] == L':' && full[2] == L'\\';
-    bool is_unc = got >= 3 && full[0] == L'\\' && full[1] == L'\\' && full[2] != L'?' &&
-                  full[2] != L'.';
+    bool is_drive =
+        got >= 3 &&
+        ((full[0] >= L'A' && full[0] <= L'Z') || (full[0] >= L'a' && full[0] <= L'z')) &&
+        full[1] == L':' && full[2] == L'\\';
+    bool is_unc =
+        got >= 3 && full[0] == L'\\' && full[1] == L'\\' && full[2] != L'?' && full[2] != L'.';
     if (!is_drive && !is_unc) {
         free(full);
         return w;

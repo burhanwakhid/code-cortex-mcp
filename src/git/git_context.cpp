@@ -115,8 +115,7 @@ static char *read_line_dup(FILE *fp, bool *too_long) {
     int c = EOF;
     while ((c = fgetc(fp)) != EOF && c != '\n') {
         if (len >= GIT_LINE_MAX) {
-            while ((c = fgetc(fp)) != EOF && c != '\n') {
-            }
+            while ((c = fgetc(fp)) != EOF && c != '\n') {}
             free(buf);
             *too_long = true;
             return NULL;
@@ -613,8 +612,7 @@ static bool read_branch_sha(const char *common, const char *branch, char *sha, s
     FILE *fp = path ? cbm_fopen(path, "rb") : NULL;
     free(path);
     bool too_long = false;
-    while (fp && ref && !found &&
-           ((line = read_line_dup(fp, &too_long)) != NULL || too_long)) {
+    while (fp && ref && !found && ((line = read_line_dup(fp, &too_long)) != NULL || too_long)) {
         if (!line) {
             continue; /* an over-long line names no branch we can have */
         }
@@ -671,8 +669,8 @@ int cbm_git_head_read(const char *root, cbm_git_head_t *out) {
                (top[len - 1] == '/' || top[len - 1] == '\\')) {
             top[--len] = '\0';
         }
-        bool at_root = (len == 1 && (top[0] == '/' || top[0] == '\\')) ||
-                       (len == 3 && top[1] == ':');
+        bool at_root =
+            (len == 1 && (top[0] == '/' || top[0] == '\\')) || (len == 3 && top[1] == ':');
         int n = snprintf(path, sizeof(path), "%s%s.git", top, at_root ? "" : "/");
 #ifdef CBM_ENABLE_TEST_SEAMS
         if (g_head_probe_cb && n > 0 && (size_t)n < sizeof(path)) {
@@ -945,9 +943,9 @@ bool cbm_git_is_linked_worktree(const char *dir) {
         val++;
     }
     char commondir[CBM_SZ_4K];
-    int cn = path_is_absolute(val) ? snprintf(commondir, sizeof(commondir), "%s/commondir", val)
-                                   : snprintf(commondir, sizeof(commondir), "%s/%s/commondir", dir,
-                                              val);
+    int cn = path_is_absolute(val)
+                 ? snprintf(commondir, sizeof(commondir), "%s/commondir", val)
+                 : snprintf(commondir, sizeof(commondir), "%s/%s/commondir", dir, val);
     if (cn <= 0 || cn >= (int)sizeof(commondir)) {
         return true;
     }
@@ -1019,8 +1017,8 @@ bool cbm_git_gitlink_is_submodule(const char *dir) {
         return false;
     }
     for (;;) {
-        bool at_root = (up[0] == '/' && up[1] == '\0') ||
-                       (up[1] == ':' && up[2] == '/' && up[3] == '\0');
+        bool at_root =
+            (up[0] == '/' && up[1] == '\0') || (up[1] == ':' && up[2] == '/' && up[3] == '\0');
         if (at_root) {
             return false; /* the filesystem root was probed: no superproject */
         }
@@ -1061,4 +1059,3 @@ bool cbm_git_gitlink_is_submodule(const char *dir) {
         return pn > 0 && pn < (int)sizeof(prefix) && strncmp(target, prefix, (size_t)pn) == 0;
     }
 }
-

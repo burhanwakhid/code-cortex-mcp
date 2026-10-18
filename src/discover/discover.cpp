@@ -870,6 +870,8 @@ static bool is_linked_worktree_root(const char *dir) {
     }
     *name = '\0';
     const char *parent = strrchr(val, '/');
+    /* NULL for a one-segment value ("x/y" cut to "x"). */
+    // cppcheck-suppress knownConditionTrueFalse
     return parent && strcmp(parent + 1, "worktrees") == 0;
 }
 

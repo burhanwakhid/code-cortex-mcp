@@ -47,7 +47,7 @@ enum {
     CBM_CACHE_EXPIRY_UNUSED_DAYS = 90,
     CBM_CACHE_EXPIRY_ROOT_GRACE_DAYS = 7,
     CBM_CACHE_EXPIRY_SLOT_DAYS = 30,
-    CBM_CACHE_EXPIRY_ROOT_CHECKS = 3,   /* missing on this many sweeps ... */
+    CBM_CACHE_EXPIRY_ROOT_CHECKS = 3,    /* missing on this many sweeps ... */
     CBM_CACHE_EXPIRY_INTERVAL_S = 86400, /* automatic sweeps at most daily */
     CBM_CACHE_EXPIRY_TRASH_S = 86400,    /* trash entries kept at least this long */
     CBM_CACHE_EXPIRY_SCRATCH_S = 3600,   /* orphan temp files older than this */
@@ -98,11 +98,11 @@ const char *cbm_cache_expiry_kind_str(cbm_cache_expiry_kind_t kind);
 
 typedef struct {
     cbm_cache_expiry_kind_t kind;
-    const char *name;   /* project, or file name for a sidecar/slot */
-    const char *path;   /* the file or directory acted on */
-    int64_t bytes;      /* what it frees (database + WAL + slots for a project) */
-    const char *reason; /* one line for humans */
-    bool removed;       /* false in a dry run, for PENDING, or when skipped */
+    const char *name;    /* project, or file name for a sidecar/slot */
+    const char *path;    /* the file or directory acted on */
+    int64_t bytes;       /* what it frees (database + WAL + slots for a project) */
+    const char *reason;  /* one line for humans */
+    bool removed;        /* false in a dry run, for PENDING, or when skipped */
     const char *skipped; /* why it was not removed (busy, in use); NULL otherwise */
 } cbm_cache_expiry_item_t;
 
@@ -119,13 +119,13 @@ typedef struct {
 } cbm_cache_sweep_opts_t;
 
 typedef struct {
-    int projects;      /* databases removed (or due, in a dry run) */
-    int slots;         /* parked slots removed (or due) */
-    int sidecars;      /* orphan files removed (or due) */
-    int purged;        /* trash entries deleted (or due) */
-    int skipped;       /* due but kept: busy, in use */
-    int64_t bytes;     /* freed (or to be freed) */
-    bool refused;      /* the sweep did not run */
+    int projects;  /* databases removed (or due, in a dry run) */
+    int slots;     /* parked slots removed (or due) */
+    int sidecars;  /* orphan files removed (or due) */
+    int purged;    /* trash entries deleted (or due) */
+    int skipped;   /* due but kept: busy, in use */
+    int64_t bytes; /* freed (or to be freed) */
+    bool refused;  /* the sweep did not run */
     char refused_reason[128];
 } cbm_cache_sweep_result_t;
 

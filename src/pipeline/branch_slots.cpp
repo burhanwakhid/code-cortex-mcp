@@ -303,8 +303,8 @@ static bool windows_reserved_name(const char *name) {
     }
     base[n] = '\0';
     if (n == 3) {
-        return strcmp(base, "con") == 0 || strcmp(base, "prn") == 0 ||
-               strcmp(base, "aux") == 0 || strcmp(base, "nul") == 0;
+        return strcmp(base, "con") == 0 || strcmp(base, "prn") == 0 || strcmp(base, "aux") == 0 ||
+               strcmp(base, "nul") == 0;
     }
     return (strncmp(base, "com", 3) == 0 || strncmp(base, "lpt", 3) == 0) &&
            isdigit((unsigned char)base[3]);
@@ -547,8 +547,8 @@ static bool win_file_identity(const char *path, DWORD *serial, DWORD *hi, DWORD 
 static bool same_file(const char *a, const char *b) {
 #ifdef _WIN32
     DWORD sa, ha, la, sb, hb, lb;
-    return win_file_identity(a, &sa, &ha, &la) && win_file_identity(b, &sb, &hb, &lb) &&
-           sa == sb && ha == hb && la == lb;
+    return win_file_identity(a, &sa, &ha, &la) && win_file_identity(b, &sb, &hb, &lb) && sa == sb &&
+           ha == hb && la == lb;
 #else
     cbm_stat_t sa;
     cbm_stat_t sb;
@@ -659,9 +659,9 @@ static bool compress_file(const char *src, const char *dst) {
     }
     FILE *in = cbm_fopen(src, "rb");
     FILE *out = in ? cbm_fopen(tmp, "wb") : NULL;
-    int64_t n = out ? cbm_zstd_compress_stream(in, out, file_size(src), BS_ZSTD_LEVEL,
-                                               BS_ZSTD_WORKERS)
-                    : -1;
+    int64_t n =
+        out ? cbm_zstd_compress_stream(in, out, file_size(src), BS_ZSTD_LEVEL, BS_ZSTD_WORKERS)
+            : -1;
     bool ok = n > 0 && sync_stream(out, tmp);
     if (out && fclose(out) != 0) {
         ok = false;
@@ -1013,8 +1013,7 @@ static void shrink_wal(sqlite3 *db) {
         return;
     }
     char sql[96];
-    snprintf(sql, sizeof(sql), "PRAGMA journal_size_limit = 0; PRAGMA user_version = %d;",
-             version);
+    snprintf(sql, sizeof(sql), "PRAGMA journal_size_limit = 0; PRAGMA user_version = %d;", version);
     (void)sqlite3_exec(db, sql, NULL, NULL, NULL);
 }
 
@@ -1324,8 +1323,8 @@ cbm_branch_switch_t cbm_branch_slots_switch(const char *db_path, const char *pro
     cbm_branch_switch_t action = CBM_BRANCH_SWITCH_NONE;
     if (strcmp(indexed, slug) != 0 && cbm_branch_db_root_matches(db_path, project, root)) {
         bs_limits_t lim = {keep, budget};
-        action = switch_from(db_path, project, slug, indexed, dir,
-                             have_incoming ? incoming : NULL, lim);
+        action =
+            switch_from(db_path, project, slug, indexed, dir, have_incoming ? incoming : NULL, lim);
     }
     if (from) {
         *from = indexed;
@@ -1501,10 +1500,11 @@ int cbm_branch_slots_info(const char *db_path, const char *project, const char *
         free(keys);
     }
     if (l.n > 1) {
-        qsort(l.items, (size_t)l.n, sizeof(cbm_branch_slot_info_t), [](const void *a, const void *b) {
-            return strcmp(((const cbm_branch_slot_info_t *)a)->file,
-                          ((const cbm_branch_slot_info_t *)b)->file);
-        });
+        qsort(l.items, (size_t)l.n, sizeof(cbm_branch_slot_info_t),
+              [](const void *a, const void *b) {
+                  return strcmp(((const cbm_branch_slot_info_t *)a)->file,
+                                ((const cbm_branch_slot_info_t *)b)->file);
+              });
     }
     *out = l.items;
     return l.n;
@@ -1617,8 +1617,7 @@ static int delete_dir_slots(const char *dir) {
 
 int cbm_branch_slots_delete_all(const char *db_path, const char *project) {
     char dir[BS_PATH_MAX];
-    if (!cbm_branch_slots_dir(db_path, project, NULL, dir, sizeof(dir)) ||
-        !slots_dir_safe(dir)) {
+    if (!cbm_branch_slots_dir(db_path, project, NULL, dir, sizeof(dir)) || !slots_dir_safe(dir)) {
         return 0;
     }
     /* Every root's slots (a derived name can be several directories'), and
@@ -1751,8 +1750,7 @@ int cbm_branch_slots_expire(const char *db_path, const char *project, int64_t sl
                             int64_t scratch_before, bool dry_run, cbm_branch_slot_expire_cb cb,
                             void *ud) {
     char dir[BS_PATH_MAX];
-    if (!cbm_branch_slots_dir(db_path, project, NULL, dir, sizeof(dir)) ||
-        !slots_dir_safe(dir)) {
+    if (!cbm_branch_slots_dir(db_path, project, NULL, dir, sizeof(dir)) || !slots_dir_safe(dir)) {
         return 0;
     }
     int removed = expire_dir(dir, slot_before, scratch_before, dry_run, cb, ud);

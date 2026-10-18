@@ -140,10 +140,10 @@ static void build_cross_props(char *buf, size_t bufsz, const char *target_projec
  * writes into a project's store records the other project as
  * target_project. NULL for a blob that is not JSON or lacks the key (a
  * truncated edge is stored as "{}"). */
-#define CR_EDGE_TARGET_SQL                                                                   \
+#define CR_EDGE_TARGET_SQL \
     "CASE WHEN json_valid(properties) THEN json_extract(properties, '$.target_project') END"
-#define CR_CROSS_TYPES_SQL                                                                   \
-    "type IN ('CROSS_HTTP_CALLS','CROSS_ASYNC_CALLS','CROSS_CHANNEL','CROSS_GRPC_CALLS',"     \
+#define CR_CROSS_TYPES_SQL                                                                \
+    "type IN ('CROSS_HTTP_CALLS','CROSS_ASYNC_CALLS','CROSS_CHANNEL','CROSS_GRPC_CALLS'," \
     "'CROSS_GRAPHQL_CALLS','CROSS_TRPC_CALLS')"
 
 /* Delete project's CROSS_* edges that point at target. */

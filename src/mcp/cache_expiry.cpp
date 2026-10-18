@@ -2,7 +2,7 @@
  * and docs/CACHE_EXPIRY.md. */
 #include "mcp/cache_expiry.h"
 
-#include "cli/cli.h" /* cbm_config_*, CBM_CONFIG_CACHE_EXPIRY* */
+#include "cli/cli.h"           /* cbm_config_*, CBM_CONFIG_CACHE_EXPIRY* */
 #include "foundation/compat.h" /* cbm_usleep */
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h" /* CBM_INDEX_BUSY */
@@ -24,7 +24,9 @@
 #include <time.h>
 
 #include <algorithm>
+#include <iterator>
 #include <mutex>
+#include <numeric>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -40,9 +42,8 @@ enum { CE_PATH_MAX = 4096, CE_BUSY_MS = 200, CE_WRITE_BUSY_MS = 2500 };
  * artifact import (<x>.db.import_tmp) write before renaming into place, and
  * the sidecars SQLite leaves beside those temp files when the writer dies. */
 static const char *const CE_SIDECAR_SUFFIXES[] = {
-    ".db-wal",        ".db-shm",        ".db-journal",       ".db.tmp",
-    ".db.tmp-wal",    ".db.tmp-shm",    ".db.tmp-journal",   ".db.import_tmp",
-    ".db.import_tmp-wal", ".db.import_tmp-shm", ".db.import_tmp-journal",
+    ".db-wal", ".db-shm", ".db-journal", ".db.tmp", ".db.tmp-wal", ".db.tmp-shm", ".db.tmp-journal",
+    ".db.import_tmp", ".db.import_tmp-wal", ".db.import_tmp-shm", ".db.import_tmp-journal",
     /* write_file_atomic adds its own ".tmp" to the import's temp name */
     ".db.import_tmp.tmp",
     /* a failed branch stamp's marker (pipeline.cpp) */
@@ -124,10 +125,9 @@ static int64_t tree_bytes(const char *dir) {
         }
     }
     cbm_closedir(d);
-    for (const auto &s : subdirs) {
-        total += tree_bytes(s.c_str());
-    }
-    return total;
+    return std::accumulate(
+        subdirs.begin(), subdirs.end(), total,
+        [](int64_t sum, const std::string &s) { return sum + tree_bytes(s.c_str()); });
 }
 
 /* Remove a link itself: a directory junction or directory symlink on
@@ -210,9 +210,9 @@ static sqlite3 *state_open_once(bool create_tables, bool read_only, int busy_ms,
         create_tables = false;
     }
     if (cbm_store_sqlite_open(path, &db,
-                              read_only ? SQLITE_OPEN_READONLY
-                                        : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) !=
-        SQLITE_OK) {
+                              read_only
+                                  ? SQLITE_OPEN_READONLY
+                                  : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) != SQLITE_OK) {
         *err = db ? sqlite3_extended_errcode(db) : SQLITE_NOMEM;
         char os_errno[CBM_SZ_32];
         snprintf(os_errno, sizeof(os_errno), "%d", db ? sqlite3_system_errno(db) : 0);
@@ -523,8 +523,7 @@ bool cbm_cache_usage_set(const char *db_path, int64_t last_used, const char *roo
         }
         r.missing_since = 0;
         r.missing_checks = 0;
-        ok = usage_put(db, key, r) &&
-             sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK;
+        ok = usage_put(db, key, r) && sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK;
         if (!ok) {
             (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
         }
@@ -596,8 +595,8 @@ void cbm_cache_usage_touch(const char *db_path, const char *root_path) {
                 r.missing_since = 0;
                 r.missing_checks = 0;
             }
-            ok = usage_put(db, key, r) &&
-                 sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK;
+            ok =
+                usage_put(db, key, r) && sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK;
             if (!ok) {
                 (void)sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
             }
@@ -640,21 +639,21 @@ static bool is_mount_parent(const std::string &dir) {
         return true;
     }
 #endif
-    static const char *const roots[] = {"/",        "/Volumes",       "/mnt",
-                                        "/media",   "/run/media",     "/net",
+    static const char *const roots[] = {"/",        "/Volumes",        "/mnt",
+                                        "/media",   "/run/media",      "/net",
                                         "/Network", "/System/Volumes", "/private/var/automount",
-                                        "/afs",     "/cifs",          "/nfs"};
-    for (const char *r : roots) {
-        if (dir == r) {
-            return true;
-        }
+                                        "/afs",     "/cifs",           "/nfs"};
+    if (std::any_of(std::begin(roots), std::end(roots),
+                    [&dir](const char *r) { return dir == r; })) {
+        return true;
     }
     /* /media/<user>, /run/media/<user> */
-    for (const char *r : {"/media/", "/run/media/"}) {
-        size_t n = strlen(r);
-        if (dir.compare(0, n, r) == 0 && dir.find('/', n) == std::string::npos) {
-            return true;
-        }
+    static const char *const user_mounts[] = {"/media/", "/run/media/"};
+    if (std::any_of(std::begin(user_mounts), std::end(user_mounts), [&dir](const char *r) {
+            size_t n = strlen(r);
+            return dir.compare(0, n, r) == 0 && dir.find('/', n) == std::string::npos;
+        })) {
+        return true;
     }
 #ifdef _WIN32
     if (dir.size() <= 3 && dir.size() >= 2 && dir[1] == ':') {
@@ -830,7 +829,7 @@ static root_state_t root_state(const std::string &root) {
              * mount point with nothing mounted (/mnt/data of an unmounted
              * /mnt/data/repo), means unavailable, not deleted. */
             return is_mount_parent(dir) || looks_like_mount_point(dir) ? ROOT_UNCERTAIN
-                                                                        : ROOT_MISSING;
+                                                                       : ROOT_MISSING;
         }
         if (errno != ENOENT && errno != ENOTDIR) {
             return ROOT_UNCERTAIN;
@@ -1121,14 +1120,14 @@ static void report(sweep_ctx_t *c, cbm_cache_expiry_kind_t kind, const std::stri
                    const std::string &path, int64_t bytes, const std::string &reason, bool removed,
                    const char *skipped) {
     if (removed) {
-        cbm_log_info("cache.expire", "kind", cbm_cache_expiry_kind_str(kind), "name",
-                     name.c_str(), "path", path.c_str(), "reason", reason.c_str());
+        cbm_log_info("cache.expire", "kind", cbm_cache_expiry_kind_str(kind), "name", name.c_str(),
+                     "path", path.c_str(), "reason", reason.c_str());
     } else if (skipped) {
         cbm_log_info("cache.expire.skip", "kind", cbm_cache_expiry_kind_str(kind), "name",
                      name.c_str(), "why", skipped);
     }
     if (c->opts->report) {
-        cbm_cache_expiry_item_t it = {kind,  name.c_str(), path.c_str(), bytes,
+        cbm_cache_expiry_item_t it = {kind,           name.c_str(), path.c_str(), bytes,
                                       reason.c_str(), removed,      skipped};
         c->opts->report(&it, c->opts->report_ud);
     }
@@ -1299,7 +1298,8 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
         bytes += info[i].bytes > 0 ? info[i].bytes : 0;
     }
     cbm_branch_slots_free_info(info, ni);
-    std::string entry = std::string(cdir) + "/trash/" + std::to_string((long long)now) + "-" + e.name;
+    std::string entry =
+        std::string(cdir) + "/trash/" + std::to_string((long long)now) + "-" + e.name;
     if (kept(c->opts, e.name.c_str())) {
         report(c, kind, label(e), e.path, bytes, reason, false, "in use by this session");
         c->res->skipped++;
@@ -1437,15 +1437,15 @@ static void expire_project(const char *cdir, const db_entry_t &e, cbm_cache_expi
 }
 
 static bool is_sidecar_name(const char *name, std::string *base) {
-    for (const char *suf : CE_SIDECAR_SUFFIXES) {
-        if (ends_with(name, suf)) {
-            /* <x>.db + suffix after ".db" */
-            size_t keep = strlen(name) - strlen(suf) + 3;
-            *base = std::string(name, keep);
-            return true;
-        }
+    const char *const *end = std::end(CE_SIDECAR_SUFFIXES);
+    const char *const *hit = std::find_if(std::begin(CE_SIDECAR_SUFFIXES), end,
+                                          [name](const char *suf) { return ends_with(name, suf); });
+    if (hit == end) {
+        return false;
     }
-    return false;
+    /* <x>.db + suffix after ".db" */
+    *base = std::string(name, strlen(name) - strlen(*hit) + 3);
+    return true;
 }
 
 int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sweep_opts_t *opts,
@@ -1525,15 +1525,15 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
                  * points outside the cache: never opened, judged or moved
                  * -- the sweep's no-follow boundary holds for files too. */
                 if (cbm_is_link(path.c_str())) {
-                    cbm_log_warn("cache.expire.skipped", "kind", "database", "path",
-                                 path.c_str(), "reason", "is_link");
+                    cbm_log_warn("cache.expire.skipped", "kind", "database", "path", path.c_str(),
+                                 "reason", "is_link");
                     continue;
                 }
                 bool is_index = true;
                 std::string name = learn_project(path.c_str(), stem, opts->dry_run, &is_index);
                 if (!is_index) {
-                    cbm_log_info("cache.expire.skipped", "kind", "database", "path",
-                                 path.c_str(), "reason", "not_an_index");
+                    cbm_log_info("cache.expire.skipped", "kind", "database", "path", path.c_str(),
+                                 "reason", "not_an_index");
                     continue;
                 }
                 if (cbm_validate_project_name(name.c_str())) {
@@ -1558,10 +1558,9 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
     }
     /* A stem that is no safe path component cannot stand in: such a copy is
      * not judged. */
-    dbs.erase(std::remove_if(dbs.begin(), dbs.end(),
-                             [](const db_entry_t &e) {
-                                 return !cbm_validate_project_name(e.name.c_str());
-                             }),
+    dbs.erase(std::remove_if(
+                  dbs.begin(), dbs.end(),
+                  [](const db_entry_t &e) { return !cbm_validate_project_name(e.name.c_str()); }),
               dbs.end());
 
     /* Usage rows; a database seen for the first time starts its clock now,
@@ -1655,7 +1654,7 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
     std::vector<std::pair<size_t, cbm_cache_expiry_kind_t>> due;
     std::vector<std::string> reasons;
     for (size_t i = 0; i < dbs.size(); i++) {
-        db_entry_t &e = dbs[i];
+        const db_entry_t &e = dbs[i];
         int64_t idle = now - e.row.last_used;
         bool root_gone = cfg->root_grace_s > 0 && e.state == ROOT_MISSING && count_roots &&
                          e.row.missing_checks >= cfg->root_checks &&
@@ -1674,8 +1673,8 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
                      fmt_time(e.row.last_used) + ")";
         } else if (e.state == ROOT_MISSING && e.row.missing_checks > 0) {
             report(&c, CBM_EXPIRE_PENDING, label(e), e.path, 0,
-                   "root " + e.row.root + " missing since " + fmt_time(e.row.missing_since) +
-                       " (" + std::to_string(e.row.missing_checks) + " of " +
+                   "root " + e.row.root + " missing since " + fmt_time(e.row.missing_since) + " (" +
+                       std::to_string(e.row.missing_checks) + " of " +
                        std::to_string(cfg->root_checks) + " sweeps)",
                    false, NULL);
             continue;
@@ -1742,8 +1741,7 @@ int cbm_cache_expiry_sweep(const cbm_cache_expiry_cfg_t *cfg, const cbm_cache_sw
         std::string dbp = std::string(cdir) + "/" + s.second;
         std::string sp = std::string(cdir) + "/" + s.first;
         int64_t mt = path_mtime(sp.c_str());
-        if (cbm_file_exists(dbp.c_str()) || mt < 0 || mt >= scratch_before ||
-            scratch_before <= 0) {
+        if (cbm_file_exists(dbp.c_str()) || mt < 0 || mt >= scratch_before || scratch_before <= 0) {
             continue;
         }
         int64_t bytes = path_size(sp.c_str());
@@ -1929,8 +1927,8 @@ int cbm_cache_trash_restore(const char *which, char *msg, size_t msg_sz) {
          * the main file, an opener finds both. */
         std::string wal = src + "-wal";
         std::string live_wal = dbp + "-wal";
-        bool wal_back = !cbm_file_exists(wal.c_str()) ||
-                        cbm_rename_replace(wal.c_str(), live_wal.c_str()) == 0;
+        bool wal_back =
+            !cbm_file_exists(wal.c_str()) || cbm_rename_replace(wal.c_str(), live_wal.c_str()) == 0;
         if (!wal_back || cbm_rename_replace(src.c_str(), dbp.c_str()) != 0) {
             snprintf(msg, msg_sz, "could not move %s back", wal_back ? src.c_str() : wal.c_str());
             if (wal_back && cbm_file_exists(live_wal.c_str())) {

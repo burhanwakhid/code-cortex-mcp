@@ -1200,7 +1200,7 @@ struct cbm_mcp_server {
     struct cbm_watcher *watcher;      /* external watcher ref (not owned) */
     struct cbm_config *config;        /* external config ref (not owned) */
     cbm_thread_t autoindex_tid;
-    bool autoindex_active;    /* true if auto-index thread was started */
+    bool autoindex_active; /* true if auto-index thread was started */
     /* Cache expiry sweep (cache_expiry.h): at most one thread at a time,
      * joined before the next one starts, before the watcher changes
      * (cbm_mcp_server_set_watcher) and at cbm_mcp_server_join_threads/free.
@@ -1342,11 +1342,11 @@ void cbm_mcp_test_store_open_hook(void (*callback)(const char *db_path, void *da
     store_open_test_cb = callback;
     store_open_test_data = data;
 }
-#define STORE_OPEN_TEST_HOOK(path)                                                                 \
-    do {                                                                                           \
-        if (store_open_test_cb) {                                                                  \
-            store_open_test_cb(path, store_open_test_data);                                        \
-        }                                                                                          \
+#define STORE_OPEN_TEST_HOOK(path)                          \
+    do {                                                    \
+        if (store_open_test_cb) {                           \
+            store_open_test_cb(path, store_open_test_data); \
+        }                                                   \
     } while (0)
 #else
 #define STORE_OPEN_TEST_HOOK(path) ((void)0)
@@ -2774,8 +2774,8 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project, bool *incom
                      * file took the path since the read: the connection
                      * would serve the moved one. */
                     *incomplete = true;
-                    cbm_log_warn("store.fallback.incomplete", "project", project, "path",
-                                 full_path, "reason", "read_gate_busy_or_replaced");
+                    cbm_log_warn("store.fallback.incomplete", "project", project, "path", full_path,
+                                 "reason", "read_gate_busy_or_replaced");
                 }
             }
             cbm_store_close(st);
@@ -7846,11 +7846,11 @@ void cbm_mcp_test_index_hook(void (*callback)(const char *project, void *data), 
     index_test_cb = callback;
     index_test_data = data;
 }
-#define INDEX_TEST_HOOK(p)                                                                         \
-    do {                                                                                           \
-        if (index_test_cb) {                                                                       \
-            index_test_cb(cbm_pipeline_project_name(p), index_test_data);                          \
-        }                                                                                          \
+#define INDEX_TEST_HOOK(p)                                                \
+    do {                                                                  \
+        if (index_test_cb) {                                              \
+            index_test_cb(cbm_pipeline_project_name(p), index_test_data); \
+        }                                                                 \
     } while (0)
 #else
 #define INDEX_TEST_HOOK(p) ((void)0)
@@ -13242,8 +13242,8 @@ static void *autoindex_thread(void *arg) {
  * over the changed files. One SQLite read and a few small file reads (HEAD,
  * the branch ref or packed-refs): initialize stays free of git subprocesses.
  * When HEAD's commit cannot be read from files, only the branch is compared. */
-static bool checkout_differs_from_index(const char *root, const char *project,
-                                        const char *db_path, std::string *note);
+static bool checkout_differs_from_index(const char *root, const char *project, const char *db_path,
+                                        std::string *note);
 
 bool cbm_mcp_checkout_differs_from_index(const char *root, const char *project,
                                          const char *db_path) {
@@ -13252,8 +13252,7 @@ bool cbm_mcp_checkout_differs_from_index(const char *root, const char *project,
 
 char *cbm_mcp_checkout_mismatch_note(const char *root, const char *project, const char *db_path) {
     std::string note;
-    return checkout_differs_from_index(root, project, db_path, &note) ? strdup(note.c_str())
-                                                                      : NULL;
+    return checkout_differs_from_index(root, project, db_path, &note) ? strdup(note.c_str()) : NULL;
 }
 
 /* "branch `x` at abc1234" / "a detached HEAD at abc1234" for the note. */
@@ -13269,8 +13268,8 @@ static std::string checkout_label(const cbm_branch_id_t *id) {
 
 /* note: when set, the comparison is the hook's (no log line) and a
  * difference fills it with one sentence naming both sides. */
-static bool checkout_differs_from_index(const char *root, const char *project,
-                                        const char *db_path, std::string *note) {
+static bool checkout_differs_from_index(const char *root, const char *project, const char *db_path,
+                                        std::string *note) {
     cbm_branch_id_t current;
     if (!cbm_branch_id_from_head(root, &current)) {
         cbm_branch_id_free(&current);
@@ -13437,11 +13436,11 @@ void cbm_mcp_test_sweep_hook(void (*callback)(int stage, void *data), void *data
     sweep_test_cb = callback;
     sweep_test_data = data;
 }
-#define SWEEP_TEST_HOOK(stage)                                                                     \
-    do {                                                                                           \
-        if (sweep_test_cb) {                                                                       \
-            sweep_test_cb((stage), sweep_test_data);                                               \
-        }                                                                                          \
+#define SWEEP_TEST_HOOK(stage)                       \
+    do {                                             \
+        if (sweep_test_cb) {                         \
+            sweep_test_cb((stage), sweep_test_data); \
+        }                                            \
     } while (0)
 #else
 #define SWEEP_TEST_HOOK(stage) ((void)0)

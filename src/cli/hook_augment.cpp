@@ -215,10 +215,10 @@ static bool ha_strip_last_component(char *dir) {
 /* A level that did not resolve to an indexed project ends the walk-up when it
  * is a git checkout root with code of its own: a .git directory (a nested
  * repo), a linked worktree's gitlink, or a repository whose git dir was put
- * elsewhere (git init --separate-git-dir: a gitlink outside any "modules"). Such a checkout inside an indexed one
- * must not be answered from the parent's index — another branch's code, with
- * no warning. A submodule's gitlink does not end the walk: discovery indexes
- * a submodule's files into the enclosing checkout's graph. */
+ * elsewhere (git init --separate-git-dir: a gitlink outside any "modules"). Such a checkout inside
+ * an indexed one must not be answered from the parent's index — another branch's code, with no
+ * warning. A submodule's gitlink does not end the walk: discovery indexes a submodule's files into
+ * the enclosing checkout's graph. */
 static bool ha_stop_at_checkout(const char *dir) {
     cbm_git_checkout_kind_t kind = cbm_git_checkout_root_kind(dir);
     return kind == CBM_GIT_CHECKOUT_MAIN ||

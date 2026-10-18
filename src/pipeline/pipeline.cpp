@@ -154,12 +154,12 @@ struct cbm_pipeline {
     /* Per-branch databases (branch_slots.h). branch_keep < 1 disables
      * parking; the outcome of this run's switch is reported back. */
     int branch_keep;
-    int64_t branch_budget; /* bytes of parked slots per checkout; <= 0 no size cap */
+    int64_t branch_budget;              /* bytes of parked slots per checkout; <= 0 no size cap */
     cbm_pipeline_indexed_fn on_indexed; /* run under the lease after success */
     void *on_indexed_ud;
     cbm_branch_switch_t branch_action;
-    char *branch_from;            /* slug the database was built for; NULL unknown */
-    int files_reparsed;           /* source files extracted this run; -1 unknown */
+    char *branch_from;  /* slug the database was built for; NULL unknown */
+    int files_reparsed; /* source files extracted this run; -1 unknown */
     /* The database was recorded for another checkout than this run's: the
      * incremental pass must not trust size+mtime alone (see
      * pipeline_decide_content_check). */
@@ -2164,8 +2164,7 @@ static void pipeline_branch_switch(cbm_pipeline_t *p) {
     if (stamp_marker_path(p->db_path, marker, sizeof(marker)) && cbm_file_exists(marker)) {
         /* The run indexes this checkout over the live database and its
          * stamp names it; nothing is parked under the stale label. */
-        cbm_log_warn("branch.park_skipped", "project", p->project_name, "reason",
-                     "stamp_pending");
+        cbm_log_warn("branch.park_skipped", "project", p->project_name, "reason", "stamp_pending");
         return;
     }
     p->branch_action = cbm_branch_slots_switch(
@@ -2404,8 +2403,8 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
                      * must not outlive the run: remove the database (under
                      * the lease); the next run rebuilds it. Unlinking frees
                      * space, so it works where the write did not. */
-                    cbm_log_error("pipeline.err", "phase", "stamp_marker", "path", marker,
-                                  "action", "remove_db");
+                    cbm_log_error("pipeline.err", "phase", "stamp_marker", "path", marker, "action",
+                                  "remove_db");
                     (void)cbm_unlink(marker);
                     if (cbm_unlink(db_path) == 0) {
                         cbm_remove_db_sidecars(db_path);

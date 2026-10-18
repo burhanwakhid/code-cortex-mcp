@@ -669,8 +669,8 @@ static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool str
     static std::atomic<unsigned> seq{0};
     sweep_orphan_snapshots();
     char tmp_path[CBM_SZ_4K];
-    snprintf(tmp_path, sizeof(tmp_path), "%s/cbm_artifact_%ld_%u.db", cbm_tmpdir(),
-             (long)getpid(), seq.fetch_add(1, std::memory_order_relaxed));
+    snprintf(tmp_path, sizeof(tmp_path), "%s/cbm_artifact_%ld_%u.db", cbm_tmpdir(), (long)getpid(),
+             seq.fetch_add(1, std::memory_order_relaxed));
     cbm_unlink(tmp_path);
 
     /* VACUUM INTO: clean compacted copy. Use raw sqlite3 to bypass store authorizer
@@ -1152,10 +1152,10 @@ bool cbm_artifact_is_current(const char *db_path, const char *repo_path, const c
         cbm_store_t *s = cbm_store_open_path_query(db_path);
         char *qn = NULL;
         char *name = NULL;
-        char fp[CBM_SHA256_HEX_LEN + 1];
-        int format = 0;
-        char gen[CBM_SZ_64];
         if (s && cbm_store_get_branch_dup(s, project, &qn, &name, NULL) != CBM_STORE_ERR) {
+            char fp[CBM_SHA256_HEX_LEN + 1];
+            int format = 0;
+            char gen[CBM_SZ_64];
             graph_generation(s, project, &format, gen, sizeof(gen));
             current = strcmp(qn ? qn : "", a_qn) == 0 && strcmp(name ? name : "", a_name) == 0 &&
                       format == (int)yyjson_get_int(a_format) && strcmp(gen, a_gen) == 0 &&
