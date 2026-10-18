@@ -64,7 +64,8 @@ echo ""
 echo "--- Scanning for raw network calls (must not exist) ---"
 
 NETWORK_FUNCS='[^a-z_]connect\(|[^a-z_]socket\(|[^a-z_]sendto\('
-if grep -rn -E "$NETWORK_FUNCS" "$ROOT/src/" --include='*.cpp' 2>/dev/null | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v 'test'; then
+# grep -rn prefixes "file:line:", so the comment filter skips past it.
+if grep -rn -E "$NETWORK_FUNCS" "$ROOT/src/" --include='*.cpp' 2>/dev/null | grep -v -E '^[^:]+:[0-9]+:[[:space:]]*(//|/?\*)' | grep -v 'test'; then
     echo "BLOCKED: Raw network calls found in src/."
     fail
 else
