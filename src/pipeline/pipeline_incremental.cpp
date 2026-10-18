@@ -1193,6 +1193,10 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_stem_marks_free(&stem_marks);
     cbm_path_alias_collection_free(path_aliases);
     cbm_cc_index_free(cc_index);
+    /* The parallel extract built a package map (merge_pkg_entries); the full
+     * pipeline frees its own at cleanup, so an incremental run must too. */
+    cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
+    cbm_pipeline_set_pkgmap(NULL);
 
     /* Re-link inbound cross-file edges that the purge orphaned. Runs after
      * re-resolution AND post-passes so the freshly re-created target nodes
