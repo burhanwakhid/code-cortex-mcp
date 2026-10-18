@@ -23,8 +23,13 @@
 #include "foundation/compat_thread.h"
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
+#include "foundation/sha256.h"
 #include "foundation/str_util.h"
 #include "pipeline/artifact.h" /* CBM_ARTIFACT_DIR: the indexer's own output directory */
+/* Parked per-branch databases of a pruned project. */
+#include "pipeline/branch_slots.h"
+/* A pruned database's usage and memo rows. */
+#include "mcp/cache_expiry.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -40,7 +45,11 @@
 typedef struct {
     char *project_name;
     char *root_path;
-    char last_head[CBM_SZ_64]; /* git HEAD hash */
+    /* HEAD hash + symbolic ref (see git_head) */
+    char last_head[CBM_SZ_512];
+    /* HEAD sampled by check_changes before the index runs; becomes last_head
+     * when that run succeeds (empty: not sampled) */
+    char seen_head[CBM_SZ_512];
     bool is_git;               /* false → skip polling */
     bool baseline_done;        /* true after first poll */
     atomic_bool index_pending; /* autoindex deferred before any completed index */
@@ -168,24 +177,61 @@ static bool is_git_repo(const char *root_path) {
     return rc == 0;
 }
 
+/* HEAD's commit AND its symbolic ref ("<sha> refs/heads/<branch>", or
+ * "<sha> HEAD" when detached), from one rev-parse. The ref matters because
+ * each branch has its own index (pipeline/branch_slots.h): checking out a
+ * branch that points at the same commit changes no SHA, yet the index must
+ * still be switched to that branch's database. */
 static int git_head(const char *root_path, char *out, size_t out_size) {
     char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse HEAD 2>%s", root_path, WATCHER_NULDEV);
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse HEAD --symbolic-full-name HEAD 2>%s",
+             root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return CBM_NOT_FOUND;
     }
 
-    if (fgets(out, (int)out_size, fp)) {
-        size_t len = strlen(out);
-        while (len > 0 && (out[len - SKIP_ONE] == '\n' || out[len - SKIP_ONE] == '\r')) {
-            out[--len] = '\0';
+    /* Read all of it: a branch name is bounded only by the filesystem, and
+     * a fixed line buffer would drop a long ref line, so two long branches
+     * at one commit would look alike. */
+    size_t cap = CBM_SZ_512;
+    size_t len = 0;
+    char *all = (char *)malloc(cap);
+    for (int c = fgetc(fp); all && c != EOF; c = fgetc(fp)) {
+        if (len + 1 >= cap) {
+            char *grown = (char *)realloc(all, cap * 2);
+            if (!grown) {
+                free(all);
+                all = NULL;
+                break;
+            }
+            all = grown;
+            cap *= 2;
         }
-        cbm_pclose(fp);
-        return 0;
+        all[len++] = c == '\n' || c == '\r' ? ' ' : (char)c;
     }
-    cbm_pclose(fp);
-    return CBM_NOT_FOUND;
+    int rc = cbm_pclose(fp);
+    while (all && len > 0 && all[len - 1] == ' ') {
+        len--;
+    }
+    if (!all || rc != 0 || len == 0) {
+        free(all);
+        return CBM_NOT_FOUND;
+    }
+    all[len] = '\0';
+    if (len < out_size) {
+        memcpy(out, all, len + 1);
+    } else {
+        /* Too long to keep verbatim: the commit, then a digest of the whole
+         * output -- still different for every distinct ref. */
+        char digest[CBM_SHA256_HEX_LEN + 1];
+        cbm_sha256_hex(all, len, digest);
+        const char *space = strchr(all, ' ');
+        int sha_len = space ? (int)(space - all) : 0;
+        snprintf(out, out_size, "%.*s #%s", sha_len, all, digest);
+    }
+    free(all);
+    return 0;
 }
 
 /* Returns true if working tree has changes (modified, untracked, etc.).
@@ -388,7 +434,12 @@ static const char *itoa_buf(int v) {
     return buf;
 }
 
-static int delete_cached_project_db(const char *project_name) {
+/* Remove the project's database and the parked slots of the checkout at
+ * root_path. Only that checkout's: a second checkout deriving the same
+ * project name keeps its own slots (separated by root key), and the shared
+ * <project>.db when that checkout indexed it last -- the database records
+ * its root, checked under the lease (cbm_branch_db_root_matches). */
+static int delete_cached_project_db(const char *project_name, const char *root_path) {
     if (!cbm_validate_project_name(project_name)) {
         return CBM_NOT_FOUND;
     }
@@ -409,11 +460,28 @@ static int delete_cached_project_db(const char *project_name) {
     // Preserve unlink's original symlink-entry semantics. The canonical target
     // is only the shared lease identity, never an expanded deletion scope.
     const char *path = requested;
+    /* A link in the cache is removed as itself (unlink, below), never its
+     * referent: whose index it points at does not matter. A real file's
+     * owner must be root_path's -- another checkout's, or one that cannot be
+     * read, is kept. */
+    if (root_path && root_path[0] && !cbm_is_link(path) && cbm_file_exists(path) &&
+        !cbm_branch_db_root_matches(path, project_name, root_path)) {
+        cbm_log_info("watcher.prune.kept_foreign_db", "project", project_name, "root", root_path);
+        (void)cbm_branch_slots_delete_root(path, project_name, root_path);
+        cbm_db_lease_release(lease);
+        return 0;
+    }
     if (cbm_unlink(path) != 0 && errno != ENOENT) {
         cbm_db_lease_release(lease);
         return CBM_NOT_FOUND;
     }
     cbm_remove_db_sidecars(path);
+    cbm_cache_usage_forget(path);
+    if (root_path && root_path[0]) {
+        (void)cbm_branch_slots_delete_root(path, project_name, root_path);
+    } else {
+        (void)cbm_branch_slots_delete_all(path, project_name);
+    }
     cbm_db_lease_release(lease);
     return 0;
 }
@@ -564,6 +632,16 @@ int cbm_watcher_watch_count(cbm_watcher_t *w) {
     return count;
 }
 
+bool cbm_watcher_is_watched(cbm_watcher_t *w, const char *project_name) {
+    if (!w || !project_name) {
+        return false;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    bool hit = cbm_ht_get(w->projects, project_name) != NULL;
+    cbm_mutex_unlock(&w->projects_lock);
+    return hit;
+}
+
 /* ── Single poll cycle ──────────────────────────────────────────── */
 
 /* Init baseline for a project: check if git, get HEAD, count files */
@@ -605,8 +683,10 @@ static bool check_changes(project_state_t *s, bool *dirty) {
     s->needs_clean_reindex |= *dirty;
 
     /* Check HEAD movement */
-    char head[CBM_SZ_64] = {0};
+    char head[CBM_SZ_512] = {0};
+    s->seen_head[0] = '\0';
     if (git_head(s->root_path, head, sizeof(head)) == 0) {
+        snprintf(s->seen_head, sizeof(s->seen_head), "%s", head);
         if (s->last_head[0] != '\0' && strcmp(head, s->last_head) != 0) {
             /* Keep the old baseline until indexing succeeds so a failed
              * attempt remains observable and is retried after backoff. */
@@ -641,7 +721,7 @@ static void prune_missing_project(cbm_watcher_t *w, project_state_t *s) {
      * is referenced by the poll_once snapshot iterating us. On OOM the
      * watch stays registered and pruning retries on the next cycle. */
     if (current == s && defer_state_free(w, s)) {
-        int rc = delete_cached_project_db(project_name);
+        int rc = delete_cached_project_db(project_name, s->root_path);
         if (rc == 0) {
             cbm_ht_delete(w->projects, project_name);
             removed = true;
@@ -748,8 +828,14 @@ static void poll_project(const char *key, void *val, void *ud) {
             atomic_store(&s->index_failure_count, 0);
             s->needs_clean_reindex = dirty;
             ctx->reindexed++;
-            /* Update HEAD after successful reindex */
-            git_head(s->root_path, s->last_head, sizeof(s->last_head));
+            /* Baseline on the HEAD seen BEFORE the run: one that moved
+             * while the run read files is then still a change at the next
+             * poll, instead of being taken as indexed. */
+            if (s->is_git && s->seen_head[0]) {
+                snprintf(s->last_head, sizeof(s->last_head), "%s", s->seen_head);
+            } else {
+                git_head(s->root_path, s->last_head, sizeof(s->last_head));
+            }
             /* Refresh file count for interval */
             s->file_count = git_file_count(s->root_path);
             s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);

@@ -117,8 +117,28 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path);
 /* Free an MCP server. */
 void cbm_mcp_server_free(cbm_mcp_server_t *srv);
 
-/* Set external watcher reference (for auto-index registration). Not owned. */
+/* Set external watcher reference (for auto-index registration). Not owned.
+ * Joins a running cache sweep first (it reads the watcher), so the caller
+ * may free the previous watcher once this returns. */
 void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w);
+
+/* Join the server's background threads (update check, auto-index, cache
+ * sweep). They use the external watcher and config, so call this before
+ * freeing either. Idempotent; cbm_mcp_server_free calls it too. */
+void cbm_mcp_server_join_threads(cbm_mcp_server_t *srv);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Callback run on the cache sweep thread: stage 0 before the sweep, stage 1
+ * after it. NULL clears. */
+void cbm_mcp_test_sweep_hook(void (*callback)(int stage, void *data), void *data);
+/* Callback run right after an index run's cbm_pipeline_run returns (its
+ * lease released), in index_repository and cbm_mcp_index_in_process. NULL
+ * clears. */
+void cbm_mcp_test_index_hook(void (*callback)(const char *project, void *data), void *data);
+/* Callback run when a tool call has just opened a project's database by
+ * name, before the server records which file it opened. NULL clears. */
+void cbm_mcp_test_store_open_hook(void (*callback)(const char *db_path, void *data), void *data);
+#endif
 
 /* Set external config store reference (for auto_index setting). Not owned. */
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg);
@@ -147,6 +167,28 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
  * is not a supervisor host). This is the shared entry the watcher re-index
  * (main.c) and the session auto-index (mcp.c) route through. */
 char *cbm_mcp_index_run_supervised_path(const char *root_path);
+
+/* Until the next tool call (or a NULL call), project lookups answer only
+ * from a database indexed from `dir` (cbm_root_matches); a walk-up sets it
+ * per level. */
+void cbm_mcp_expect_project_root(const char *dir);
+
+/* Session start's pending decision: whether the checkout at root (HEAD read
+ * from files, no git subprocess) differs from the identity the database at
+ * db_path records for project, so the watcher's first poll must index. */
+bool cbm_mcp_checkout_differs_from_index(const char *root, const char *project,
+                                         const char *db_path);
+
+/* The same comparison for the SessionStart hook: when the checkout differs
+ * from the indexed identity, one sentence naming both (branch or detached
+ * HEAD, short commit) for the brief to carry; else NULL. Caller frees. */
+char *cbm_mcp_checkout_mismatch_note(const char *root, const char *project, const char *db_path);
+
+/* The in-process fallback of the above: a full index of root_path in THIS
+ * process, with the persisted index config (branch_index, branch_index_keep)
+ * applied exactly as index_repository applies it. The caller holds the
+ * pipeline lock. Returns cbm_pipeline_run's code. */
+int cbm_mcp_index_in_process(const char *root_path);
 
 /* ── Idle store eviction ──────────────────────────────────────── */
 

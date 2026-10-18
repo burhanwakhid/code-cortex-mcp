@@ -36,6 +36,7 @@
 #include "foundation/platform.h"
 #include "foundation/mem.h"
 #include "foundation/subprocess.h"
+#include "git/git_context.h"
 #include "mcp/mcp.h"
 #include "pipeline/pipeline.h"
 #include "yyjson/yyjson.h"
@@ -48,6 +49,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <iterator>
 #include <mutex>
 #include <string_view>
 #include <thread>
@@ -211,6 +213,38 @@ static bool ha_strip_last_component(char *dir) {
     return true;
 }
 
+/* A level that did not resolve to an indexed project ends the walk-up when it
+ * is a git checkout root with code of its own: a .git directory (a nested
+ * repo), a linked worktree's gitlink, or a repository whose git dir was put
+ * elsewhere (git init --separate-git-dir: a gitlink outside any "modules"). Such a checkout inside
+ * an indexed one must not be answered from the parent's index — another branch's code, with no
+ * warning. A submodule's gitlink does not end the walk: discovery indexes a submodule's files into
+ * the enclosing checkout's graph. */
+static bool ha_stop_at_checkout(const char *dir) {
+    cbm_git_checkout_kind_t kind = cbm_git_checkout_root_kind(dir);
+    return kind == CBM_GIT_CHECKOUT_MAIN ||
+           (kind == CBM_GIT_CHECKOUT_GITLINK && !cbm_git_gitlink_is_submodule(dir));
+}
+
+/* The project a walk-up level would answer from: dir's derived name, which
+ * may also be another directory's (names fold separators to '-'), so the
+ * lookups that follow accept only a database indexed from dir itself
+ * (cbm_mcp_expect_project_root). Every walk-up uses this, inside a
+ * ha_root_scope that clears the expectation when the walk ends. Caller frees. */
+static char *ha_level_project(const char *dir) {
+    cbm_mcp_expect_project_root(dir);
+    return cbm_project_name_from_path(dir);
+}
+
+struct ha_root_scope {
+    ha_root_scope() = default;
+    ha_root_scope(const ha_root_scope &) = delete;
+    ha_root_scope &operator=(const ha_root_scope &) = delete;
+    ~ha_root_scope() {
+        cbm_mcp_expect_project_root(nullptr);
+    }
+};
+
 /* Walk up from the file's parent directory to find the indexed project, then
  * check whether the file (repo-relative) is listed in its coverage report.
  * Mirrors ha_resolve_and_query: an MCP error means "not indexed here" →
@@ -222,8 +256,9 @@ static char *ha_resolve_coverage(cbm_mcp_server_t *srv, const char *file_path) {
         return NULL; /* file directly at a root — nothing to resolve against */
     }
 
+    ha_root_scope root_scope;
     for (int level = 0; level < HA_MAX_WALKUP && cbm_hook_path_is_abs(dir); level++) {
-        char *project = cbm_project_name_from_path(dir);
+        char *project = ha_level_project(dir);
         if (project) {
             bool resolved = false;
             const char *rel = file_path + strlen(dir) + 1;
@@ -236,7 +271,7 @@ static char *ha_resolve_coverage(cbm_mcp_server_t *srv, const char *file_path) {
                 return NULL; /* indexed project, file not listed → stop */
             }
         }
-        if (!ha_strip_last_component(dir)) {
+        if (ha_stop_at_checkout(dir) || !ha_strip_last_component(dir)) {
             break;
         }
     }
@@ -1489,8 +1524,9 @@ static char *ha_session_brief(cbm_mcp_server_t *srv, const char *project, bool *
 static char *ha_walk_symbol(cbm_mcp_server_t *srv, const char *start, const char *token) {
     char dir[4096];
     snprintf(dir, sizeof(dir), "%s", start);
+    ha_root_scope root_scope;
     for (int level = 0; level < HA_MAX_WALKUP && cbm_hook_path_is_abs(dir); level++) {
-        char *project = cbm_project_name_from_path(dir);
+        char *project = ha_level_project(dir);
         if (project) {
             bool resolved = false;
             char *ctx = ha_symbol_brief(srv, project, token, &resolved);
@@ -1502,6 +1538,60 @@ static char *ha_walk_symbol(cbm_mcp_server_t *srv, const char *start, const char
                 return NULL;
             }
         }
+        if (ha_stop_at_checkout(dir) || !ha_strip_last_component(dir)) {
+            break;
+        }
+    }
+    return NULL;
+}
+
+/* The brief describes the graph as indexed. When the checkout at root has
+ * moved since (a branch switch, pull or commit while no server watched), say
+ * so: the server refreshes the index on its first poll, but this text is read
+ * before that, and on a large repository the refresh takes minutes. Takes
+ * and returns ownership of brief. */
+static char *ha_append_checkout_note(char *brief, const char *root, const char *project) {
+    char db_path[4096];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cbm_resolve_cache_dir(), project);
+    char *note = cbm_mcp_checkout_mismatch_note(root, project, db_path);
+    if (!note) {
+        return brief;
+    }
+    std::string text = brief;
+    text += "\n";
+    text += note;
+    free(note);
+    free(brief);
+    return strdup(text.c_str());
+}
+
+/* *indexed reports whether some level resolved; when none did and the walk
+ * stopped at a checkout root, that root is copied to stop_root (else ""). */
+static char *ha_walk_session(cbm_mcp_server_t *srv, const char *start, bool *indexed,
+                             char *stop_root, size_t stop_root_sz) {
+    *indexed = false;
+    stop_root[0] = '\0';
+    char dir[4096];
+    snprintf(dir, sizeof(dir), "%s", start);
+    ha_root_scope root_scope;
+    for (int level = 0; level < HA_MAX_WALKUP && cbm_hook_path_is_abs(dir); level++) {
+        char *project = ha_level_project(dir);
+        if (project) {
+            bool resolved = false;
+            char *ctx = ha_session_brief(srv, project, &resolved);
+            if (ctx) {
+                ctx = ha_append_checkout_note(ctx, dir, project);
+            }
+            free(project);
+            if (ctx || resolved) {
+                *indexed = true;
+                return ctx;
+            }
+        }
+        if (ha_stop_at_checkout(dir)) {
+            snprintf(stop_root, stop_root_sz, "%s", dir);
+            break;
+        }
         if (!ha_strip_last_component(dir)) {
             break;
         }
@@ -1509,28 +1599,62 @@ static char *ha_walk_symbol(cbm_mcp_server_t *srv, const char *start, const char
     return NULL;
 }
 
-static char *ha_walk_session(cbm_mcp_server_t *srv, const char *start) {
-    char dir[4096];
-    snprintf(dir, sizeof(dir), "%s", start);
-    for (int level = 0; level < HA_MAX_WALKUP && cbm_hook_path_is_abs(dir); level++) {
-        char *project = cbm_project_name_from_path(dir);
-        if (project) {
-            bool resolved = false;
-            char *ctx = ha_session_brief(srv, project, &resolved);
-            free(project);
-            if (ctx) {
-                return ctx;
-            }
-            if (resolved) {
-                return NULL;
-            }
-        }
-        if (!ha_strip_last_component(dir)) {
-            break;
-        }
+/* What SessionStart prints for cwd: the brief, or the "not indexed" pointer —
+ * naming the checkout root to index when the walk stopped at one. NULL when an
+ * indexed project has no brief to show. Caller frees. */
+static char *ha_session_start_text(cbm_mcp_server_t *srv, const char *cwd) {
+    bool indexed = false;
+    char root[4096];
+    char *brief = ha_walk_session(srv, cwd, &indexed, root, sizeof(root));
+    if (brief || indexed) {
+        return brief;
     }
-    return NULL;
+    std::string text = "code-cortex: this repository is not indexed, so callers, impact and "
+                       "cross-language queries are unavailable. Index it once with the "
+                       "index_repository tool (repo_path = ";
+    text += root[0] ? root : "the repository root";
+    text += "); it takes seconds for most repositories and stays current afterwards.";
+    if (root[0] && cbm_git_is_linked_worktree(root)) {
+        text += " This is a linked git worktree: each worktree has its own index, and the main "
+                "checkout's index is not used here.";
+    }
+    return strdup(text.c_str());
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+char *cbm_session_start_text_for_testing(const char *cwd) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    cbm_mcp_server_set_scan_fallback(srv, false);
+    char *text = ha_session_start_text(srv, cwd);
+    cbm_mcp_server_free(srv);
+    return text;
+}
+
+char *cbm_hook_symbol_walk_for_testing(const char *cwd, const char *token) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    cbm_mcp_server_set_scan_fallback(srv, false);
+    char *ctx = ha_walk_symbol(srv, cwd, token);
+    cbm_mcp_server_free(srv);
+    return ctx;
+}
+
+char *cbm_hook_coverage_walk_for_testing(const char *file_path) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    cbm_mcp_server_set_scan_fallback(srv, false);
+    char *note = ha_resolve_coverage(srv, file_path);
+    cbm_mcp_server_free(srv);
+    return note;
+}
+#endif
 
 static char *ha_walk_edit(cbm_mcp_server_t *srv, const char *file_path) {
     char dir[4096];
@@ -1538,8 +1662,9 @@ static char *ha_walk_edit(cbm_mcp_server_t *srv, const char *file_path) {
     if (!ha_strip_last_component(dir)) {
         return NULL;
     }
+    ha_root_scope root_scope;
     for (int level = 0; level < HA_MAX_WALKUP && cbm_hook_path_is_abs(dir); level++) {
-        char *project = cbm_project_name_from_path(dir);
+        char *project = ha_level_project(dir);
         if (project) {
             bool resolved = false;
             const char *rel = file_path + strlen(dir) + 1;
@@ -1552,7 +1677,7 @@ static char *ha_walk_edit(cbm_mcp_server_t *srv, const char *file_path) {
                 return NULL;
             }
         }
-        if (!ha_strip_last_component(dir)) {
+        if (ha_stop_at_checkout(dir) || !ha_strip_last_component(dir)) {
             break;
         }
     }
@@ -1796,12 +1921,7 @@ struct ha_prompt_parse {
 };
 
 static bool ha_word_in(const std::string &w, std::initializer_list<const char *> set) {
-    for (const char *s : set) {
-        if (w == s) {
-            return true;
-        }
-    }
-    return false;
+    return std::any_of(set.begin(), set.end(), [&w](const char *s) { return w == s; });
 }
 
 /* Words after which, in the same clause, a quoted identifier is an example or
@@ -2210,11 +2330,11 @@ static ha_prompt_parse ha_prompt_parse_request(const char *prompt) {
      * (`NEWS`) in an earlier paragraph does not make that paragraph the
      * subject when a later one names `CGAL::sdf_values`. */
     int subject_para = out.targets.empty() ? 0 : out.targets.front().para;
-    for (const auto &t : out.targets) {
-        if (!t.qualifier.empty() || t.strong_qualifier || ha_token_looks_like_code(t.bare)) {
-            subject_para = t.para;
-            break;
-        }
+    auto subject = std::find_if(out.targets.begin(), out.targets.end(), [](const auto &t) {
+        return !t.qualifier.empty() || t.strong_qualifier || ha_token_looks_like_code(t.bare);
+    });
+    if (subject != out.targets.end()) {
+        subject_para = subject->para;
     }
 
     /* Merge: an identifier that is the owner of another target is not a
@@ -2331,10 +2451,10 @@ static void ha_split_lines(const std::string &data, std::vector<std::string> *ou
 }
 
 static const ha_file_lines &ha_read_file(ha_reader *r, const std::string &rel) {
-    for (const auto &f : r->cache) {
-        if (f.first == rel) {
-            return f.second;
-        }
+    auto cached = std::find_if(r->cache.begin(), r->cache.end(),
+                               [&rel](const auto &f) { return f.first == rel; });
+    if (cached != r->cache.end()) {
+        return cached->second;
     }
     ha_file_lines fl;
     FILE *fp = ha_safe_rel(rel) ? fopen((r->root + "/" + rel).c_str(), "rb") : nullptr;
@@ -2470,20 +2590,15 @@ static void ha_node_names(ha_node &n, const std::string &project) {
     if (dot != std::string::npos && (slash == std::string::npos || dot > slash)) {
         module.resize(dot);
     }
-    for (char &c : module) {
-        if (c == '/') {
-            c = '.';
-        }
-    }
+    std::replace(module.begin(), module.end(), '/', '.');
     if (!module.empty() && rest.compare(0, module.size() + 1, module + ".") == 0) {
         rest = rest.substr(module.size() + 1);
     }
     std::vector<std::string> segs;
-    for (const auto &s : ha_qual_segments(rest)) {
-        if (s.rfind("__decl_", 0) != 0 && s.rfind("__", 0) != 0) {
-            segs.push_back(s);
-        }
-    }
+    const std::vector<std::string> all_segs = ha_qual_segments(rest);
+    std::copy_if(
+        all_segs.begin(), all_segs.end(), std::back_inserter(segs),
+        [](const std::string &s) { return s.rfind("__decl_", 0) != 0 && s.rfind("__", 0) != 0; });
     std::string bare = n.name.empty() ? (segs.empty() ? rest : segs.back()) : n.name;
     if (!segs.empty() && segs.back() == bare) {
         segs.pop_back();
@@ -2508,12 +2623,11 @@ static int ha_owner_score(const ha_node &n, const std::vector<std::string> &q) {
         /* No owner recorded: a namespace qualifier may still show in the
          * path (CGAL::Polygon_mesh_processing::centroid lives under
          * Polygon_mesh_processing/include/CGAL/Polygon_mesh_processing/). */
-        int hits = 0;
         std::string path = "/" + n.file + "/";
-        for (const auto &seg : q) {
-            hits += path.find("/" + seg + "/") != std::string::npos;
-        }
-        return 1 + hits;
+        auto hits = std::count_if(q.begin(), q.end(), [&path](const std::string &seg) {
+            return path.find("/" + seg + "/") != std::string::npos;
+        });
+        return 1 + (int)hits;
     }
     int k = 0;
     while (k < (int)q.size() && k < (int)n.owner.size() &&
@@ -2524,10 +2638,8 @@ static int ha_owner_score(const ha_node &n, const std::vector<std::string> &q) {
         return 1 + k;
     }
     /* A namespace qualifier ("pcpp::f", "CGAL::f") anywhere on the owner path. */
-    for (const auto &o : n.owner) {
-        if (o == q.back()) {
-            return 2;
-        }
+    if (std::find(n.owner.begin(), n.owner.end(), q.back()) != n.owner.end()) {
+        return 2;
     }
     return -1;
 }
@@ -2553,11 +2665,9 @@ static bool ha_path_matches(const std::string &file, const std::string &hint) {
  * inline (`meta.f`, `schema.F`) are not owners the index records. */
 static std::vector<std::string> ha_checkable_qualifier(const ha_target &t) {
     std::vector<std::string> q;
-    for (const auto &s : ha_qual_segments(t.qualifier)) {
-        if (!ha_all_caps(s)) {
-            q.push_back(s);
-        }
-    }
+    const std::vector<std::string> segs = ha_qual_segments(t.qualifier);
+    std::copy_if(segs.begin(), segs.end(), std::back_inserter(q),
+                 [](const std::string &s) { return !ha_all_caps(s); });
     /* `obj.method` / `pkg.Func` written with a dot: a receiver or package,
      * not an owner. `ns::f` keeps a lower-case namespace (pcpp::, cv::). */
     if (!q.empty() && !t.strong_qualifier && islower((unsigned char)q.back()[0]) &&
@@ -2587,11 +2697,7 @@ static std::vector<ha_node> ha_disambiguate(std::vector<ha_node> nodes, const ha
                                             const std::vector<std::string> &prompt_paths) {
     auto keep_if = [&nodes](auto pred, bool allow_empty) {
         std::vector<ha_node> kept;
-        for (const auto &n : nodes) {
-            if (pred(n)) {
-                kept.push_back(n);
-            }
-        }
+        std::copy_if(nodes.begin(), nodes.end(), std::back_inserter(kept), pred);
         if (!kept.empty() || allow_empty) {
             nodes = kept;
         }
@@ -2652,24 +2758,16 @@ static std::vector<ha_node> ha_disambiguate(std::vector<ha_node> nodes, const ha
     if (ha_distinct_defs(nodes) > 1 && !t.file_hints.empty()) {
         keep_if(
             [&](const ha_node &n) {
-                for (const auto &h : t.file_hints) {
-                    if (ha_path_matches(n.file, h)) {
-                        return true;
-                    }
-                }
-                return false;
+                return std::any_of(t.file_hints.begin(), t.file_hints.end(),
+                                   [&n](const auto &h) { return ha_path_matches(n.file, h); });
             },
             false);
     }
     if (ha_distinct_defs(nodes) > 1 && !prompt_paths.empty()) {
         keep_if(
             [&](const ha_node &n) {
-                for (const auto &h : prompt_paths) {
-                    if (ha_path_matches(n.file, h)) {
-                        return true;
-                    }
-                }
-                return false;
+                return std::any_of(prompt_paths.begin(), prompt_paths.end(),
+                                   [&n](const auto &h) { return ha_path_matches(n.file, h); });
             },
             false);
     }
@@ -2936,11 +3034,12 @@ static std::vector<std::string> ha_scan_files(const std::string &root, const std
     for (const auto &f : files) {
         *not_indexed += !std::binary_search(idx.begin(), idx.end(), f);
     }
-    for (const auto &f : idx) {
-        if (!std::binary_search(files.begin(), files.end(), f)) {
-            files.push_back(f);
-        }
-    }
+    /* Collected apart, so every search sees only the sorted original list. */
+    std::vector<std::string> extra;
+    std::copy_if(idx.begin(), idx.end(), std::back_inserter(extra), [&files](const std::string &f) {
+        return !std::binary_search(files.begin(), files.end(), f);
+    });
+    files.insert(files.end(), extra.begin(), extra.end());
     std::sort(files.begin(), files.end());
     return files;
 }
@@ -3015,10 +3114,9 @@ static void ha_scan_matches(const std::string &root, const std::vector<std::stri
                 dot == std::string::npos || (slash != std::string::npos && dot < slash)
                     ? std::string()
                     : files[i].substr(dot);
-            bool hash_comment =
-                ha_word_in(ext, {".py", ".rb", ".sh", ".bash", ".cmake", ".yml", ".yaml",
-                                 ".toml", ".pl", ".r", ".txt", ".tcl", ".pyi", ".mk",
-                                 ".conf", ".cfg", ".ini"});
+            bool hash_comment = ha_word_in(ext, {".py", ".rb", ".sh", ".bash", ".cmake", ".yml",
+                                                 ".yaml", ".toml", ".pl", ".r", ".txt", ".tcl",
+                                                 ".pyi", ".mk", ".conf", ".cfg", ".ini"});
             bool dash_comment = ha_word_in(ext, {".sql", ".lua", ".hs"});
             bool block_comment = false;
             bool line_comment = false;
@@ -3168,8 +3266,7 @@ static void ha_scan_matches(const std::string &root, const std::vector<std::stri
                 }
                 if (hay[pos] == '"' || hay[pos] == '\'' || hay[pos] == '`') {
                     quote = hay[pos];
-                    triple = pos + 2 < hay.size() && hay[pos + 1] == quote &&
-                             hay[pos + 2] == quote;
+                    triple = pos + 2 < hay.size() && hay[pos + 1] == quote && hay[pos + 2] == quote;
                     escaped = false;
                     pos += triple ? 3 : 1;
                     continue;
@@ -3218,9 +3315,8 @@ static void ha_scan_matches(const std::string &root, const std::vector<std::stri
 static bool ha_match_is_import(const std::string &text) {
     size_t a = text.find_first_not_of(" \t");
     std::string t = a == std::string::npos ? std::string() : text.substr(a);
-    return t.rfind("#include", 0) == 0 || t.rfind("import ", 0) == 0 ||
-           t.rfind("from ", 0) == 0 || t.rfind("require", 0) == 0 ||
-           t.rfind("using ", 0) == 0;
+    return t.rfind("#include", 0) == 0 || t.rfind("import ", 0) == 0 || t.rfind("from ", 0) == 0 ||
+           t.rfind("require", 0) == 0 || t.rfind("using ", 0) == 0;
 }
 
 /* A graph call site must still name the callee outside recognized comments
@@ -3342,21 +3438,14 @@ struct ha_symbol_facts {
 };
 
 static bool ha_is_call_line(const ha_symbol_facts &f, const std::string &file, int line) {
-    for (const auto &c : f.call_lines) {
-        if (c.first == file && line == c.second) {
-            return true;
-        }
-    }
-    return false;
+    return std::any_of(f.call_lines.begin(), f.call_lines.end(),
+                       [&](const auto &c) { return c.first == file && line == c.second; });
 }
 
 static bool ha_is_loc(const std::vector<ha_loc> &locs, const std::string &file, int line) {
-    for (const auto &l : locs) {
-        if (l.file == file && (l.line == line || l.node_line == line)) {
-            return true;
-        }
-    }
-    return false;
+    return std::any_of(locs.begin(), locs.end(), [&](const ha_loc &l) {
+        return l.file == file && (l.line == line || l.node_line == line);
+    });
 }
 
 struct ha_classification {
@@ -3537,11 +3626,7 @@ static std::vector<ha_alias_hit> ha_find_module_imports(
         return out;
     }
     std::string dotted = def_file.substr(0, def_file.rfind('.'));
-    for (char &c : dotted) {
-        if (c == '/') {
-            c = '.';
-        }
-    }
+    std::replace(dotted.begin(), dotted.end(), '/', '.');
     std::string parent = dotted.size() > stem.size()
                              ? dotted.substr(0, dotted.size() - stem.size() - 1)
                              : std::string();
@@ -3665,8 +3750,8 @@ static std::string ha_callers_block(ha_reader *rd, const ha_symbol_facts &f,
             ha_classification c = ha_classify(f, fm.first, m);
             r.indexed_edge_candidates += c.indexed_edge_candidates;
             r.unresolved_call_shapes += c.unresolved_call_shapes;
-            r.other_occurrences += c.definitions + c.declarations + c.comments + c.strings +
-                                   c.imports + c.references;
+            r.other_occurrences +=
+                c.definitions + c.declarations + c.comments + c.strings + c.imports + c.references;
             r.lines.emplace_back(&m, std::move(c));
             total++;
         }
@@ -3822,8 +3907,8 @@ static std::string ha_callers_block(ha_reader *rd, const ha_symbol_facts &f,
     if (scan.not_indexed) {
         out += "; " + std::to_string(scan.not_indexed) + " of them are not in the index";
     }
-    out += "); " + std::string(scan.complete ? "" : "at least ") +
-           std::to_string(rows.size()) + " files contain the whole word" +
+    out += "); " + std::string(scan.complete ? "" : "at least ") + std::to_string(rows.size()) +
+           " files contain the whole word" +
            (by_ext.empty() ? std::string() : "; by extension: " + by_ext);
     if (!scan.complete) {
         out += "\n  (scan stopped at its time budget after " + std::to_string(scan.elapsed_ms) +
@@ -4036,10 +4121,10 @@ static ha_symbol_facts ha_collect_facts(cbm_mcp_server_t *srv, const std::string
     }
     auto add_loc = [&](std::vector<ha_loc> &v, const std::string &file, int line,
                        const std::string &label, int window = HA_NAME_WINDOW) {
-        for (const auto &l : v) {
-            if (l.file == file && l.node_line == line) {
-                return;
-            }
+        if (std::any_of(v.begin(), v.end(), [&](const ha_loc &have) {
+                return have.file == file && have.node_line == line;
+            })) {
+            return;
         }
         ha_loc l;
         l.file = file;
@@ -4156,10 +4241,11 @@ static std::string ha_chain_block(cbm_mcp_server_t *srv, yyjson_doc *d, const st
             return true;
         }
         if (freshness) {
-            for (const auto &entry : *freshness) {
-                if (entry.first == node.file) {
-                    return entry.second;
-                }
+            auto seen =
+                std::find_if(freshness->begin(), freshness->end(),
+                             [&node](const auto &entry) { return entry.first == node.file; });
+            if (seen != freshness->end()) {
+                return seen->second;
             }
         }
         bool fresh = ha_prompt_symbol_is_fresh(srv, project.c_str(), node.qn);
@@ -4407,8 +4493,11 @@ static char *ha_prompt_context(cbm_mcp_server_t *srv, const char *cwd, const ha_
     snprintf(dir, sizeof(dir), "%s", cwd);
     char *project = nullptr;
     char *first = nullptr;
+    /* Held to the end: the targets after the first are looked up in the
+     * project the walk settled on, under the same ownership check. */
+    ha_root_scope root_scope;
     for (int level = 0; level < HA_MAX_WALKUP && cbm_hook_path_is_abs(dir); level++) {
-        char *name = cbm_project_name_from_path(dir);
+        char *name = ha_level_project(dir);
         if (name) {
             bool resolved = false;
             char *json = cbm_mcp_symbol_nodes(srv, name, req.targets[0].bare.c_str(), &resolved);
@@ -4420,7 +4509,7 @@ static char *ha_prompt_context(cbm_mcp_server_t *srv, const char *cwd, const ha_
             free(json);
             free(name);
         }
-        if (!ha_strip_last_component(dir)) {
+        if (ha_stop_at_checkout(dir) || !ha_strip_last_component(dir)) {
             break;
         }
     }
@@ -4549,10 +4638,8 @@ static char *ha_prompt_context(cbm_mcp_server_t *srv, const char *cwd, const ha_
                          ha_src(ha_line_text(&rd, n.file, L)) + "  (" + n.display + ", " + n.label +
                          ")";
             }
-            size_t ndecl = 0;
-            for (const auto &n : r.all) {
-                ndecl += n.label == "Declaration";
-            }
+            auto ndecl = std::count_if(r.all.begin(), r.all.end(),
+                                       [](const ha_node &n) { return n.label == "Declaration"; });
             block += "\n  exact-name definitions: " + std::to_string(ha_distinct_defs(r.nodes)) +
                      "; declarations: " + std::to_string(ndecl);
             blocks.push_back(block);
@@ -4598,9 +4685,12 @@ static char *ha_prompt_context(cbm_mcp_server_t *srv, const char *cwd, const ha_
             char *json = cbm_mcp_symbol_nodes(srv, proj.c_str(), f.bare.c_str(), nullptr, true);
             yyjson_doc *nd = json ? yyjson_read(json, strlen(json), 0) : nullptr;
             free(json);
-            for (auto &n : ha_parse_nodes(nd, proj, nullptr, nullptr)) {
-                if (ha_label_is_symbol(n.label) && n.label != "Declaration" &&
-                    similar.size() < 12) {
+            const std::vector<ha_node> named = ha_parse_nodes(nd, proj, nullptr, nullptr);
+            for (const auto &n : named) {
+                if (similar.size() >= 12) {
+                    break;
+                }
+                if (ha_label_is_symbol(n.label) && n.label != "Declaration") {
                     similar.push_back(n);
                 }
             }
@@ -4620,9 +4710,9 @@ static char *ha_prompt_context(cbm_mcp_server_t *srv, const char *cwd, const ha_
             ha_scan_matches(rd.root, files, f.bare, deadline, &scan);
             scan.not_indexed = not_indexed;
             aliases = ha_find_aliases(f, scan);
-            for (auto &m : ha_find_module_imports(f, rd.root, files, deadline, &rd)) {
-                aliases.push_back(m);
-            }
+            const std::vector<ha_alias_hit> imports =
+                ha_find_module_imports(f, rd.root, files, deadline, &rd);
+            aliases.insert(aliases.end(), imports.begin(), imports.end());
             if (getenv("CBM_HOOK_TIMING")) {
                 fprintf(stderr, "hook.timing scan_ms=%ld read=%zu\n", scan.elapsed_ms,
                         scan.files_read);
@@ -4931,17 +5021,11 @@ int cbm_cmd_hook_augment(void) {
             cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
             if (srv) {
                 cbm_mcp_server_set_scan_fallback(srv, false);
-                char *brief = ha_walk_session(srv, cwd);
-                if (brief) {
-                    fputs(brief, stdout);
+                char *text = ha_session_start_text(srv, cwd);
+                if (text) {
+                    fputs(text, stdout);
                     fputc('\n', stdout);
-                    free(brief);
-                } else {
-                    fputs("code-cortex: this repository is not indexed, so callers, impact and "
-                          "cross-language queries are unavailable. Index it once with the "
-                          "index_repository tool (repo_path = the repository root); it takes "
-                          "seconds for most repositories and stays current afterwards.\n",
-                          stdout);
+                    free(text);
                 }
                 cbm_mcp_server_free(srv);
             }

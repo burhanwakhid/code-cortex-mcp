@@ -1,5 +1,6 @@
 #include "pipeline/result_store.h"
 #include <algorithm>
+#include <atomic>
 #include <iterator>
 #include <vector>
 /*
@@ -20,6 +21,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #define PL_NSEC_PER_SEC 1000000000LL
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
+#include "pipeline/branch_slots.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/worker_pool.h"
@@ -91,6 +93,10 @@ struct cbm_pipeline {
      * consulting cbm_artifact_export_last_error(), a global that can still
      * hold a PREVIOUS run's error. */
     char export_error[CBM_SZ_1K];
+    /* The end-of-run branch stamp was needed and could not be written: the
+     * database holds this checkout's graph under another branch's name, and
+     * the run fails rather than let the next one park it as that branch. */
+    bool stamp_failed;
     bool default_db_path;
     cbm_db_lease_t *index_lease;
     char *project_name;
@@ -144,6 +150,36 @@ struct cbm_pipeline {
      * carried over when recomputing it would be too slow (see
      * pipeline_refresh_session_brief). */
     char *saved_brief;
+
+    /* Per-branch databases (branch_slots.h). branch_keep < 1 disables
+     * parking; the outcome of this run's switch is reported back. */
+    int branch_keep;
+    int64_t branch_budget;              /* bytes of parked slots per checkout; <= 0 no size cap */
+    cbm_pipeline_indexed_fn on_indexed; /* run under the lease after success */
+    void *on_indexed_ud;
+    cbm_branch_switch_t branch_action;
+    char *branch_from;  /* slug the database was built for; NULL unknown */
+    int files_reparsed; /* source files extracted this run; -1 unknown */
+    /* The database was recorded for another checkout than this run's: the
+     * incremental pass must not trust size+mtime alone (see
+     * pipeline_decide_content_check). */
+    bool verify_content;
+    /* The live database changed this run after the last artifact export of
+     * the run (or with none): a restore, a dump, a stamp. Read at the end of
+     * cbm_pipeline_run, which exports iff it is set. */
+    bool artifact_stale;
+    /* An export of this run succeeded and nothing changed the database
+     * after it. The end-of-run check then trusts it instead of re-hashing
+     * the whole payload it just wrote (cbm_artifact_is_current). */
+    bool artifact_exported;
+    /* The full rebuild's dump committed the database. A requested artifact
+     * export after it can still fail the run, but the run did build the
+     * database, so the on-indexed callback still runs. */
+    bool db_committed;
+    /* The database under this project's name was indexed from another
+     * directory (a derived-name collision): this checkout has no index, so
+     * the run rebuilds in full and carries nothing over from it. */
+    bool foreign_db;
 };
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
@@ -365,6 +401,20 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->persistence = false;
     p->committed_nodes = -1;
     p->committed_edges = -1;
+    p->files_reparsed = -1;
+    /* Default on; CBM_BRANCH_INDEX=0 is the process-wide off switch for the
+     * paths that never consult the config store (in-process fallbacks). */
+    char bi_env[CBM_SZ_32] = "";
+    cbm_safe_getenv("CBM_BRANCH_INDEX", bi_env, sizeof(bi_env), NULL);
+    p->branch_keep = strcmp(bi_env, "0") == 0 ? 0 : CBM_BRANCH_SLOTS_DEFAULT_KEEP;
+    /* CBM_BRANCH_INDEX_BUDGET (e.g. "4G") overrides the default size budget
+     * for the same paths; the MCP server applies the config key over it. */
+    p->branch_budget = CBM_BRANCH_SLOTS_DEFAULT_BUDGET;
+    char budget_env[CBM_SZ_32] = "";
+    if (cbm_safe_getenv("CBM_BRANCH_INDEX_BUDGET", budget_env, sizeof(budget_env), NULL) &&
+        !cbm_branch_budget_parse(budget_env, &p->branch_budget)) {
+        cbm_log_warn("branch.budget_invalid", "value", budget_env);
+    }
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -422,6 +472,7 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     p->file_errors_count = 0;
     p->file_errors_cap = 0;
     free(p->branch_qn);
+    free(p->branch_from);
     free(p->saved_brief);
     p->saved_brief = NULL;
     free(p->saved_adr); /* freed here too: error paths can exit before the
@@ -540,6 +591,59 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) 
     if (p) {
         p->committed_nodes = nodes;
         p->committed_edges = edges;
+    }
+}
+
+void cbm_pipeline_set_files_reparsed(cbm_pipeline_t *p, int count) {
+    if (p) {
+        p->files_reparsed = count;
+    }
+}
+
+void cbm_pipeline_set_artifact_stale(cbm_pipeline_t *p, bool stale) {
+    if (p) {
+        p->artifact_stale = stale;
+        p->artifact_exported = !stale;
+    }
+}
+
+bool cbm_pipeline_verify_content(const cbm_pipeline_t *p) {
+    return p && p->verify_content;
+}
+
+void cbm_pipeline_set_branch_keep(cbm_pipeline_t *p, int keep) {
+    if (p) {
+        p->branch_keep = keep;
+    }
+}
+
+void cbm_pipeline_set_branch_budget(cbm_pipeline_t *p, int64_t budget) {
+    if (p) {
+        p->branch_budget = budget;
+    }
+}
+
+void cbm_pipeline_set_on_indexed(cbm_pipeline_t *p, cbm_pipeline_indexed_fn fn, void *ud) {
+    if (p) {
+        p->on_indexed = fn;
+        p->on_indexed_ud = ud;
+    }
+}
+
+void cbm_pipeline_get_branch_switch(const cbm_pipeline_t *p, const char **action, const char **from,
+                                    const char **to, int *files_reparsed) {
+    if (action) {
+        *action = cbm_branch_switch_str(p ? p->branch_action : CBM_BRANCH_SWITCH_NONE);
+    }
+    if (from) {
+        *from = p ? p->branch_from : NULL;
+    }
+    if (to) {
+        *to =
+            p && p->git_ctx.is_git ? cbm_branch_slug_from_qn(p->branch_qn, p->project_name) : NULL;
+    }
+    if (files_reparsed) {
+        *files_reparsed = p ? p->files_reparsed : -1;
     }
 }
 
@@ -829,11 +933,10 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_stem_marks_t *marks,
     cbm_gbuf_upsert_node(p->gbuf, "Project", p->project_name, p->project_name, NULL, 0, 0, "{}");
     const char *branch_qn = p->branch_qn ? p->branch_qn : p->project_name;
     const char *branch_name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
-    char branch_props[CBM_SZ_2K];
-    const char *branch_props_json = "{}";
-    if (cbm_git_context_props_json(&p->git_ctx, branch_props, sizeof(branch_props)) > 0) {
-        branch_props_json = branch_props;
-    }
+    /* Sized to fit, as the stamp writes it: a long branch name or path must
+     * not degrade the identity to "{}". */
+    char *branch_props = cbm_git_context_props_json_dup(&p->git_ctx);
+    const char *branch_props_json = branch_props ? branch_props : "{}";
     if (p->branch_qn) {
         int64_t branch_id = cbm_gbuf_upsert_node(p->gbuf, "Branch", branch_name, branch_qn, NULL, 0,
                                                  0, branch_props_json);
@@ -843,6 +946,7 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_stem_marks_t *marks,
                                  branch_props_json);
         }
     }
+    free(branch_props);
 
     /* Collect unique directories and create Folder/Package nodes */
     CBMHashTable *seen_dirs = cbm_ht_create(CBM_SZ_256);
@@ -1551,7 +1655,12 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         free(db_path);
         return CBM_NOT_FOUND;
     }
-    cbm_store_t *check_store = cbm_store_open_path(db_path);
+    /* Another directory's database (pipeline_check_foreign_db): nothing in
+     * it is this checkout's -- not its file hashes, not its ADR. */
+    cbm_store_t *check_store = p->foreign_db ? NULL : cbm_store_open_path(db_path);
+    if (p->foreign_db) {
+        cbm_log_info("pipeline.route", "path", "foreign_db_reindex");
+    }
     if (check_store && cbm_store_check_integrity(check_store)) {
         /* #769: an index written under an older format identity encodes a
          * different QN/node-identity scheme. Patching it incrementally would
@@ -1603,7 +1712,7 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     cbm_log_info("pipeline.route", "path", "reindex", "action", "deleting old db");
     /* Capture any ADR before deleting the DB so the full-reindex rebuild can
      * restore it (project_summaries is otherwise lost). Issue #516. */
-    {
+    if (!p->foreign_db) {
         cbm_store_t *adr_store = cbm_store_open_path(db_path);
         if (adr_store) {
             cbm_adr_t existing;
@@ -1682,6 +1791,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         cbm_log_error("pipeline.err", "phase", "dump");
         return rc;
     }
+    p->db_committed = true;
     cbm_log_info("pass.timing", "pass", "dump", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
     /* Persist-tail spans (phase "persist"): attribute the ~60s that lands here
      * AFTER cbm_gbuf_dump_to_sqlite returns. Active only under CBM_PROFILE. */
@@ -1789,6 +1899,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     p->saved_adr = NULL;
 
     /* Export persistent artifact if enabled */
+    cbm_pipeline_set_artifact_stale(p, true);
     if (p->persistence) {
         CBM_PROF_START(t_art);
         int arc = cbm_artifact_export(db_path, p->repo_path, p->project_name, CBM_ARTIFACT_BEST);
@@ -1802,6 +1913,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
             /* A failed persistence export intentionally fails the run; this used to be ignored. */
             return arc;
         }
+        cbm_pipeline_set_artifact_stale(p, false);
     }
 
     return 0;
@@ -1971,12 +2083,25 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
  * The SessionStart hook uses the same bound for its live fallback. */
 #define PL_BRIEF_RECOMPUTE_MAX_NODES 200000
 
+static int64_t brief_recompute_max_nodes = PL_BRIEF_RECOMPUTE_MAX_NODES;
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_pipeline_test_set_brief_recompute_max(int64_t nodes) {
+    brief_recompute_max_nodes = nodes > 0 ? nodes : PL_BRIEF_RECOMPUTE_MAX_NODES;
+}
+#endif
+
 /* Store the SessionStart brief inputs in the freshly written database, so the
  * hook reads one row instead of running architecture queries per session.
  * Full runs always recompute. Incremental runs keep a brief that survived
- * (a no-op run leaves the file untouched), recompute on small graphs, and
- * otherwise carry the previous brief over (counts as of the last full run).
- * Best-effort: a failure leaves no brief, and the hook degrades. */
+ * (a no-op run leaves the file untouched, so the graph it describes is the
+ * same), recompute on small graphs, and otherwise carry the previous brief
+ * over (counts as of the last full run) -- unless the stored graph was built
+ * from another checkout (verify_content): the previous brief then describes
+ * another branch or commit, so it is recomputed whatever the size. That puts
+ * the seconds-long queries on switch, pull and commit runs of very large
+ * graphs, which already pay for the identity change. Best-effort: a failure
+ * leaves no brief, and the hook degrades. */
 static void pipeline_refresh_session_brief(cbm_pipeline_t *p, bool full) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
@@ -1990,8 +2115,8 @@ static void pipeline_refresh_session_brief(cbm_pipeline_t *p, bool full) {
     char *brief = NULL;
     if (!full && cbm_store_session_brief_get(store, p->project_name, &brief) == CBM_STORE_OK) {
         how = "kept";
-    } else if (!full && p->saved_brief &&
-               cbm_store_node_id_ceiling(store) >= PL_BRIEF_RECOMPUTE_MAX_NODES) {
+    } else if (!full && p->saved_brief && !p->verify_content &&
+               cbm_store_node_id_ceiling(store) >= brief_recompute_max_nodes) {
         how = "carried";
         if (cbm_store_session_brief_put(store, p->project_name, p->saved_brief) != CBM_STORE_OK) {
             how = "failed";
@@ -2010,11 +2135,220 @@ const char *cbm_pipeline_export_error(const cbm_pipeline_t *p) {
     return p ? p->export_error : "";
 }
 
+bool cbm_pipeline_branch_stamp_failed(const cbm_pipeline_t *p) {
+    return p && p->stamp_failed;
+}
+
+/* Park/restore the cache database when the checkout's branch differs from
+ * the one it was built for (branch_slots.h). Runs under the index lease,
+ * before routing, so the incremental pass sees the restored or seeded graph.
+ * Only the default cache database takes part: an explicit db_path is a file
+ * the caller owns, and outside git there is no branch to key on. */
+/* <db>.stamp-pending: an end-of-run branch stamp was needed and failed, so
+ * the database holds a graph under another branch's name. While it exists
+ * the database is never parked: its label cannot be trusted. */
+static bool stamp_marker_path(const char *db_path, char *out, size_t out_sz) {
+    int n = snprintf(out, out_sz, "%s.stamp-pending", db_path ? db_path : "");
+    return db_path && n > 0 && (size_t)n < out_sz;
+}
+
+static void pipeline_branch_switch(cbm_pipeline_t *p) {
+    p->branch_action = CBM_BRANCH_SWITCH_NONE;
+    free(p->branch_from);
+    p->branch_from = NULL;
+    if (!p->default_db_path || !p->db_path || !p->git_ctx.is_git || p->branch_keep < 1) {
+        return;
+    }
+    p->artifact_stale = false;
+    char marker[CBM_SZ_4K];
+    if (stamp_marker_path(p->db_path, marker, sizeof(marker)) && cbm_file_exists(marker)) {
+        /* The run indexes this checkout over the live database and its
+         * stamp names it; nothing is parked under the stale label. */
+        cbm_log_warn("branch.park_skipped", "project", p->project_name, "reason", "stamp_pending");
+        return;
+    }
+    p->branch_action = cbm_branch_slots_switch(
+        p->db_path, p->project_name, cbm_branch_slug_from_qn(p->branch_qn, p->project_name),
+        p->repo_path, p->branch_keep, p->branch_budget, &p->branch_from);
+    /* A restore replaced the live content; nothing has exported it yet. */
+    p->artifact_stale = p->branch_action == CBM_BRANCH_SWITCH_RESTORED;
+}
+
+/* Record the checkout this run indexed on the Branch node: the QN (the slot
+ * the next run's park step reads) and the properties (branch name, HEAD
+ * commit -- the identity session start and index_status compare), with the
+ * HAS_BRANCH edge and the node's full-text entry (cbm_store_set_branch). A
+ * full run builds the node from the current checkout already; an incremental
+ * (or no-op) run keeps the stored structure, which names whichever checkout
+ * last ran a full rebuild. Written only when the node or an edge differs, so
+ * a no-op run on an unmoved HEAD leaves the file untouched and a torn earlier
+ * stamp is repaired. s is open read-write. True when it wrote. */
+#ifdef CBM_ENABLE_TEST_SEAMS
+static std::atomic<bool> g_fail_stamp{false};
+void cbm_pipeline_test_fail_stamp(bool fail) {
+    g_fail_stamp = fail;
+}
+#endif
+
+int cbm_pipeline_stamp_branch_store(cbm_pipeline_t *p, cbm_store_t *s) {
+    if (!p || !p->branch_qn) {
+        return 0;
+    }
+    if (!s) {
+        return -1;
+    }
+    char *props = cbm_git_context_props_json_dup(&p->git_ctx);
+    const char *props_json = props ? props : "{}";
+    const char *name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
+    int rc = 0;
+    if (cbm_store_get_branch(s, p->project_name, NULL, 0, NULL, 0) == CBM_STORE_OK &&
+        !cbm_store_branch_is(s, p->project_name, p->branch_qn, name, props_json)) {
+        bool skip = false;
+#ifdef CBM_ENABLE_TEST_SEAMS
+        skip = g_fail_stamp; /* as if the write had failed */
+#endif
+        bool wrote = !skip && cbm_store_set_branch(s, p->project_name, p->branch_qn, name,
+                                                   props_json) == CBM_STORE_OK;
+        rc = wrote ? 1 : -1;
+        if (!wrote) {
+            cbm_log_warn("pipeline.err", "phase", "branch_stamp", "project", p->project_name, "err",
+                         cbm_store_error(s));
+        }
+    }
+    free(props);
+    return rc;
+}
+
+int cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path) {
+    if (!p || !p->branch_qn || !db_path) {
+        return 0;
+    }
+    /* Check on a read-only connection first: opening read-write is itself a
+     * write (WAL setup), which a no-op run must not do. */
+    char *props = cbm_git_context_props_json_dup(&p->git_ctx);
+    const char *props_json = props ? props : "{}";
+    const char *name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    bool needed = s && cbm_store_get_branch(s, p->project_name, NULL, 0, NULL, 0) == CBM_STORE_OK &&
+                  !cbm_store_branch_is(s, p->project_name, p->branch_qn, name, props_json);
+    cbm_store_close(s);
+    free(props);
+    if (!needed) {
+        return 0;
+    }
+    s = cbm_store_open_path(db_path);
+    if (!s) {
+        cbm_log_warn("pipeline.err", "phase", "branch_stamp", "project", p->project_name);
+    }
+    int rc = cbm_pipeline_stamp_branch_store(p, s);
+    cbm_store_close(s);
+    return rc;
+}
+
+static int pipeline_run_claimed(cbm_pipeline_t *p);
+
+/* Whether the database this run would write was indexed from another
+ * directory: the root it records (projects.root_path) is not this run's.
+ * Checked before anything compares branches -- the same branch, commit and
+ * bytes in another checkout must not pass for this checkout's index. One
+ * small query per run; a database without a recorded root is accepted. */
+static void pipeline_check_foreign_db(cbm_pipeline_t *p) {
+    p->foreign_db = false;
+    char *db_path = resolve_db_path(p);
+    cbm_store_t *s =
+        db_path && cbm_file_exists(db_path) ? cbm_store_open_path_query(db_path) : NULL;
+    cbm_project_t proj = {0};
+    if (s && cbm_store_get_project(s, p->project_name, &proj) == CBM_STORE_OK) {
+        p->foreign_db = !cbm_root_matches(proj.root_path, p->repo_path);
+        if (p->foreign_db) {
+            cbm_log_warn("pipeline.foreign_db", "project", p->project_name, "indexed_root",
+                         proj.root_path ? proj.root_path : "", "root", p->repo_path);
+        }
+        cbm_project_free_fields(&proj);
+    }
+    cbm_store_close(s);
+    free(db_path);
+}
+
+/* Re-resolve the checkout once the run owns the index. cbm_pipeline_new
+ * captured it, but the caller may have waited on the lease or the pipeline
+ * lock since, and the slot choice, the Branch node and the stamp must all
+ * name the checkout whose files discovery is about to read. */
+static void pipeline_refresh_checkout(cbm_pipeline_t *p) {
+    cbm_git_context_t fresh;
+    (void)cbm_git_context_resolve(p->repo_path, &fresh);
+    cbm_git_context_free(&p->git_ctx);
+    p->git_ctx = fresh;
+    free(p->branch_qn);
+    p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
+}
+
+/* The checkout moved WHILE the run read files, so the graph may mix both
+ * states. The run still stamps the identity it started with (the Branch
+ * node of a full run already carries it): that is what the graph is mostly
+ * built from, and it guarantees a mismatch with the checkout now -- the next
+ * session start or index_status sees the difference, and the watcher, which
+ * baselines on the HEAD it saw before the run, polls a moved HEAD again. The
+ * next incremental pass then re-extracts every file whose bytes changed. */
+static void pipeline_note_checkout_moved(const cbm_pipeline_t *p) {
+    cbm_branch_id_t start;
+    cbm_branch_id_t now;
+    cbm_branch_id_from_context(&p->git_ctx, &start);
+    if (cbm_branch_id_from_head(p->repo_path, &now) && !cbm_branch_id_same(&start, &now)) {
+        cbm_log_warn("pipeline.checkout_moved", "project", p->project_name, "indexed", start.slug,
+                     "indexed_head", start.head_sha, "checkout", now.slug, "checkout_head",
+                     now.head_sha);
+    }
+    cbm_branch_id_free(&start);
+    cbm_branch_id_free(&now);
+}
+
+/* Whether this run's incremental pass must verify same-size files by content.
+ * A file can differ in bytes yet keep the stored size and mtime (whole-second
+ * timestamps, tools that preserve mtimes, two branches written in the same
+ * second), and the mtime shortcut would then keep another checkout's symbols
+ * for good. That can only happen when the graph was built from another
+ * checkout: a seeded or failed switch, two branches sharing a slot, a parked
+ * graph older than its branch, a pull. So compare the identity the database
+ * records -- read after the switch, so a restored graph is judged by its own
+ * stamp, and before this run stamps anything -- with the checkout now. An
+ * unrecorded identity or commit counts as different; a non-git checkout has
+ * none. */
+static void pipeline_decide_content_check(cbm_pipeline_t *p) {
+    p->verify_content = false;
+    cbm_branch_id_t current;
+    cbm_branch_id_from_context(&p->git_ctx, &current);
+    char *db_path = current.known ? resolve_db_path(p) : NULL;
+    cbm_store_t *s = db_path ? cbm_store_open_path_query(db_path) : NULL;
+    if (s) {
+        cbm_branch_id_t indexed;
+        /* Strict: the lenient comparison calls a side without a commit a
+         * match, which here would accept a graph of unknown age on the same
+         * branch (a legacy node with no properties, after a pull) and let the
+         * stamp vouch for it. This side comes from git itself
+         * (cbm_git_context_resolve), which has a commit on any born branch,
+         * reftable included; only an unborn branch has none, and there both
+         * sides are empty and nothing can have moved -- so no repository is
+         * verified on every run. */
+        (void)cbm_branch_id_indexed(s, p->project_name, &indexed);
+        p->verify_content = !cbm_branch_id_same_strict(&indexed, &current);
+        cbm_branch_id_free(&indexed);
+        cbm_store_close(s);
+    }
+    cbm_branch_id_free(&current);
+    free(db_path);
+    if (p->verify_content) {
+        cbm_log_info("pipeline.verify_content", "project", p->project_name, "reason",
+                     "checkout_changed");
+    }
+}
+
 int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
     p->export_error[0] = '\0';
+    p->stamp_failed = false;
     int claim_rc = cbm_pipeline_claim_index(p);
     if (claim_rc != 0) {
         return claim_rc;
@@ -2023,6 +2357,111 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     // export. MCP may already own this lease before artifact bootstrap.
     pipeline_lease_scope lease_scope{p};
 
+    p->artifact_exported = false;
+    pipeline_refresh_checkout(p);
+    pipeline_check_foreign_db(p);
+    if (!p->foreign_db) {
+        pipeline_branch_switch(p);
+    }
+    pipeline_decide_content_check(p);
+    int rc = pipeline_run_claimed(p);
+    /* The run built or kept a database: a requested export that fails after
+     * the commit (here or in the full rebuild) fails the run, but the
+     * database is in place and its use must still be recorded. */
+    bool indexed = rc == 0 || p->db_committed;
+    if (rc == 0 && !check_cancel(p)) {
+        char *db_path = resolve_db_path(p);
+        /* A stamp alone does not make the artifact stale: when it renames
+         * the branch, cbm_artifact_is_current sees the new QN and name below;
+         * when it only records a new HEAD commit or checkout path (the commit
+         * that added the artifact, another clone), the graph the artifact
+         * holds is still this one, and re-exporting it would dirty the tree
+         * after every commit. */
+        int stamp_rc = cbm_pipeline_stamp_branch(p, db_path);
+        bool stamped = stamp_rc != 0;
+        if (stamp_rc < 0) {
+            /* The database holds this checkout's graph under the branch it
+             * names; left so, the next run on another branch would park it
+             * as that branch's slot. Fail the run (nothing is exported) and
+             * leave the marker that stops the park until a stamp succeeds. */
+            cbm_log_error("pipeline.err", "phase", "branch_stamp", "project", p->project_name);
+            p->stamp_failed = true;
+            rc = CBM_NOT_FOUND;
+        }
+        char marker[CBM_SZ_4K];
+        if (stamp_marker_path(db_path, marker, sizeof(marker))) {
+            if (stamp_rc < 0) {
+                FILE *mf = cbm_fopen(marker, "wb");
+                bool marked = mf != NULL;
+                if (mf && fclose(mf) != 0) {
+                    marked = false;
+                }
+                if (!marked) {
+                    /* Without the marker nothing would stop the park, and the
+                     * failure that stopped the stamp (a full disk, a
+                     * read-only cache) may stop this too. A mislabeled graph
+                     * must not outlive the run: remove the database (under
+                     * the lease); the next run rebuilds it. Unlinking frees
+                     * space, so it works where the write did not. */
+                    cbm_log_error("pipeline.err", "phase", "stamp_marker", "path", marker, "action",
+                                  "remove_db");
+                    (void)cbm_unlink(marker);
+                    if (cbm_unlink(db_path) == 0) {
+                        cbm_remove_db_sidecars(db_path);
+                    }
+                }
+            } else if (cbm_file_exists(marker)) {
+                (void)cbm_unlink(marker); /* the label is right again */
+            }
+        }
+        /* Export iff the artifact is behind the live database: a restore
+         * with nothing re-extracted, a stamp-only switch, a full rebuild
+         * without the persistence flag while an artifact exists, an earlier
+         * run's failed export. The dump paths clear artifact_stale when they
+         * export themselves, so no run exports twice, and a run right after
+         * a successful export finds the metadata current and exports
+         * nothing. The artifact directory is not indexed, so an export
+         * changes nothing the next run reads: no loop. */
+        /* Behind: changed this run after its last export, or -- durable
+         * across runs, so a failed export is repaired by any later run --
+         * the artifact's metadata no longer matches the live database, or
+         * the run asked for an artifact that does not exist yet. */
+        /* An export this run made, with no stamp written after it, is
+         * current by construction: skip re-hashing the payload it just
+         * wrote. A stamp that wrote may have renamed the branch, so the
+         * metadata check decides then. */
+        bool exists = cbm_artifact_exists(p->repo_path);
+        bool trusted = p->artifact_exported && !stamped && exists;
+        bool behind = p->artifact_stale || (p->persistence && !exists) ||
+                      (exists && !trusted &&
+                       !cbm_artifact_is_current(db_path, p->repo_path, p->project_name));
+        if (rc == 0 && behind && (p->persistence || exists)) {
+            int arc = cbm_artifact_export(db_path, p->repo_path, p->project_name,
+                                          p->persistence ? CBM_ARTIFACT_BEST : CBM_ARTIFACT_FAST);
+            if (arc != 0) {
+                const char *err = cbm_artifact_export_last_error();
+                cbm_log_error("pipeline.err", "phase", "artifact_export", "err",
+                              err ? err : "unknown");
+                /* As the full-index path: an export the caller asked for
+                 * fails the run. Refreshing an artifact nobody asked for this
+                 * run (persistence off) stays best-effort, like the
+                 * incremental path's. */
+                if (p->persistence) {
+                    rc = arc;
+                }
+            }
+        }
+        free(db_path);
+        pipeline_note_checkout_moved(p);
+    }
+    /* Still under the lease (lease_scope releases it on return). */
+    if (indexed && p->on_indexed) {
+        p->on_indexed(p, p->on_indexed_ud);
+    }
+    return rc;
+}
+
+static int pipeline_run_claimed(cbm_pipeline_t *p) {
     CBM_PROF_START(t_pipeline_total);
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -2106,6 +2545,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         return rc;
     }
     cbm_log_info("pipeline.route", "path", "full");
+    p->files_reparsed = file_count;
 
     /* Capture source versions before extraction. Changes after this snapshot
      * must remain visible to the next incremental run, even if extraction

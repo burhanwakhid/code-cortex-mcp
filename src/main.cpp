@@ -183,14 +183,7 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
         return 0;
     }
 
-    cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
-    if (!p) {
-        cbm_pipeline_unlock();
-        return CBM_NOT_FOUND;
-    }
-
-    int rc = cbm_pipeline_run(p);
-    cbm_pipeline_free(p);
+    int rc = cbm_mcp_index_in_process(root_path);
     cbm_pipeline_unlock();
     return rc;
 }
@@ -586,6 +579,7 @@ static void print_help(void) {
     printf("  code-cortex-mcp update [-y|-n]\n");
     printf("  code-cortex-mcp config <list|get|set|reset>\n");
     printf("  code-cortex-mcp doctor       Check install, hooks, and whether cwd is indexed\n");
+    printf("  code-cortex-mcp cache <expire [--dry-run]|trash|restore <entry>>\n");
     printf("  code-cortex-mcp task-context Read {project|repo_path,symbol|request,max_bytes?} JSON "
            "from stdin; "
            "emit optional source context\n");
@@ -643,6 +637,9 @@ static int handle_subcommand(int argc, char **argv) {
         }
         if (strcmp(argv[i], "config") == 0) {
             return cbm_cmd_config(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
+        }
+        if (strcmp(argv[i], "cache") == 0) {
+            return cbm_cmd_cache(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "doctor") == 0) {
             cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
@@ -834,13 +831,18 @@ int main(int argc, char **argv) {
         cbm_watcher_stop(g_watcher);
         cbm_thread_join(&watcher_tid);
     }
-    cbm_watcher_free(g_watcher);
+    /* The server's background threads (auto-index, cache sweep) use the
+     * watcher and the config: join them before either is freed. */
+    cbm_mcp_server_join_threads(g_server);
+    cbm_mcp_server_set_watcher(g_server, NULL);
+    cbm_watcher_t *watcher = g_watcher;
+    g_watcher = NULL; /* the signal handler must not reach a freed watcher */
+    cbm_watcher_free(watcher);
     cbm_store_close(watch_store);
-    cbm_mcp_server_free(g_server);
-    cbm_config_close(runtime_config);
-
-    g_watcher = NULL;
+    cbm_mcp_server_t *server = g_server;
     g_server = NULL;
+    cbm_mcp_server_free(server);
+    cbm_config_close(runtime_config);
     cbm_diag_stop();
 
     return rc;

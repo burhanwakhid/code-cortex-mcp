@@ -35,6 +35,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1
 #include <sys/stat.h>
 #include "foundation/cbm_atomic.h"
 #include <stdint.h>
+#include <memory>
 #include <vector>
 
 static constexpr size_t INCR_SOURCE_DIGEST_STRIDE = CBM_SHA256_HEX_LEN + 1;
@@ -111,12 +112,71 @@ struct classified_version {
     char sha256[CBM_SHA256_HEX_LEN + 1] = {0};
 };
 
+static bool stored_sha_valid(const cbm_file_hash_t *h) {
+    bool valid = h->sha256 && strlen(h->sha256) == CBM_SHA256_HEX_LEN;
+    for (size_t j = 0; valid && j < CBM_SHA256_HEX_LEN; ++j) {
+        valid = isxdigit((unsigned char)h->sha256[j]) != 0;
+    }
+    return valid;
+}
+
+/* An empty file on disk where the stored row is an empty file too: the same
+ * bytes, whatever the mtime. Extraction records no digest for an empty file
+ * (its row's sha256 is ""), so the content check below cannot settle it; a
+ * checkout that deletes and recreates an empty __init__.py would otherwise
+ * re-extract it, and with it run the whole incremental pass, on every switch
+ * back to a parked branch. */
+static bool empty_both(const cbm_file_hash_t *h, const struct stat *st) {
+    return h->size == 0 && st->st_size == 0;
+}
+
+/* SHA-256 of a file's bytes, the same digest extraction records over the
+ * buffer it parses. False when the file cannot be read in full. */
+static bool file_sha256_hex(const char *path, char out[CBM_SHA256_HEX_LEN + 1]) {
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    cbm_sha256_ctx c;
+    cbm_sha256_init(&c);
+    enum { CHUNK = 64 * 1024 };
+    std::vector<unsigned char> buf(CHUNK);
+    size_t n;
+    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
+        cbm_sha256_update(&c, buf.data(), n);
+    }
+    bool ok = ferror(f) == 0;
+    (void)fclose(f);
+    if (!ok) {
+        return false;
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&c, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[(i * 2) + 1] = hex[digest[i] & 0xF];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+    return true;
+}
+
 /* Classify discovered files against stored hashes using mtime+size.
  * Returns a boolean array: changed[i] = true if files[i] needs re-parsing.
- * Caller must free the returned array. */
+ * Caller must free the returned array.
+ *
+ * Same size under a new mtime is settled by content: `git checkout` rewrites
+ * every file that differs between two branches, so after switching back to a
+ * branch whose database was parked (branch_slots.h) those files carry new
+ * mtimes over the very bytes the stored graph was built from. Hashing them is
+ * a read; re-extracting them is a parse. Such files are unchanged, and
+ * refreshed[i] marks that their stored row needs the new mtime.
+ *
+ * verify_content (the stored graph was built from another checkout) settles
+ * same size AND same mtime by content too: there the pair proves nothing. */
 static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_hash_t *stored,
                             int stored_count, int *out_changed, int *out_unchanged,
-                            classified_version *versions) {
+                            classified_version *versions, bool *refreshed, bool verify_content) {
     bool *changed = (bool *)calloc((size_t)file_count, sizeof(bool));
     if (!changed) {
         return NULL;
@@ -147,15 +207,25 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
             continue;
         }
 
-        if (stat_mtime_ns(&st) != h->mtime_ns || st.st_size != h->size) {
+        if (st.st_size != h->size) {
             changed[i] = true;
             n_changed++;
-        } else {
-            bool valid_sha = h->sha256 && strlen(h->sha256) == CBM_SHA256_HEX_LEN;
-            for (size_t j = 0; valid_sha && j < CBM_SHA256_HEX_LEN; ++j) {
-                valid_sha = isxdigit((unsigned char)h->sha256[j]) != 0;
+        } else if (stat_mtime_ns(&st) != h->mtime_ns || verify_content) {
+            char digest[CBM_SHA256_HEX_LEN + 1] = "";
+            if (empty_both(h, &st) ||
+                (stored_sha_valid(h) && file_sha256_hex(files[i].path, digest) &&
+                 strcmp(digest, h->sha256) == 0)) {
+                snprintf(versions[i].sha256, sizeof(versions[i].sha256), "%s", digest);
+                if (refreshed && stat_mtime_ns(&st) != h->mtime_ns) {
+                    refreshed[i] = true;
+                }
+                n_unchanged++;
+            } else {
+                changed[i] = true;
+                n_changed++;
             }
-            if (valid_sha) {
+        } else {
+            if (stored_sha_valid(h)) {
                 snprintf(versions[i].sha256, sizeof(versions[i].sha256), "%s", h->sha256);
             }
             n_unchanged++;
@@ -175,6 +245,8 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
  * A stored file is classified as:
  *   - "deleted"      — `stat()` returns ENOENT or ENOTDIR. Its nodes will
  *                       be purged and its hash row dropped.
+ *   - "deleted"      — also any file under CBM_ARTIFACT_DIR, which no mode
+ *                       discovers (an older build indexed it).
  *   - "mode-skipped" — `stat()` succeeds. The file exists on disk but the
  *                       current discovery pass didn't visit it (e.g. excluded
  *                       by FAST_SKIP_DIRS in fast/moderate mode). Its nodes
@@ -210,9 +282,24 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
  * deleted should be classified as deleted from the indexer's perspective
  * because the indexer follows symlinks during discovery — a stale symlink
  * has no source to parse. */
+/* Whether rel_path lies under the indexer's own artifact directory
+ * (CBM_ARTIFACT_DIR, at any depth, as discovery skips it). */
+static bool in_artifact_dir(const char *rel_path) {
+    static const size_t n = sizeof(CBM_ARTIFACT_DIR) - 1;
+    for (const char *s = rel_path; s && *s;) {
+        if (strncmp(s, CBM_ARTIFACT_DIR, n) == 0 && (s[n] == '/' || s[n] == '\\')) {
+            return true;
+        }
+        const char *sep = strpbrk(s, "/\\");
+        s = sep ? sep + 1 : NULL;
+    }
+    return false;
+}
+
 static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int file_count,
-                              cbm_file_hash_t *stored, int stored_count, char ***out_deleted,
-                              cbm_file_hash_t **out_mode_skipped, int *out_mode_skipped_count) {
+                              cbm_file_hash_t *stored, int stored_count, bool verify_content,
+                              char ***out_deleted, cbm_file_hash_t **out_mode_skipped,
+                              int *out_mode_skipped_count) {
     *out_deleted = NULL;
     *out_mode_skipped = NULL;
     *out_mode_skipped_count = 0;
@@ -259,15 +346,46 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
         bool preserve = false;
         char abs_path[CBM_SZ_4K];
         int n = snprintf(abs_path, sizeof(abs_path), "%s/%s", repo_path, stored[i].rel_path);
-        if (n < 0 || n >= (int)sizeof(abs_path)) {
+        if (in_artifact_dir(stored[i].rel_path)) {
+            /* Discovery never visits the artifact directory in any mode; a
+             * row for it is left from a build that indexed it, so purge it
+             * whether or not the file is still there. */
+        } else if (n < 0 || n >= (int)sizeof(abs_path)) {
             /* Truncation or encoding error — can't reliably stat. Preserve. */
             cbm_log_warn("incremental.path_truncated", "rel_path", stored[i].rel_path);
             preserve = true;
         } else {
             struct stat st;
             if (stat(abs_path, &st) == 0) {
-                /* File exists on disk — mode-skipped, not deleted. */
-                preserve = true;
+                /* File exists on disk — mode-skipped, not deleted. When the
+                 * stored graph was built from another checkout
+                 * (verify_content), that holds only for the same bytes: this
+                 * mode will not re-extract the file, so a changed one is
+                 * purged rather than kept with the other checkout's symbols
+                 * (the next run that discovers it extracts it afresh). A file
+                 * that stats but cannot be read has unknown bytes, not other
+                 * ones: kept, as a failed stat keeps it below, since this
+                 * mode would never re-extract it once purged. */
+                char digest[CBM_SHA256_HEX_LEN + 1];
+                preserve = !verify_content || empty_both(&stored[i], &st);
+                if (!preserve && !stored_sha_valid(&stored[i])) {
+                    /* No digest to compare against (a row from before
+                     * digests were stored, or a malformed one): the bytes
+                     * are unknown, not known to differ. Kept, like an
+                     * unreadable file; purged, this mode could never
+                     * re-extract it. */
+                    cbm_log_warn("incremental.digest_unknown", "rel_path", stored[i].rel_path);
+                    preserve = true;
+                } else if (!preserve) {
+                    errno = 0;
+                    if (!file_sha256_hex(abs_path, digest)) {
+                        cbm_log_warn("incremental.stat_uncertain", "rel_path", stored[i].rel_path,
+                                     "errno", itoa_buf(errno));
+                        preserve = true;
+                    } else {
+                        preserve = strcmp(digest, stored[i].sha256) == 0;
+                    }
+                }
             } else if (errno != ENOENT && errno != ENOTDIR) {
                 /* Transient or permission error — fail safe by preserving.
                  * EACCES, EIO, ELOOP, ENAMETOOLONG, etc. */
@@ -677,13 +795,28 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
  * not visited this pass". */
-static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
-                             cbm_file_info_t *files, int file_count,
+static void dump_and_persist(cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const char *db_path,
+                             const char *project, cbm_file_info_t *files, int file_count,
                              const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
                              const char *repo_path, const cbm_coverage_row_t *cov, int cov_count,
                              const classified_version *versions) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+
+    /* The re-dump below starts project_summaries empty: carry the ADR over,
+     * as the full rebuild does (#516). No ADR needs nothing; one that cannot
+     * be read is lost with the old file, so say so. */
+    char *saved_adr = NULL;
+    cbm_store_t *adr_store = cbm_store_open_path_query(db_path);
+    cbm_adr_t adr = {0};
+    int adr_rc = adr_store ? cbm_store_adr_get(adr_store, project, &adr) : CBM_STORE_ERR;
+    if (adr_rc == CBM_STORE_OK) {
+        saved_adr = adr.content ? strdup(adr.content) : NULL;
+    } else if (adr_rc != CBM_STORE_NOT_FOUND) {
+        cbm_log_error("incremental.err", "msg", "adr_unreadable", "project", project);
+    }
+    cbm_store_adr_free(&adr);
+    cbm_store_close(adr_store);
 
     cbm_unlink(db_path);
     char wal[INCR_WAL_BUF];
@@ -697,6 +830,7 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
     cbm_log_info("incremental.dump", "rc", itoa_buf(dump_rc), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
 
+    bool stamp_failed = false;
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
         /* #769: this path DELETES and re-dumps the DB, so the format stamp has
@@ -709,6 +843,10 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
 
         persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count,
                        versions);
+
+        if (saved_adr && cbm_store_adr_store(hash_store, project, saved_adr) != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "msg", "adr_restore", "project", project);
+        }
 
         /* Coverage rows (#963): re-write the merged set into the rebuilt DB
          * (AFTER hashes, so the deleted-file prune sees the live file set). */
@@ -724,12 +862,26 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
          * writer, so a node re-dumped here keeps its prose `body` column. */
         (void)cbm_store_fts_rebuild(hash_store);
 
+        /* The stored structure names the checkout of the last full rebuild;
+         * name this one before the artifact below copies the database. After
+         * the FTS rebuild, so the stamp finds the Branch node's entry and
+         * replaces it (cbm_store_set_branch). */
+        if (dump_rc == 0 && !atomic_load(cbm_pipeline_cancelled_ptr(p))) {
+            stamp_failed = cbm_pipeline_stamp_branch_store(p, hash_store) < 0;
+        }
+
         cbm_store_close(hash_store);
     }
+    free(saved_adr);
 
-    /* Auto-update artifact if one already exists (persistence was enabled previously) */
-    if (repo_path && cbm_artifact_exists(repo_path)) {
-        cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
+    /* Auto-update artifact if one already exists (persistence was enabled
+     * previously). Not after a failed stamp: the copy would carry the new
+     * graph under the old branch; the end-of-run stamp retries, and exports
+     * only once it holds. */
+    cbm_pipeline_set_artifact_stale(p, true);
+    if (!stamp_failed && repo_path && cbm_artifact_exists(repo_path) &&
+        cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST) == 0) {
+        cbm_pipeline_set_artifact_stale(p, false);
     }
 }
 
@@ -758,17 +910,19 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int n_changed = 0;
     int n_unchanged = 0;
     std::vector<classified_version> versions((size_t)file_count);
-    bool *is_changed = classify_files(files, file_count, stored, stored_count, &n_changed,
-                                      &n_unchanged, versions.data());
+    std::unique_ptr<bool[]> refreshed(new bool[(size_t)file_count + 1]());
+    bool *is_changed =
+        classify_files(files, file_count, stored, stored_count, &n_changed, &n_unchanged,
+                       versions.data(), refreshed.get(), cbm_pipeline_verify_content(p));
 
     /* Classify stored files absent from current discovery: truly-deleted
      * (purge) vs mode-skipped (preserve nodes AND hash rows). */
     char **deleted = NULL;
     cbm_file_hash_t *mode_skipped = NULL;
     int mode_skipped_count = 0;
-    int deleted_count =
-        find_deleted_files(cbm_pipeline_repo_path(p), files, file_count, stored, stored_count,
-                           &deleted, &mode_skipped, &mode_skipped_count);
+    int deleted_count = find_deleted_files(cbm_pipeline_repo_path(p), files, file_count, stored,
+                                           stored_count, cbm_pipeline_verify_content(p), &deleted,
+                                           &mode_skipped, &mode_skipped_count);
 
     cbm_log_info("incremental.classify", "changed", itoa_buf(n_changed), "unchanged",
                  itoa_buf(n_unchanged), "deleted", itoa_buf(deleted_count), "mode_skipped",
@@ -787,6 +941,17 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * that were already preserved by an earlier run) remain intact. */
     if (n_changed == 0 && deleted_count == 0) {
         cbm_log_info("incremental.noop", "reason", "no_changes");
+        cbm_pipeline_set_files_reparsed(p, 0);
+        /* Content matched under a new mtime (classify_files): record the new
+         * mtime, or every later run would hash those files again. */
+        for (int i = 0; i < file_count; i++) {
+            if (refreshed[i] && cbm_store_upsert_file_hash(store, project, files[i].rel_path,
+                                                           versions[i].sha256, versions[i].mtime_ns,
+                                                           versions[i].size) != CBM_STORE_OK) {
+                cbm_log_warn("incremental.persist_hash_failed", "scope", "refresh", "rel_path",
+                             files[i].rel_path);
+            }
+        }
         free(is_changed);
         free(deleted);
         free_mode_skipped(mode_skipped, mode_skipped_count);
@@ -826,6 +991,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     free(is_changed);
 
     cbm_log_info("incremental.reparse", "files", itoa_buf(ci));
+    cbm_pipeline_set_files_reparsed(p, ci);
 
     struct timespec t;
 
@@ -1027,6 +1193,10 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_stem_marks_free(&stem_marks);
     cbm_path_alias_collection_free(path_aliases);
     cbm_cc_index_free(cc_index);
+    /* The parallel extract built a package map (merge_pkg_entries); the full
+     * pipeline frees its own at cleanup, so an incremental run must too. */
+    cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
+    cbm_pipeline_set_pkgmap(NULL);
 
     /* Re-link inbound cross-file edges that the purge orphaned. Runs after
      * re-resolution AND post-passes so the freshly re-created target nodes
@@ -1060,7 +1230,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * covers incremental reindexes, not just full ones. */
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
-    dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
+    dump_and_persist(p, existing, db_path, project, files, file_count, mode_skipped,
                      mode_skipped_count, cbm_pipeline_repo_path(p), cov, cov_n, versions.data());
     free(cov);
     cbm_store_free_coverage(old_cov, old_cov_count);

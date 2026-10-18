@@ -810,10 +810,23 @@ void cbm_pipeline_set_before_dump_hook_for_tests(void (*hook)(const cbm_gbuf_t *
 #endif
 
 #ifdef CBM_ENABLE_TEST_SEAMS
+/* Session-brief carry-over bound (PL_BRIEF_RECOMPUTE_MAX_NODES); <= 0 resets. */
+void cbm_pipeline_test_set_brief_recompute_max(int64_t nodes);
 /* One-shot callback after classification, for concurrent source-edit tests. */
 void cbm_pipeline_test_after_classify(void (*callback)(void *), void *data);
 void cbm_pipeline_test_after_extract(void (*callback)(void *), void *data);
+/* While set, every branch stamp write fails (as a busy or read-only cache
+ * would make it). */
+void cbm_pipeline_test_fail_stamp(bool fail);
 #endif
+
+/* Write this checkout's branch onto the Branch node of the database at
+ * db_path when it names another (pipeline.cpp). 1 wrote, 0 nothing to
+ * write, -1 a write was needed and failed. */
+int cbm_pipeline_stamp_branch(cbm_pipeline_t *p, const char *db_path);
+/* The same on a store the caller has open read-write (NULL: -1), with the
+ * same returns. */
+int cbm_pipeline_stamp_branch_store(cbm_pipeline_t *p, cbm_store_t *s);
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
@@ -821,6 +834,14 @@ atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */
 void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
+/* Record how many source files this run re-extracted (incremental path). */
+void cbm_pipeline_set_files_reparsed(cbm_pipeline_t *p, int count);
+/* True when this run's database was recorded for another checkout, so the
+ * incremental pass hashes same-size files even when their mtime matches. */
+bool cbm_pipeline_verify_content(const cbm_pipeline_t *p);
+/* Whether the live database changed after the run's last artifact export
+ * (cbm_pipeline_run exports at the end iff so). */
+void cbm_pipeline_set_artifact_stale(cbm_pipeline_t *p, bool stale);
 
 /* Parse a gRPC stub call "<service-stub>.<method>" into the canonical proto
  * service name + method. Returns true ONLY when a recognized gRPC stub/client

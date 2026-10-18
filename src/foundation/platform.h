@@ -172,6 +172,26 @@ const char *cbm_resolve_cache_dir(void);
 /* Check if a path exists. */
 bool cbm_file_exists(const char *path);
 
+/* Whether a database's recorded project root `recorded` is the directory
+ * `dir`: same string, same realpath, or same device+inode (a case-insensitive
+ * volume); case-insensitive string compare on Windows. True when either is
+ * empty -- a legacy database records no root. Project names derived from
+ * paths collide (separators fold to '-'), so every lookup by derived name
+ * that must not answer from another directory checks this. */
+bool cbm_root_matches(const char *recorded, const char *dir);
+
+enum { CBM_ROOT_MAX = 4096 };
+
+/* Pure string form of a root, for comparing and keying: '\\' to '/',
+ * lowercase drive letter, "." and empty segments dropped, ".." applied,
+ * no trailing separator ("/" and "c:/" stay roots); fold_case lowercases
+ * everything (Windows). False when it does not fit out. */
+bool cbm_root_normalize(const char *in, bool fold_case, char *out, size_t out_sz);
+/* cbm_root_normalize of the platform's canonical spelling of root: the
+ * normalized path's realpath (POSIX) or _fullpath plus case folding
+ * (Windows) when that succeeds, else the normalized path. */
+bool cbm_root_canonical(const char *root, char *out, size_t out_sz);
+
 /* Check if path is a directory. */
 bool cbm_is_dir(const char *path);
 

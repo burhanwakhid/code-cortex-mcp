@@ -30,6 +30,9 @@
 #include <stdlib.h> /* qsort, malloc: the field-owner index */
 #include <string.h>
 
+#include <algorithm>
+#include <iterator>
+
 /* Confidence floor below which LSP-resolved calls are ignored and the
  * registry resolver is consulted instead. Locked at 0.6 per the v1
  * Python-LSP integration plan; revisit when telemetry justifies a knob.
@@ -385,13 +388,9 @@ static inline bool cbm_pipeline_rust_external_target(CBMLanguage lang, const cha
         "lsp_method_dispatch", "lsp_trait_dispatch", "lsp_deref_dispatch", "lsp_bound_dispatch",
         "lsp_direct",          "lsp_ufcs",           "lsp_constructor",
     };
-    bool registered_target = false;
-    for (const char *s : registered_target_strategies) {
-        if (strcmp(strategy, s) == 0) {
-            registered_target = true;
-            break;
-        }
-    }
+    bool registered_target = std::any_of(
+        std::begin(registered_target_strategies), std::end(registered_target_strategies),
+        [strategy](const char *s) { return strcmp(strategy, s) == 0; });
     if (!registered_target) {
         return false;
     }

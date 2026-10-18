@@ -6,6 +6,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "discover/discover.h"
+#include "git/git_context.h"
 
 /* ── Directory skip (always skipped) ───────────────────────────── */
 
@@ -468,6 +469,155 @@ TEST(discover_skips_worktrees) {
         ASSERT_NULL(strstr(files[i].rel_path, ".worktrees"));
     }
     ASSERT_TRUE(found_main);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* A linked worktree added anywhere inside the checkout (git worktree add
+ * ./wt) has its own index; the parent's walk must not take in its files. A
+ * submodule (gitlink to .../modules/<name>) and a nested clone (.git
+ * directory) are still walked, as before. */
+TEST(discover_skips_nested_linked_worktree) {
+    char *base = th_mktempdir("cbm_disc_nwt");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    th_write_file(TH_PATH(base, ".git/worktrees/wt-feature/commondir"), "../..\n");
+    char gitlink[1200];
+    snprintf(gitlink, sizeof(gitlink), "gitdir: %s/.git/worktrees/wt-feature\n", base);
+    th_write_file(TH_PATH(base, "wt-feature/.git"), gitlink);
+    th_write_file(TH_PATH(base, "wt-feature/src/app.go"), "package app\n");
+    th_write_file(TH_PATH(base, "deps/lib/.git"), "gitdir: ../../.git/modules/deps/lib\n");
+    th_write_file(TH_PATH(base, "deps/lib/lib.go"), "package lib\n");
+    th_write_file(TH_PATH(base, "clone/.git/HEAD"), "ref: refs/heads/main\n");
+    th_write_file(TH_PATH(base, "clone/c.go"), "package c\n");
+
+    cbm_discover_opts_t opts = {};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    bool found_main = false;
+    bool found_lib = false;
+    bool found_clone = false;
+    for (int i = 0; i < count; i++) {
+        ASSERT_NULL(strstr(files[i].rel_path, "wt-feature"));
+        found_main = found_main || strcmp(files[i].rel_path, "src/main.go") == 0;
+        found_lib = found_lib || strcmp(files[i].rel_path, "deps/lib/lib.go") == 0;
+        found_clone = found_clone || strcmp(files[i].rel_path, "clone/c.go") == 0;
+    }
+    ASSERT_TRUE(found_main);
+    ASSERT_TRUE(found_lib);
+    ASSERT_TRUE(found_clone);
+    ASSERT_EQ(count, 3);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* A submodule checked out at worktrees/<name> has the gitdir
+ * .git/modules/worktrees/<name>: the parent directory is named "worktrees",
+ * but it is no linked worktree (no commondir in its admin directory), so it
+ * is walked like any other submodule. A linked worktree whose gitlink is
+ * relative (worktree.useRelativePaths) is still skipped. */
+TEST(discover_walks_submodule_under_worktrees_path) {
+    char *base = th_mktempdir("cbm_disc_smwt");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    th_write_file(TH_PATH(base, ".git/modules/worktrees/foo/HEAD"), "ref: refs/heads/main\n");
+    th_write_file(TH_PATH(base, "worktrees/foo/.git"), "gitdir: ../../.git/modules/worktrees/foo\n");
+    th_write_file(TH_PATH(base, "worktrees/foo/foo.go"), "package foo\n");
+    th_write_file(TH_PATH(base, ".git/worktrees/rel/commondir"), "../..\n");
+    th_write_file(TH_PATH(base, "rel/.git"), "gitdir: ../.git/worktrees/rel\n");
+    th_write_file(TH_PATH(base, "rel/r.go"), "package r\n");
+
+    cbm_discover_opts_t opts = {};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    bool found_sub = false;
+    for (int i = 0; i < count; i++) {
+        ASSERT_NULL(strstr(files[i].rel_path, "rel/"));
+        found_sub = found_sub || strcmp(files[i].rel_path, "worktrees/foo/foo.go") == 0;
+    }
+    ASSERT_TRUE(found_sub);
+    ASSERT_EQ(count, 2);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* A gitlink whose "gitdir:" path does not fit the reader's buffer cannot be
+ * checked for a commondir. Read cut short, the check missed it and the walk
+ * took in the linked worktree; it now fails closed and skips the directory.
+ * cbm_git_is_linked_worktree, which this check mirrors, agrees. */
+TEST(discover_skips_gitlink_too_long_to_check) {
+    char *base = th_mktempdir("cbm_disc_longwt");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    enum { NAME_LEN = 5000 };
+    char *gitlink = (char *)malloc(strlen(base) + NAME_LEN + 64);
+    ASSERT(gitlink != NULL);
+    int n = sprintf(gitlink, "gitdir: %s/.git/worktrees/", base);
+    memset(gitlink + n, 'w', NAME_LEN);
+    snprintf(gitlink + n + NAME_LEN, 2, "\n");
+    th_write_file(TH_PATH(base, "wt/.git"), gitlink);
+    free(gitlink);
+    th_write_file(TH_PATH(base, "wt/src/app.go"), "package app\n");
+
+    cbm_discover_opts_t opts = {};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    for (int i = 0; i < count; i++) {
+        ASSERT_NULL(strstr(files[i].rel_path, "wt/"));
+    }
+    ASSERT_EQ(count, 1);
+    cbm_discover_free(files, count);
+
+    char wt[1200];
+    snprintf(wt, sizeof(wt), "%s/wt", base);
+    ASSERT_TRUE(cbm_git_is_linked_worktree(wt));
+
+    th_cleanup(base);
+    PASS();
+}
+
+/* The indexer's artifact directory is not un-skipped by a .cbmignore
+ * negation: indexed, every export would change a source of the next run. A
+ * negation still un-skips an ordinary built-in skip dir (#500). */
+TEST(discover_artifact_dir_not_negatable) {
+    char *base = th_mktempdir("cbm_disc_artneg");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".cbmignore"), "!.code-cortex/\n!vendor/\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, ".code-cortex/artifact.json"), "{\"schema_version\": 1}\n");
+    th_write_file(TH_PATH(base, "vendor/v.go"), "package v\n");
+
+    cbm_discover_opts_t opts = {};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    bool found_vendor = false;
+    for (int i = 0; i < count; i++) {
+        ASSERT_NULL(strstr(files[i].rel_path, ".code-cortex"));
+        found_vendor = found_vendor || strcmp(files[i].rel_path, "vendor/v.go") == 0;
+    }
+    ASSERT_TRUE(found_vendor);
 
     cbm_discover_free(files, count);
     th_cleanup(base);
@@ -1390,6 +1540,10 @@ SUITE(discover) {
 
     /* Go test ports (cross-platform) */
     RUN_TEST(discover_skips_worktrees);
+    RUN_TEST(discover_skips_nested_linked_worktree);
+    RUN_TEST(discover_walks_submodule_under_worktrees_path);
+    RUN_TEST(discover_skips_gitlink_too_long_to_check);
+    RUN_TEST(discover_artifact_dir_not_negatable);
     RUN_TEST(discover_cbmignore);
     RUN_TEST(discover_cbmignore_stacks);
     RUN_TEST(discover_symlink_skipped);

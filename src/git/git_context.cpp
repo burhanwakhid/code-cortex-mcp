@@ -1,8 +1,10 @@
 #include "git/git_context.h"
 
+#include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/platform.h" /* cbm_is_dir — wide path on Windows */
+#include "foundation/sha256.h"
 #include "foundation/str_util.h"
 
 #include <ctype.h>
@@ -12,9 +14,66 @@
 #include <string.h>
 #include <sys/stat.h>
 
+enum { GIT_CONFIG_ENV_MAX = 10000 };
+
+/* Config keys compare case-insensitively (section and variable names). */
+static bool git_config_key_equal(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+            return false;
+        }
+    }
+    return *a == *b;
+}
+
+bool cbm_git_config_env_append(const char *key, const char *value) {
+    const char *count = getenv("GIT_CONFIG_COUNT");
+    long n = 0;
+    if (count && count[0]) {
+        char *end = NULL;
+        n = strtol(count, &end, 10);
+        if (*end || n < 0 || n >= GIT_CONFIG_ENV_MAX) {
+            return false; /* git rejects it too: leave the caller's value alone */
+        }
+    }
+    char name[64];
+    for (long i = 0; i < n; i++) {
+        snprintf(name, sizeof(name), "GIT_CONFIG_KEY_%ld", i);
+        const char *k = getenv(name);
+        if (k && git_config_key_equal(k, key)) {
+            return true; /* the caller's own setting wins */
+        }
+    }
+    char num[24];
+    snprintf(name, sizeof(name), "GIT_CONFIG_KEY_%ld", n);
+    cbm_setenv(name, key, 1);
+    snprintf(name, sizeof(name), "GIT_CONFIG_VALUE_%ld", n);
+    cbm_setenv(name, value, 1);
+    snprintf(num, sizeof(num), "%ld", n + 1);
+    cbm_setenv("GIT_CONFIG_COUNT", num, 1);
+    return true;
+}
+
+#ifdef _WIN32
+/* Git for Windows refuses a ref whose loose file sits past MAX_PATH unless
+ * core.longpaths is on, and a branch name is unbounded: without it the
+ * identity git reports for such a checkout is "detached, no commit". Every
+ * git this process runs gets the setting through the environment (git 2.31+
+ * reads GIT_CONFIG_COUNT), appended to a caller's own GIT_CONFIG_* set. */
+static bool git_longpaths_env_init(void) {
+    (void)cbm_git_config_env_append("core.longpaths", "true");
+    return true;
+}
+static const bool g_git_longpaths_env = git_longpaths_env_init();
+#endif
+
 enum {
     GIT_CMD_MAX = 1024,
     GIT_OUTPUT_MAX = 4096,
+    /* Longest line read_line_dup returns. A loose ref's path must fit
+     * PATH_MAX, so no branch name git can create comes near it; a longer
+     * line is a damaged or hostile file, not a name. */
+    GIT_LINE_MAX = 4096,
 };
 
 static char *git_strdup(const char *s) {
@@ -38,6 +97,47 @@ static void trim_newlines(char *s) {
     while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
         s[--n] = '\0';
     }
+}
+
+/* One whole line from fp, newline stripped (fgets into a fixed buffer would
+ * cut a long branch name, and differently on each reader). A line longer than
+ * GIT_LINE_MAX is consumed and not returned: NULL with *too_long set, so a
+ * reader treats it as not found instead of growing without bound on a huge
+ * HEAD or packed-refs line. NULL at end of file. Caller frees. */
+static char *read_line_dup(FILE *fp, bool *too_long) {
+    *too_long = false;
+    size_t cap = 128;
+    size_t len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) {
+        return NULL;
+    }
+    int c = EOF;
+    while ((c = fgetc(fp)) != EOF && c != '\n') {
+        if (len >= GIT_LINE_MAX) {
+            while ((c = fgetc(fp)) != EOF && c != '\n') {}
+            free(buf);
+            *too_long = true;
+            return NULL;
+        }
+        if (len + 1 >= cap) {
+            char *grown = (char *)realloc(buf, cap * 2);
+            if (!grown) {
+                free(buf);
+                return NULL;
+            }
+            buf = grown;
+            cap *= 2;
+        }
+        buf[len++] = (char)c;
+    }
+    if (c == EOF && len == 0) {
+        free(buf);
+        return NULL;
+    }
+    buf[len] = '\0';
+    trim_newlines(buf);
+    return buf;
 }
 
 static bool git_validate_repo_path(const char *repo_path) {
@@ -81,20 +181,17 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
         return CBM_NOT_FOUND;
     }
 
-    char buf[GIT_OUTPUT_MAX];
-    if (!fgets(buf, sizeof(buf), fp)) {
-        cbm_pclose(fp);
-        return CBM_NOT_FOUND;
-    }
-    trim_newlines(buf);
-
+    bool too_long = false;
+    char *line = read_line_dup(fp, &too_long);
+    /* Drain: closing early would hand git SIGPIPE. */
+    for (int ch = fgetc(fp); ch != EOF; ch = fgetc(fp)) {}
     int rc = cbm_pclose(fp);
-    if (rc != 0 || buf[0] == '\0') {
+    if (!line || rc != 0 || line[0] == '\0') {
+        free(line);
         return CBM_NOT_FOUND;
     }
-
-    *out = git_strdup(buf);
-    return *out ? 0 : CBM_NOT_FOUND;
+    *out = line;
+    return 0;
 }
 
 /* Capture up to `max_lines` output lines instead of just the first.
@@ -258,11 +355,26 @@ static char *derive_canonical_root(const char *input_path, const char *worktree_
     return root;
 }
 
+/* The slug of a branch name: [A-Za-z0-9._-] only, runs of anything else one
+ * '-'. "detached" (every detached HEAD) and "working-tree" (no git) are
+ * reserved. Whenever the slug is not the name itself -- a character was
+ * replaced or dropped ("a/b" and "a-b"), nothing was left (an all-non-ASCII
+ * name), or the name is a reserved one -- '-' and the first SLUG_HASH_HEX hex
+ * digits of the SHA-256 of the whole name follow, so distinct names keep
+ * distinct slugs (and slots). A name that is its own slug stays readable. */
+enum { SLUG_HASH_HEX = 12 };
+
 static char *slug_from_branch(const char *branch, bool detached) {
-    const char *fallback = detached ? "detached" : "working-tree";
-    const char *src = detached ? fallback : (branch && branch[0] ? branch : fallback);
+    if (detached) {
+        return git_strdup("detached");
+    }
+    if (!branch || !branch[0]) {
+        return git_strdup("working-tree");
+    }
+    const char *src = branch;
     size_t len = strlen(src);
-    char *slug = (char *)malloc(len + 1);
+    /* Room for "branch" (an empty slug) or the slug, then '-' and the hash. */
+    char *slug = (char *)malloc(len + sizeof("branch") + 1 + SLUG_HASH_HEX + 1);
     if (!slug) {
         return NULL;
     }
@@ -288,10 +400,17 @@ static char *slug_from_branch(const char *branch, bool detached) {
     }
     slug[j] = '\0';
 
-    if (slug[0] == '\0') {
-        free(slug);
-        return git_strdup(fallback);
+    bool reserved = strcmp(src, "detached") == 0 || strcmp(src, "working-tree") == 0;
+    if (strcmp(slug, src) == 0 && !reserved) {
+        return slug;
     }
+    if (j == 0) {
+        memcpy(slug, "branch", sizeof("branch"));
+        j = sizeof("branch") - 1;
+    }
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(src, len, digest);
+    snprintf(slug + j, 1 + SLUG_HASH_HEX + 1, "-%.*s", (int)SLUG_HASH_HEX, digest);
     return slug;
 }
 
@@ -377,9 +496,19 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
         out->head_sha = git_strdup("");
     }
 
-    if (git_capture(path, "symbolic-ref --quiet --short HEAD", &out->branch) != 0) {
+    /* The full ref, then "refs/heads/" removed: the name cbm_git_head_read
+     * takes from the HEAD file. --short abbreviates to the shortest
+     * unambiguous name, so a tag of the same name made it "heads/v1.2" here
+     * and "v1.2" there, and the two identities never matched. */
+    if (git_capture(path, "symbolic-ref --quiet HEAD", &out->branch) != 0) {
         out->branch = git_strdup("DETACHED");
         out->is_detached = true;
+    } else if (out->branch) {
+        static const char heads[] = "refs/heads/";
+        if (strncmp(out->branch, heads, sizeof(heads) - 1) == 0) {
+            memmove(out->branch, out->branch + sizeof(heads) - 1,
+                    strlen(out->branch) - (sizeof(heads) - 1) + 1);
+        }
     }
 
     out->is_worktree =
@@ -399,6 +528,242 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
     }
 
     return 0;
+}
+
+/* First line of a small text file, newline stripped. False when unreadable. */
+static bool read_first_line(const char *path, char *buf, size_t bufsz) {
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        return false;
+    }
+    bool ok = fgets(buf, (int)bufsz, fp) != NULL;
+    (void)fclose(fp);
+    if (ok) {
+        trim_newlines(buf);
+    }
+    return ok;
+}
+
+/* The whole first line of a small text file; NULL when unreadable. */
+static char *read_first_line_dup(const char *path) {
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        return NULL;
+    }
+    bool too_long = false;
+    char *line = read_line_dup(fp, &too_long);
+    (void)fclose(fp);
+    return line;
+}
+
+/* "<a><b><c>" in a new allocation. Caller frees. */
+static char *str_cat3(const char *a, const char *b, const char *c) {
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+    size_t lc = strlen(c);
+    char *out = (char *)malloc(la + lb + lc + 1);
+    if (out) {
+        memcpy(out, a, la);
+        memcpy(out + la, b, lb);
+        memcpy(out + la + lb, c, lc + 1);
+    }
+    return out;
+}
+
+/* "<dir>/<rel>", or rel itself when absolute. False when it does not fit. */
+static bool path_under(const char *dir, const char *rel, char *buf, size_t bufsz) {
+    int n = path_is_absolute(rel) ? snprintf(buf, bufsz, "%s", rel)
+                                  : snprintf(buf, bufsz, "%s/%s", dir, rel);
+    return n > 0 && (size_t)n < bufsz;
+}
+
+static bool is_object_id(const char *s) {
+    size_t len = strlen(s);
+    if (len != 40 && len != 64) { /* SHA-1, SHA-256 */
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (!isxdigit((unsigned char)s[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The commit refs/heads/<branch> names, from the loose ref file or
+ * packed-refs in the common dir. False when neither has it: an unborn
+ * branch, a symbolic ref, or a ref store this does not read. */
+static bool read_branch_sha(const char *common, const char *branch, char *sha, size_t shasz) {
+    char *ref = str_cat3("refs/heads/", branch, "");
+    char *path = ref ? str_cat3(common, "/", ref) : NULL;
+    char *line = path ? read_first_line_dup(path) : NULL;
+    free(path);
+    bool found = false;
+    if (line) {
+        found = is_object_id(line);
+        if (found) {
+            snprintf(sha, shasz, "%s", line);
+        }
+        free(line);
+        free(ref);
+        return found;
+    }
+    path = str_cat3(common, "/packed-refs", "");
+    FILE *fp = path ? cbm_fopen(path, "rb") : NULL;
+    free(path);
+    bool too_long = false;
+    while (fp && ref && !found && ((line = read_line_dup(fp, &too_long)) != NULL || too_long)) {
+        if (!line) {
+            continue; /* an over-long line names no branch we can have */
+        }
+        char *space = strchr(line, ' ');
+        if (line[0] != '#' && line[0] != '^' && space) {
+            *space = '\0';
+            if (strcmp(space + 1, ref) == 0 && is_object_id(line)) {
+                snprintf(sha, shasz, "%s", line);
+                found = true;
+            }
+        }
+        free(line);
+    }
+    if (fp) {
+        (void)fclose(fp);
+    }
+    free(ref);
+    return found;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void (*g_head_probe_cb)(const char *, void *) = nullptr;
+static void *g_head_probe_data = nullptr;
+
+void cbm_git_test_on_head_probe(void (*callback)(const char *path, void *data), void *data) {
+    g_head_probe_cb = callback;
+    g_head_probe_data = data;
+}
+#endif
+
+int cbm_git_head_read(const char *root, cbm_git_head_t *out) {
+    if (!out) {
+        return CBM_NOT_FOUND;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!root || !root[0]) {
+        return CBM_NOT_FOUND;
+    }
+    char path[GIT_OUTPUT_MAX];
+    char gitdir[GIT_OUTPUT_MAX];
+    char line[GIT_OUTPUT_MAX];
+    /* An index root can sit below the checkout root (repo/services/api): walk
+     * up to the nearest directory holding a .git, as git itself does. */
+    char top[GIT_OUTPUT_MAX];
+    snprintf(top, sizeof(top), "%s", root);
+    cbm_stat_t st; /* cbm_stat: non-ASCII and long checkout paths on Windows */
+    for (;;) {
+        /* Drop trailing separators ("/repo/sub/", or what a cut below
+         * leaves of "/repo//sub"): the cut would otherwise land on one and
+         * end the walk before /repo/.git is probed. A filesystem root ("/",
+         * "C:\") keeps its separator: "C:" alone is a relative path. */
+        size_t len = strlen(top);
+        while (len > 1 && !(len == 3 && top[1] == ':') &&
+               (top[len - 1] == '/' || top[len - 1] == '\\')) {
+            top[--len] = '\0';
+        }
+        bool at_root =
+            (len == 1 && (top[0] == '/' || top[0] == '\\')) || (len == 3 && top[1] == ':');
+        int n = snprintf(path, sizeof(path), "%s%s.git", top, at_root ? "" : "/");
+#ifdef CBM_ENABLE_TEST_SEAMS
+        if (g_head_probe_cb && n > 0 && (size_t)n < sizeof(path)) {
+            g_head_probe_cb(path, g_head_probe_data);
+        }
+#endif
+        if (n > 0 && (size_t)n < sizeof(path) && cbm_stat(path, &st) == 0) {
+            break;
+        }
+        if (at_root) {
+            return CBM_NOT_FOUND; /* the filesystem root was probed too */
+        }
+        char *slash = strrchr(top, '/');
+        char *bslash = strrchr(top, '\\');
+        if (bslash && (!slash || bslash > slash)) {
+            slash = bslash;
+        }
+        if (!slash) {
+            return CBM_NOT_FOUND; /* a relative path with nothing above */
+        }
+        /* A repository rooted at the filesystem root ("/", "C:\\") is probed
+         * once more: "/sub" becomes "/" and "C:\\sub" becomes "C:\\" -- with
+         * its separator, "C:" alone being a drive-relative path. */
+        if (slash == top) {
+            top[1] = '\0';
+        } else if (slash == top + 2 && top[1] == ':') {
+            top[3] = '\0';
+        } else {
+            *slash = '\0';
+        }
+        if (strlen(top) >= len) {
+            /* No progress: a root this walk does not recognize (a UNC
+             * path's \\server reduced to a lone backslash). Stop rather
+             * than probe it forever. */
+            return CBM_NOT_FOUND;
+        }
+    }
+    if (S_ISDIR(st.st_mode)) {
+        snprintf(gitdir, sizeof(gitdir), "%s", path);
+    } else {
+        /* Linked worktree or submodule: ".git" holds "gitdir: <dir>",
+         * absolute or relative to the directory holding that file. */
+        static const char prefix[] = "gitdir: ";
+        if (!read_first_line(path, line, sizeof(line)) ||
+            strncmp(line, prefix, sizeof(prefix) - 1) != 0 ||
+            !path_under(top, line + sizeof(prefix) - 1, gitdir, sizeof(gitdir))) {
+            return CBM_NOT_FOUND;
+        }
+    }
+    /* Branch refs live in the common dir; a linked worktree's gitdir names it
+     * in its "commondir" file, relative to the gitdir. */
+    char common[GIT_OUTPUT_MAX];
+    snprintf(path, sizeof(path), "%s/commondir", gitdir);
+    if (!read_first_line(path, line, sizeof(line)) ||
+        !path_under(gitdir, line, common, sizeof(common))) {
+        snprintf(common, sizeof(common), "%s", gitdir);
+    }
+    snprintf(path, sizeof(path), "%s/HEAD", gitdir);
+    char *head = read_first_line_dup(path); /* whole line: names are unbounded */
+    if (!head) {
+        return CBM_NOT_FOUND;
+    }
+    static const char ref_prefix[] = "ref: refs/heads/";
+    int rc = CBM_NOT_FOUND;
+    if (strncmp(head, ref_prefix, sizeof(ref_prefix) - 1) == 0) {
+        const char *branch = head + sizeof(ref_prefix) - 1;
+        /* A reftable repository keeps refs out of the file tree and points
+         * HEAD at the placeholder "refs/heads/.invalid". */
+        snprintf(path, sizeof(path), "%s/reftable", common);
+        if (strcmp(branch, ".invalid") != 0 && !cbm_is_dir(path)) {
+            out->branch = git_strdup(branch);
+            (void)read_branch_sha(common, branch, out->head_sha, sizeof(out->head_sha));
+            rc = out->branch ? 0 : CBM_NOT_FOUND;
+        }
+    } else if (is_object_id(head)) {
+        /* A detached HEAD holds the commit id itself. */
+        out->is_detached = true;
+        snprintf(out->head_sha, sizeof(out->head_sha), "%s", head);
+        rc = 0;
+    }
+    free(head);
+    return rc;
+}
+
+void cbm_git_head_free(cbm_git_head_t *head) {
+    if (head) {
+        free(head->branch);
+        head->branch = NULL;
+    }
+}
+
+char *cbm_git_branch_slug(const char *branch, bool detached) {
+    return slug_from_branch(branch, detached);
 }
 
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx) {
@@ -505,4 +870,192 @@ int cbm_git_context_props_json(const cbm_git_context_t *ctx, char *buf, int buf_
         return 0;
     }
     return off;
+}
+
+char *cbm_git_context_props_json_dup(const cbm_git_context_t *ctx) {
+    for (int size = 4096; size <= (1 << 24); size *= 2) {
+        char *buf = (char *)malloc((size_t)size);
+        if (!buf) {
+            return NULL;
+        }
+        if (cbm_git_context_props_json(ctx, buf, size) > 0) {
+            return buf;
+        }
+        free(buf);
+    }
+    return NULL;
+}
+
+cbm_git_checkout_kind_t cbm_git_checkout_root_kind(const char *dir) {
+    if (!dir || !dir[0]) {
+        return CBM_GIT_CHECKOUT_NONE;
+    }
+    char dot_git[CBM_SZ_4K];
+    if (snprintf(dot_git, sizeof(dot_git), "%s/.git", dir) >= (int)sizeof(dot_git)) {
+        return CBM_GIT_CHECKOUT_NONE;
+    }
+    if (cbm_is_dir(dot_git)) {
+        return CBM_GIT_CHECKOUT_MAIN;
+    }
+    return cbm_file_exists(dot_git) ? CBM_GIT_CHECKOUT_GITLINK : CBM_GIT_CHECKOUT_NONE;
+}
+
+bool cbm_git_is_linked_worktree(const char *dir) {
+    if (cbm_git_checkout_root_kind(dir) != CBM_GIT_CHECKOUT_GITLINK) {
+        return false;
+    }
+    char path[CBM_SZ_4K];
+    snprintf(path, sizeof(path), "%s/.git", dir);
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return false;
+    }
+    char line[CBM_SZ_4K];
+    bool got = fgets(line, sizeof(line), f) != NULL;
+    bool cut = got && !strchr(line, '\n') && fgetc(f) != EOF;
+    fclose(f);
+    if (!got || strncmp(line, "gitdir:", 7) != 0) {
+        return false;
+    }
+    /* "gitdir: <common>/worktrees/<name>" — a submodule's is ".../modules/<path>".
+     * Strip the line end and trailing separators, then the <name> component.
+     * The admin directory must hold the "commondir" file git writes for every
+     * linked worktree: a submodule at worktrees/foo has the gitdir
+     * .git/modules/worktrees/foo, whose parent is named "worktrees" too.
+     * A gitdir path too long to check (the line or the commondir path does
+     * not fit the buffer) answers yes, as discover's mirror of this check
+     * does: a linked worktree taken for a submodule is indexed twice. */
+    if (cut) {
+        return true;
+    }
+    char *val = line + 7;
+    size_t n = strlen(val);
+    for (size_t i = 0; i < n; i++) {
+        if (val[i] == '\\') {
+            val[i] = '/';
+        }
+    }
+    while (n > 0 &&
+           (val[n - 1] == '\n' || val[n - 1] == '\r' || val[n - 1] == ' ' || val[n - 1] == '/')) {
+        val[--n] = '\0';
+    }
+    while (*val == ' ') {
+        val++;
+    }
+    char commondir[CBM_SZ_4K];
+    int cn = path_is_absolute(val)
+                 ? snprintf(commondir, sizeof(commondir), "%s/commondir", val)
+                 : snprintf(commondir, sizeof(commondir), "%s/%s/commondir", dir, val);
+    if (cn <= 0 || cn >= (int)sizeof(commondir)) {
+        return true;
+    }
+    if (!cbm_file_exists(commondir)) {
+        return false;
+    }
+    char *name = strrchr(val, '/');
+    if (!name) {
+        return false;
+    }
+    *name = '\0';
+    const char *parent = strrchr(val, '/');
+    return parent && strcmp(parent + 1, "worktrees") == 0;
+}
+
+/* The git dir a gitlink at <dir>/.git names, resolved against dir and
+ * canonical (cbm_root_canonical); false when dir has no readable gitlink. */
+static bool gitlink_target(const char *dir, char *out, size_t out_sz) {
+    char path[CBM_SZ_4K];
+    if (snprintf(path, sizeof(path), "%s/.git", dir) >= (int)sizeof(path)) {
+        return false;
+    }
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return false;
+    }
+    char line[CBM_SZ_4K];
+    bool got = fgets(line, sizeof(line), f) != NULL;
+    fclose(f);
+    if (!got || strncmp(line, "gitdir:", 7) != 0) {
+        return false;
+    }
+    char *v = line + 7;
+    while (*v == ' ') {
+        v++;
+    }
+    size_t n = strlen(v);
+    while (n > 0 && (v[n - 1] == '\n' || v[n - 1] == '\r' || v[n - 1] == ' ')) {
+        v[--n] = '\0';
+    }
+    if (!v[0]) {
+        return false;
+    }
+    bool absolute = v[0] == '/' || v[0] == '\\' || (v[0] && v[1] == ':');
+    char joined[CBM_SZ_4K];
+    int jn = absolute ? snprintf(joined, sizeof(joined), "%s", v)
+                      : snprintf(joined, sizeof(joined), "%s/%s", dir, v);
+    return jn > 0 && jn < (int)sizeof(joined) && cbm_root_canonical(joined, out, out_sz);
+}
+
+bool cbm_git_gitlink_is_submodule(const char *dir) {
+    if (cbm_git_checkout_root_kind(dir) != CBM_GIT_CHECKOUT_GITLINK ||
+        cbm_git_is_linked_worktree(dir)) {
+        return false;
+    }
+    char target[CBM_SZ_4K];
+    if (!gitlink_target(dir, target, sizeof(target))) {
+        return false;
+    }
+    /* A submodule's git dir lives in its superproject's git dir, under
+     * "modules": <super>/.git/modules/<path>, or, for a submodule of a
+     * submodule, <the parent submodule's git dir>/modules/<path>. The
+     * superproject is the nearest enclosing directory with a .git of its
+     * own. Anything else -- a git dir put elsewhere with --separate-git-dir,
+     * wherever it sits, even under a directory named "modules" -- is a
+     * repository of its own: a checkout boundary. */
+    char up[CBM_SZ_4K];
+    if (!cbm_root_canonical(dir, up, sizeof(up))) {
+        return false;
+    }
+    for (;;) {
+        bool at_root =
+            (up[0] == '/' && up[1] == '\0') || (up[1] == ':' && up[2] == '/' && up[3] == '\0');
+        if (at_root) {
+            return false; /* the filesystem root was probed: no superproject */
+        }
+        char *slash = strrchr(up, '/');
+        if (!slash) {
+            return false;
+        }
+        /* Keep a root's separator ("/", "C:/"): it is probed too, once -- a
+         * superproject rooted at the filesystem root has its .git there. */
+        if (slash == up) {
+            up[1] = '\0';
+        } else if (slash == up + 2 && up[1] == ':') {
+            up[3] = '\0';
+        } else {
+            *slash = '\0';
+        }
+#ifdef CBM_ENABLE_TEST_SEAMS
+        if (g_head_probe_cb) {
+            g_head_probe_cb(up, g_head_probe_data); /* each superproject candidate */
+        }
+#endif
+        cbm_git_checkout_kind_t kind = cbm_git_checkout_root_kind(up);
+        if (kind == CBM_GIT_CHECKOUT_NONE) {
+            continue;
+        }
+        char super_git[CBM_SZ_4K];
+        if (kind == CBM_GIT_CHECKOUT_MAIN) {
+            char dot[CBM_SZ_4K];
+            snprintf(dot, sizeof(dot), "%s/.git", up);
+            if (!cbm_root_canonical(dot, super_git, sizeof(super_git))) {
+                return false;
+            }
+        } else if (!gitlink_target(up, super_git, sizeof(super_git))) {
+            return false;
+        }
+        char prefix[CBM_SZ_4K];
+        int pn = snprintf(prefix, sizeof(prefix), "%s/modules/", super_git);
+        return pn > 0 && pn < (int)sizeof(prefix) && strncmp(target, prefix, (size_t)pn) == 0;
+    }
 }

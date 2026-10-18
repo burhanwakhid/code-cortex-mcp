@@ -69,6 +69,7 @@ enum {
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "store/store.h"
+#include "foundation/sha256.h"
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
@@ -83,12 +84,17 @@ enum {
 
 #include <sqlite3.h>
 #include <atomic>
+#include <ctype.h>
+#include <string>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include "foundation/win_utf8.h"
+#endif
 
 /* ── SQLite bind helpers ───────────────────────────────────────── */
 
@@ -153,6 +159,19 @@ struct cbm_store {
     sqlite3_stmt *stmt_get_file_hashes;
     sqlite3_stmt *stmt_delete_file_hash;
     sqlite3_stmt *stmt_delete_file_hashes;
+
+    cbm_db_lease_t *read_gate; /* shared reader gate, or NULL (ungated) */
+
+    /* Identity (device, inode) of the file a query open read, taken around
+     * the open: cbm_store_hold_read_gate compares it with the file at the
+     * path. open_id_known is false where the platform has no inode (Windows,
+     * where an open database cannot be moved anyway); open_id_raced is true
+     * when the path changed files during the open, so which one the
+     * connection reads is unknown. */
+    uint64_t open_dev;
+    uint64_t open_ino;
+    bool open_id_known;
+    bool open_id_raced;
 };
 
 /* ── Helpers ────────────────────────────────────────────────────── */
@@ -560,6 +579,39 @@ int64_t cbm_store_resolve_mmap_size(void) {
  * django index). 64 MiB = 1024 pages, the budget bulk mode already used; the
  * cache only grows as pages are touched. Query connections keep the default. */
 static const char ST_WRITE_CACHE_SQL[] = "PRAGMA cache_size = -65536;";
+int64_t cbm_store_resolve_journal_size_limit(void) {
+    enum { BASE_10 = 10 };
+    const int64_t jsl_default = (int64_t)256 * 1024 * 1024; /* 256 MiB */
+    char buf[ST_BUF_64];
+    if (cbm_safe_getenv("CBM_SQLITE_JOURNAL_SIZE_LIMIT", buf, sizeof(buf), NULL) == NULL) {
+        return jsl_default;
+    }
+    char *end = NULL;
+    errno = 0;
+    long long parsed = strtoll(buf, &end, BASE_10);
+    /* Malformed or out of range (strtoll saturates, ERANGE): the default,
+     * never a failed open and never an unbounded WAL from a typo. */
+    if (end == buf || *end != '\0' || errno == ERANGE) {
+        return jsl_default;
+    }
+    return parsed < 0 ? -1 : (int64_t)parsed;
+}
+
+int64_t cbm_store_journal_size_limit(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, "PRAGMA journal_size_limit;", -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    int64_t limit = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        limit = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return limit;
+}
 
 /* Configure connection pragmas.
  *   in_memory  — :memory: DB (synchronous OFF, no journal file).
@@ -602,15 +654,31 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory, bool read_only) {
         if (rc != CBM_STORE_OK) {
             return rc;
         }
-        /* Recover stale WAL from previous crash (best-effort).
-         * PASSIVE never blocks readers and never ftruncates.
-         * May fail with SQLITE_BUSY if another process holds a lock. */
+        /* Recover stale WAL from previous crash (best-effort). PASSIVE
+         * copies what it can without waiting for or blocking readers; it
+         * may fail with SQLITE_BUSY if another process holds a lock. See
+         * cbm_store_checkpoint for which shrinks of the files are safe. */
         (void)sqlite3_exec(s->db, "PRAGMA wal_checkpoint(PASSIVE)", NULL, NULL, NULL);
         rc = exec_sql(s, "PRAGMA synchronous = NORMAL;");
         if (rc != CBM_STORE_OK) {
             return rc;
         }
         rc = exec_sql(s, ST_WRITE_CACHE_SQL);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+        /* #1083: bound the -wal file. Without a limit SQLite never shrinks
+         * it while the database is open, so a log that grew while readers
+         * starved the checkpoint (or a branch restore, which commits the
+         * whole database through the WAL) keeps its peak size on disk. With
+         * one, the first write after a full checkpoint resets the log and
+         * truncates the file to the limit. The default (256 MiB) is far
+         * above the healthy WAL (one autocheckpoint, ~66 MB at this page
+         * size), so normal runs never truncate and regrow. */
+        char jsl_sql[ST_BUF_64];
+        snprintf(jsl_sql, sizeof(jsl_sql), "PRAGMA journal_size_limit = %lld;",
+                 (long long)cbm_store_resolve_journal_size_limit());
+        rc = exec_sql(s, jsl_sql);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
@@ -805,6 +873,74 @@ static void sqlite_cosine_i8(sqlite3_context *ctx, int argc, sqlite3_value **arg
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
+/* sqlite3_open_v2 for a file path. SQLite's win32 VFS opens a path through
+ * the wide APIs as it is given: past MAX_PATH that needs the extended-length
+ * form (\\?\C:\...), which the VFS accepts but never adds. A branch slot
+ * named after a long branch is that long. Elsewhere the path goes as is. */
+int cbm_store_sqlite_open(const char *path, sqlite3 **db, int flags) {
+#ifdef _WIN32
+    char *long_path = path ? cbm_utf8_long_path(path) : NULL;
+    int rc = sqlite3_open_v2(long_path ? long_path : path, db, flags, NULL);
+    free(long_path);
+    return rc;
+#else
+    return sqlite3_open_v2(path, db, flags, NULL);
+#endif
+}
+
+/* Whether path is an SQLite file in WAL mode: its header's read and write
+ * format versions (bytes 18 and 19) are 2. */
+static bool sqlite_file_is_wal(const char *path) {
+    enum { HDR_LEN = 20, WAL_VERSION = 2 };
+    unsigned char hdr[HDR_LEN];
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    bool got = fread(hdr, 1, sizeof(hdr), f) == sizeof(hdr);
+    fclose(f);
+    return got && memcmp(hdr, "SQLite format 3", 16) == 0 && hdr[18] == WAL_VERSION &&
+           hdr[19] == WAL_VERSION;
+}
+
+/* "file:" URI for path, every byte outside the unreserved set escaped. */
+static std::string sqlite_file_uri(const char *path) {
+    static const char hex[] = "0123456789ABCDEF";
+    std::string uri = "file:";
+#ifdef _WIN32
+    if (isalpha((unsigned char)path[0]) && path[1] == ':') {
+        uri += '/'; /* file:/C:/... */
+    }
+#endif
+    for (const unsigned char *c = (const unsigned char *)path; *c; c++) {
+        unsigned char ch = *c;
+#ifdef _WIN32
+        if (ch == '\\') {
+            ch = '/';
+        }
+#endif
+        if (isalnum(ch) || strchr("/-._~:", ch)) {
+            uri += (char)ch;
+        } else {
+            uri += '%';
+            uri += hex[ch >> 4];
+            uri += hex[ch & 0xF];
+        }
+    }
+    return uri + "?immutable=1";
+}
+
+int cbm_store_sqlite_open_inspect(const char *path, sqlite3 **db) {
+    if (path && sqlite_file_is_wal(path)) {
+        std::string wal = std::string(path) + "-wal";
+        if (!cbm_file_exists(wal.c_str())) {
+            return sqlite3_open_v2(sqlite_file_uri(path).c_str(), db,
+                                   SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL);
+        }
+    }
+    return cbm_store_sqlite_open(path, db, SQLITE_OPEN_READONLY);
+}
+
 /* SQLite authorizer: deny dangerous operations that could be exploited via
  * SQL injection through the Cypher→SQL translation layer. */
 static int store_authorizer(void *user_data, int action, const char *p3, const char *p4,
@@ -823,19 +959,20 @@ static int store_authorizer(void *user_data, int action, const char *p3, const c
     }
 }
 
-static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
+static cbm_store_t *store_open_internal(const char *path, bool in_memory, bool create = true) {
     cbm_store_t *s = (cbm_store_t *)calloc(CBM_ALLOC_ONE, sizeof(cbm_store_t));
     if (!s) {
         return NULL;
     }
 
-    int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+    int flags = SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0);
     if (in_memory) {
         flags |= SQLITE_OPEN_MEMORY;
     }
 
-    int rc = sqlite3_open_v2(path, &s->db, flags, NULL);
+    int rc = cbm_store_sqlite_open(path, &s->db, flags);
     if (rc != SQLITE_OK) {
+        sqlite3_close(s->db); /* a failed open still allocates the handle */
         free(s);
         return NULL;
     }
@@ -881,6 +1018,13 @@ cbm_store_t *cbm_store_open_path(const char *db_path) {
         return NULL;
     }
     return store_open_internal(db_path, false);
+}
+
+cbm_store_t *cbm_store_open_path_existing(const char *db_path) {
+    if (!db_path) {
+        return NULL;
+    }
+    return store_open_internal(db_path, false, false);
 }
 
 const char *cbm_store_db_path(const cbm_store_t *s) {
@@ -946,6 +1090,18 @@ static bool build_immutable_uri(const char *path, char *out, size_t out_sz) {
     return true;
 }
 
+/* (device, inode) of the file at path; false when it cannot be stat'ed or the
+ * platform reports no inode (st_ino is 0 on Windows). */
+static bool store_file_id(const char *path, uint64_t *dev, uint64_t *ino) {
+    cbm_stat_t st;
+    if (cbm_stat(path, &st) != 0 || st.st_ino == 0) {
+        return false;
+    }
+    *dev = (uint64_t)st.st_dev;
+    *ino = (uint64_t)st.st_ino;
+    return true;
+}
+
 cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     if (!db_path) {
         return NULL;
@@ -955,6 +1111,10 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     if (!s) {
         return NULL;
     }
+    /* The file at the path before the open; compared after it below. */
+    uint64_t pre_dev = 0;
+    uint64_t pre_ino = 0;
+    bool pre_known = store_file_id(db_path, &pre_dev, &pre_ino);
 
     /* Query tools open the project DB READ-ONLY: a read query must never
      * mutate the DB (the previous READWRITE open + WAL write-pragmas did),
@@ -969,7 +1129,7 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
      *
      * No SQLITE_OPEN_CREATE on either path — a missing DB must return NULL
      * (no ghost .db for unknown/unindexed projects). */
-    int rc = sqlite3_open_v2(db_path, &s->db, SQLITE_OPEN_READONLY, NULL);
+    int rc = cbm_store_sqlite_open(db_path, &s->db, SQLITE_OPEN_READONLY);
     if (rc == SQLITE_OK) {
         /* Force first DB access so a read-only-FS WAL failure surfaces now. */
         if (sqlite3_exec(s->db, "SELECT 1 FROM sqlite_master LIMIT 1;", NULL, NULL, NULL) !=
@@ -1005,6 +1165,22 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     }
 
     s->db_path = heap_strdup(db_path);
+    /* SQLite opened its descriptor between the two stats. The same file at
+     * both is the file it reads; different files mean it may read either. */
+    uint64_t post_dev = 0;
+    uint64_t post_ino = 0;
+    bool post_known = store_file_id(db_path, &post_dev, &post_ino);
+    if (pre_known) {
+        /* A path with no file at the second stat changed under the open
+         * (moved to trash, replaced): the connection may read the old inode,
+         * so it is a race as much as a different file is. Unknown here, and a
+         * path recreated before store_still_at_path asks, was taken on the
+         * path's existence alone. */
+        s->open_id_known = true;
+        s->open_id_raced = !post_known || pre_dev != post_dev || pre_ino != post_ino;
+        s->open_dev = pre_dev;
+        s->open_ino = pre_ino;
+    }
 
     /* Security: block ATTACH/DETACH to prevent file creation via SQL injection. */
     sqlite3_set_authorizer(s->db, store_authorizer, NULL);
@@ -1027,6 +1203,71 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     }
 
     return s;
+}
+
+cbm_store_t *cbm_store_open_path_reader(const char *db_path) {
+    /* Gate first: an open that waited on a move finds the file gone. A gate
+     * held exclusive past the wait is a move or delete still in progress:
+     * no connection, as an ungated one could be left reading the moved file.
+     * A gate that cannot be had at all (a read-only cache, no lock file)
+     * leaves the connection ungated, as before the gate existed: the sweep
+     * cannot take that gate either, so it moves nothing. */
+    cbm_db_lease_t *gate = NULL;
+    if (cbm_db_read_gate_acquire(db_path, false, &gate) == CBM_INDEX_BUSY) {
+        return NULL;
+    }
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        cbm_db_lease_release(gate);
+        return NULL;
+    }
+    s->read_gate = gate;
+    return s;
+}
+
+/* Whether the file this connection reads is still the one at its path. A
+ * path that merely exists is not enough: a move to trash followed by a
+ * restore or re-index puts another file there, while the connection still
+ * reads the moved one. */
+static bool store_still_at_path(const cbm_store_t *s) {
+    if (!cbm_file_exists(s->db_path)) {
+        return false;
+    }
+    if (!s->open_id_known) {
+        return true; /* no inode (Windows): an open database cannot be moved */
+    }
+    uint64_t dev = 0;
+    uint64_t ino = 0;
+    return !s->open_id_raced && store_file_id(s->db_path, &dev, &ino) && dev == s->open_dev &&
+           ino == s->open_ino;
+}
+
+bool cbm_store_open_inode(const cbm_store_t *s, uint64_t *ino) {
+    if (!s || !ino || !s->open_id_known || s->open_id_raced) {
+        return false;
+    }
+    *ino = s->open_ino;
+    return true;
+}
+
+bool cbm_store_hold_read_gate(cbm_store_t *s) {
+    if (!s || !s->db_path || s->read_gate) {
+        return true;
+    }
+    cbm_db_lease_t *gate = NULL;
+    int rc = cbm_db_read_gate_acquire(s->db_path, false, &gate);
+    if (rc == CBM_INDEX_BUSY) {
+        return false; /* a move in progress: the file may leave under us */
+    }
+    if (rc != 0) {
+        return store_still_at_path(s);
+    }
+    if (!store_still_at_path(s)) {
+        cbm_db_lease_release(gate);
+        return false;
+    }
+    s->read_gate = gate;
+    return true;
 }
 
 /* ── Integrity check ───────────────────────────────────────────── */
@@ -1303,12 +1544,24 @@ void cbm_store_close(cbm_store_t *s) {
     /* Use sqlite3_close_v2 — auto-deallocates when last statement finalizes.
      * Prevents ASan false-positive leaks from sqlite3 internal state. */
     sqlite3_close_v2(s->db);
+    cbm_db_lease_release(s->read_gate); /* after the connection is gone */
     safe_str_free(&s->db_path);
     free(s);
 }
 
 sqlite3 *cbm_store_get_db(cbm_store_t *s) {
     return s ? s->db : NULL;
+}
+
+void cbm_store_end_reads(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return;
+    }
+    for (sqlite3_stmt *st = sqlite3_next_stmt(s->db, NULL); st; st = sqlite3_next_stmt(s->db, st)) {
+        if (sqlite3_stmt_busy(st)) {
+            sqlite3_reset(st);
+        }
+    }
 }
 
 int cbm_store_exec(cbm_store_t *s, const char *sql) {
@@ -1379,11 +1632,17 @@ int cbm_store_checkpoint(cbm_store_t *s) {
     if (!s) {
         return CBM_STORE_ERR;
     }
-    /* PASSIVE never blocks readers and never ftruncate()s either file.
-     * SQLite recommends PASSIVE for shared databases — TRUNCATE shrinks
-     * the WAL via ftruncate(fd, 0) on success, which on macOS can raise
-     * SIGBUS in a sibling process that has the DB mmap'd through SQLite
-     * when it next faults a page in the now-shorter region.
+    /* PASSIVE: copies what it can without waiting for or blocking readers
+     * (TRUNCATE/RESTART would wait on readers via the busy handler). Any
+     * mode may shrink the main db file when the whole WAL is backfilled,
+     * and a WAL reset may truncate the -wal under journal_size_limit; both
+     * are safe for other processes: SQLite reads the -wal with pread (it is
+     * never mmap'd) and shrinks either file only under locks that exclude
+     * every reader still using the removed part. What does raise SIGBUS
+     * ("cluster_pagein past EOF", v0.6.0) is a non-SQLite truncate of the
+     * main db while another process has it mmap'd (mmap_size /
+     * CBM_SQLITE_MMAP_SIZE): never rewrite a live db in place -- publish
+     * via temp file + rename (cbm_write_db).
      * See https://www.sqlite.org/c3ref/c_checkpoint_full.html */
     int rc = sqlite3_wal_checkpoint_v2(s->db, NULL, SQLITE_CHECKPOINT_PASSIVE, NULL, NULL);
     if (rc != SQLITE_OK) {
@@ -1404,22 +1663,35 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
         return CBM_STORE_ERR;
     }
 
+    /* Both buffers must hold their whole path: a cut temp name could be
+     * dest_path itself (unlinked below, then written in place, no longer
+     * atomic) or another file; a cut directory name would create the wrong
+     * one. Refused rather than truncated. */
+    char dir[CBM_PATH_MAX];
+    char tmp_path[CBM_PATH_MAX];
+    int dn = snprintf(dir, sizeof(dir), "%s", dest_path);
+    int tn = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", dest_path);
+    if (dn <= 0 || (size_t)dn >= sizeof(dir) || tn <= 0 || (size_t)tn >= sizeof(tmp_path)) {
+        store_set_error(s, "dump: destination path too long");
+        return CBM_STORE_ERR;
+    }
+
     /* Ensure parent directory exists */
-    char dir[CBM_SZ_1K];
-    snprintf(dir, sizeof(dir), "%s", dest_path);
     char *sl = strrchr(dir, '/');
     if (sl) {
         *sl = '\0';
+#ifdef _WIN32
+        (void)cbm_mkdir_p(dir, 0755); /* wide, and past MAX_PATH */
+#else
         (void)cbm_mkdir(dir);
+#endif
     }
 
     /* Write to temp file for atomic swap */
-    char tmp_path[CBM_SZ_1K];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", dest_path);
-    (void)unlink(tmp_path);
+    (void)cbm_unlink(tmp_path);
 
     sqlite3 *dest_db = NULL;
-    int rc = sqlite3_open(tmp_path, &dest_db);
+    int rc = cbm_store_sqlite_open(tmp_path, &dest_db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
     if (rc != SQLITE_OK) {
         store_set_error(s, "dump: cannot open temp file");
         return CBM_STORE_ERR;
@@ -1429,7 +1701,7 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
     if (!bk) {
         store_set_error(s, "dump: backup init failed");
         sqlite3_close(dest_db);
-        (void)unlink(tmp_path);
+        (void)cbm_unlink(tmp_path);
         return CBM_STORE_ERR;
     }
 
@@ -1439,7 +1711,7 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
     if (rc != SQLITE_DONE) {
         store_set_error(s, "dump: backup step failed");
         sqlite3_close(dest_db);
-        (void)unlink(tmp_path);
+        (void)cbm_unlink(tmp_path);
         return CBM_STORE_ERR;
     }
 
@@ -1458,7 +1730,7 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
      * dump_install_ignores_stale_wal_sidecar on the Windows runner). */
     if (cbm_rename_replace(tmp_path, dest_path) != 0) {
         store_set_error(s, "dump: rename failed");
-        (void)unlink(tmp_path);
+        (void)cbm_unlink(tmp_path);
         return CBM_STORE_ERR;
     }
 
@@ -2657,8 +2929,7 @@ int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash
 int cbm_store_get_file_hash(cbm_store_t *s, const char *project, const char *rel_path,
                             char *sha256_out, size_t sha256_out_size, int64_t *mtime_ns,
                             int64_t *size) {
-    if (!s || !project || !rel_path || !sha256_out || sha256_out_size == 0 || !mtime_ns ||
-        !size) {
+    if (!s || !project || !rel_path || !sha256_out || sha256_out_size == 0 || !mtime_ns || !size) {
         return CBM_STORE_ERR;
     }
     sha256_out[0] = '\0';
@@ -3272,6 +3543,275 @@ int cbm_store_set_format_version(cbm_store_t *s, int version) {
     char sql[ST_BUF_64];
     snprintf(sql, sizeof(sql), "PRAGMA user_version = %d;", version);
     return exec_sql(s, sql);
+}
+
+/* ── Indexed branch (the project's Branch node) ─────────────────── */
+
+int cbm_store_get_branch(cbm_store_t *s, const char *project, char *qn_buf, size_t qn_sz,
+                         char *name_buf, size_t name_sz) {
+    return cbm_store_get_branch_props(s, project, qn_buf, qn_sz, name_buf, name_sz, NULL, 0);
+}
+
+int cbm_store_get_branch_props(cbm_store_t *s, const char *project, char *qn_buf, size_t qn_sz,
+                               char *name_buf, size_t name_sz, char *props_buf, size_t props_sz) {
+    if (qn_buf && qn_sz > 0) {
+        qn_buf[0] = '\0';
+    }
+    if (name_buf && name_sz > 0) {
+        name_buf[0] = '\0';
+    }
+    if (props_buf && props_sz > 0) {
+        props_buf[0] = '\0';
+    }
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT qualified_name, name, properties FROM nodes "
+                           "WHERE project = ?1 AND label = 'Branch' ORDER BY id LIMIT 1;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int rc = sqlite3_step(stmt);
+    int result = CBM_STORE_NOT_FOUND;
+    if (rc == SQLITE_ROW) {
+        const char *qn = (const char *)sqlite3_column_text(stmt, 0);
+        const char *name = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        if (qn_buf && qn_sz > 0) {
+            snprintf(qn_buf, qn_sz, "%s", qn ? qn : "");
+        }
+        if (name_buf && name_sz > 0) {
+            snprintf(name_buf, name_sz, "%s", name ? name : "");
+        }
+        const char *props = (const char *)sqlite3_column_text(stmt, ST_COL_2);
+        if (props_buf && props_sz > 0) {
+            snprintf(props_buf, props_sz, "%s", props ? props : "");
+        }
+        result = CBM_STORE_OK;
+    } else if (rc != SQLITE_DONE) {
+        result = CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+/* Step one statement on the project's Branch row(s): ?1 project, then the
+ * optional ?2..?4 texts. SQLITE_DONE/ROW as an int, or -1 when it would not
+ * prepare. */
+static int branch_exec(cbm_store_t *s, const char *sql, const char *project, const char *a,
+                       const char *b, const char *c) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    if (a) {
+        bind_text(stmt, ST_COL_2, a);
+    }
+    if (b) {
+        bind_text(stmt, ST_COL_3, b);
+    }
+    if (c) {
+        bind_text(stmt, ST_COL_4, c);
+    }
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+/* Remove (del) or add the Branch row's nodes_fts entry. nodes_fts is
+ * contentless: a delete must repeat the values the entry was indexed with,
+ * so this computes them exactly as cbm_store_fts_rebuild does, trying the
+ * same capability ladder in the same order. */
+static bool fts_branch_row(cbm_store_t *s, const char *project, bool del) {
+    const bool with_body = fts_has_body_column(s);
+    static const struct {
+        bool body;
+        bool camel;
+    } ladder[] = {{true, true}, {true, false}, {false, true}, {false, false}};
+    for (const auto &step : ladder) {
+        if (step.body && !with_body) {
+            continue;
+        }
+        char sql[FTS_SQL_BUF * 2];
+        int n = snprintf(sql, sizeof(sql),
+                         "INSERT INTO nodes_fts (%srowid, name, qualified_name, label, file_path%s)"
+                         " SELECT %sid, %s, qualified_name, label, file_path%s FROM nodes"
+                         " WHERE project = ?1 AND label = 'Branch';",
+                         del ? "nodes_fts, " : "", step.body ? ", body" : "",
+                         del ? "'delete', " : "", step.camel ? "cbm_camel_split(name)" : "name",
+                         step.body ? ", " FTS_BODY_EXPR : "");
+        if (n <= 0 || (size_t)n >= sizeof(sql)) {
+            return false;
+        }
+        if (branch_exec(s, sql, project, NULL, NULL, NULL) == SQLITE_DONE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Whether the Branch row has a nodes_fts entry to keep in step. None when
+ * FTS5 is absent or the index was never backfilled (a legacy database opened
+ * read-write gets an empty nodes_fts); a contentless 'delete' of an entry
+ * that is not there reports corruption, and adding just this one row would
+ * make an empty index look populated. */
+static bool fts_branch_indexed(cbm_store_t *s, const char *project) {
+    return branch_exec(s,
+                       "SELECT 1 FROM nodes_fts WHERE rowid = (SELECT id FROM nodes WHERE "
+                       "project = ?1 AND label = 'Branch' ORDER BY id LIMIT 1);",
+                       project, NULL, NULL, NULL) == SQLITE_ROW;
+}
+
+bool cbm_store_content_fingerprint(cbm_store_t *s, const char *project,
+                                   char out[CBM_SHA256_HEX_LEN + 1]) {
+    out[0] = '\0';
+    sqlite3_stmt *stmt = NULL;
+    if (!s || !s->db || !project ||
+        sqlite3_prepare_v2(s->db,
+                           "SELECT rel_path, sha256 FROM file_hashes WHERE project = ?1 "
+                           "ORDER BY rel_path;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    cbm_sha256_ctx c;
+    cbm_sha256_init(&c);
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        for (int col = 0; col < 2; col++) {
+            const unsigned char *v = sqlite3_column_text(stmt, col);
+            int n = sqlite3_column_bytes(stmt, col);
+            cbm_sha256_update(&c, v ? v : (const unsigned char *)"", (size_t)n);
+            cbm_sha256_update(&c, "", 1); /* field separator: NUL */
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        return false;
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&c, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[(i * 2) + 1] = hex[digest[i] & 0xF];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+    return true;
+}
+
+int cbm_store_get_branch_dup(cbm_store_t *s, const char *project, char **qn, char **name,
+                             char **props) {
+    char **outs[] = {qn, name, props};
+    for (char **o : outs) {
+        if (o) {
+            *o = NULL;
+        }
+    }
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT qualified_name, name, properties FROM nodes "
+                           "WHERE project = ?1 AND label = 'Branch' ORDER BY id LIMIT 1;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int rc = sqlite3_step(stmt);
+    int result = rc == SQLITE_ROW    ? CBM_STORE_OK
+                 : rc == SQLITE_DONE ? CBM_STORE_NOT_FOUND
+                                     : CBM_STORE_ERR;
+    for (int i = 0; result == CBM_STORE_OK && i < 3; i++) {
+        if (outs[i]) {
+            const char *v = (const char *)sqlite3_column_text(stmt, i);
+            *outs[i] = heap_strdup(v ? v : "");
+        }
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+int cbm_store_set_branch(cbm_store_t *s, const char *project, const char *qn, const char *name,
+                         const char *props_json) {
+    if (!s || !s->db || !project || !qn || !name) {
+        return CBM_STORE_ERR;
+    }
+    const char *props = props_json && props_json[0] ? props_json : "{}";
+    /* Node, edge and full-text entry change together or not at all: a torn
+     * stamp would leave search or traversal naming another branch. */
+    if (exec_sql(s, "BEGIN IMMEDIATE;") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    int result = CBM_STORE_ERR;
+    bool fts = fts_branch_indexed(s, project);
+    if (fts && !fts_branch_row(s, project, true)) {
+        store_set_error_sqlite(s, "set_branch_fts");
+    } else if (branch_exec(s,
+                           "UPDATE nodes SET qualified_name = ?2, name = ?3, properties = ?4 "
+                           "WHERE project = ?1 AND label = 'Branch';",
+                           project, qn, name, props) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "set_branch");
+    } else if (sqlite3_changes(s->db) == 0) {
+        result = CBM_STORE_NOT_FOUND;
+    } else if (branch_exec(s,
+                           "UPDATE edges SET properties = ?2 "
+                           "WHERE project = ?1 AND type = 'HAS_BRANCH';",
+                           project, props, NULL, NULL) != SQLITE_DONE ||
+               /* A legacy or torn database may have lost the edge: put it
+                * back from the Project node, or traversals from the project
+                * never reach the branch. */
+               branch_exec(s,
+                           "INSERT INTO edges (project, source_id, target_id, type, properties) "
+                           "SELECT ?1, pn.id, b.id, 'HAS_BRANCH', ?2 FROM nodes pn, nodes b "
+                           "WHERE pn.project = ?1 AND pn.label = 'Project' AND "
+                           "pn.qualified_name = ?1 AND b.project = ?1 AND b.label = 'Branch' "
+                           "AND NOT EXISTS (SELECT 1 FROM edges WHERE project = ?1 AND "
+                           "type = 'HAS_BRANCH' AND target_id = b.id) LIMIT 1;",
+                           project, props, NULL, NULL) != SQLITE_DONE ||
+               (fts && !fts_branch_row(s, project, false))) {
+        store_set_error_sqlite(s, "set_branch_edge");
+    } else {
+        result = CBM_STORE_OK;
+    }
+    if (result == CBM_STORE_OK) {
+        if (exec_sql(s, "COMMIT;") != CBM_STORE_OK) {
+            (void)exec_sql(s, "ROLLBACK;");
+            result = CBM_STORE_ERR;
+        }
+    } else {
+        (void)exec_sql(s, "ROLLBACK;");
+    }
+    return result;
+}
+
+bool cbm_store_branch_is(cbm_store_t *s, const char *project, const char *qn, const char *name,
+                         const char *props_json) {
+    if (!s || !s->db || !project || !qn || !name) {
+        return false;
+    }
+    const char *props = props_json && props_json[0] ? props_json : "{}";
+    /* Any Branch row or HAS_BRANCH edge that differs -- including the edge of
+     * a stamp torn before stamps were transactional -- or a Branch node with
+     * no HAS_BRANCH edge while a Project node exists to carry one (set
+     * recreates it). */
+    int rc = branch_exec(s,
+                         "SELECT 1 WHERE EXISTS (SELECT 1 FROM nodes WHERE project = ?1 AND "
+                         "label = 'Branch') AND NOT EXISTS (SELECT 1 FROM nodes WHERE project = "
+                         "?1 AND label = 'Branch' AND (qualified_name IS NOT ?2 OR name IS NOT "
+                         "?3 OR properties IS NOT ?4)) AND NOT EXISTS (SELECT 1 FROM edges WHERE "
+                         "project = ?1 AND type = 'HAS_BRANCH' AND properties IS NOT ?4) AND "
+                         "NOT EXISTS (SELECT 1 FROM nodes b WHERE b.project = ?1 AND "
+                         "b.label = 'Branch' AND EXISTS (SELECT 1 FROM nodes pn WHERE "
+                         "pn.project = ?1 AND pn.label = 'Project' AND pn.qualified_name = ?1) "
+                         "AND NOT EXISTS (SELECT 1 FROM edges WHERE project = ?1 AND "
+                         "type = 'HAS_BRANCH' AND target_id = b.id));",
+                         project, qn, name, props);
+    return rc == SQLITE_ROW;
 }
 
 /* ── Node neighbor names ──────────────────────────────────────── */

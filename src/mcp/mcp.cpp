@@ -63,11 +63,15 @@ enum {
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <condition_variable>
+#include <exception>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <new>
@@ -97,6 +101,9 @@ enum {
 #include "foundation/dump_verify.h"
 #include "foundation/compat_regex.h"
 #include "pipeline/artifact.h"
+#include "pipeline/branch_slots.h"
+#include "mcp/cache_expiry.h"
+#include "pipeline/pipeline_internal.h" /* cbm_pipeline_repo_path */
 
 static size_t trace_hash_file_max = MCP_PATH_HASH_FILE_MAX;
 static size_t trace_hash_request_max = MCP_PATH_HASH_REQUEST_MAX;
@@ -1064,6 +1071,9 @@ static char *normalize_project_arg(char *project) {
     project = canonicalize_repo_path_if_exists(project);
     char *normalized = cbm_project_name_from_path(project);
     if (normalized) {
+        /* The path names the directory; the derived name alone may belong to
+         * another one (see cbm_root_matches). */
+        cbm_mcp_expect_project_root(project);
         free(project);
         return normalized;
     }
@@ -1190,7 +1200,15 @@ struct cbm_mcp_server {
     struct cbm_watcher *watcher;      /* external watcher ref (not owned) */
     struct cbm_config *config;        /* external config ref (not owned) */
     cbm_thread_t autoindex_tid;
-    bool autoindex_active;    /* true if auto-index thread was started */
+    bool autoindex_active; /* true if auto-index thread was started */
+    /* Cache expiry sweep (cache_expiry.h): at most one thread at a time,
+     * joined before the next one starts, before the watcher changes
+     * (cbm_mcp_server_set_watcher) and at cbm_mcp_server_join_threads/free.
+     * The struct is calloc'd, so cbm_mcp_server_new constructs sweep_running
+     * in place; zeroed bytes are not a constructed std::atomic. */
+    cbm_thread_t sweep_tid;
+    bool sweep_active;
+    std::atomic<bool> sweep_running;
     int autoindex_file_limit; /* auto_index_limit, read before the thread starts */
 
     /* Active pipeline tracking for cancellation support */
@@ -1199,11 +1217,20 @@ struct cbm_mcp_server {
     char *active_request_id_str;     /* string JSON-RPC id of the in-progress tool call */
 };
 
+/* The server is calloc'd and released with free(): every member must be
+ * valid when zeroed except the ones cbm_mcp_server_new constructs in place,
+ * and none may need a destructor. */
+static_assert(std::is_trivially_destructible_v<cbm_mcp_server>,
+              "cbm_mcp_server is released with free(); members must not need destructors");
+
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)calloc(CBM_ALLOC_ONE, sizeof(*srv));
     if (!srv) {
         return NULL;
     }
+    /* calloc gives zeroed bytes, not objects: begin the atomic's lifetime. */
+    new (&srv->sweep_running) std::atomic<bool>(false);
+    srv->sweep_active = false;
 
     /* If a store_path is given, open that project directly.
      * Otherwise, create an in-memory store for test/embedded use. */
@@ -1230,10 +1257,36 @@ void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project) {
     srv->current_project = project ? heap_strdup(project) : NULL;
 }
 
+/* Join the cache sweep thread, if one was started. The sweep reads
+ * srv->watcher (sweep_keep_watched), so it must be gone before the watcher
+ * changes or is freed. */
+static void join_sweep(cbm_mcp_server_t *srv) {
+    if (srv->sweep_active) {
+        cbm_thread_join(&srv->sweep_tid);
+        srv->sweep_active = false;
+    }
+}
+
 void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w) {
     if (srv) {
+        join_sweep(srv);
         srv->watcher = w;
     }
+}
+
+void cbm_mcp_server_join_threads(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return;
+    }
+    if (srv->update_thread_active) {
+        cbm_thread_join(&srv->update_tid);
+        srv->update_thread_active = false;
+    }
+    if (srv->autoindex_active) {
+        cbm_thread_join(&srv->autoindex_tid);
+        srv->autoindex_active = false;
+    }
+    join_sweep(srv);
 }
 
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg) {
@@ -1246,12 +1299,7 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     if (!srv) {
         return;
     }
-    if (srv->update_thread_active) {
-        cbm_thread_join(&srv->update_tid);
-    }
-    if (srv->autoindex_active) {
-        cbm_thread_join(&srv->autoindex_tid);
-    }
+    cbm_mcp_server_join_threads(srv);
     if (srv->owns_store && srv->store) {
         cbm_store_close(srv->store);
     }
@@ -1286,16 +1334,68 @@ void cbm_mcp_server_evict_idle(cbm_mcp_server_t *srv, int timeout_s) {
     srv->store_last_used = 0;
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void (*store_open_test_cb)(const char *, void *) = nullptr;
+static void *store_open_test_data = nullptr;
+
+void cbm_mcp_test_store_open_hook(void (*callback)(const char *db_path, void *data), void *data) {
+    store_open_test_cb = callback;
+    store_open_test_data = data;
+}
+#define STORE_OPEN_TEST_HOOK(path)                          \
+    do {                                                    \
+        if (store_open_test_cb) {                           \
+            store_open_test_cb(path, store_open_test_data); \
+        }                                                   \
+    } while (0)
+#else
+#define STORE_OPEN_TEST_HOOK(path) ((void)0)
+#endif
+
+/* Record the generation of the file the cached store reads, for
+ * cbm_mcp_server_revalidate_store. It is stat'ed by path after the open, the
+ * integrity check and the project read, and an index run can replace the
+ * file in that time (a full rebuild deletes and recreates it; a restore with
+ * no live database renames one in). The path's generation would then be the
+ * new file's while the connection reads the old one, and every later call
+ * would find them "equal" and keep answering from the deleted file: the
+ * multi-process stress test saw a server serve another branch's graph that
+ * way, persistently. So the generation counts only when its inode is the
+ * one the open saw; otherwise it is recorded as never equal, and the next
+ * call reopens.
+ *
+ * The same holds when nothing is at the path any more: an incremental run
+ * unlinks the file and only renames its re-dump in when the dump is done,
+ * so the stat can fail while the connection reads the deleted file. An
+ * unknown generation used to leave store_gen_valid false, which
+ * cbm_mcp_server_revalidate_store reads as "never revalidate": the stress
+ * test saw a tool worker answer from the deleted pre-switch graph for every
+ * call until it exited. A failed stat is recorded as never equal too. */
 static void note_store_generation(cbm_mcp_server_t *srv, const char *path) {
     srv->store_gen_valid = false;
     if (!path || !path[0]) {
         return;
     }
-    srv->store_gen_valid = cbm_file_generation(path, &srv->store_gen);
+    bool at_path = cbm_file_generation(path, &srv->store_gen);
+    uint64_t ino = 0;
+    bool raced = !at_path || (srv->store_gen.ino != 0 && (!cbm_store_open_inode(srv->store, &ino) ||
+                                                          ino != srv->store_gen.ino));
+    if (raced) {
+        cbm_log_info("store.generation_raced", "path", path, "reason",
+                     at_path ? "replaced" : "file_gone");
+        srv->store_gen.size = CBM_NOT_FOUND; /* cbm_file_gen_equal: never equal */
+    }
+    srv->store_gen_valid = true;
 }
 
 void cbm_mcp_server_revalidate_store(cbm_mcp_server_t *srv) {
-    if (!srv || !srv->store || !srv->owns_store || !srv->store_gen_valid) {
+    if (!srv || !srv->store) {
+        return;
+    }
+    /* Same file or not, an index run may have written into it in place:
+     * start this request on a fresh read snapshot. */
+    cbm_store_end_reads(srv->store);
+    if (!srv->owns_store || !srv->store_gen_valid) {
         return;
     }
     const char *path = cbm_store_db_path(srv->store);
@@ -1374,6 +1474,11 @@ static bool g_cwd_project_probed;
 /* Cache dir the memo was computed against; a change (tests repoint
  * CBM_CACHE_DIR per fixture) invalidates it. */
 static char g_cwd_project_cache_dir[CBM_SZ_1K];
+/* Generation of the memoized project's database when the hit was accepted.
+ * The ownership check behind the hit judged THAT file: a replacement (an
+ * expiry and a re-index from a directory that derives the same name) is
+ * another file, and is judged again. */
+static cbm_file_gen_t g_cwd_project_gen;
 
 static bool project_db_exists(const char *project) {
     if (!project || !project[0]) {
@@ -1384,18 +1489,88 @@ static bool project_db_exists(const char *project) {
     return path[0] != '\0' && cbm_file_exists(path);
 }
 
+/* ── Project ownership of a directory ───────────────────────────
+ * A project name derived from a path is not unique: cbm_project_name_from_path
+ * folds separators and unsafe characters to '-', so /x/a-b/repo and
+ * /x/a/b-repo both derive the same name. A resolver that tries a directory's
+ * derived name must therefore check that the database found under it was
+ * indexed from THAT directory before answering from it -- otherwise an
+ * unindexed checkout is silently answered from another one. */
+
+/* The directory the current tool call's project must have been indexed from,
+ * or "": set by a walk-up level (cbm_mcp_expect_project_root) or by a project
+ * argument given as a path. Not cleared per call: cbm_mcp_handle_tool and
+ * every other reader of a project argument outside a tool call save it and
+ * restore it afterwards, so a path argument scopes only its own call and a
+ * caller's walk-up level stays in force. Per process, like g_project_note. */
+static char g_expected_root[CBM_SZ_4K];
+
+void cbm_mcp_expect_project_root(const char *dir) {
+    snprintf(g_expected_root, sizeof(g_expected_root), "%s", dir ? dir : "");
+}
+
+static void store_meta_note_project(const char *path, const char *project, const char *root_path);
+
+/* Whether <project>.db was indexed from dir: the root recorded in the memo at
+ * the file's current generation, else read from the database once (and
+ * memoized, as resolve_store does). True when the file is absent or holds no
+ * row for project. False when the database exists but cannot be read: an
+ * owner that cannot be learned may be another checkout's, whose index a
+ * watcher here would overwrite -- fail closed. */
+static bool project_db_owned_by(const char *project, const char *dir, cbm_store_meta_db_t *meta) {
+    char path[CBM_SZ_1K];
+    project_db_path(project, path, sizeof(path));
+    cbm_file_gen_t gen;
+    if (!path[0] || !cbm_file_generation(path, &gen)) {
+        return true;
+    }
+    cbm_store_meta_row_t row;
+    if (meta && cbm_store_meta_get(meta, path, &gen, &row) && strcmp(row.project, project) == 0 &&
+        strlen(row.root_path) < CBM_STORE_META_PATH_MAX - 1) { /* else maybe truncated */
+        return cbm_root_matches(row.root_path, dir);
+    }
+    cbm_store_t *s = cbm_store_open_path_query(path);
+    cbm_project_t proj = {0};
+    int prc = s ? cbm_store_get_project(s, project, &proj) : CBM_STORE_ERR;
+    bool owned = prc == CBM_STORE_NOT_FOUND;
+    if (prc == CBM_STORE_OK) {
+        owned = cbm_root_matches(proj.root_path, dir);
+        store_meta_note_project(path, project, proj.root_path);
+        cbm_project_free_fields(&proj);
+    } else if (prc != CBM_STORE_NOT_FOUND) {
+        cbm_log_info("project.owner_unreadable", "project", project, "path", path);
+    }
+    cbm_store_close(s);
+    return owned;
+}
+
+/* Record the generation of <project>.db as the memo's; true when it exists. */
+static bool cwd_project_note_gen(const char *project) {
+    char path[CBM_SZ_1K];
+    project_db_path(project, path, sizeof(path));
+    return path[0] && cbm_file_generation(path, &g_cwd_project_gen);
+}
+
 /* Project name derived from cwd or one of its ancestors that has an indexed
  * db, or NULL. Cached for the life of the process (cwd does not change). */
 static const char *cwd_project_name(void) {
     char cdir[CBM_SZ_1K];
     cache_dir(cdir, sizeof(cdir));
-    /* Only a HIT is memoized, and only while its db still exists: a persistent
-     * worker started in an unindexed repository must pick the index up once
-     * index_repository has run, and a deleted project must not linger. A miss
-     * re-probes (eight stats and memo lookups), which is cheap. */
-    if (g_cwd_project_probed && strcmp(cdir, g_cwd_project_cache_dir) == 0 && g_cwd_project[0] &&
-        project_db_exists(g_cwd_project)) {
-        return g_cwd_project;
+    /* Only a HIT is memoized, and only while its db is the same generation
+     * that was checked: a persistent worker started in an unindexed repository
+     * must pick the index up once index_repository has run, a deleted project
+     * must not linger, and a database replaced by one indexed from another
+     * directory (derived names collide) must be checked for ownership again.
+     * A miss re-probes (eight stats and memo lookups), which is cheap; so does
+     * a re-index of the project itself, once. */
+    if (g_cwd_project_probed && strcmp(cdir, g_cwd_project_cache_dir) == 0 && g_cwd_project[0]) {
+        char path[CBM_SZ_1K];
+        project_db_path(g_cwd_project, path, sizeof(path));
+        cbm_file_gen_t now;
+        if (path[0] && cbm_file_generation(path, &now) &&
+            cbm_file_gen_equal(&now, &g_cwd_project_gen)) {
+            return g_cwd_project;
+        }
     }
     g_cwd_project_probed = true;
     g_cwd_project[0] = '\0';
@@ -1408,7 +1583,10 @@ static const char *cwd_project_name(void) {
     for (int level = 0; level < CWD_PROJECT_MAX_WALKUP; level++) {
         char *pname = cbm_project_name_from_path(dir);
         if (pname) {
-            bool hit = project_db_exists(pname);
+            /* The generation is taken before the checks: a file replaced
+             * after it is a changed generation on the next call. */
+            cwd_project_note_gen(pname);
+            bool hit = project_db_exists(pname) && project_db_owned_by(pname, dir, meta);
             if (hit) {
                 snprintf(g_cwd_project, sizeof(g_cwd_project), "%s", pname);
             }
@@ -1418,13 +1596,26 @@ static const char *cwd_project_name(void) {
                 return g_cwd_project;
             }
         }
-        /* A project indexed under a custom name: the memo records its root. */
+        /* A project indexed under a custom name: the memo records its root.
+         * The row may describe an earlier generation of the file, so the
+         * root is confirmed against the file as it is now. */
         cbm_store_meta_row_t row;
         if (meta && cbm_store_meta_find_root(meta, dir, &row) && row.project[0] &&
-            project_db_exists(row.project)) {
+            cwd_project_note_gen(row.project) && project_db_exists(row.project) &&
+            project_db_owned_by(row.project, dir, meta)) {
             snprintf(g_cwd_project, sizeof(g_cwd_project), "%s", row.project);
             cbm_store_meta_close(meta);
             return g_cwd_project;
+        }
+        /* An unindexed git checkout root (a linked worktree, a nested repo,
+         * one made with --separate-git-dir)
+         * ends the walk: the enclosing checkout's index is other code. A
+         * submodule's gitlink does not: discovery indexes its files into the
+         * enclosing checkout's graph. */
+        cbm_git_checkout_kind_t kind = cbm_git_checkout_root_kind(dir);
+        if (kind == CBM_GIT_CHECKOUT_MAIN ||
+            (kind == CBM_GIT_CHECKOUT_GITLINK && !cbm_git_gitlink_is_submodule(dir))) {
+            break;
         }
         char *slash = strrchr(dir, '/');
         char *bslash = strrchr(dir, '\\');
@@ -1666,10 +1857,42 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     return store;
 }
 
+static cbm_store_t *resolve_store_by_name(cbm_mcp_server_t *srv, const char *project);
+
+/* resolve_store_by_name, then the ownership check when the call expects a
+ * root (g_expected_root): a database indexed from another directory under
+ * the same derived name is "not found" here. One point query on the handle
+ * the call needs anyway. */
+static cbm_store_t *resolve_store_open(cbm_mcp_server_t *srv, const char *project) {
+    cbm_store_t *store = resolve_store_by_name(srv, project);
+    if (store && g_expected_root[0]) {
+        cbm_project_t proj = {0};
+        if (cbm_store_get_project(store, project, &proj) == CBM_STORE_OK) {
+            bool owned = cbm_root_matches(proj.root_path, g_expected_root);
+            if (!owned) {
+                cbm_log_info("project.name_collision", "project", project, "indexed_root",
+                             proj.root_path ? proj.root_path : "", "wanted", g_expected_root);
+                store = NULL;
+            }
+            cbm_project_free_fields(&proj);
+        }
+    }
+    if (store && cbm_validate_project_name(project)) {
+        /* Usage for cache expiry (cache_expiry.h): throttled in process, so a
+         * repeat call costs a map lookup. The file actually opened, which the
+         * fallback scan may have found under another name than <project>.db. */
+        const char *used = cbm_store_db_path(store);
+        if (used && used[0] && cbm_file_exists(used)) {
+            cbm_cache_usage_touch(used, NULL);
+        }
+    }
+    return store;
+}
+
 /* Open the right project's .db file for query tools.
  * Caches the connection — reopens only when project changes.
  * Tracks last-access time so the event loop can evict idle stores. */
-static cbm_store_t *resolve_store_open(cbm_mcp_server_t *srv, const char *project) {
+static cbm_store_t *resolve_store_by_name(cbm_mcp_server_t *srv, const char *project) {
     srv->store_resolution_incomplete = false;
     srv->store_resolution_state = CBM_INTEGRITY_OK;
     if (!project) {
@@ -1702,8 +1925,11 @@ static cbm_store_t *resolve_store_open(cbm_mcp_server_t *srv, const char *projec
      * internal name predates validation. */
     char path[CBM_SZ_1K];
     project_db_path(project, path, sizeof(path));
-    srv->store = path[0] ? cbm_store_open_path_query(path) : NULL;
+    /* A reader open: it holds the database's reader gate while cached, so the
+     * cache expiry sweep does not move the file under this connection. */
+    srv->store = path[0] ? cbm_store_open_path_reader(path) : NULL;
     if (srv->store) {
+        STORE_OPEN_TEST_HOOK(path);
         /* Check DB integrity — back up (never silently delete) a corrupt DB.
          *
          * #1206/#1037: the decision is tri-state, not a bool. The shallow
@@ -1777,11 +2003,7 @@ static cbm_store_t *resolve_store_open(cbm_mcp_server_t *srv, const char *projec
             snprintf(shm_path, sizeof(shm_path), "%s-shm", path);
             cbm_unlink(wal_path);
             cbm_unlink(shm_path);
-            {
-                cbm_store_meta_db_t *meta = cbm_store_meta_open();
-                cbm_store_meta_forget(meta, path);
-                cbm_store_meta_close(meta);
-            }
+            cbm_cache_usage_forget(path);
             cbm_db_lease_release(lease);
             srv->store_resolution_state = CBM_INTEGRITY_CORRUPT;
             return NULL;
@@ -2156,7 +2378,87 @@ static void add_git_context_string(yyjson_mut_doc *doc, yyjson_mut_val *obj, con
     }
 }
 
-static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *root_path) {
+/* Per-branch index facts for one project (pipeline/branch_slots.h), added to
+ * its git block: the branch the graph was built for (only when the caller has
+ * the store open — list_projects answers from the store_meta memo and does
+ * not), whether that matches the checkout, and the parked branch databases (a
+ * directory read). A mismatch means the graph answers for another branch
+ * until the next index run swaps it. */
+typedef struct {
+    int keep;
+    int64_t budget;
+} branch_limits_t;
+static branch_limits_t branch_index_limits(const cbm_mcp_server_t *srv);
+
+static void add_branch_index_json(yyjson_mut_doc *doc, yyjson_mut_val *git, cbm_store_t *store,
+                                  const char *project, const char *root_path,
+                                  const cbm_git_context_t *ctx) {
+    /* The per-slot detail is index_status's (it has the store open);
+     * list_projects keeps to the names. */
+    bool detail = store != NULL;
+    if (!project || !ctx->is_git) {
+        return;
+    }
+    if (store) {
+        char *name = NULL;
+        if (cbm_store_get_branch_dup(store, project, NULL, &name, NULL) == CBM_STORE_OK) {
+            yyjson_mut_obj_add_strcpy(doc, git, "indexed_branch", name ? name : "");
+            /* Branch name and HEAD commit, not the slug two branches can
+             * share; a graph with no recorded commit is not claimed current
+             * (the strict form the content check uses). */
+            cbm_branch_id_t indexed;
+            cbm_branch_id_t current;
+            cbm_branch_id_from_context(ctx, &current);
+            if (cbm_branch_id_indexed(store, project, &indexed) && current.known) {
+                yyjson_mut_obj_add_bool(doc, git, "index_matches_checkout",
+                                        cbm_branch_id_same_strict(&indexed, &current));
+            }
+            cbm_branch_id_free(&indexed);
+            cbm_branch_id_free(&current);
+        }
+        free(name);
+    }
+    char db_path[CBM_SZ_1K];
+    project_db_path(project, db_path, sizeof(db_path));
+    char **parked = NULL;
+    /* This checkout's slots only: a derived name can be several roots'. */
+    bool here = db_path[0] && root_path && root_path[0];
+    int n = here ? cbm_branch_slots_list(db_path, project, root_path, &parked) : 0;
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < n; i++) {
+        yyjson_mut_arr_add_strcpy(doc, arr, parked[i]);
+    }
+    cbm_branch_slots_free_list(parked, n);
+    yyjson_mut_obj_add_val(doc, git, "parked_branches", arr);
+    if (!detail) {
+        return;
+    }
+    /* Each slot file with its size, their total, and the limits the next
+     * park enforces. */
+    cbm_branch_slot_info_t *info = NULL;
+    int ni = here ? cbm_branch_slots_info(db_path, project, root_path, &info) : 0;
+    yyjson_mut_val *files = yyjson_mut_arr(doc);
+    int64_t total = 0;
+    for (int i = 0; i < ni; i++) {
+        yyjson_mut_val *o = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, o, "branch", info[i].name);
+        yyjson_mut_obj_add_int(doc, o, "bytes", info[i].bytes);
+        yyjson_mut_obj_add_bool(doc, o, "compressed", info[i].compressed);
+        yyjson_mut_arr_append(files, o);
+        total += info[i].bytes > 0 ? info[i].bytes : 0;
+    }
+    cbm_branch_slots_free_info(info, ni);
+    yyjson_mut_obj_add_val(doc, git, "parked_slots", files);
+    yyjson_mut_obj_add_int(doc, git, "parked_bytes", total);
+    branch_limits_t lim = branch_index_limits(NULL);
+    yyjson_mut_obj_add_int(doc, git, "branch_index_keep",
+                           lim.keep >= 0 ? lim.keep : CBM_BRANCH_SLOTS_DEFAULT_KEEP);
+    yyjson_mut_obj_add_int(doc, git, "branch_index_budget_bytes",
+                           lim.budget >= 0 ? lim.budget : CBM_BRANCH_SLOTS_DEFAULT_BUDGET);
+}
+
+static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *root_path,
+                                 cbm_store_t *store = NULL, const char *project = NULL) {
     cbm_git_context_t ctx = {0};
     (void)cbm_git_context_resolve(root_path, &ctx);
 
@@ -2173,6 +2475,7 @@ static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const
     add_git_context_string(doc, git, "branch_slug", ctx.branch_slug);
     add_git_context_string(doc, git, "head_sha", ctx.head_sha);
     add_git_context_string(doc, git, "base_sha", ctx.base_sha);
+    add_branch_index_json(doc, git, store, project, root_path, &ctx);
     yyjson_mut_obj_add_val(doc, obj, "git", git);
 
     cbm_git_context_free(&ctx);
@@ -2381,9 +2684,23 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project, bool *incom
             cbm_store_t *st = NULL;
             if (db_internal_project_name(hint_path, iname, sizeof(iname), &st, deadline_ms) ==
                 DB_PROJECT_FOUND) {
+                /* The gate comes after the read here: a file moved between
+                 * the two reads as gone. A path still there either has its
+                 * gate held (a move in progress) or holds another file than
+                 * the one read (moved, then restored or re-indexed): the
+                 * lookup is incomplete, not a miss, and a scan would only
+                 * meet the same file again. */
                 if (strcmp(iname, project) == 0) {
-                    cbm_store_meta_close(meta);
-                    return st; /* caller takes ownership */
+                    if (cbm_store_hold_read_gate(st)) {
+                        cbm_store_meta_close(meta);
+                        return st; /* caller takes ownership */
+                    }
+                    if (cbm_file_exists(hint_path)) {
+                        cbm_store_close(st);
+                        cbm_store_meta_close(meta);
+                        *incomplete = true;
+                        return NULL;
+                    }
                 }
                 cbm_store_close(st);
             }
@@ -2448,8 +2765,18 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project, bool *incom
                 (void)cbm_store_meta_put(meta, &row);
             }
             if (strcmp(iname, project) == 0) {
-                found = st; /* adopt — caller takes ownership */
-                break;
+                if (cbm_store_hold_read_gate(st)) {
+                    found = st; /* adopt — caller takes ownership */
+                    break;
+                }
+                if (cbm_file_exists(full_path)) {
+                    /* Its gate stays held (a move in progress), or another
+                     * file took the path since the read: the connection
+                     * would serve the moved one. */
+                    *incomplete = true;
+                    cbm_log_warn("store.fallback.incomplete", "project", project, "path", full_path,
+                                 "reason", "read_gate_busy_or_replaced");
+                }
             }
             cbm_store_close(st);
         }
@@ -2471,7 +2798,7 @@ static void list_projects_emit_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr,
     yyjson_mut_obj_add_strcpy(doc, p, "name", project_name);
     if (include_details) {
         yyjson_mut_obj_add_strcpy(doc, p, "root_path", root_path);
-        add_git_context_json(doc, p, root_path[0] ? root_path : NULL);
+        add_git_context_json(doc, p, root_path[0] ? root_path : NULL, NULL, project_name);
         yyjson_mut_obj_add_int(doc, p, "nodes", nodes);
         yyjson_mut_obj_add_int(doc, p, "edges", edges);
         yyjson_mut_obj_add_int(doc, p, "size_bytes", size_bytes);
@@ -3870,7 +4197,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         if (cbm_store_get_project(store, project, &proj_info) == CBM_STORE_OK) {
             yyjson_mut_obj_add_strcpy(doc, root, "root_path",
                                       proj_info.root_path ? proj_info.root_path : "");
-            add_git_context_json(doc, root, proj_info.root_path);
+            add_git_context_json(doc, root, proj_info.root_path, store, project);
             safe_str_free(&proj_info.name);
             safe_str_free(&proj_info.indexed_at);
             safe_str_free(&proj_info.root_path);
@@ -3934,9 +4261,47 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     }
     // Keep path as requested. Canonicalization chooses the lock identity only;
     // deleting a cache symlink must unlink that entry, not its backing database.
+    /* The reader gate is not taken here, unlike the expiry sweep's move: a
+     * server in another process holds it shared for as long as it caches
+     * the store (until idle eviction), so an explicit delete would fail for
+     * as long as any session had the project open. It does not need it:
+     * every tool call starts with cbm_mcp_server_revalidate_store, which
+     * finds the file gone and drops the cached handle, so no later call is
+     * answered from the deleted inode -- only one already in flight
+     * finishes on it. The sweep moves the file into the trash instead, where
+     * a restore must not race a reader, hence its gate. */
+
+    /* Which checkout the database is: the root it records, read under both
+     * gates. Two directories can derive one project name (/x/a-b/repo,
+     * /x/a/b-repo) and share <name>.db, while their parked slots are filed
+     * per root. A path argument names one of them (g_expected_root): a
+     * database the other indexed is not its to delete -- the ownership
+     * check every read applies -- and only that path's slots go. Given a
+     * bare name, the slots of the root the database records go with it;
+     * every root's only when nothing records one (no database left). A
+     * database whose owner cannot be read (it will not open, or its
+     * projects table will not answer) is kept from a path argument as a
+     * foreign one is: it may be the other directory's. A bare name still
+     * deletes it -- the way to remove a corrupt index. */
+    char owner[CBM_SZ_4K] = "";
+    bool owner_unknown = false;
+    if (cbm_file_exists(path)) {
+        cbm_store_t *os = cbm_store_open_path_query(path);
+        cbm_project_t proj = {0};
+        int prc = os ? cbm_store_get_project(os, name, &proj) : CBM_STORE_ERR;
+        if (prc == CBM_STORE_OK) {
+            snprintf(owner, sizeof(owner), "%s", proj.root_path ? proj.root_path : "");
+            cbm_project_free_fields(&proj);
+        }
+        owner_unknown = prc != CBM_STORE_OK && prc != CBM_STORE_NOT_FOUND;
+        cbm_store_close(os);
+    }
+    bool foreign = g_expected_root[0] &&
+                   (owner_unknown || (owner[0] && !cbm_root_matches(owner, g_expected_root)));
+    const char *slot_root = g_expected_root[0] ? g_expected_root : owner;
 
     /* Close store if it's the project being deleted */
-    if (srv->current_project && strcmp(srv->current_project, name) == 0) {
+    if (!foreign && srv->current_project && strcmp(srv->current_project, name) == 0) {
         if (srv->owns_store && srv->store) {
             cbm_store_close(srv->store);
             srv->store = NULL;
@@ -3945,31 +4310,34 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
         srv->current_project = NULL;
     }
 
-    /* Delete the .db file + WAL/SHM while both gates are held. */
-    char wal[CBM_SZ_1K];
-    char shm[CBM_SZ_1K];
-    snprintf(wal, sizeof(wal), "%s-wal", path);
-    snprintf(shm, sizeof(shm), "%s-shm", path);
-
-    bool exists = (access(path, F_OK) == 0);
+    /* Delete the .db file + WAL/SHM, its parked branches and its memo and
+     * usage rows while both gates are held -- the same removal cache expiry
+     * uses (cbm_cache_remove_project). Parked branches can outlive a main
+     * file that is already gone; they are kept when the main file could not
+     * be removed: the project still exists, and its branches with it. A
+     * database another directory indexed stays, as if absent; the slots of
+     * the named directory still go. */
     const char *status = "not_found";
     const char *error_detail = NULL;
     bool is_error = false;
-
-    if (exists) {
-        int rc = cbm_unlink(path);
-        (void)cbm_unlink(wal);
-        (void)cbm_unlink(shm);
-        if (rc == 0) {
-            status = "deleted";
-            cbm_store_meta_db_t *meta = cbm_store_meta_open();
-            cbm_store_meta_forget(meta, path);
-            cbm_store_meta_close(meta);
-        } else {
-            status = "delete_failed";
-            error_detail = strerror(errno);
-            is_error = true;
-        }
+    int parked_deleted = 0;
+    int removed = 1;
+    if (foreign) {
+        cbm_log_info("project.name_collision", "project", name, "indexed_root", owner, "wanted",
+                     g_expected_root);
+        parked_deleted = cbm_branch_slots_delete_root(path, name, g_expected_root);
+    } else {
+        removed = cbm_cache_remove_project_root(path, name, slot_root, &parked_deleted);
+    }
+    bool slots_left = removed == 2;
+    if (removed == 0 || slots_left) {
+        status = "deleted";
+    } else if (removed < 0) {
+        status = "delete_failed";
+        error_detail = strerror(errno);
+        is_error = true;
+    } else if (parked_deleted > 0) {
+        status = "deleted";
     } else {
         is_error = true;
     }
@@ -3977,7 +4345,7 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     cbm_pipeline_unlock();
     cbm_db_lease_release(lease);
 
-    if (srv->watcher) {
+    if (srv->watcher && !foreign) {
         cbm_watcher_unwatch(srv->watcher, name);
     }
 
@@ -3988,6 +4356,25 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "project", name);
     yyjson_mut_obj_add_str(doc, root, "status", status);
+    if (foreign && owner_unknown) {
+        yyjson_mut_obj_add_str(doc, root, "note",
+                               "the database under this name could not be read to learn which "
+                               "directory it was indexed from, so it is kept; delete it by "
+                               "project name to remove it anyway");
+    } else if (foreign) {
+        yyjson_mut_obj_add_strcpy(doc, root, "kept_database_of", owner);
+        yyjson_mut_obj_add_str(doc, root, "note",
+                               "the database under this name was indexed from another directory "
+                               "(a project-name collision); it is kept");
+    }
+    if (parked_deleted > 0) {
+        yyjson_mut_obj_add_int(doc, root, "parked_branches_deleted", parked_deleted);
+    }
+    if (slots_left) {
+        yyjson_mut_obj_add_str(doc, root, "warning",
+                               "some parked branches could not be removed; the cache sweep "
+                               "retries (cache.remove.slots_left in the log)");
+    }
     if (error_detail) {
         yyjson_mut_obj_add_str(doc, root, "error", error_detail);
     }
@@ -5385,8 +5772,7 @@ static int64_t trace_stat_mtime_ns(const struct stat *st) {
 #elif defined(_WIN32)
     return (int64_t)st->st_mtime * (int64_t)CBM_NSEC_PER_SEC;
 #else
-    return ((int64_t)st->st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-           (int64_t)st->st_mtim.tv_nsec;
+    return ((int64_t)st->st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
 #endif
 }
 
@@ -5475,8 +5861,8 @@ static bool trace_fd_same_file(const trace_fd_stat_t &before, const trace_fd_sta
 }
 
 static trace_file_freshness_t trace_check_path_file(cbm_store_t *store, const char *project,
-                                                     const char *project_root, const char *file,
-                                                     trace_hash_budget_t *budget) {
+                                                    const char *project_root, const char *file,
+                                                    trace_hash_budget_t *budget) {
     trace_file_freshness_t out = {file ? file : "", "unknown", "no_file_path"};
     if (!trace_relative_file_safe(file)) {
         out.reason = file && file[0] ? "outside_root" : "no_file_path";
@@ -5792,10 +6178,9 @@ static int trace_direct_path_to_json(cbm_store_t *store, const char *project, co
         std::vector<trace_file_freshness_t> checks;
         bool all_match = true;
         for (const auto &file : files) {
-            checks.push_back(trace_check_path_file(store, project,
-                                                   project_root.empty() ? nullptr
-                                                                        : project_root.c_str(),
-                                                   file.c_str(), &budget));
+            checks.push_back(trace_check_path_file(
+                store, project, project_root.empty() ? nullptr : project_root.c_str(), file.c_str(),
+                &budget));
             all_match = all_match && strcmp(checks.back().state, "match") == 0;
         }
         yyjson_mut_val *freshness = yyjson_mut_obj(doc);
@@ -6296,6 +6681,10 @@ static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
 /* ── index_repository ─────────────────────────────────────────── */
 
 /* Handle mode="cross-repo-intelligence" — extract to reduce complexity. */
+static void cross_repo_note_used(const char *db_path) {
+    cbm_cache_usage_touch(db_path, NULL);
+}
+
 static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
     /* cbm_project_name_from_path already returns a heap copy we own; wrapping
      * it in heap_strdup leaked the original on every cross-repo call. */
@@ -6344,6 +6733,9 @@ static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
         targets[ti++] = yyjson_get_str(val);
     }
 
+    /* Record the use of every database the pass opens: the sweep that may
+     * follow must not judge them unused. */
+    cbm_cross_repo_set_usage_hook(cross_repo_note_used);
     cbm_cross_repo_result_t result = cbm_cross_repo_match(project, targets, tp_count);
     free(targets);
     yyjson_doc_free(jdoc);
@@ -6356,7 +6748,8 @@ static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
                   "other than the source matched target_projects. Index the other service first "
                   "(run list_projects to see what is indexed); existing cross-repo edges were "
                   "left unchanged."
-                : "cross-repo source or target project is missing, invalid, or not indexed; "
+                : "cross-repo source or target project is missing, invalid, not indexed, or busy "
+                  "(a cache sweep moving it); "
                   "existing cross-repo edges were left unchanged.",
             true);
     }
@@ -7388,6 +7781,143 @@ static char *resolved_repo_path_from_project_arg(const char *args) {
     return root_path;
 }
 
+/* Parked-branch limits for an index run (pipeline/branch_slots.h): config
+ * branch_index (default true), branch_index_keep (default 8) and
+ * branch_index_budget (bytes, "2G" style; default 2 GiB). The environment
+ * wins: CBM_BRANCH_INDEX=0 turns parking off and CBM_BRANCH_INDEX_BUDGET sets
+ * the size budget. The supervised worker runs without srv->config, so the
+ * store is opened just for this read. A field left at -1 keeps the
+ * pipeline's own default. */
+static branch_limits_t branch_index_limits(const cbm_mcp_server_t *srv) {
+    branch_limits_t lim = {-1, -1};
+    char env[CBM_SZ_32] = "";
+    cbm_safe_getenv("CBM_BRANCH_INDEX", env, sizeof(env), NULL);
+    if (strcmp(env, "0") == 0) {
+        lim.keep = 0;
+        return lim;
+    }
+    cbm_config_t *cfg = srv ? srv->config : NULL;
+    cbm_config_t *owned = NULL;
+    if (!cfg) {
+        const char *dir = cbm_resolve_cache_dir();
+        owned = dir ? cbm_config_open(dir) : NULL;
+        cfg = owned;
+    }
+    if (cfg) {
+        lim.keep = cbm_config_get_bool(cfg, CBM_CONFIG_BRANCH_INDEX, true)
+                       ? cbm_config_get_int(cfg, CBM_CONFIG_BRANCH_INDEX_KEEP,
+                                            CBM_BRANCH_SLOTS_DEFAULT_KEEP)
+                       : 0;
+        const char *b = cbm_config_get(cfg, CBM_CONFIG_BRANCH_INDEX_BUDGET, "");
+        int64_t v = 0;
+        if (b && b[0] && cbm_branch_budget_parse(b, &v)) {
+            lim.budget = v;
+        } else if (b && b[0]) {
+            cbm_log_warn("branch.budget_invalid", "value", b);
+        }
+    }
+    cbm_config_close(owned);
+    char benv[CBM_SZ_32] = "";
+    int64_t v = 0;
+    if (cbm_safe_getenv("CBM_BRANCH_INDEX_BUDGET", benv, sizeof(benv), NULL) &&
+        cbm_branch_budget_parse(benv, &v)) {
+        lim.budget = v;
+    }
+    return lim;
+}
+
+static void apply_branch_index_config(const cbm_mcp_server_t *srv, cbm_pipeline_t *p) {
+    branch_limits_t lim = branch_index_limits(srv);
+    if (lim.keep >= 0) {
+        cbm_pipeline_set_branch_keep(p, lim.keep);
+    }
+    if (lim.budget >= 0) {
+        cbm_pipeline_set_branch_budget(p, lim.budget);
+    }
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void (*index_test_cb)(const char *, void *) = nullptr;
+static void *index_test_data = nullptr;
+
+void cbm_mcp_test_index_hook(void (*callback)(const char *project, void *data), void *data) {
+    index_test_cb = callback;
+    index_test_data = data;
+}
+#define INDEX_TEST_HOOK(p)                                                \
+    do {                                                                  \
+        if (index_test_cb) {                                              \
+            index_test_cb(cbm_pipeline_project_name(p), index_test_data); \
+        }                                                                 \
+    } while (0)
+#else
+#define INDEX_TEST_HOOK(p) ((void)0)
+#endif
+
+/* An index run is a use, and it knows the checkout root exactly. The
+ * pipeline calls this before it releases the index lease: a sweep in another
+ * process that judged the database stale before the run takes the lease
+ * only after this write, re-reads the row, and keeps the database. */
+static void touch_indexed(const cbm_pipeline_t *p, void *ud) {
+    (void)ud;
+    const char *name = cbm_pipeline_project_name(p);
+    char path[CBM_SZ_1K];
+    project_db_path(name, path, sizeof(path));
+    if (path[0] && cbm_file_exists(path)) {
+        cbm_cache_usage_touch(path, cbm_pipeline_repo_path(p));
+    }
+}
+
+/* A full in-process index of root_path that records its use and root
+ * (touch_indexed). srv supplies the branch-index config (NULL: defaults);
+ * serialize holds the process-wide pipeline lock around the run. */
+static int index_in_process(const cbm_mcp_server_t *srv, const char *root_path, bool serialize) {
+    cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
+    if (!p) {
+        return CBM_NOT_FOUND;
+    }
+    apply_branch_index_config(srv, p);
+    cbm_pipeline_set_on_indexed(p, touch_indexed, NULL);
+    if (serialize) {
+        cbm_pipeline_lock();
+    }
+    int rc = cbm_pipeline_run(p);
+    if (serialize) {
+        cbm_pipeline_unlock();
+    }
+    INDEX_TEST_HOOK(p);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+int cbm_mcp_index_in_process(const char *root_path) {
+    return index_in_process(NULL, root_path, false);
+}
+
+/* index_repository's "branch" block: which branch this run indexed, which one
+ * the database had been built for, and what the per-branch switch did. */
+static void add_branch_switch_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                   const cbm_pipeline_t *p) {
+    const char *action = NULL;
+    const char *from = NULL;
+    const char *to = NULL;
+    int reparsed = -1;
+    cbm_pipeline_get_branch_switch(p, &action, &from, &to, &reparsed);
+    if (!to) {
+        return;
+    }
+    yyjson_mut_val *b = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_strcpy(doc, b, "indexed", to);
+    if (from) {
+        yyjson_mut_obj_add_strcpy(doc, b, "previous", from);
+    }
+    yyjson_mut_obj_add_strcpy(doc, b, "switch", action);
+    if (reparsed >= 0) {
+        yyjson_mut_obj_add_int(doc, b, "files_reparsed", reparsed);
+    }
+    yyjson_mut_obj_add_val(doc, root, "branch", b);
+}
+
 static bool wait_for_pipeline_lock(int timeout_ms) {
     uint64_t deadline_ms = cbm_now_ms() + (uint64_t)timeout_ms;
     do {
@@ -7465,6 +7995,7 @@ static char *index_repository_in_process(cbm_mcp_server_t *srv, const char *args
     }
     free(name_override);
     cbm_pipeline_set_persistence(p, persistence);
+    apply_branch_index_config(srv, p);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
 
@@ -7496,9 +8027,11 @@ static char *index_repository_in_process(cbm_mcp_server_t *srv, const char *args
      * can cancel it mid-run. */
     cbm_pipeline_lock();
     srv->active_pipeline = p;
+    cbm_pipeline_set_on_indexed(p, touch_indexed, NULL);
     int rc = cbm_pipeline_run(p);
     srv->active_pipeline = NULL;
     cbm_pipeline_unlock();
+    INDEX_TEST_HOOK(p);
 
     /* Capture the excluded-subtree list (#411) while the pipeline (which owns
      * the strings) is still alive — the response builder copies them into the
@@ -7543,6 +8076,7 @@ static char *index_repository_in_process(cbm_mcp_server_t *srv, const char *args
         if (cbm_pipeline_had_format_migration(p)) {
             yyjson_mut_obj_add_bool(doc, root, "format_migration", true);
         }
+        add_branch_switch_json(doc, root, p);
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         /* #1665: a post-publish artifact export failure (read-only repo, etc.)
@@ -7550,7 +8084,13 @@ static char *index_repository_in_process(cbm_mcp_server_t *srv, const char *args
          * export error of THIS run, so its presence names the phase exactly —
          * the graph database was already published when the export ran. */
         const char *export_error = cbm_pipeline_export_error(p);
-        if (export_error && export_error[0]) {
+        if (cbm_pipeline_branch_stamp_failed(p)) {
+            yyjson_mut_obj_add_str(doc, root, "hint",
+                                   "Index database was built, but recording its git branch "
+                                   "failed (database busy or cache not writable). Re-run "
+                                   "index_repository; the database is not parked under another "
+                                   "branch meanwhile.");
+        } else if (export_error && export_error[0]) {
             char hint[CBM_SZ_2K];
             (void)snprintf(
                 hint, sizeof(hint),
@@ -12389,9 +12929,38 @@ static bool mcp_tool_reads_in_batch(const char *tool_name) {
 }
 
 static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json);
+static char *handle_tool_impl(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json);
 
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
+    /* A project argument given as a path scopes lookups to that directory for
+     * this call only, so the expectation is restored on the way out and never
+     * leaks into a later call or a direct cbm_mcp_* lookup. One the caller set
+     * (a hook walk-up level, cbm_mcp_expect_project_root) stays in force for
+     * the call: clearing it here answered a walk-up level from another
+     * checkout's database under the same derived name. */
+    char saved[sizeof(g_expected_root)];
+    memcpy(saved, g_expected_root, sizeof(saved));
+    char *result = handle_tool_impl(srv, tool_name, args_json);
+    memcpy(g_expected_root, saved, sizeof(saved));
+    /* Cached statements are reset on their next use, so the call's last
+     * queries still hold a read snapshot. Release it now, not when the next
+     * request starts: an idle connection would otherwise pin the snapshot
+     * for as long as the client is quiet, and block a WAL reset (a cache
+     * restore's checkpoint) all that time. */
+    if (srv && srv->store) {
+        cbm_store_end_reads(srv->store);
+    }
+    return result;
+}
+
+static char *handle_tool_impl(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     g_project_note[0] = '\0';
+    /* Every tool call starts here -- tool-server worker, in-process stdio
+     * server, CLI, hooks -- and none is nested inside another's statement
+     * loop: a re-index or delete may have replaced the file behind the
+     * cached store, or written into it in place, since the last call, so
+     * never answer from a stale generation or snapshot. */
+    cbm_mcp_server_revalidate_store(srv);
     if (!tool_name) {
         return cbm_mcp_text_result("missing tool name", true);
     }
@@ -12489,6 +13058,36 @@ static void detect_session(cbm_mcp_server_t *srv) {
         if (pname) {
             snprintf(srv->session_project, sizeof(srv->session_project), "%s", pname);
             free(pname);
+        }
+        /* A session started in a subdirectory of an indexed checkout belongs
+         * to that project, as the tool calls' cwd resolution and the sweep's
+         * exemption already say. The name derived from cwd itself names no
+         * database: the watcher and the startup branch check would look for
+         * it and find nothing, and with auto_index on the subdirectory would
+         * be indexed as a second project. Take the project the walk-up finds
+         * and the root it records; with nothing indexed, the cwd stays the
+         * session root. Only a project named after its root: the watcher
+         * re-indexes by root path, which derives the name, so watching a
+         * custom-named index would build a second database under that name. */
+        const char *indexed = cwd_project_name();
+        if (indexed && indexed[0]) {
+            char db_path[CBM_SZ_1K];
+            project_db_path(indexed, db_path, sizeof(db_path));
+            cbm_store_t *store = db_path[0] ? cbm_store_open_path_query(db_path) : NULL;
+            cbm_project_t proj = {0};
+            char *derived = NULL;
+            if (store && cbm_store_get_project(store, indexed, &proj) == CBM_STORE_OK &&
+                proj.root_path && proj.root_path[0] &&
+                strlen(proj.root_path) < sizeof(srv->session_root) &&
+                (derived = cbm_project_name_from_path(proj.root_path)) != NULL &&
+                strcmp(derived, indexed) == 0) {
+                snprintf(srv->session_project, sizeof(srv->session_project), "%s", indexed);
+                snprintf(srv->session_root, sizeof(srv->session_root), "%s", proj.root_path);
+                cbm_log_info("session.root.indexed", "project", indexed, "path", proj.root_path);
+            }
+            free(derived);
+            cbm_project_free_fields(&proj);
+            cbm_store_close(store);
         }
     }
 }
@@ -12609,18 +13208,9 @@ static void *autoindex_thread(void *arg) {
         return NULL;
     }
 
-    cbm_pipeline_t *p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);
-    if (!p) {
-        cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
-        return NULL;
-    }
-
-    /* Block until any concurrent pipeline finishes */
-    cbm_pipeline_lock();
-    int rc = cbm_pipeline_run(p);
-    cbm_pipeline_unlock();
-
-    cbm_pipeline_free(p);
+    /* Block until any concurrent pipeline finishes. The run records its use
+     * and root for cache expiry, as every other index path does. */
+    int rc = index_in_process(srv, srv->session_root, true);
     /* Extraction builds a THREAD-LOCAL node-type bitset cache (cbm_kind_in_set).
      * Parallel workers free theirs in pass_parallel.cpp; the in-process auto-index
      * runs extraction on THIS short-lived thread, so it must free its own cache
@@ -12641,6 +13231,81 @@ static void *autoindex_thread(void *arg) {
 }
 
 /* Start auto-indexing if configured and project not yet indexed. */
+/* True when the session's index was built for another checkout than the one
+ * there now -- another branch, or the same branch (or a detached HEAD) at
+ * another commit: a checkout, pull or commit made while no server was
+ * watching. The watcher baselines on the CURRENT HEAD, so it would never see
+ * that move; marking the project pending makes its first poll run the index,
+ * which swaps in this branch's database (pipeline/branch_slots.h) and passes
+ * over the changed files. One SQLite read and a few small file reads (HEAD,
+ * the branch ref or packed-refs): initialize stays free of git subprocesses.
+ * When HEAD's commit cannot be read from files, only the branch is compared. */
+static bool checkout_differs_from_index(const char *root, const char *project, const char *db_path,
+                                        std::string *note);
+
+bool cbm_mcp_checkout_differs_from_index(const char *root, const char *project,
+                                         const char *db_path) {
+    return checkout_differs_from_index(root, project, db_path, nullptr);
+}
+
+char *cbm_mcp_checkout_mismatch_note(const char *root, const char *project, const char *db_path) {
+    std::string note;
+    return checkout_differs_from_index(root, project, db_path, &note) ? strdup(note.c_str()) : NULL;
+}
+
+/* "branch `x` at abc1234" / "a detached HEAD at abc1234" for the note. */
+static std::string checkout_label(const cbm_branch_id_t *id) {
+    std::string s = id->is_detached || !(id->branch || id->slug)
+                        ? std::string("a detached HEAD")
+                        : "branch `" + std::string(id->branch ? id->branch : id->slug) + "`";
+    if (id->has_sha && id->head_sha[0]) {
+        s += " at " + std::string(id->head_sha, strnlen(id->head_sha, 7));
+    }
+    return s;
+}
+
+/* note: when set, the comparison is the hook's (no log line) and a
+ * difference fills it with one sentence naming both sides. */
+static bool checkout_differs_from_index(const char *root, const char *project, const char *db_path,
+                                        std::string *note) {
+    cbm_branch_id_t current;
+    if (!cbm_branch_id_from_head(root, &current)) {
+        cbm_branch_id_free(&current);
+        return false;
+    }
+    cbm_branch_id_t indexed = {};
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    bool known = store && cbm_branch_id_indexed(store, project, &indexed);
+    cbm_store_close(store);
+    /* With HEAD's commit read from files, a recorded identity without one
+     * (a legacy node) is not trusted: pending once, and that run's stamp
+     * records the commit. Without it (a ref store files cannot read), the
+     * lenient comparison, so such a checkout is never marked pending on
+     * every session. An index with no usable identity at all (no Branch
+     * node; one built while git refused the checkout) is left alone: no run
+     * would record one, so marking it would repeat every session. */
+    bool other = known && !(current.has_sha ? cbm_branch_id_same_strict(&indexed, &current)
+                                            : cbm_branch_id_same(&indexed, &current));
+    if (other && note) {
+        *note = "Note: this index was built for " + checkout_label(&indexed) +
+                ", but the checkout is now " + checkout_label(&current) +
+                ". Until the next index run (the MCP server's watcher starts one on its first "
+                "poll; or call index_repository), graph answers describe the indexed code, not "
+                "the files on disk.";
+    } else if (other) {
+        cbm_log_info("autoindex.checkout_changed", "project", project, "indexed", indexed.slug,
+                     "indexed_head", indexed.head_sha, "checkout", current.slug, "checkout_head",
+                     current.head_sha);
+    }
+    cbm_branch_id_free(&indexed);
+    cbm_branch_id_free(&current);
+    return other;
+}
+
+static bool session_index_on_other_branch(const cbm_mcp_server_t *srv, const char *db_path) {
+    return cbm_mcp_checkout_differs_from_index(srv->session_root, srv->session_project, db_path);
+}
+
 static void maybe_auto_index(cbm_mcp_server_t *srv) {
     if (srv->session_root[0] == '\0') {
         return; /* no session root detected */
@@ -12652,11 +13317,22 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         char db_check[CBM_SZ_1K];
         snprintf(db_check, sizeof(db_check), "%s/%s.db", cbm_resolve_cache_dir(),
                  srv->session_project);
+        if (cbm_file_size(db_check) >= 0 &&
+            !project_db_owned_by(srv->session_project, srv->session_root, NULL)) {
+            /* The derived name belongs to a database indexed from another
+             * directory (cbm_root_matches). Watching or auto-indexing this
+             * root under that name would overwrite the other checkout's
+             * index, so do neither; an explicit index_repository with a
+             * name override is the way out. */
+            cbm_log_warn("autoindex.skip", "reason", "project_name_collision", "project",
+                         srv->session_project, "path", srv->session_root);
+            return;
+        }
         if (cbm_file_size(db_check) >= 0) {
             /* Already indexed → register watcher for change detection */
             cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",
                          srv->session_project);
-            register_watcher_if_enabled(srv);
+            register_watcher_if_enabled(srv, session_index_on_other_branch(srv, db_check));
             return;
         }
     }
@@ -12748,6 +13424,102 @@ bool cbm_mcp_update_check_enabled(void) {
     return !value || strcmp(value, "0") != 0;
 }
 
+/* ── Cache expiry ───────────────────────────────────────────────── */
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void (*sweep_test_cb)(int, void *) = nullptr;
+static void *sweep_test_data = nullptr;
+
+void cbm_mcp_test_sweep_hook(void (*callback)(int stage, void *data), void *data) {
+    sweep_test_cb = callback;
+    sweep_test_data = data;
+}
+#define SWEEP_TEST_HOOK(stage)                       \
+    do {                                             \
+        if (sweep_test_cb) {                         \
+            sweep_test_cb((stage), sweep_test_data); \
+        }                                            \
+    } while (0)
+#else
+#define SWEEP_TEST_HOOK(stage) ((void)0)
+#endif
+
+static bool sweep_keep_watched(const char *project, void *ud) {
+    cbm_mcp_server_t *srv = (cbm_mcp_server_t *)ud;
+    return srv->watcher && cbm_watcher_is_watched(srv->watcher, project);
+}
+
+/* The sweep thread's view of the session: the project name is copied on the
+ * main thread before the sweep starts, because initialize may rewrite
+ * srv->session_project while a sweep is running. */
+struct sweep_job {
+    cbm_mcp_server_t *srv;
+    char keep_project[CBM_SZ_256];
+};
+
+static void *sweep_thread(void *arg) {
+    sweep_job *job = (sweep_job *)arg;
+    cbm_mcp_server_t *srv = job->srv;
+    /* An exception leaving a thread function terminates the server: the
+     * sweep is housekeeping, so a failure in it (bad_alloc in the scan) is
+     * logged and dropped. Either way the flag is cleared and the job freed,
+     * so a later sweep can start. */
+    try {
+        SWEEP_TEST_HOOK(0);
+        cbm_cache_expiry_cfg_t cfg;
+        cbm_cache_expiry_cfg_load(&cfg, NULL);
+        cbm_cache_sweep_opts_t opts = {};
+        opts.keep_project = job->keep_project[0] ? job->keep_project : NULL;
+        opts.keep = sweep_keep_watched;
+        opts.keep_ud = srv;
+        cbm_cache_sweep_result_t res;
+        (void)cbm_cache_expiry_sweep(&cfg, &opts, &res);
+        SWEEP_TEST_HOOK(1);
+    } catch (const std::exception &e) {
+        cbm_log_warn("cache.expire.error", "msg", e.what());
+    } catch (...) {
+        cbm_log_warn("cache.expire.error", "msg", "unknown exception");
+    }
+    srv->sweep_running.store(false);
+    free(job);
+    return NULL;
+}
+
+/* Start a background sweep when one is due (at most once a day per cache,
+ * recorded in _config.db). Called at initialize and after an index run; the
+ * due check is one read of _config.db. */
+static void maybe_sweep_cache(cbm_mcp_server_t *srv) {
+    cbm_cache_expiry_cfg_t cfg;
+    cbm_cache_expiry_cfg_load(&cfg, srv->config);
+    if (!cbm_cache_expiry_due(&cfg, (int64_t)time(NULL))) {
+        return;
+    }
+    if (srv->sweep_running.load()) {
+        return; /* the earlier sweep records last_sweep when it ends */
+    }
+    join_sweep(srv); /* finished: reap it */
+    sweep_job *job = (sweep_job *)calloc(1, sizeof(*job));
+    if (!job) {
+        return;
+    }
+    job->srv = srv;
+    /* The project to exempt is the one the session's tool calls resolve to:
+     * the indexed ancestor the cwd walk-up finds (a server started in a
+     * subdirectory, or on a custom-named index), not the name derived from
+     * cwd itself, which names no database and would exempt nothing while the
+     * live index went to trash. */
+    const char *keep = cwd_project_name();
+    snprintf(job->keep_project, sizeof(job->keep_project), "%s",
+             keep && keep[0] ? keep : srv->session_project);
+    srv->sweep_running.store(true);
+    if (cbm_thread_create(&srv->sweep_tid, 0, sweep_thread, job) == 0) {
+        srv->sweep_active = true;
+    } else {
+        srv->sweep_running.store(false);
+        free(job);
+    }
+}
+
 static void start_update_check(cbm_mcp_server_t *srv) {
     if (srv->update_checked || !cbm_mcp_update_check_enabled()) {
         return;
@@ -12833,6 +13605,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         start_update_check(srv);
         detect_session(srv);
         maybe_auto_index(srv);
+        maybe_sweep_cache(srv);
     } else if (strcmp(req.method, "ping") == 0) {
         result_json = heap_strdup("{}");
     } else if (strcmp(req.method, "tools/list") == 0) {
@@ -12849,9 +13622,17 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
         bool wrap_tool = mcp_tool_known(tool_name) && strcmp(tool_name, "index_repository") != 0 &&
                          cbm_tool_supervisor_should_wrap();
-        char *delete_project = wrap_tool && strcmp(tool_name, "delete_project") == 0
-                                   ? get_project_arg(tool_args)
-                                   : NULL;
+        /* get_project_arg records a path argument's directory as the
+         * expected root (normalize_project_arg); this lookup is not a tool
+         * call, so put the expectation back, or it would scope every later
+         * call in this process to that directory. */
+        char *delete_project = NULL;
+        if (wrap_tool && strcmp(tool_name, "delete_project") == 0) {
+            char saved_root[sizeof(g_expected_root)];
+            memcpy(saved_root, g_expected_root, sizeof(saved_root));
+            delete_project = get_project_arg(tool_args);
+            memcpy(g_expected_root, saved_root, sizeof(saved_root));
+        }
         bool delete_locked = false;
         if (delete_project) {
             delete_locked = cbm_pipeline_try_lock();
@@ -12908,7 +13689,14 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
                 char delete_path[CBM_SZ_1K];
                 project_db_path(delete_project, delete_path, sizeof(delete_path));
                 bool delete_gone = delete_path[0] && !cbm_file_exists(delete_path);
-                if (((usable_response && !response_error) || delete_gone) && srv->watcher) {
+                /* A worker that kept the database because another checkout
+                 * owns it (a project-name collision: "kept_database_of")
+                 * leaves that checkout's watch in place, as the in-process
+                 * handler does; unwatching by name would stop its
+                 * re-indexing. */
+                bool kept_foreign = result_json && strstr(result_json, "kept_database_of");
+                if (((usable_response && !response_error && !kept_foreign) || delete_gone) &&
+                    srv->watcher) {
                     cbm_watcher_unwatch(srv->watcher, delete_project);
                 }
                 cbm_pipeline_unlock();
@@ -12934,6 +13722,9 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         request_logged = true;
 
         result_json = inject_update_notice(srv, result_json);
+        if (tool_name && strcmp(tool_name, "index_repository") == 0) {
+            maybe_sweep_cache(srv);
+        }
         free(tool_name);
         free(tool_args);
     } else {

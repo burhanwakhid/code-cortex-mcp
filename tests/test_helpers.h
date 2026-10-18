@@ -54,7 +54,9 @@ static inline int th_write_file(const char *path, const char *content) {
         cbm_mkdir_p(dir, 0755);
     }
 
-    FILE *f = fopen(path, "w");
+    /* Binary: on Windows text mode would turn every \n into \r\n, and a test
+     * hashing the string it wrote would no longer match the file. */
+    FILE *f = fopen(path, "wb");
     if (!f) {
         return -1;
     }

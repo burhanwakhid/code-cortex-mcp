@@ -9,12 +9,15 @@
 #include "../src/foundation/sha256.h"
 #include "../src/foundation/str_util.h" /* CBM_CROSS_REPO_DB_FILENAME */
 #include "test_framework.h"
+#include <algorithm>
+#include <vector>
 #include "test_helpers.h" /* th_write_file / th_rmtree / th_mktempdir */
 #include <mcp/mcp.h>
 #include <mcp/mcp_internal.h> /* cbm_detect_node_in_hunks (#1363) */
 #include <mcp/index_supervisor.h>
 #include <mcp/store_meta.h> /* custom-name cwd resolution test */
 #include <pipeline/pipeline.h>
+#include <pipeline/pass_cross_repo.h>
 #include <store/store.h>
 #include <yyjson/yyjson.h>
 #include <sqlite3.h> /* legacy four-column nodes_fts fixture (#518) */
@@ -1986,7 +1989,7 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     /* Write sample source file */
     char src_path[512];
     snprintf(src_path, sizeof(src_path), "%s/main.go", proj_dir);
-    FILE *fp = fopen(src_path, "w");
+    FILE *fp = fopen(src_path, "wb"); /* binary: its hash is stored from sample_source */
     if (!fp)
         return NULL;
     const char *sample_source = "package main\n"
@@ -3041,6 +3044,86 @@ TEST(tool_index_repository_cross_repo_rejects_non_string_targets) {
 
     cbm_mcp_server_free(srv);
     cbm_rmdir(tmp_dir);
+    PASS();
+}
+
+/* The cross-repo pass opens other projects' databases only when they exist
+ * and under their reader gate: a missing target (moved to trash, never
+ * indexed) is skipped, not created empty, and one whose gate is held
+ * exclusive (a move in progress) is skipped untouched. */
+static std::vector<std::string> g_xr_used;
+static void xr_record_used(const char *db_path) {
+    g_xr_used.push_back(db_path);
+}
+
+TEST(cross_repo_never_creates_missing_target) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s", th_mktempdir("cbm_xrepo_gate"));
+    ASSERT_TRUE(cache[0] != '\0');
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char src_db[512];
+    char tgt_db[512];
+    char missing_db[512];
+    snprintf(src_db, sizeof(src_db), "%s/xr-src.db", cache);
+    snprintf(tgt_db, sizeof(tgt_db), "%s/xr-tgt.db", cache);
+    snprintf(missing_db, sizeof(missing_db), "%s/xr-missing.db", cache);
+    const char *dbs[] = {src_db, tgt_db};
+    const char *names[] = {"xr-src", "xr-tgt"};
+    for (int i = 0; i < 2; i++) {
+        cbm_store_t *st = cbm_store_open_path(dbs[i]);
+        ASSERT_NOT_NULL(st);
+        cbm_store_upsert_project(st, names[i], cache);
+        cbm_store_close(st);
+    }
+
+    const char *missing[] = {"xr-missing"};
+    cbm_cross_repo_result_t r = cbm_cross_repo_match("xr-src", missing, 1);
+    bool created = cbm_file_exists(missing_db);
+    int scanned_missing = r.projects_scanned;
+
+    const char *present[] = {"xr-tgt"};
+    g_xr_used.clear();
+    cbm_cross_repo_set_usage_hook(xr_record_used);
+    r = cbm_cross_repo_match("xr-src", present, 1);
+    cbm_cross_repo_set_usage_hook(NULL);
+    int scanned_present = r.projects_scanned;
+    /* Both databases the pass opened are reported for usage recording. */
+    bool used_src = std::find(g_xr_used.begin(), g_xr_used.end(), src_db) != g_xr_used.end();
+    bool used_tgt = std::find(g_xr_used.begin(), g_xr_used.end(), tgt_db) != g_xr_used.end();
+
+    /* The source's reader gate held exclusive (a move in progress): no pass,
+     * so nothing is written into a file about to be trashed. */
+    cbm_db_lease_t *src_gate = NULL;
+    int sgrc = cbm_db_read_gate_acquire(src_db, true, &src_gate);
+    r = cbm_cross_repo_match("xr-src", present, 1);
+    int scanned_src_moving = r.projects_scanned;
+    cbm_db_lease_release(src_gate);
+
+    cbm_db_lease_t *gate = NULL;
+    int grc = cbm_db_read_gate_acquire(tgt_db, true, &gate);
+    r = cbm_cross_repo_match("xr-src", present, 1);
+    int scanned_moving = r.projects_scanned;
+    cbm_db_lease_release(gate);
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(cache);
+    ASSERT_FALSE(created);
+    ASSERT_EQ(scanned_missing, 0);
+    ASSERT_EQ(scanned_present, 1);
+    ASSERT_EQ(grc, 0);
+    ASSERT_EQ(scanned_moving, 0);
+    ASSERT_TRUE(used_src);
+    ASSERT_TRUE(used_tgt);
+    ASSERT_EQ(sgrc, 0);
+    ASSERT_EQ(scanned_src_moving, 0);
     PASS();
 }
 
@@ -6138,6 +6221,246 @@ TEST(tool_project_resolves_from_cwd) {
 #endif
 }
 
+#ifndef _WIN32
+#include <cli/cli.h>
+#include <watcher/watcher.h>
+
+/* A server started in a subdirectory of an indexed checkout takes that
+ * project as its session: the watcher registers it under its root, and with
+ * auto_index on the subdirectory is not indexed as a second project. */
+TEST(session_in_subdirectory_uses_indexed_ancestor) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm_subdir_cache_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    char made[256];
+    snprintf(made, sizeof(made), "/tmp/cbm_subdir_repo_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(made));
+    char *repo = realpath(made, NULL); /* the canonical root index_repository records */
+    ASSERT_NOT_NULL(repo);
+    char sub[512];
+    snprintf(sub, sizeof(sub), "%s/src", repo);
+    ASSERT_TRUE(cbm_mkdir_p(sub, 0755));
+    char src_file[600];
+    snprintf(src_file, sizeof(src_file), "%s/a.py", sub);
+    ASSERT_EQ(th_write_file(src_file, "def sub_fn():\n    return 1\n"), 0);
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    const char *saved_upd = getenv("CBM_UPDATE_CHECK");
+    char *saved_upd_copy = saved_upd ? strdup(saved_upd) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_UPDATE_CHECK", "0", 1);
+
+    char *pname = cbm_project_name_from_path(repo);
+    char *sub_name = cbm_project_name_from_path(sub);
+    ASSERT_NOT_NULL(pname);
+    ASSERT_NOT_NULL(sub_name);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, pname);
+    cbm_store_t *st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+    cbm_store_upsert_project(st, pname, repo);
+    cbm_store_close(st);
+    char sub_db[512];
+    snprintf(sub_db, sizeof(sub_db), "%s/%s.db", cache, sub_name);
+
+    cbm_config_t *cfg = cbm_config_open(cache);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true"), 0);
+
+    char old_cwd[1024];
+    ASSERT_NOT_NULL(getcwd(old_cwd, sizeof(old_cwd)));
+    ASSERT_EQ(chdir(sub), 0);
+    cbm_mcp_reset_cwd_project_cache();
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    cbm_mcp_server_set_watcher(srv, w);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{"
+             "\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},"
+             "\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    cbm_mcp_server_join_threads(srv); /* an auto-index, had one started */
+    bool watched = cbm_watcher_is_watched(w, pname);
+    int watch_count = cbm_watcher_watch_count(w);
+    bool second_db = cbm_file_exists(sub_db);
+    cbm_mcp_server_set_watcher(srv, NULL);
+    cbm_mcp_server_set_config(srv, NULL);
+    cbm_mcp_server_free(srv);
+    cbm_watcher_free(w);
+    cbm_config_close(cfg);
+
+    ASSERT_EQ(chdir(old_cwd), 0);
+    cbm_mcp_reset_cwd_project_cache();
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_upd_copy) {
+        cbm_setenv("CBM_UPDATE_CHECK", saved_upd_copy, 1);
+        free(saved_upd_copy);
+    } else {
+        cbm_unsetenv("CBM_UPDATE_CHECK");
+    }
+    th_rmtree(cache);
+    th_rmtree(repo);
+    free(repo);
+    free(pname);
+    free(sub_name);
+
+    ASSERT_TRUE(watched);
+    ASSERT_EQ(watch_count, 1);
+    ASSERT_FALSE(second_db);
+    PASS();
+}
+#endif
+
+#ifndef _WIN32
+/* Child of delete_path_arg_does_not_scope_later_calls: marks the process as
+ * the supervising host (irreversible, hence the fork). 0 = pass. */
+static int expected_root_leak_check(const char *cache) {
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/leak-proj.db", cache);
+    cbm_store_t *st = cbm_store_open_path(db_path);
+    if (!st) {
+        return 2;
+    }
+    cbm_store_upsert_project(st, "leak-proj", cache);
+    cbm_node_t n = {0};
+    n.project = "leak-proj";
+    n.label = "Function";
+    n.name = "LeakProbe";
+    n.qualified_name = "leak-proj.LeakProbe";
+    n.file_path = "a.go";
+    n.start_line = 1;
+    n.end_line = 2;
+    cbm_store_upsert_node(st, &n);
+    cbm_store_close(st);
+
+    cbm_unsetenv("CBM_TOOL_SUPERVISOR");
+    cbm_index_supervisor_mark_host(); /* delete_project takes the wrapped path */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return 3;
+    }
+    /* The pipeline lock is held, so the wrapped delete answers "busy" without
+     * spawning a worker; its project argument (a path) was read before that. */
+    cbm_pipeline_lock();
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"delete_project\",\"arguments\":{\"project\":\"/nonexistent/elsewhere\"}}}");
+    cbm_pipeline_unlock();
+    bool busy = resp && strstr(resp, "cannot run while indexing") != NULL;
+    free(resp);
+    if (!busy) {
+        cbm_mcp_server_free(srv);
+        return 4;
+    }
+    /* A later in-process call for a project indexed from another directory
+     * must not be scoped to that path. */
+    resp = cbm_mcp_handle_tool(srv, "search_graph",
+                               "{\"project\":\"leak-proj\",\"name_pattern\":\"LeakProbe\"}");
+    bool found = resp && strstr(resp, "LeakProbe") != NULL && !strstr(resp, "not found");
+    free(resp);
+    cbm_mcp_server_free(srv);
+    return found ? 0 : 5;
+}
+
+TEST(delete_path_arg_does_not_scope_later_calls) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s", th_mktempdir("cbm_rootleak"));
+    ASSERT_TRUE(cache[0] != '\0');
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(60);
+        _exit(expected_root_leak_check(cache));
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    th_rmtree(cache);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    PASS();
+}
+#endif
+
+/* A tool call leaves no statement of the server's cached store holding a
+ * read open: an idle connection would otherwise keep its read snapshot until
+ * the next request, and block a WAL reset (after a cache restore) for as
+ * long as the client stays quiet. */
+TEST(tool_call_ends_reads_on_cached_store) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s", th_mktempdir("cbm_endreads"));
+    ASSERT_TRUE(cache[0] != '\0');
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/endreads-proj.db", cache);
+    cbm_store_t *st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+    cbm_store_upsert_project(st, "endreads-proj", cache);
+    for (int i = 0; i < 5; i++) {
+        char name[32];
+        char qn[64];
+        snprintf(name, sizeof(name), "EndReads%d", i);
+        snprintf(qn, sizeof(qn), "endreads-proj.%s", name);
+        cbm_node_t n = {0};
+        n.project = "endreads-proj";
+        n.label = "Function";
+        n.name = name;
+        n.qualified_name = qn;
+        n.file_path = "a.go";
+        n.start_line = i + 1;
+        n.end_line = i + 1;
+        cbm_store_upsert_node(st, &n);
+    }
+    cbm_store_close(st);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    const char *calls[][2] = {
+        {"search_graph", "{\"project\":\"endreads-proj\",\"name_pattern\":\"EndReads\",\"limit\":1}"},
+        {"index_status", "{\"project\":\"endreads-proj\"}"},
+        {"get_architecture", "{\"project\":\"endreads-proj\"}"},
+    };
+    int busy = 0;
+    bool had_store = false;
+    for (auto &call : calls) {
+        char *resp = cbm_mcp_handle_tool(srv, call[0], call[1]);
+        ASSERT_NOT_NULL(resp);
+        free(resp);
+        cbm_store_t *cached = cbm_mcp_server_store(srv);
+        sqlite3 *db = cached ? cbm_store_get_db(cached) : NULL;
+        had_store = had_store || db != NULL;
+        for (sqlite3_stmt *s = db ? sqlite3_next_stmt(db, NULL) : NULL; s;
+             s = sqlite3_next_stmt(db, s)) {
+            busy += sqlite3_stmt_busy(s) ? 1 : 0;
+        }
+    }
+    cbm_mcp_server_free(srv);
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(cache);
+    ASSERT_TRUE(had_store);
+    ASSERT_EQ(busy, 0);
+    PASS();
+}
+
 TEST(hook_edit_impact_note) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -8218,6 +8541,7 @@ SUITE(mcp) {
     RUN_TEST(tool_unknown_project_skips_nonregular_cache_db);
 #endif
     RUN_TEST(tool_index_repository_cross_repo_rejects_non_string_targets);
+    RUN_TEST(cross_repo_never_creates_missing_target);
     RUN_TEST(tool_index_repository_resolves_root_path_from_project_name_issue1211);
     RUN_TEST(index_format_stale_db_rebuilds_once_issue769);
     RUN_TEST(index_recovery_quarantines_exit_nonzero);
@@ -8253,6 +8577,11 @@ SUITE(mcp) {
     RUN_TEST(tool_inspect_symbol_ambiguous_returns_suggestions);
     RUN_TEST(tool_search_code_max_bytes_truncates_with_continuation);
     RUN_TEST(tool_project_resolves_from_cwd);
+#ifndef _WIN32
+    RUN_TEST(session_in_subdirectory_uses_indexed_ancestor);
+    RUN_TEST(delete_path_arg_does_not_scope_later_calls);
+#endif
+    RUN_TEST(tool_call_ends_reads_on_cached_store);
     RUN_TEST(hook_edit_impact_note);
     /* #518/#519 — BM25 prose search */
     RUN_TEST(bm25_finds_section_by_its_prose_issue518);

@@ -70,6 +70,15 @@ int cbm_pipeline_claim_index(cbm_pipeline_t *p);
  * Discovers files, extracts, resolves, and dumps to SQLite. */
 int cbm_pipeline_run(cbm_pipeline_t *p);
 
+/* Callback run() calls once a run has its database in place, before it
+ * releases the index lease: what must happen before another process can
+ * take the database (the cache sweep judges it under that lease) goes here,
+ * not after run() returns. It also runs when a requested artifact export
+ * fails the run after the database was committed. Runs on run()'s thread;
+ * NULL clears. Set before run. */
+typedef void (*cbm_pipeline_indexed_fn)(const cbm_pipeline_t *p, void *ud);
+void cbm_pipeline_set_on_indexed(cbm_pipeline_t *p, cbm_pipeline_indexed_fn fn, void *ud);
+
 /* Request cancellation of a running pipeline (thread-safe). */
 void cbm_pipeline_cancel(cbm_pipeline_t *p);
 
@@ -100,7 +109,29 @@ bool cbm_pipeline_had_format_migration(const cbm_pipeline_t *p);
  * #1665). Owned by p. */
 const char *cbm_pipeline_export_error(const cbm_pipeline_t *p);
 
+/* The run failed because the database's branch could not be recorded after
+ * it was built (busy or read-only cache). */
+bool cbm_pipeline_branch_stamp_failed(const cbm_pipeline_t *p);
+
 void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges);
+
+/* Per-branch databases (pipeline/branch_slots.h): how many parked branch
+ * databases to keep for this project. < 1 turns parking off, so a branch
+ * switch reindexes the one database in place. Default
+ * CBM_BRANCH_SLOTS_DEFAULT_KEEP, or 0 when CBM_BRANCH_INDEX=0. Set before run. */
+void cbm_pipeline_set_branch_keep(cbm_pipeline_t *p, int keep);
+/* Total bytes the parked databases of this checkout may take on disk (<= 0:
+ * no size cap); the least recently parked go first. Default
+ * CBM_BRANCH_SLOTS_DEFAULT_BUDGET, or CBM_BRANCH_INDEX_BUDGET. Set before run. */
+void cbm_pipeline_set_branch_budget(cbm_pipeline_t *p, int64_t budget);
+
+/* After run: what the branch switch did ("none", "restored", "seeded",
+ * "in_place"), the slug the database had been built for (NULL unknown), the
+ * slug this run indexed (NULL outside git), and how many source files the run
+ * re-extracted (-1 unknown). Borrowed strings, valid until free. Any out
+ * pointer may be NULL. */
+void cbm_pipeline_get_branch_switch(const cbm_pipeline_t *p, const char **action, const char **from,
+                                    const char **to, int *files_reparsed);
 
 /* ── Per-file indexing failures (Stage 2 / Track B) ─────────────── */
 

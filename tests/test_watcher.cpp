@@ -361,6 +361,49 @@ TEST(watcher_detects_git_commit) {
     PASS();
 }
 
+/* Each branch has its own index (pipeline/branch_slots.h), so checking out a
+ * branch at the SAME commit still has to trigger a run: the SHA alone does not
+ * move. */
+TEST(watcher_detects_branch_switch_same_commit) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_test_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+    ASSERT_EQ(wt_git(tmpdir, "branch -q side"), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "temp-repo", tmpdir);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w); /* baseline */
+    ASSERT_EQ(index_call_count, 0);
+
+    ASSERT_EQ(wt_git(tmpdir, "checkout -q side"), 0);
+    cbm_watcher_touch(w, "temp-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    cbm_watcher_touch(w, "temp-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* settled on the new branch */
+
+    ASSERT_EQ(wt_git(tmpdir, "checkout -q --detach HEAD"), 0);
+    cbm_watcher_touch(w, "temp-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2); /* detaching is a switch too */
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(watcher_detects_dirty_worktree) {
     /* Create a temporary git repo */
     char tmpdir[256];
@@ -1368,6 +1411,67 @@ TEST(watcher_modify_tracked_file) {
     PASS();
 }
 
+/* A commit lands WHILE the index runs: that run read the old HEAD's files,
+ * so the next poll must still see a change instead of taking the new HEAD as
+ * indexed. */
+static int commit_during_index_callback(const char *name, const char *path, void *ud) {
+    (void)name;
+    (void)ud;
+    index_call_count++;
+    if (index_call_count == 1) {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), path, "file.txt"), "mid-run\n");
+        wt_git(path, "commit -q -am mid-run");
+    }
+    return 0;
+}
+
+TEST(watcher_head_moved_during_index_reindexes) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_midrun_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "one\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m initial");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, commit_during_index_callback, NULL);
+    cbm_watcher_watch(w, "midrun-repo", tmpdir);
+    index_call_count = 0;
+    cbm_watcher_poll_once(w); /* baseline */
+
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "two\n");
+    }
+    wt_git(tmpdir, "commit -q -am two");
+    cbm_watcher_touch(w, "midrun-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* commits "mid-run" while indexing */
+
+    cbm_watcher_touch(w, "midrun-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2); /* the mid-run commit was not indexed */
+
+    cbm_watcher_touch(w, "midrun-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2); /* settled */
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(watcher_failed_commit_index_retries_without_losing_head) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_retry_XXXXXX");
@@ -1878,7 +1982,11 @@ TEST(watcher_null_watch_count) {
  * ══════════════════════════════════════════════════════════════════ */
 
 #include <foundation/constants.h>
+#include <mcp/cache_expiry.h>
+#include <pipeline/branch_slots.h>
+#include "sqlite3.h"
 #include <string>
+#include <time.h>
 
 struct prune_lease_env {
     const char *name;
@@ -1889,6 +1997,24 @@ struct prune_lease_env {
         else { cbm_unsetenv(name); }
     }
 };
+/* Rows cache_usage holds for <cache>/<key>. */
+static int prune_usage_rows(const char *cache, const char *key) {
+    std::string cp = std::string(cache) + "/_config.db";
+    sqlite3 *db = NULL;
+    int n = -1;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_open(cp.c_str(), &db) == SQLITE_OK &&
+        sqlite3_prepare_v2(db, "SELECT count(*) FROM cache_usage WHERE db_name = ?1;", -1, &st,
+                           NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, key, -1, SQLITE_STATIC);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            n = sqlite3_column_int(st, 0);
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return n;
+}
 static bool prune_bytes_equal(const std::string& path, const char *expected) {
     FILE *f = cbm_fopen(path.c_str(), "rb");
     if (!f) { return false; }
@@ -1896,6 +2022,36 @@ static bool prune_bytes_equal(const std::string& path, const char *expected) {
     size_t n = fread(bytes, 1, sizeof(bytes), f);
     fclose(f);
     return n == strlen(expected) && memcmp(bytes, expected, n) == 0;
+}
+
+/* A minimal project database at path for project, recording root. */
+static bool prune_make_db(const std::string &path, const char *project, const std::string &root) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) {
+        sqlite3_close(db);
+        return false;
+    }
+    std::string sql = "CREATE TABLE projects(name TEXT PRIMARY KEY, indexed_at TEXT, root_path "
+                      "TEXT); INSERT INTO projects VALUES('" +
+                      std::string(project) + "','2026-01-01T00:00:00Z','" + root + "');";
+    bool ok = sqlite3_exec(db, sql.c_str(), NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(db);
+    return ok;
+}
+
+static std::string prune_read_all(const std::string &path) {
+    std::string out;
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) {
+        return out;
+    }
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        out.append(buf, n);
+    }
+    fclose(f);
+    return out;
 }
 
 TEST(watcher_prune_lease_preserves_grace_and_retry) {
@@ -1906,8 +2062,13 @@ TEST(watcher_prune_lease_preserves_grace_and_retry) {
     std::string db = std::string(root) + "/missing-target.db";
     std::string absent = std::string(root) + "/absent-root";
     const char *suffixes[] = {"", "-wal", "-shm"};
-    const char *values[] = {"keep db", "keep wal", "keep shm"};
-    for (int i = 0; i < 3; ++i) { ASSERT_EQ(th_write_file((db + suffixes[i]).c_str(), values[i]), 0); }
+    /* The database records the vanished root: the prune may remove it. */
+    ASSERT(prune_make_db(db, "missing-target", absent));
+    std::string db_bytes = prune_read_all(db);
+    const char *values[] = {db_bytes.c_str(), "keep wal", "keep shm"};
+    for (int i = 1; i < 3; ++i) { ASSERT_EQ(th_write_file((db + suffixes[i]).c_str(), values[i]), 0); }
+    ASSERT(cbm_cache_usage_set(db.c_str(), (int64_t)time(NULL), absent.c_str()));
+    ASSERT_EQ(prune_usage_rows(root, "missing-target.db"), 1);
     cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
     cbm_watcher_watch(w, "missing-target", absent.c_str());
     for (int i = 0; i < 4; ++i) { ASSERT_EQ(cbm_watcher_poll_once(w), 0); }
@@ -1917,12 +2078,127 @@ TEST(watcher_prune_lease_preserves_grace_and_retry) {
     cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", "0", 1);
     for (int i = 0; i < 4; ++i) { ASSERT_EQ(cbm_watcher_poll_once(w), 0); }
     ASSERT_EQ(cbm_watcher_watch_count(w), 1); // Busy state remains registered and alive.
-    for (int i = 0; i < 3; ++i) { ASSERT(prune_bytes_equal(db + suffixes[i], values[i])); }
+    ASSERT(prune_read_all(db) == db_bytes);
+    for (int i = 1; i < 3; ++i) { ASSERT(prune_bytes_equal(db + suffixes[i], values[i])); }
     cbm_db_lease_release(lease);
     ASSERT_EQ(cbm_watcher_poll_once(w), 0);
     ASSERT_EQ(cbm_watcher_watch_count(w), 0); // Retained absence state retries when free.
     for (const char *suffix : suffixes) { ASSERT(!cbm_is_regular_file((db + suffix).c_str())); }
     ASSERT(cbm_is_regular_file((db + ".index.lock").c_str()));
+    // A database rebuilt at this path must not inherit the pruned one's row.
+    ASSERT_EQ(prune_usage_rows(root, "missing-target.db"), 0);
+    cbm_watcher_free(w);
+    th_rmtree(root);
+    PASS();
+}
+
+/* Two checkouts deriving the same project name keep separate slot
+ * directories (root key). Pruning the one that vanished takes its own slots
+ * only; the other checkout's parked branches stay. */
+TEST(watcher_prune_keeps_colliding_roots_slots) {
+    char root[256] = "/tmp/cbm_prune_coll_XXXXXX";
+    ASSERT(cbm_mkdtemp(root));
+    prune_lease_env cache("CBM_CACHE_DIR", root);
+    prune_lease_env grace("CBM_WATCHER_PRUNE_GRACE_S", "0");
+    std::string db = std::string(root) + "/coll.db";
+    std::string absent = std::string(root) + "/absent-root";
+    std::string other = std::string(root) + "/other-root";
+    ASSERT(cbm_mkdir_p(other.c_str(), 0755));
+    ASSERT(prune_make_db(db, "coll", absent)); /* last indexed from the vanished root */
+    char adir[1024];
+    char bdir[1024];
+    ASSERT(cbm_branch_slots_dir(db.c_str(), "coll", absent.c_str(), adir, sizeof(adir)));
+    ASSERT(cbm_branch_slots_dir(db.c_str(), "coll", other.c_str(), bdir, sizeof(bdir)));
+    ASSERT(strcmp(adir, bdir) != 0);
+    ASSERT(cbm_mkdir_p(adir, 0755));
+    ASSERT(cbm_mkdir_p(bdir, 0755));
+    std::string a_slot = std::string(adir) + "/main.db.zst";
+    std::string b_slot = std::string(bdir) + "/main.db.zst";
+    ASSERT_EQ(th_write_file(a_slot.c_str(), "a"), 0);
+    ASSERT_EQ(th_write_file(b_slot.c_str(), "b"), 0);
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    cbm_watcher_watch(w, "coll", absent.c_str());
+    for (int i = 0; i < 4 && cbm_watcher_watch_count(w) == 1; ++i) {
+        ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    }
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+    ASSERT(!cbm_is_regular_file(db.c_str()));
+    ASSERT(!cbm_is_regular_file(a_slot.c_str()));
+    ASSERT(cbm_is_regular_file(b_slot.c_str())); /* the other checkout's slot stays */
+    cbm_watcher_free(w);
+    th_rmtree(root);
+    PASS();
+}
+
+/* The shared <project>.db is the other checkout's when that one indexed it
+ * last: pruning the vanished checkout keeps it (and the other's slots), and
+ * removes only the vanished checkout's own slots. */
+TEST(watcher_prune_keeps_colliding_roots_db) {
+    char root[256] = "/tmp/cbm_prune_colldb_XXXXXX";
+    ASSERT(cbm_mkdtemp(root));
+    prune_lease_env cache("CBM_CACHE_DIR", root);
+    prune_lease_env grace("CBM_WATCHER_PRUNE_GRACE_S", "0");
+    std::string db = std::string(root) + "/coll.db";
+    std::string absent = std::string(root) + "/absent-root";
+    std::string other = std::string(root) + "/other-root";
+    ASSERT(cbm_mkdir_p(other.c_str(), 0755));
+    cbm_store_t *s = cbm_store_open_path(db.c_str());
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "coll", other.c_str()), CBM_STORE_OK);
+    cbm_store_close(s);
+    char adir[1024];
+    char bdir[1024];
+    ASSERT(cbm_branch_slots_dir(db.c_str(), "coll", absent.c_str(), adir, sizeof(adir)));
+    ASSERT(cbm_branch_slots_dir(db.c_str(), "coll", other.c_str(), bdir, sizeof(bdir)));
+    ASSERT(cbm_mkdir_p(adir, 0755));
+    ASSERT(cbm_mkdir_p(bdir, 0755));
+    std::string a_slot = std::string(adir) + "/main.db.zst";
+    std::string b_slot = std::string(bdir) + "/main.db.zst";
+    ASSERT_EQ(th_write_file(a_slot.c_str(), "a"), 0);
+    ASSERT_EQ(th_write_file(b_slot.c_str(), "b"), 0);
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    cbm_watcher_watch(w, "coll", absent.c_str());
+    for (int i = 0; i < 4 && cbm_watcher_watch_count(w) == 1; ++i) {
+        ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    }
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+    ASSERT(cbm_is_regular_file(db.c_str())); /* the other checkout's live index */
+    ASSERT(!cbm_is_regular_file(a_slot.c_str()));
+    ASSERT(cbm_is_regular_file(b_slot.c_str()));
+    /* The database the vanished checkout itself indexed still goes. */
+    s = cbm_store_open_path(db.c_str());
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "coll", absent.c_str()), CBM_STORE_OK);
+    cbm_store_close(s);
+    cbm_watcher_watch(w, "coll", absent.c_str());
+    for (int i = 0; i < 4 && cbm_watcher_watch_count(w) == 1; ++i) {
+        ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    }
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+    ASSERT(!cbm_is_regular_file(db.c_str()));
+    ASSERT(cbm_is_regular_file(b_slot.c_str()));
+    cbm_watcher_free(w);
+    th_rmtree(root);
+    PASS();
+}
+
+/* A vanished checkout's prune must not delete a database whose owner it
+ * cannot read (corrupt, unreadable): with a colliding derived name it may be
+ * another checkout's index. Unknown ownership defers the prune. */
+TEST(watcher_prune_defers_on_unreadable_owner) {
+    char root[256] = "/tmp/cbm_prune_unread_XXXXXX";
+    ASSERT(cbm_mkdtemp(root));
+    prune_lease_env cache("CBM_CACHE_DIR", root);
+    prune_lease_env grace("CBM_WATCHER_PRUNE_GRACE_S", "0");
+    std::string db = std::string(root) + "/unread.db";
+    std::string absent = std::string(root) + "/absent-root";
+    ASSERT_EQ(th_write_file(db.c_str(), "not a sqlite database, owner unknown"), 0);
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    cbm_watcher_watch(w, "unread", absent.c_str());
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    }
+    ASSERT(cbm_is_regular_file(db.c_str())); /* kept */
     cbm_watcher_free(w);
     th_rmtree(root);
     PASS();
@@ -1994,6 +2270,9 @@ TEST(watcher_pending_mark_during_callback_survives_success) {
 SUITE(watcher) {
     RUN_TEST(watcher_pending_mark_during_callback_survives_success);
     RUN_TEST(watcher_prune_lease_preserves_grace_and_retry);
+    RUN_TEST(watcher_prune_keeps_colliding_roots_slots);
+    RUN_TEST(watcher_prune_defers_on_unreadable_owner);
+    RUN_TEST(watcher_prune_keeps_colliding_roots_db);
     RUN_TEST(watcher_pending_initial_index_retries_clean_baseline);
 
     /* Adaptive interval */
@@ -2017,6 +2296,8 @@ SUITE(watcher) {
 
     /* Git change detection */
     RUN_TEST(watcher_detects_git_commit);
+    RUN_TEST(watcher_detects_branch_switch_same_commit);
+    RUN_TEST(watcher_head_moved_during_index_reindexes);
     RUN_TEST(watcher_detects_dirty_worktree);
     RUN_TEST(watcher_detects_new_file);
     RUN_TEST(watcher_reindexes_clean_reset_and_retries_failure);

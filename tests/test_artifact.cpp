@@ -10,6 +10,15 @@
 
 #include <sys/stat.h>
 #include <stdio.h>
+#ifdef _WIN32
+#include <process.h> /* _getpid */
+#define getpid _getpid
+#else
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+#include <thread>
+#include <vector>
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
@@ -55,6 +64,225 @@ static void cleanup_dir(const char *path) {
 }
 
 /* ── Tests ───────────────────────────────────────────────────────── */
+
+/* Two exports at once (two projects in one server, or a server and the
+ * CLI) must each snapshot into their own temp file: with one shared name,
+ * the second VACUUM INTO fails or reads the first one's bytes, and the
+ * first one's unlink pulls the file out from under the second. */
+TEST(artifact_concurrent_exports_do_not_collide) {
+    setup_artifact_test();
+    enum { N = 4 };
+    char repos[N][1024];
+    char dbs[N][1024];
+    for (int i = 0; i < N; i++) {
+        snprintf(repos[i], sizeof(repos[i]), "%s/repo%d", g_tmpdir, i);
+        snprintf(dbs[i], sizeof(dbs[i]), "%s/test%d.db", g_tmpdir, i);
+        cbm_mkdir_p(repos[i], 0755);
+        create_test_db(dbs[i]);
+    }
+
+    int rcs[N];
+    std::vector<std::thread> threads;
+    for (int i = 0; i < N; i++) {
+        threads.emplace_back([&, i] {
+            /* BEST strips indexes and VACUUMs the copy, the longer race window. */
+            rcs[i] = cbm_artifact_export(dbs[i], repos[i], "test-proj", CBM_ARTIFACT_BEST);
+        });
+    }
+    for (auto &t : threads) {
+        t.join();
+    }
+    for (int i = 0; i < N; i++) {
+        ASSERT_EQ(rcs[i], 0);
+        char import_db[1024];
+        snprintf(import_db, sizeof(import_db), "%s/imported%d.db", g_tmpdir, i);
+        ASSERT_EQ(cbm_artifact_import(repos[i], import_db), 0);
+        cbm_store_t *s = cbm_store_open_path(import_db);
+        ASSERT_NOT_NULL(s);
+        ASSERT_EQ(cbm_store_count_nodes(s, "test-proj"), 2);
+        ASSERT_EQ(cbm_store_count_edges(s, "test-proj"), 1);
+        cbm_store_close(s);
+    }
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* Exports of different graphs into ONE repository at once (two projects
+ * indexed from one path under different names) publish one consistent pair:
+ * the metadata's node count is the payload's. Without the per-repository
+ * publish lock they shared the temp names and could pair one snapshot's
+ * payload with another's metadata. */
+TEST(artifact_concurrent_exports_one_repo_publish_one_pair) {
+    setup_artifact_test();
+    enum { N = 4 };
+    char repo[1024];
+    snprintf(repo, sizeof(repo), "%s/shared-repo", g_tmpdir);
+    cbm_mkdir_p(repo, 0755);
+    char dbs[N][1024];
+    for (int i = 0; i < N; i++) {
+        snprintf(dbs[i], sizeof(dbs[i]), "%s/shared%d.db", g_tmpdir, i);
+        create_test_db(dbs[i]);
+        cbm_store_t *s = cbm_store_open_path(dbs[i]);
+        for (int k = 0; k < i * 3; k++) { /* graph i has 2 + 3i nodes */
+            char sql[256];
+            snprintf(sql, sizeof(sql),
+                     "INSERT INTO nodes(project, label, name, qualified_name, file_path) "
+                     "VALUES('test-proj', 'Function', 'x%d', 'test-proj.x%d', 'x.c');",
+                     k, k);
+            cbm_store_exec(s, sql);
+        }
+        cbm_store_close(s);
+    }
+    int rcs[N];
+    std::vector<std::thread> threads;
+    for (int i = 0; i < N; i++) {
+        threads.emplace_back(
+            [&, i] { rcs[i] = cbm_artifact_export(dbs[i], repo, "test-proj", CBM_ARTIFACT_BEST); });
+    }
+    for (auto &t : threads) {
+        t.join();
+    }
+    for (int i = 0; i < N; i++) {
+        ASSERT_EQ(rcs[i], 0);
+    }
+    char meta[1100];
+    snprintf(meta, sizeof(meta), "%s/.code-cortex/artifact.json", repo);
+    FILE *f = fopen(meta, "rb");
+    ASSERT_NOT_NULL(f);
+    char text[8192] = {0};
+    size_t got = fread(text, 1, sizeof(text) - 1, f);
+    fclose(f);
+    ASSERT_TRUE(got > 0);
+    const char *nk = strstr(text, "\"nodes\":");
+    ASSERT_NOT_NULL(nk);
+    int meta_nodes = atoi(nk + strlen("\"nodes\":"));
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/shared-imported.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repo, import_db), 0);
+    cbm_store_t *s = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(s);
+    int payload_nodes = cbm_store_count_nodes(s, "test-proj");
+    cbm_store_close(s);
+    ASSERT_EQ(meta_nodes, payload_nodes);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* No publish lock to be had (a read-only cache): the export fails closed
+ * rather than publishing unlocked through the shared temp names. */
+TEST(artifact_export_fails_closed_without_publish_lock) {
+#ifndef _WIN32
+    if (geteuid() == 0) {
+        PASS(); /* root ignores directory permissions */
+    }
+    setup_artifact_test();
+    char repo[1024];
+    char db[1024];
+    char rocache[1024];
+    snprintf(repo, sizeof(repo), "%s/lockless-repo", g_tmpdir);
+    snprintf(db, sizeof(db), "%s/lockless.db", g_tmpdir);
+    snprintf(rocache, sizeof(rocache), "%s/ro-cache", g_tmpdir);
+    cbm_mkdir_p(repo, 0755);
+    cbm_mkdir_p(rocache, 0755);
+    create_test_db(db);
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", rocache, 1);
+    ASSERT_EQ(chmod(rocache, 0555), 0);
+    int rc = cbm_artifact_export(db, repo, "test-proj", CBM_ARTIFACT_FAST);
+    chmod(rocache, 0755);
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    ASSERT_NEQ(rc, 0);
+    char meta[1100];
+    snprintf(meta, sizeof(meta), "%s/.code-cortex/artifact.json", repo);
+    ASSERT_FALSE(cbm_file_exists(meta));
+    cleanup_dir(g_tmpdir);
+#endif
+    PASS();
+}
+
+/* The import refuses a payload artifact.json does not describe (an export
+ * caught between publishing the payload and the metadata). */
+TEST(artifact_import_refuses_payload_metadata_mismatch) {
+    setup_artifact_test();
+    char repo[1024];
+    char db[1024];
+    snprintf(repo, sizeof(repo), "%s/pfp-repo", g_tmpdir);
+    snprintf(db, sizeof(db), "%s/pfp.db", g_tmpdir);
+    cbm_mkdir_p(repo, 0755);
+    create_test_db(db);
+    ASSERT_EQ(cbm_artifact_export(db, repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/pfp-imported.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repo, import_db), 0); /* the pair as published */
+    char zst[1100];
+    snprintf(zst, sizeof(zst), "%s/.code-cortex/graph.db.zst", repo);
+    FILE *f = fopen(zst, "ab");
+    ASSERT_NOT_NULL(f);
+    fputs("another payload", f);
+    fclose(f);
+    char import_db2[1024];
+    snprintf(import_db2, sizeof(import_db2), "%s/pfp-imported2.db", g_tmpdir);
+    ASSERT_NEQ(cbm_artifact_import(repo, import_db2), 0);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* An export removes the snapshot files (cbm_artifact_<pid>_<n>.db and its
+ * sidecars) that a process which died mid-export left in the temp
+ * directory; this process's own and a live process's stay. */
+static long artifact_dead_pid(void) {
+#ifdef _WIN32
+    return 0x7FFFFFF0L; /* no such process: OpenProcess fails */
+#else
+    pid_t child = fork();
+    if (child == 0) {
+        _exit(0);
+    }
+    if (child < 0) {
+        return -1;
+    }
+    int status = 0;
+    (void)waitpid(child, &status, 0);
+    return (long)child;
+#endif
+}
+
+TEST(artifact_export_removes_orphaned_snapshots) {
+    setup_artifact_test();
+    create_test_db(g_db);
+    long dead = artifact_dead_pid();
+    ASSERT_GT(dead, 0);
+    char orphan[1024];
+    char orphan_wal[1100];
+    char mine[1024];
+    char unrelated[1024];
+    snprintf(orphan, sizeof(orphan), "%s/cbm_artifact_%ld_7.db", cbm_tmpdir(), dead);
+    snprintf(orphan_wal, sizeof(orphan_wal), "%s-wal", orphan);
+    snprintf(mine, sizeof(mine), "%s/cbm_artifact_%ld_999999.db", cbm_tmpdir(), (long)getpid());
+    snprintf(unrelated, sizeof(unrelated), "%s/cbm_artifact_%ld_7.dbx", cbm_tmpdir(), dead);
+    const char *files[] = {orphan, orphan_wal, mine, unrelated};
+    for (const char *f : files) {
+        FILE *fp = fopen(f, "wb");
+        ASSERT_NOT_NULL(fp);
+        fputs("snapshot", fp);
+        fclose(fp);
+    }
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+    ASSERT_FALSE(cbm_file_exists(orphan));
+    ASSERT_FALSE(cbm_file_exists(orphan_wal));
+    ASSERT_TRUE(cbm_file_exists(mine));      /* this process: maybe mid-export */
+    ASSERT_TRUE(cbm_file_exists(unrelated)); /* not a snapshot name */
+    (void)cbm_unlink(mine);
+    (void)cbm_unlink(unrelated);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
 
 TEST(artifact_export_fast_roundtrip) {
     setup_artifact_test();
@@ -395,6 +623,11 @@ TEST(artifact_roundtrip_non_ascii_paths) {
 SUITE(artifact) {
     RUN_TEST(artifact_fast_export_snapshots_live_wal_store);
     RUN_TEST(store_deep_integrity_detects_page_corruption);
+    RUN_TEST(artifact_concurrent_exports_do_not_collide);
+    RUN_TEST(artifact_concurrent_exports_one_repo_publish_one_pair);
+    RUN_TEST(artifact_export_fails_closed_without_publish_lock);
+    RUN_TEST(artifact_import_refuses_payload_metadata_mismatch);
+    RUN_TEST(artifact_export_removes_orphaned_snapshots);
     RUN_TEST(artifact_export_fast_roundtrip);
     RUN_TEST(artifact_export_best_roundtrip);
     RUN_TEST(artifact_exists_check);

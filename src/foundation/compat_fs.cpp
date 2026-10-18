@@ -46,7 +46,7 @@ cbm_dir_t *cbm_opendir(const char *path) {
     if (!path) {
         return NULL;
     }
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return NULL;
     }
@@ -118,7 +118,11 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     memcpy(d->entry.name, u8, nlen);
     d->entry.name[nlen] = '\0';
     free(u8);
-    d->entry.is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    /* A junction or directory symlink carries FILE_ATTRIBUTE_DIRECTORY too;
+     * it is a link, not a directory a walker may descend into. */
+    DWORD attr = d->find_data.dwFileAttributes;
+    d->entry.is_dir =
+        (attr & FILE_ATTRIBUTE_DIRECTORY) != 0 && (attr & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
     d->entry.d_type = 0;
     d->entry.is_link = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
     return &d->entry;
@@ -454,7 +458,7 @@ int cbm_pclose(FILE *f) {
 }
 
 FILE *cbm_fopen(const char *path, const char *mode) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return NULL;
     }
@@ -470,7 +474,7 @@ FILE *cbm_fopen(const char *path, const char *mode) {
 }
 
 bool cbm_is_regular_file(const char *path) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return false;
     }
@@ -480,9 +484,31 @@ bool cbm_is_regular_file(const char *path) {
     return ret == 0 && (wst.st_mode & _S_IFMT) == _S_IFREG;
 }
 
+bool cbm_is_link(const char *path) {
+    wchar_t *wpath = path ? cbm_utf8_to_wide_path(path) : NULL;
+    if (!wpath) {
+        return false;
+    }
+    /* GetFileAttributesW reports the reparse point itself, never its target. */
+    DWORD attr = GetFileAttributesW(wpath);
+    free(wpath);
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT);
+}
+
+int cbm_stat(const char *path, cbm_stat_t *st) {
+    wchar_t *wpath = path ? cbm_utf8_to_wide_path(path) : NULL;
+    if (!wpath) {
+        errno = ENOENT;
+        return CBM_NOT_FOUND;
+    }
+    int ret = _wstat64(wpath, st);
+    free(wpath);
+    return ret;
+}
+
 bool cbm_mkdir_p(const char *path, int mode) {
     (void)mode;
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return false;
     }
@@ -498,7 +524,21 @@ bool cbm_mkdir_p(const char *path, int mode) {
         return false;
     }
     wmemcpy(tmp, wpath, wlen + 1);
-    for (wchar_t *p = tmp + SKIP_ONE; *p; p++) {
+    /* An extended-length path walks from its root: \\?\C:\ or the share of
+     * \\?\UNC\server\share\. Its prefix components are not directories. */
+    wchar_t *start = tmp + SKIP_ONE;
+    if (cbm_wide_has_long_prefix(tmp)) {
+        start = tmp + 4; /* past \\?\ */
+        if (wcsncmp(start, L"UNC\\", 4) == 0) {
+            start += 4;
+            for (int seps = 0; *start && seps < 2; start++) {
+                seps += *start == L'\\';
+            }
+        } else if (start[0] && start[1] == L':' && start[2] == L'\\') {
+            start += 3;
+        }
+    }
+    for (wchar_t *p = start; *p; p++) {
         if (*p == L'/' || *p == L'\\') {
             *p = L'\0';
             _wmkdir(tmp);
@@ -512,7 +552,7 @@ bool cbm_mkdir_p(const char *path, int mode) {
 }
 
 int cbm_unlink(const char *path) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return CBM_NOT_FOUND;
     }
@@ -522,7 +562,7 @@ int cbm_unlink(const char *path) {
 }
 
 int cbm_rmdir(const char *path) {
-    wchar_t *wpath = cbm_utf8_to_wide(path);
+    wchar_t *wpath = cbm_utf8_to_wide_path(path);
     if (!wpath) {
         return CBM_NOT_FOUND;
     }
@@ -720,9 +760,19 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
         }
         memcpy(d->entry.name, de->d_name, nlen);
         d->entry.name[nlen] = '\0';
-        d->entry.is_dir = (de->d_type == DT_DIR);
         d->entry.d_type = de->d_type;
-        d->entry.is_link = (de->d_type == DT_LNK);
+        if (de->d_type == DT_UNKNOWN) {
+            /* NFS, FUSE and some XFS/ReiserFS mounts leave d_type unset;
+             * ask the entry itself, without following a symlink, so the
+             * answer matches what DT_DIR / DT_LNK would have said. */
+            struct stat st;
+            bool got = fstatat(dirfd(d->dir), de->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0;
+            d->entry.is_dir = got && S_ISDIR(st.st_mode);
+            d->entry.is_link = got && S_ISLNK(st.st_mode);
+        } else {
+            d->entry.is_dir = (de->d_type == DT_DIR);
+            d->entry.is_link = (de->d_type == DT_LNK);
+        }
         return &d->entry;
     }
     return NULL;
@@ -896,6 +946,11 @@ bool cbm_is_regular_file(const char *path) {
     return stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
+bool cbm_is_link(const char *path) {
+    struct stat st;
+    return path && lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
+}
+
 bool cbm_mkdir_p(const char *path, int mode) {
     /* Try direct mkdir first */
     if (mkdir(path, (mode_t)mode) == 0) {
@@ -1017,8 +1072,8 @@ bool cbm_find_git(char *out, size_t out_sz) {
  * (wide paths — raw MoveFileExA would re-mangle non-ASCII cache paths). */
 int cbm_rename_replace(const char *src, const char *dst) {
 #ifdef _WIN32
-    wchar_t *wsrc = cbm_utf8_to_wide(src);
-    wchar_t *wdst = cbm_utf8_to_wide(dst);
+    wchar_t *wsrc = cbm_utf8_to_wide_path(src);
+    wchar_t *wdst = cbm_utf8_to_wide_path(dst);
     int ret = CBM_NOT_FOUND;
     if (wsrc && wdst) {
         if (MoveFileExW(wsrc, wdst,
@@ -1141,7 +1196,7 @@ static bool db_lease_windows_components_safe(const Char *path, bool allow_naviga
 static char *db_lease_real_path(const char *path, bool *missing) {
     *missing = false;
 #ifdef _WIN32
-    wchar_t *wide = cbm_utf8_to_wide(path);
+    wchar_t *wide = cbm_utf8_to_wide_path(path);
     if (!wide) {
         return NULL;
     }
@@ -1296,7 +1351,7 @@ int cbm_db_lease_try_acquire(const char *db_path, cbm_db_lease_t **out) {
     }
     lease->target = target;
 #ifdef _WIN32
-    wchar_t *wide = cbm_utf8_to_wide(lock_path);
+    wchar_t *wide = cbm_utf8_to_wide_path(lock_path);
     lease->handle =
         wide ? CreateFileW(wide, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                            NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)
@@ -1331,6 +1386,114 @@ int cbm_db_lease_try_acquire(const char *db_path, cbm_db_lease_t **out) {
     return 0;
 }
 
+/* Shared body of the probes: the lock file <real db path><suffix>, opened
+ * only if it exists, tried exclusively and released. */
+static int db_lock_probe(const char *db_path, const char *suffix) {
+    bool missing = false;
+    char *target = db_path && db_path[0] && strlen(db_path) < DB_LEASE_PATH_MAX - 32
+                       ? db_lease_real_path(db_path, &missing)
+                       : NULL;
+    if (!target && missing) {
+        /* No database yet -- but an index run or a trash restore takes the
+         * lease BEFORE the file appears, so the lock file can be held
+         * already. It sits beside the database under the parent's real
+         * path, as the lease derives it; resolve that without creating
+         * anything (no parent: no lock file can exist). */
+        char parent[DB_LEASE_PATH_MAX];
+        snprintf(parent, sizeof(parent), "%s", db_path);
+        char *slash = strrchr(parent, '/');
+#ifdef _WIN32
+        char *backslash = strrchr(parent, '\\');
+        if (backslash && (!slash || backslash > slash)) {
+            slash = backslash;
+        }
+#endif
+        if (!slash || !slash[1]) {
+            return 0;
+        }
+        char leaf[DB_LEASE_PATH_MAX];
+        snprintf(leaf, sizeof(leaf), "%s", slash + 1);
+        if (slash == parent) {
+            slash[1] = '\0'; /* "/x.db": the parent is "/" */
+        } else if (slash == parent + 2 && parent[1] == ':') {
+            slash[1] = '\0'; /* "C:\x.db": the parent is "C:\", not drive-relative "C:" */
+        } else {
+            *slash = '\0';
+        }
+        bool parent_missing = false;
+        char *real_parent = db_lease_real_path(parent, &parent_missing);
+        if (!real_parent) {
+            return parent_missing ? 0 : -1;
+        }
+        size_t need = strlen(real_parent) + 1 + strlen(leaf) + 1;
+        target = (char *)malloc(need);
+        if (!target) {
+            free(real_parent);
+            return -1;
+        }
+        snprintf(target, need, "%s/%s", real_parent, leaf);
+        free(real_parent);
+    }
+    if (!target) {
+        return -1;
+    }
+    char lock_path[DB_LEASE_PATH_MAX];
+    int n = snprintf(lock_path, sizeof(lock_path), "%s%s", target, suffix);
+    free(target);
+    if (n <= 0 || (size_t)n >= sizeof(lock_path)) {
+        return -1;
+    }
+#ifdef _WIN32
+    wchar_t *wide = cbm_utf8_to_wide_path(lock_path);
+    HANDLE h =
+        wide ? CreateFileW(wide, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL)
+             : INVALID_HANDLE_VALUE;
+    if (h == INVALID_HANDLE_VALUE && wide) {
+        h = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+    free(wide);
+    if (h == INVALID_HANDLE_VALUE) {
+        return GetLastError() == ERROR_FILE_NOT_FOUND ? 0 : -1;
+    }
+    OVERLAPPED overlap = {};
+    int rc = 0;
+    if (LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &overlap)) {
+        OVERLAPPED unlock = {};
+        UnlockFileEx(h, 0, 1, 0, &unlock);
+    } else {
+        rc = GetLastError() == ERROR_LOCK_VIOLATION ? CBM_INDEX_BUSY : -1;
+    }
+    CloseHandle(h);
+    return rc;
+#else
+    int fd = open(lock_path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        fd = open(lock_path, O_RDONLY | O_CLOEXEC);
+    }
+    if (fd < 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    int rc = 0;
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        (void)flock(fd, LOCK_UN);
+    } else {
+        rc = errno == EWOULDBLOCK || errno == EAGAIN ? CBM_INDEX_BUSY : -1;
+    }
+    close(fd);
+    return rc;
+#endif
+}
+
+int cbm_db_lease_probe(const char *db_path) {
+    return db_lock_probe(db_path, ".index.lock");
+}
+
+int cbm_db_read_gate_probe(const char *db_path) {
+    return db_lock_probe(db_path, ".read.lock");
+}
+
 const char *cbm_db_lease_target(const cbm_db_lease_t *lease) {
     return lease ? lease->target : NULL;
 }
@@ -1350,4 +1513,91 @@ void cbm_db_lease_release(cbm_db_lease_t *lease) {
 #endif
     free(lease->target);
     free(lease);
+}
+
+enum { DB_READ_GATE_WAIT_MS = 2000, DB_READ_GATE_POLL_MS = 5 };
+
+int cbm_db_read_gate_acquire(const char *db_path, bool exclusive, cbm_db_lease_t **out) {
+    if (!out) {
+        return CBM_NOT_FOUND;
+    }
+    *out = NULL;
+    // Only an existing database has readers to protect: never create a
+    // parent directory or a lock file for a path that holds nothing.
+    bool missing = false;
+    char *target = db_path && db_path[0] && strlen(db_path) < DB_LEASE_PATH_MAX - 32
+                       ? db_lease_real_path(db_path, &missing)
+                       : NULL;
+    if (!target) {
+        return CBM_NOT_FOUND;
+    }
+    char lock_path[DB_LEASE_PATH_MAX];
+    int n = snprintf(lock_path, sizeof(lock_path), "%s.read.lock", target);
+    if (n <= 0 || (size_t)n >= sizeof(lock_path)) {
+        free(target);
+        return CBM_NOT_FOUND;
+    }
+    cbm_db_lease_t *gate = (cbm_db_lease_t *)calloc(1, sizeof(*gate));
+    if (!gate) {
+        free(target);
+        return CBM_NOT_FOUND;
+    }
+    gate->target = target;
+#ifdef _WIN32
+    wchar_t *wide = cbm_utf8_to_wide_path(lock_path);
+    gate->handle =
+        wide ? CreateFileW(wide, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)
+             : INVALID_HANDLE_VALUE;
+    if (gate->handle == INVALID_HANDLE_VALUE && wide && !exclusive) {
+        // A read-only cache directory: lock an existing file read-only.
+        gate->handle = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+    free(wide);
+    if (gate->handle == INVALID_HANDLE_VALUE) {
+        cbm_db_lease_release(gate);
+        return CBM_NOT_FOUND;
+    }
+    DWORD flags = LOCKFILE_FAIL_IMMEDIATELY | (exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0);
+    for (int waited = 0;; waited += DB_READ_GATE_POLL_MS) {
+        OVERLAPPED overlap = {};
+        if (LockFileEx(gate->handle, flags, 0, 1, 0, &overlap)) {
+            break;
+        }
+        DWORD error = GetLastError();
+        if (error != ERROR_LOCK_VIOLATION || exclusive || waited >= DB_READ_GATE_WAIT_MS) {
+            cbm_db_lease_release(gate);
+            return error == ERROR_LOCK_VIOLATION ? CBM_INDEX_BUSY : CBM_NOT_FOUND;
+        }
+        Sleep(DB_READ_GATE_POLL_MS);
+    }
+#else
+    gate->fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (gate->fd < 0 && !exclusive) {
+        // A read-only cache directory: flock works on a read-only descriptor.
+        gate->fd = open(lock_path, O_RDONLY | O_CLOEXEC);
+    }
+    if (gate->fd < 0) {
+        cbm_db_lease_release(gate);
+        return CBM_NOT_FOUND;
+    }
+    // Polled, not blocking: a holder of the exclusive side never waits on
+    // anything, so the wait is short, and a bounded one cannot deadlock.
+    int op = (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB;
+    for (int waited = 0;; waited += DB_READ_GATE_POLL_MS) {
+        if (flock(gate->fd, op) == 0) {
+            break;
+        }
+        int error = errno;
+        bool busy = error == EWOULDBLOCK || error == EAGAIN;
+        if ((!busy && error != EINTR) || exclusive || waited >= DB_READ_GATE_WAIT_MS) {
+            cbm_db_lease_release(gate);
+            return busy ? CBM_INDEX_BUSY : CBM_NOT_FOUND;
+        }
+        usleep(DB_READ_GATE_POLL_MS * 1000);
+    }
+#endif
+    *out = gate;
+    return 0;
 }

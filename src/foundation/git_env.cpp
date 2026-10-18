@@ -94,6 +94,25 @@ static bool git_env_wide_entry_is_repo_local(const wchar_t *entry) {
     return git_env_name_is_repo_local(name, n);
 }
 
+/* GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n>: inert once GIT_CONFIG_COUNT is
+ * scrubbed, and dropped so the block's own entries below cannot collide. */
+static bool git_env_wide_entry_is_config_item(const wchar_t *entry) {
+    return wcsncmp(entry, L"GIT_CONFIG_KEY_", 15) == 0 ||
+           wcsncmp(entry, L"GIT_CONFIG_VALUE_", 17) == 0;
+}
+
+/* The one setting every git child gets: Git for Windows refuses a ref whose
+ * loose file sits past MAX_PATH unless core.longpaths is on, and a branch
+ * name is unbounded -- without it a long-named branch reads as detached. A
+ * parent's GIT_CONFIG_COUNT is scrubbed (it may carry another repository's
+ * settings), so this is the block's whole config set. */
+static const wchar_t GIT_ENV_LONGPATHS[] =
+    L"GIT_CONFIG_COUNT=1\0GIT_CONFIG_KEY_0=core.longpaths\0GIT_CONFIG_VALUE_0=true\0";
+
+static bool git_env_wide_entry_dropped(const wchar_t *entry) {
+    return git_env_wide_entry_is_repo_local(entry) || git_env_wide_entry_is_config_item(entry);
+}
+
 wchar_t *cbm_git_child_env_block(void) {
     wchar_t *current = GetEnvironmentStringsW();
     if (!current) {
@@ -101,24 +120,27 @@ wchar_t *cbm_git_child_env_block(void) {
     }
     size_t kept = 0;
     for (const wchar_t *e = current; *e; e += wcslen(e) + 1) {
-        if (!git_env_wide_entry_is_repo_local(e)) {
+        if (!git_env_wide_entry_dropped(e)) {
             kept += wcslen(e) + 1;
         }
     }
+    const size_t extra = sizeof(GIT_ENV_LONGPATHS) / sizeof(wchar_t) - 1; /* w/o final NUL */
     /* +2: a block that keeps nothing still needs its double terminator. */
-    wchar_t *block = (wchar_t *)malloc((kept + 2) * sizeof(wchar_t));
+    wchar_t *block = (wchar_t *)malloc((kept + extra + 2) * sizeof(wchar_t));
     if (!block) {
         FreeEnvironmentStringsW(current);
         return NULL;
     }
     size_t pos = 0;
     for (const wchar_t *e = current; *e; e += wcslen(e) + 1) {
-        if (!git_env_wide_entry_is_repo_local(e)) {
+        if (!git_env_wide_entry_dropped(e)) {
             size_t len = wcslen(e) + 1;
             memcpy(block + pos, e, len * sizeof(wchar_t));
             pos += len;
         }
     }
+    memcpy(block + pos, GIT_ENV_LONGPATHS, extra * sizeof(wchar_t));
+    pos += extra;
     block[pos] = L'\0';
     if (pos == 0) {
         block[1] = L'\0';

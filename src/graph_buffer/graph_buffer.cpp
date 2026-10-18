@@ -40,6 +40,7 @@ enum {
 #include "xxhash/xxhash.h"
 #include <sqlite3.h>
 
+#include <chrono>
 #include <algorithm>
 #include <vector>
 #include <limits.h>
@@ -2293,13 +2294,24 @@ static int count_live_nodes(cbm_gbuf_t *gb) {
     return count;
 }
 
+/* The dump's time, to the microsecond: it is also the graph's generation
+ * (pipeline/artifact.cpp), and two dumps of different graphs within one
+ * second (a quick rebuild from unchanged sources after an extractor change)
+ * must not share it, or a stale artifact reads as current. Readers parse the
+ * seconds and ignore the fraction. */
 static void generate_iso_timestamp(char *buf, size_t buf_size) {
-    time_t now = time(NULL);
+    auto now_tp = std::chrono::system_clock::now();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(now_tp.time_since_epoch());
+    time_t now = (time_t)(us.count() / 1000000);
+    long frac = (long)(us.count() % 1000000);
     struct tm tm_buf;
     struct tm *tm_val = cbm_gmtime_r(&now, &tm_buf);
-    if (strftime(buf, buf_size, "%Y-%m-%dT%H:%M:%SZ", tm_val) == 0) {
+    char sec[CBM_SZ_32];
+    if (!tm_val || strftime(sec, sizeof(sec), "%Y-%m-%dT%H:%M:%S", tm_val) == 0) {
         snprintf(buf, buf_size, "1970-01-01T00:00:00Z");
+        return;
     }
+    snprintf(buf, buf_size, "%s.%06ldZ", sec, frac);
 }
 
 /* Release lookup indexes then remap+sort+dedup vectors for the B-tree writer. */

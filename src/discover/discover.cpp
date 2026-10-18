@@ -33,6 +33,10 @@ int cbm_gitignore_match_result(const cbm_gitignore_t *gi, const char *rel_path, 
 static const char *ALWAYS_SKIP_DIRS[] = {
     /* VCS */
     ".git", ".hg", ".svn", ".worktrees",
+    /* The indexer's own artifact (pipeline/artifact.h CBM_ARTIFACT_DIR): an
+     * export rewrites it, so indexing it made every run after an export
+     * re-extract and re-export it. */
+    ".code-cortex",
     /* IDE */
     ".idea", ".vs", ".vscode", ".eclipse", ".claude", ".claude-worktrees", "Antigravity",
     /* Python */
@@ -791,11 +795,84 @@ static int gitignore_chain_result(const gitignore_link_t *link, const char *rel_
  * #489), node_modules explodes discovery, and the worktree-internal dirs
  * (.worktrees / .claude-worktrees, the worktree entries in ALWAYS_SKIP_DIRS)
  * contain parallel checkouts of the same repo whose indexing would duplicate
- * the whole codebase (#802). */
+ * the whole codebase (#802). The indexer's own artifact directory
+ * (CBM_ARTIFACT_DIR) too: indexed, every export would rewrite a source the
+ * next run sees changed, and that run would export again. */
 static bool is_safety_core_dir(const char *name) {
-    static const char *const SAFETY_CORE_DIRS[] = {".git", "node_modules", ".worktrees",
-                                                   ".claude-worktrees", NULL};
+    static const char *const SAFETY_CORE_DIRS[] = {
+        ".git", "node_modules", ".worktrees", ".claude-worktrees", ".code-cortex", NULL};
     return str_in_list(name, SAFETY_CORE_DIRS);
+}
+
+static bool discover_path_is_absolute(const char *path);
+
+/* Whether dir is the root of a linked git worktree: its .git is a gitlink
+ * file "gitdir: <common dir>/worktrees/<name>" and that admin directory
+ * holds the "commondir" file git writes for every linked worktree. A
+ * worktree added anywhere inside the checkout (not only under .worktrees) is
+ * a parallel copy of the repository with an index of its own; walking into
+ * it duplicated every symbol in the parent's graph. A submodule's gitlink
+ * names ".../modules/<path>" and is still walked, as is a nested clone (.git
+ * directory). The parent name alone is not enough: a submodule at
+ * worktrees/foo has the gitdir .git/modules/worktrees/foo, which has no
+ * commondir. Mirrors cbm_git_is_linked_worktree, which discover does not
+ * link against. One open attempt per directory: it fails where there is no
+ * .git, and reading a .git directory yields no "gitdir:" line. A gitdir path
+ * too long to check (the line or the commondir path does not fit the
+ * buffer) fails closed: the directory is taken for a linked worktree and
+ * skipped, since walking a linked worktree indexes the repository twice. */
+static bool is_linked_worktree_root(const char *dir) {
+    char dot_git[CBM_SZ_4K];
+    if (snprintf(dot_git, sizeof(dot_git), "%s/.git", dir) >= (int)sizeof(dot_git)) {
+        return false;
+    }
+    FILE *f = cbm_fopen(dot_git, "r");
+    if (!f) {
+        return false;
+    }
+    char line[CBM_SZ_4K];
+    bool got = fgets(line, sizeof(line), f) != NULL;
+    bool cut = got && !strchr(line, '\n') && fgetc(f) != EOF;
+    (void)fclose(f);
+    if (!got || strncmp(line, "gitdir:", 7) != 0) {
+        return false;
+    }
+    if (cut) {
+        return true;
+    }
+    char *val = line + 7;
+    size_t n = strlen(val);
+    for (size_t i = 0; i < n; i++) {
+        if (val[i] == '\\') {
+            val[i] = '/';
+        }
+    }
+    while (n > 0 &&
+           (val[n - 1] == '\n' || val[n - 1] == '\r' || val[n - 1] == ' ' || val[n - 1] == '/')) {
+        val[--n] = '\0';
+    }
+    while (*val == ' ') {
+        val++;
+    }
+    char commondir[CBM_SZ_4K];
+    int cn = discover_path_is_absolute(val)
+                 ? snprintf(commondir, sizeof(commondir), "%s/commondir", val)
+                 : snprintf(commondir, sizeof(commondir), "%s/%s/commondir", dir, val);
+    if (cn <= 0 || cn >= (int)sizeof(commondir)) {
+        return true;
+    }
+    if (!cbm_file_exists(commondir)) {
+        return false;
+    }
+    char *name = strrchr(val, '/');
+    if (!name) {
+        return false;
+    }
+    *name = '\0';
+    const char *parent = strrchr(val, '/');
+    /* NULL for a one-segment value ("x/y" cut to "x"). */
+    // cppcheck-suppress knownConditionTrueFalse
+    return parent && strcmp(parent + 1, "worktrees") == 0;
 }
 
 /* What the ignore rules say about a directory. DIR_GIT_IGNORED comes from
@@ -1116,8 +1193,9 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
         if (verdict == DIR_KEEP && frame->git_ignored) {
             verdict = DIR_GIT_IGNORED; /* below a git-ignored directory, as in git */
         }
-        if (verdict == DIR_KEEP ||
-            (verdict == DIR_GIT_IGNORED && tracked_has_dir(out->tracked, rel_path))) {
+        if ((verdict == DIR_KEEP ||
+             (verdict == DIR_GIT_IGNORED && tracked_has_dir(out->tracked, rel_path))) &&
+            !is_linked_worktree_root(abs_path)) {
             if (!walk_push_subdir(ws, abs_path, rel_path, frame, verdict == DIR_GIT_IGNORED)) {
                 /* Growth failed (OOM). This tree has no discover-level failure
                  * flag, so record the subtree as dropped rather than skipping

@@ -356,7 +356,7 @@ cbm_add_cxx_library(cbm_sqlite_writer SOURCES ${CBM_INTERNAL}/sqlite_writer.cpp)
 # ── src/ subsystems (C++23) ────────────────────────────────────
 cbm_add_cxx_library(cbm_store     SOURCES src/store/store.cpp)
 cbm_add_cxx_library(cbm_cypher    SOURCES src/cypher/cypher.cpp)
-cbm_add_cxx_library(cbm_mcp       SOURCES src/mcp/mcp.cpp src/mcp/index_supervisor.cpp src/mcp/store_meta.cpp src/mcp/tool_server.cpp)
+cbm_add_cxx_library(cbm_mcp       SOURCES src/mcp/mcp.cpp src/mcp/index_supervisor.cpp src/mcp/store_meta.cpp src/mcp/tool_server.cpp src/mcp/cache_expiry.cpp)
 cbm_add_cxx_library(cbm_discover  SOURCES
     src/discover/userconfig.cpp
     src/discover/gitignore.cpp
@@ -371,6 +371,7 @@ cbm_add_cxx_library(cbm_pipeline  SOURCES
     src/pipeline/result_snapshot.cpp
     src/pipeline/result_store.cpp
     src/pipeline/pipeline_incremental.cpp
+    src/pipeline/branch_slots.cpp
     src/pipeline/worker_pool.cpp
     src/pipeline/pass_parallel.cpp
     src/pipeline/pass_definitions.cpp
@@ -455,7 +456,8 @@ set(CBM_TEST_SRCS
     tests/test_security.cpp tests/test_yaml.cpp tests/test_simhash.cpp
     tests/test_stack_overflow.cpp
     # integration
-    tests/test_integration.cpp tests/test_incremental.cpp
+    tests/test_integration.cpp tests/test_incremental.cpp tests/test_branch_index.cpp
+    tests/test_cache_expiry.cpp
     # hybrid LSP resolvers (java / kotlin / rust)
     tests/test_java_lsp.cpp tests/test_java_lsp_coverage.cpp
     tests/test_kotlin_lsp.cpp tests/test_rust_lsp.cpp

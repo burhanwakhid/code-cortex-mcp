@@ -24,6 +24,7 @@ enum {
 
 #include "pipeline/artifact.h"
 #include "store/store.h"
+#include "foundation/sha256.h"
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat.h"
@@ -35,6 +36,8 @@ enum {
 #include <sqlite3.h>
 #include <yyjson/yyjson.h>
 
+#include <atomic>
+#include <string>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -43,6 +46,13 @@ enum {
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#ifdef _WIN32
+#include <process.h> /* _getpid */
+#define getpid _getpid
+#else
+#include <signal.h> /* kill: is an orphaned snapshot's owner alive */
+#include <unistd.h> /* getpid */
+#endif
 #include <unistd.h>
 #ifdef _WIN32
 #include <windows.h>
@@ -298,33 +308,128 @@ static int read_metadata_version(const char *repo_path) {
     return version;
 }
 
-/* Read original_size from artifact.json. Returns 0 on error. */
-static size_t read_metadata_original_size(const char *repo_path) {
+/* The fields an import needs, all from ONE read of artifact.json: read
+ * separately, an export publishing between the reads could pair one
+ * generation's schema version and size with the next one's fingerprint. */
+typedef struct {
+    int version;          /* CBM_NOT_FOUND when unreadable */
+    size_t original_size; /* 0 when absent */
+    std::string payload_fp;
+} import_meta_t;
+
+static import_meta_t read_import_meta(const char *repo_path) {
+    import_meta_t m = {CBM_NOT_FOUND, 0, ""};
     char meta_path[CBM_SZ_4K];
     artifact_path(meta_path, sizeof(meta_path), repo_path, CBM_ARTIFACT_META);
-
     size_t len = 0;
     char *json = read_file_alloc(meta_path, &len);
-    if (!json) {
-        return 0;
-    }
-
-    yyjson_doc *doc = yyjson_read(json, len, 0);
+    yyjson_doc *doc = json ? yyjson_read(json, len, 0) : NULL;
     free(json);
     if (!doc) {
-        return 0;
+        return m;
     }
-
     yyjson_val *root = yyjson_doc_get_root(doc);
-    yyjson_val *val = yyjson_obj_get(root, "original_size");
-    size_t result = val ? (size_t)yyjson_get_uint(val) : 0;
+    yyjson_val *ver = yyjson_obj_get(root, "schema_version");
+    m.version = ver ? yyjson_get_int(ver) : CBM_NOT_FOUND;
+    yyjson_val *size = yyjson_obj_get(root, "original_size");
+    m.original_size = size ? (size_t)yyjson_get_uint(size) : 0;
+    const char *fp = yyjson_get_str(yyjson_obj_get(root, "payload_fp"));
+    m.payload_fp = fp ? fp : "";
     yyjson_doc_free(doc);
-    return result;
+    return m;
+}
+
+/* The graph's generation: the index format it was written under (PRAGMA
+ * user_version), the time of the dump that wrote it (projects.indexed_at,
+ * which only a dump sets), and a digest of the project's ADR. A rebuild from
+ * unchanged sources, after a format or extractor upgrade, keeps the Branch
+ * node and the content fingerprint but moves the dump time; a manage_adr
+ * write moves neither, nor the files, so without the ADR digest a
+ * no-change index kept distributing the old ADR. */
+static void graph_generation(cbm_store_t *s, const char *project, int *format, char *gen,
+                             size_t gen_sz) {
+    *format = 0;
+    gen[0] = '\0';
+    (void)cbm_store_get_format_version(s, format);
+    cbm_project_t proj = {0};
+    if (cbm_store_get_project(s, project, &proj) == CBM_STORE_OK) {
+        cbm_adr_t adr = {0};
+        char adr_hex[CBM_SHA256_HEX_LEN + 1] = "none";
+        if (cbm_store_adr_get(s, project, &adr) == CBM_STORE_OK && adr.content) {
+            cbm_sha256_hex(adr.content, strlen(adr.content), adr_hex);
+            adr_hex[16] = '\0'; /* a short digest is plenty to tell ADRs apart */
+        }
+        cbm_store_adr_free(&adr);
+        snprintf(gen, gen_sz, "%s|adr:%s", proj.indexed_at ? proj.indexed_at : "", adr_hex);
+        cbm_project_free_fields(&proj);
+    }
 }
 
 /* Write artifact.json metadata. */
+/* The payload's fingerprint, binding artifact.json to it: a SHA-256 of the
+ * whole compressed file. Not the mtime -- a git checkout resets it, and a
+ * committed artifact must stay current on every clone -- and not a sample
+ * of the bytes: ZSTD_compress writes no content checksum, so two payloads
+ * of one size could share any sampled bytes. An export interrupted between
+ * publishing the payload and the metadata leaves a payload whose
+ * fingerprint the metadata does not record: not current, and refused by
+ * the import. */
+static void sha256_to_hex(const uint8_t digest[CBM_SHA256_DIGEST_LEN],
+                          char out[CBM_SHA256_HEX_LEN + 1]) {
+    static const char hexd[] = "0123456789abcdef";
+    for (int k = 0; k < CBM_SHA256_DIGEST_LEN; k++) {
+        out[2 * k] = hexd[digest[k] >> 4];
+        out[2 * k + 1] = hexd[digest[k] & 0xf];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+/* The fingerprint of a payload held in memory (export, import). */
+static void payload_fingerprint_bytes(const char *data, size_t size,
+                                      char out[CBM_SHA256_HEX_LEN + 1]) {
+    cbm_sha256_hex(data, size, out);
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static std::atomic<int> g_payload_file_hashes{0};
+
+int cbm_artifact_test_payload_file_hashes(void) {
+    return g_payload_file_hashes.load();
+}
+#endif
+
+/* The fingerprint of the payload file, streamed (freshness check). */
+static bool payload_fingerprint(const char *path, char out[CBM_SHA256_HEX_LEN + 1]) {
+    out[0] = '\0';
+#ifdef CBM_ENABLE_TEST_SEAMS
+    g_payload_file_hashes++;
+#endif
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    cbm_sha256_ctx ctx;
+    cbm_sha256_init(&ctx);
+    std::string buf(1 << 20, '\0');
+    size_t n;
+    while ((n = fread(&buf[0], 1, buf.size(), f)) > 0) {
+        cbm_sha256_update(&ctx, buf.data(), n);
+    }
+    bool ok = !ferror(f);
+    fclose(f);
+    if (!ok) {
+        return false;
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&ctx, digest);
+    sha256_to_hex(digest, out);
+    return true;
+}
+
 static int write_metadata(const char *repo_path, const char *project_name, int nodes, int edges,
-                          size_t original_size, size_t compressed_size, int compression_level) {
+                          const char *branch_qn, const char *branch_name, const char *content_fp,
+                          int index_format, const char *graph_gen, size_t original_size,
+                          size_t compressed_size, int compression_level, const char *payload_fp) {
     char commit[CBM_SZ_64] = "";
     git_head_hash(repo_path, commit, sizeof(commit));
 
@@ -341,6 +446,20 @@ static int write_metadata(const char *repo_path, const char *project_name, int n
     yyjson_mut_obj_add_str(doc, root, "project", project_name);
     yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, root, "edges", edges);
+    /* The graph's branch, so a later run can tell, without opening the
+     * artifact, whether the live database has moved on from it
+     * (cbm_artifact_is_current). Only the QN and the branch name: the Branch
+     * node's properties also hold this checkout's absolute paths and HEAD
+     * commit. Recorded here, committing the artifact moved HEAD and made it
+     * look behind (a re-export and a dirty tree after every commit), each
+     * developer's clone overwrote the others' artifact, and the file
+     * published local paths. */
+    yyjson_mut_obj_add_str(doc, root, "branch_qn", branch_qn ? branch_qn : "");
+    yyjson_mut_obj_add_str(doc, root, "branch_name", branch_name ? branch_name : "");
+    yyjson_mut_obj_add_str(doc, root, "content_fp", content_fp ? content_fp : "");
+    yyjson_mut_obj_add_int(doc, root, "index_format", index_format);
+    yyjson_mut_obj_add_str(doc, root, "graph_generation", graph_gen ? graph_gen : "");
+    yyjson_mut_obj_add_str(doc, root, "payload_fp", payload_fp ? payload_fp : "");
     yyjson_mut_obj_add_uint(doc, root, "original_size", (uint64_t)original_size);
     yyjson_mut_obj_add_uint(doc, root, "compressed_size", (uint64_t)compressed_size);
     yyjson_mut_obj_add_int(doc, root, "compression_level", compression_level);
@@ -430,15 +549,128 @@ static const char *DROP_INDEXES_SQL = "DROP INDEX IF EXISTS idx_nodes_label;"
 
 /* ── Export helpers ───────────────────────────────────────────────── */
 
+/* Whether process pid is gone for sure. Unknown (no permission to ask, a
+ * pid reused by another process) counts as alive: its file is kept. */
+static bool snapshot_owner_gone(long pid) {
+    if (pid <= 0) {
+        return false;
+    }
+#ifdef _WIN32
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+    if (h) {
+        DWORD code = 0;
+        bool exited = GetExitCodeProcess(h, &code) && code != STILL_ACTIVE;
+        CloseHandle(h);
+        return exited;
+    }
+    return GetLastError() == ERROR_INVALID_PARAMETER; /* no such process */
+#else
+    return kill((pid_t)pid, 0) != 0 && errno == ESRCH;
+#endif
+}
+
+/* Remove export snapshots a crashed process left in the temp directory:
+ * cbm_artifact_<pid>_<n>.db and its SQLite sidecars, for a pid that no
+ * longer runs. prepare_snapshot_db unlinks its own file when it finishes, so
+ * only a process that died mid-export leaves one -- a copy of a whole graph
+ * that nothing else ever removes. This process's own files, and a live
+ * process's, are left alone. */
+static void sweep_orphan_snapshots(void) {
+    const char *tmp = cbm_tmpdir();
+    cbm_dir_t *d = tmp ? cbm_opendir(tmp) : NULL;
+    if (!d) {
+        return;
+    }
+    static const char prefix[] = "cbm_artifact_";
+    const long self = (long)getpid();
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        const char *name = ent->name;
+        if (ent->is_dir || strncmp(name, prefix, sizeof(prefix) - 1) != 0) {
+            continue;
+        }
+        const char *p = name + sizeof(prefix) - 1;
+        char *end = NULL;
+        long pid = strtol(p, &end, 10);
+        if (end == p || *end != '_' || !(end[1] >= '0' && end[1] <= '9')) {
+            continue;
+        }
+        p = end + 1;
+        while (*p >= '0' && *p <= '9') {
+            p++;
+        }
+        bool ours = strcmp(p, ".db") == 0 || strcmp(p, ".db-wal") == 0 ||
+                    strcmp(p, ".db-shm") == 0 || strcmp(p, ".db-journal") == 0;
+        if (!ours || pid == self || !snapshot_owner_gone(pid)) {
+            continue;
+        }
+        char path[CBM_SZ_4K];
+        int n = snprintf(path, sizeof(path), "%s/%s", tmp, name);
+        if (n > 0 && (size_t)n < sizeof(path) && !cbm_is_link(path) && cbm_unlink(path) == 0) {
+            cbm_log_info("artifact.orphan_snapshot_removed", "path", path);
+        }
+    }
+    cbm_closedir(d);
+}
+
 /* Prepare a stripped DB copy for best-quality export.
  * VACUUM INTO → (optionally) drop indexes → VACUUM. Returns malloc'd buffer
  * or NULL. VACUUM INTO runs on BOTH quality levels: it is the consistent
  * snapshot — the store runs in WAL mode, so raw main-file bytes miss
  * committed transactions still in the -wal and can be mid-checkpoint torn
  * (#895). Only the index-stripping is BEST-only. */
-static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool strip_indexes) {
+/* What artifact.json says about the graph, read from the snapshot itself:
+ * the payload and its metadata are then one state by construction. Reading
+ * the live database before and after (an ADR written meanwhile, without the
+ * index lease) could not prove that: A -> B -> A around the snapshot passed
+ * the comparison with B in the payload. */
+typedef struct {
+    int nodes;
+    int edges;
+    char *branch_qn;
+    char *branch_name;
+    char content_fp[CBM_SHA256_HEX_LEN + 1];
+    int index_format;
+    char graph_gen[CBM_SZ_64];
+} snapshot_meta_t;
+
+static void snapshot_meta_free(snapshot_meta_t *m) {
+    free(m->branch_qn);
+    free(m->branch_name);
+    m->branch_qn = NULL;
+    m->branch_name = NULL;
+}
+
+static void graph_generation(cbm_store_t *s, const char *project, int *format, char *gen,
+                             size_t gen_sz);
+
+static void read_snapshot_meta(const char *snap_path, const char *project, snapshot_meta_t *m) {
+    cbm_store_t *s = cbm_store_open_path_query(snap_path);
+    if (!s) {
+        return;
+    }
+    m->nodes = cbm_store_count_nodes(s, project);
+    m->edges = cbm_store_count_edges(s, project);
+    /* A failed read is CBM_STORE_ERR; never record it as a count. */
+    m->nodes = m->nodes < 0 ? 0 : m->nodes;
+    m->edges = m->edges < 0 ? 0 : m->edges;
+    (void)cbm_store_get_branch_dup(s, project, &m->branch_qn, &m->branch_name, NULL);
+    (void)cbm_store_content_fingerprint(s, project, m->content_fp);
+    graph_generation(s, project, &m->index_format, m->graph_gen, sizeof(m->graph_gen));
+    cbm_store_close(s);
+}
+
+static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool strip_indexes,
+                                 const char *project, snapshot_meta_t *meta) {
+    /* One snapshot file per export: the name carries the pid and a
+     * per-process counter, so two exports at once (two servers, a server
+     * and the CLI, two projects in one process) never VACUUM INTO, read
+     * and unlink the same file. */
+    static std::atomic<unsigned> seq{0};
+    sweep_orphan_snapshots();
     char tmp_path[CBM_SZ_4K];
-    snprintf(tmp_path, sizeof(tmp_path), "%s/cbm_artifact_tmp.db", cbm_tmpdir());
+    snprintf(tmp_path, sizeof(tmp_path), "%s/cbm_artifact_%ld_%u.db", cbm_tmpdir(), (long)getpid(),
+             seq.fetch_add(1, std::memory_order_relaxed));
     cbm_unlink(tmp_path);
 
     /* VACUUM INTO: clean compacted copy. Use raw sqlite3 to bypass store authorizer
@@ -463,6 +695,9 @@ static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool str
         cbm_unlink(tmp_path);
         return NULL;
     }
+
+    /* The metadata comes from this copy, before its indexes are dropped. */
+    read_snapshot_meta(tmp_path, project, meta);
 
     /* Strip indexes from the copy for better compression (BEST only). */
     if (strip_indexes) {
@@ -492,6 +727,59 @@ static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool str
 
 /* ── Export ───────────────────────────────────────────────────────── */
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void (*g_after_payload_cb)(void *) = nullptr;
+static void *g_after_payload_data = nullptr;
+
+void cbm_artifact_test_after_payload(void (*callback)(void *data), void *data) {
+    g_after_payload_cb = callback;
+    g_after_payload_data = data;
+}
+#endif
+
+/* One publisher per repository at a time. The payload and its metadata are
+ * written through fixed temp names and published as a pair, so two exports
+ * into one repository at once (two projects indexed from one path under
+ * different names: two index leases) could overwrite each other's temp files
+ * or pair one snapshot's payload with another's metadata. The lock is a
+ * lease on a cache-side name derived from the repository's canonical path:
+ * no file appears in the repository. Waits up to ART_PUBLISH_WAIT_MS. */
+enum { ART_PUBLISH_WAIT_MS = 10000, ART_PUBLISH_POLL_MS = 100 };
+
+static int artifact_publish_lock(const char *repo_path, cbm_db_lease_t **out) {
+    *out = NULL;
+    const char *cdir = cbm_resolve_cache_dir();
+    char canon[CBM_SZ_4K];
+    if (!cdir || !cdir[0] || !cbm_root_canonical(repo_path, canon, sizeof(canon))) {
+        return 0; /* no cache to lock in: publish unlocked, as before */
+    }
+    char hex[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(canon, strlen(canon), hex);
+    hex[16] = '\0';
+    char key[CBM_SZ_4K];
+    if (snprintf(key, sizeof(key), "%s/artifact-publish-%s.db", cdir, hex) >= (int)sizeof(key)) {
+        return 0;
+    }
+    for (int waited = 0;; waited += ART_PUBLISH_POLL_MS) {
+        int rc = cbm_db_lease_try_acquire(key, out);
+        if (rc == 0) {
+            return 0;
+        }
+        if (rc != CBM_INDEX_BUSY) {
+            /* No lock to be had (a read-only cache): publishing unlocked would
+             * reopen the race the lock is for. Fail closed. */
+            return CBM_NOT_FOUND;
+        }
+        if (waited >= ART_PUBLISH_WAIT_MS) {
+            return CBM_INDEX_BUSY;
+        }
+        cbm_usleep(ART_PUBLISH_POLL_MS * 1000);
+    }
+}
+
+static int export_locked(const char *db_path, const char *repo_path, const char *project_name,
+                         int quality);
+
 int cbm_artifact_export(const char *db_path, const char *repo_path, const char *project_name,
                         int quality) {
     clear_export_error();
@@ -515,25 +803,46 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
         return artifact_export_fail("prepare_artifact_dir", art_dir, "not_directory", 0);
     }
 
+    cbm_db_lease_t *publish = NULL;
+    int lrc = artifact_publish_lock(repo_path, &publish);
+    if (lrc == CBM_INDEX_BUSY) {
+        cbm_log_warn("artifact.export.busy", "repo", repo_path, "reason",
+                     "another export into this repository is publishing");
+        return CBM_INDEX_BUSY; /* not current: the next run exports */
+    }
+    if (lrc != 0) {
+        return artifact_export_fail("publish_lock", repo_path, "lock_unavailable", 0);
+    }
+    int export_rc = export_locked(db_path, repo_path, project_name, quality);
+    cbm_db_lease_release(publish);
+    return export_rc;
+}
+
+/* cbm_artifact_export's body, under the per-repository publish lock. */
+static int export_locked(const char *db_path, const char *repo_path, const char *project_name,
+                         int quality) {
+    snapshot_meta_t snap = {};
     size_t db_size = 0;
     char *db_data = NULL;
     int compression_level = ART_ZSTD_FAST;
 
     if (quality == CBM_ARTIFACT_BEST) {
         compression_level = ART_ZSTD_BEST;
-        db_data = prepare_snapshot_db(db_path, &db_size, true);
+        db_data = prepare_snapshot_db(db_path, &db_size, true, project_name, &snap);
     } else {
         /* FAST keeps zstd-3 and its indexes, but still snapshots via
          * VACUUM INTO: the raw main-file bytes of a live WAL store are a
          * torn copy (#895). */
-        db_data = prepare_snapshot_db(db_path, &db_size, false);
+        db_data = prepare_snapshot_db(db_path, &db_size, false, project_name, &snap);
     }
 
     if (!db_data || db_size == 0) {
         free(db_data);
         if (cbm_artifact_export_last_error()) {
+            snapshot_meta_free(&snap);
             return CBM_NOT_FOUND;
         }
+        snapshot_meta_free(&snap);
         return artifact_export_fail("read_db", db_path, "empty_or_unreadable", errno);
     }
 
@@ -544,6 +853,7 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     char *compressed = (char *)malloc(bound);
     if (!compressed) {
         free(db_data);
+        snapshot_meta_free(&snap);
         return artifact_export_fail("compress", NULL, "alloc_compressed_buffer", 0);
     }
 
@@ -552,6 +862,7 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
 
     if (clen <= 0) {
         free(compressed);
+        snapshot_meta_free(&snap);
         return artifact_export_fail("compress", NULL, "zstd_compress", 0);
     }
 
@@ -559,32 +870,36 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     char zst_path[CBM_SZ_4K];
     if (!artifact_path(zst_path, sizeof(zst_path), repo_path, CBM_ARTIFACT_FILENAME)) {
         free(compressed);
+        snapshot_meta_free(&snap);
         return artifact_export_fail("write_artifact", repo_path, "path_too_long", 0);
     }
+    /* The fingerprint of the bytes being published, taken from the buffer
+     * itself: a reread of the file could fingerprint a replacement written
+     * meanwhile (another exporter, a checkout) under this snapshot's
+     * metadata. Always present, so the import always verifies it. */
+    char payload_fp[CBM_SHA256_HEX_LEN + 1];
+    payload_fingerprint_bytes(compressed, (size_t)clen, payload_fp);
     artifact_file_error_t ioerr;
     int wrc = write_file_atomic(zst_path, compressed, (size_t)clen, &ioerr);
     free(compressed);
 
     if (wrc != 0) {
+        snapshot_meta_free(&snap);
         return artifact_export_fail("write_artifact", zst_path, ioerr.err, ioerr.err_no);
     }
 
-    /* Get node/edge counts for metadata */
-    int nodes = 0;
-    int edges = 0;
-    cbm_store_t *count_store = cbm_store_open_path(db_path);
-    if (count_store) {
-        nodes = cbm_store_count_nodes(count_store, project_name);
-        edges = cbm_store_count_edges(count_store, project_name);
-        cbm_store_close(count_store);
-        /* A failed read is CBM_STORE_ERR; never record it as a count. */
-        nodes = nodes < 0 ? 0 : nodes;
-        edges = edges < 0 ? 0 : edges;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_after_payload_cb) {
+        g_after_payload_cb(g_after_payload_data);
     }
+#endif
 
     /* Write metadata */
-    if (write_metadata(repo_path, project_name, nodes, edges, db_size, (size_t)clen,
-                       compression_level) != 0) {
+    int mrc = write_metadata(repo_path, project_name, snap.nodes, snap.edges, snap.branch_qn,
+                             snap.branch_name, snap.content_fp, snap.index_format, snap.graph_gen,
+                             db_size, (size_t)clen, compression_level, payload_fp);
+    snapshot_meta_free(&snap);
+    if (mrc != 0) {
         cbm_unlink(zst_path);
         return CBM_NOT_FOUND;
     }
@@ -608,31 +923,54 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
         return CBM_NOT_FOUND;
     }
 
-    /* Check schema version compatibility */
-    int version = read_metadata_version(repo_path);
-    if (version < 0 || version > CBM_ARTIFACT_SCHEMA_VERSION) {
-        cbm_log_info("artifact.import", "skip", "schema_version_mismatch", "artifact_ver",
-                     itoa_buf(version), "current_ver", itoa_buf(CBM_ARTIFACT_SCHEMA_VERSION));
-        return CBM_NOT_FOUND;
-    }
-
-    /* Get original_size for decompression buffer */
-    size_t original_size = read_metadata_original_size(repo_path);
-    if (original_size == 0) {
-        cbm_log_error("artifact.import", "err", "missing_original_size");
-        return CBM_NOT_FOUND;
-    }
-
-    /* Read compressed artifact */
+    /* The metadata and the payload must be one publication's: every field
+     * comes from one read of artifact.json, and the payload read after it
+     * must carry the fingerprint that read names. An import that meets an
+     * export between the two reads sees a mismatch and reads both again; a
+     * few attempts outlast one publication. Metadata from before the
+     * fingerprint has none and is not checked. */
+    enum { IMPORT_ATTEMPTS = 3 };
     char zst_path[CBM_SZ_4K];
     artifact_path(zst_path, sizeof(zst_path), repo_path, CBM_ARTIFACT_FILENAME);
-
+    import_meta_t meta;
     size_t clen = 0;
-    char *compressed = read_file_alloc(zst_path, &clen);
+    char *compressed = NULL;
+    for (int attempt = 0; attempt < IMPORT_ATTEMPTS; attempt++) {
+        meta = read_import_meta(repo_path);
+        if (meta.version < 0 || meta.version > CBM_ARTIFACT_SCHEMA_VERSION) {
+            cbm_log_info("artifact.import", "skip", "schema_version_mismatch", "artifact_ver",
+                         itoa_buf(meta.version), "current_ver",
+                         itoa_buf(CBM_ARTIFACT_SCHEMA_VERSION));
+            return CBM_NOT_FOUND;
+        }
+        if (meta.original_size == 0) {
+            cbm_log_error("artifact.import", "err", "missing_original_size");
+            return CBM_NOT_FOUND;
+        }
+        compressed = read_file_alloc(zst_path, &clen);
+        if (!compressed) {
+            cbm_log_error("artifact.import", "err", "read_artifact");
+            return CBM_NOT_FOUND;
+        }
+        if (meta.payload_fp.empty()) {
+            break;
+        }
+        char got_fp[CBM_SHA256_HEX_LEN + 1];
+        payload_fingerprint_bytes(compressed, clen, got_fp);
+        if (meta.payload_fp == got_fp) {
+            break;
+        }
+        free(compressed);
+        compressed = NULL;
+        cbm_log_info("artifact.import", "retry", "payload_metadata_mismatch", "attempt",
+                     itoa_buf(attempt + 1));
+        cbm_usleep(100000); /* let the publication in progress finish */
+    }
     if (!compressed) {
-        cbm_log_error("artifact.import", "err", "read_artifact");
+        cbm_log_error("artifact.import", "err", "payload_metadata_mismatch");
         return CBM_NOT_FOUND;
     }
+    size_t original_size = meta.original_size;
 
     /* Decompress */
     /* Size the destination from the zstd frame's own content-size header, not
@@ -709,6 +1047,27 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
         return CBM_NOT_FOUND;
     }
 
+    /* The artifact is adopted by THIS checkout: record its root, not the
+     * exporter's. Every ownership check (cbm_root_matches) then treats it as
+     * this checkout's own index, and the first run compares the exporter's
+     * Branch identity with this checkout and verifies content where they
+     * differ. File hashes are content digests, so the incremental pass works
+     * across machines. The exporter's root stays in the Branch properties
+     * until that first run's stamp. */
+    sqlite3 *idb = cbm_store_get_db(store);
+    sqlite3_stmt *rebind = NULL;
+    bool rebound = idb &&
+                   sqlite3_prepare_v2(idb, "UPDATE projects SET root_path = ?1;", -1, &rebind,
+                                      NULL) == SQLITE_OK &&
+                   sqlite3_bind_text(rebind, 1, repo_path, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                   sqlite3_step(rebind) == SQLITE_DONE;
+    sqlite3_finalize(rebind);
+    if (!rebound) {
+        /* Left as the exporter's root, the next run rebuilds it as a foreign
+         * index: slower, never wrong. */
+        cbm_log_warn("artifact.import", "warn", "rebind_root_failed");
+    }
+
     cbm_store_close(store);
 
     /* Atomic rename to final path. Drop the DESTINATION's leftover
@@ -761,6 +1120,53 @@ bool cbm_artifact_exists(const char *repo_path) {
     /* Check schema version is compatible */
     int version = read_metadata_version(repo_path);
     return version >= 0 && version <= CBM_ARTIFACT_SCHEMA_VERSION;
+}
+
+bool cbm_artifact_is_current(const char *db_path, const char *repo_path, const char *project) {
+    char meta_path[CBM_SZ_4K];
+    if (!db_path || !project ||
+        !artifact_path(meta_path, sizeof(meta_path), repo_path, CBM_ARTIFACT_META)) {
+        return false;
+    }
+    size_t len = 0;
+    char *json = read_file_alloc(meta_path, &len);
+    yyjson_doc *doc = json ? yyjson_read(json, len, 0) : NULL;
+    free(json);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    const char *a_qn = yyjson_get_str(root ? yyjson_obj_get(root, "branch_qn") : NULL);
+    const char *a_name = yyjson_get_str(root ? yyjson_obj_get(root, "branch_name") : NULL);
+    const char *a_fp = yyjson_get_str(root ? yyjson_obj_get(root, "content_fp") : NULL);
+    yyjson_val *a_format = root ? yyjson_obj_get(root, "index_format") : NULL;
+    const char *a_gen = yyjson_get_str(root ? yyjson_obj_get(root, "graph_generation") : NULL);
+    const char *a_pfp = yyjson_get_str(root ? yyjson_obj_get(root, "payload_fp") : NULL);
+    bool current = false;
+    /* Metadata from a build that did not record these is never current: one
+     * export brings it up to date. */
+    char zst_path[CBM_SZ_4K];
+    char now_pfp[CBM_SHA256_HEX_LEN + 1] = "";
+    bool payload_ok = a_pfp && a_pfp[0] &&
+                      artifact_path(zst_path, sizeof(zst_path), repo_path, CBM_ARTIFACT_FILENAME) &&
+                      payload_fingerprint(zst_path, now_pfp) && strcmp(now_pfp, a_pfp) == 0;
+    if (payload_ok && a_qn && a_name && a_fp && a_fp[0] && yyjson_is_int(a_format) && a_gen &&
+        a_gen[0]) {
+        cbm_store_t *s = cbm_store_open_path_query(db_path);
+        char *qn = NULL;
+        char *name = NULL;
+        if (s && cbm_store_get_branch_dup(s, project, &qn, &name, NULL) != CBM_STORE_ERR) {
+            char fp[CBM_SHA256_HEX_LEN + 1];
+            int format = 0;
+            char gen[CBM_SZ_64];
+            graph_generation(s, project, &format, gen, sizeof(gen));
+            current = strcmp(qn ? qn : "", a_qn) == 0 && strcmp(name ? name : "", a_name) == 0 &&
+                      format == (int)yyjson_get_int(a_format) && strcmp(gen, a_gen) == 0 &&
+                      cbm_store_content_fingerprint(s, project, fp) && strcmp(fp, a_fp) == 0;
+        }
+        free(qn);
+        free(name);
+        cbm_store_close(s);
+    }
+    yyjson_doc_free(doc);
+    return current;
 }
 
 /* ── Commit hash extraction ──────────────────────────────────────── */

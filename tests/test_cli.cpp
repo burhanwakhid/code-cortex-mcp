@@ -15,11 +15,17 @@
 #include "test_helpers.h"
 #include <cli/cli.h>
 #include <foundation/sha256.h>
+#include <pipeline/branch_slots.h>
+#include <foundation/compat_fs.h>
+#include <foundation/platform.h> /* cbm_file_exists */
 #include <foundation/yaml.h>
 #include <yyjson/yyjson.h>
+#include <sqlite3.h>
+#include <chrono>
 #include <string>
 #include <vector>
 #include <string.h>
+#include <thread>
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/stat.h>
@@ -1566,6 +1572,49 @@ TEST(cli_uninstall_dry_run) {
     PASS();
 }
 
+/* `uninstall --dry-run` modifies nothing: a cache holding only parked
+ * branch databases (counted as indexes) keeps them, and the cache trash. */
+TEST(cli_uninstall_dry_run_keeps_parked_slots) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-dryslot-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char cache[512];
+    snprintf(cache, sizeof(cache), "%s/cache", tmpdir);
+    ASSERT_TRUE(cbm_mkdir_p(cache, 0755));
+    char old_cache[1024];
+    char old_home[1024];
+    bool had_cache = cbm_safe_getenv("CBM_CACHE_DIR", old_cache, sizeof(old_cache), NULL);
+    bool had_home = cbm_safe_getenv("HOME", old_home, sizeof(old_home), NULL);
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("HOME", tmpdir, 1);
+    char db[600];
+    snprintf(db, sizeof(db), "%s/parked.db", cache); /* never created: slots only */
+    char sdir[1100];
+    ASSERT_TRUE(cbm_branch_slots_dir(db, "parked", tmpdir, sdir, sizeof(sdir)));
+    ASSERT_TRUE(cbm_mkdir_p(sdir, 0755));
+    char slot[1300];
+    snprintf(slot, sizeof(slot), "%s/main.db.zst", sdir);
+    ASSERT_EQ(th_write_file(slot, "slot"), 0);
+    char trash[700];
+    snprintf(trash, sizeof(trash), "%s/trash/1700000000-old", cache);
+    ASSERT_TRUE(cbm_mkdir_p(trash, 0755));
+    char trashed[900];
+    snprintf(trashed, sizeof(trashed), "%s/old.db", trash);
+    ASSERT_EQ(th_write_file(trashed, "db"), 0);
+
+    const char *argv[] = {"uninstall", "--dry-run"};
+    int rc = cbm_cmd_uninstall(2, (char **)argv);
+
+    if (had_cache) cbm_setenv("CBM_CACHE_DIR", old_cache, 1); else cbm_unsetenv("CBM_CACHE_DIR");
+    if (had_home) cbm_setenv("HOME", old_home, 1); else cbm_unsetenv("HOME");
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(cbm_file_exists(slot));
+    ASSERT_TRUE(cbm_file_exists(trashed));
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Full install + uninstall lifecycle
  * ═══════════════════════════════════════════════════════════════════ */
@@ -1989,7 +2038,13 @@ TEST(cli_codex_native_prompt_hook_toml) {
     ASSERT_NOT_NULL(strstr(data, "timeout = 2"));
     ASSERT_NOT_NULL(strstr(data, "additionalContextLimit = 3000"));
     ASSERT_NOT_NULL(strstr(data, "echo user-owned"));
+#ifdef _WIN32
+    /* Windows double-quotes the path (TOML-escaped as \"); POSIX shells get
+     * single quotes with ' escaped as '\''. */
+    ASSERT_NOT_NULL(strstr(data, "\\\"/tmp/O'Brien $bin/code-cortex-mcp\\\" hook-augment"));
+#else
     ASSERT_NOT_NULL(strstr(data, "O'\\\\''Brien $bin"));
+#endif
     const char *owned = strstr(data, "--code-cortex-user-prompt-submit");
     ASSERT_NOT_NULL(owned);
     ASSERT_NULL(strstr(owned + 1, "--code-cortex-user-prompt-submit"));
@@ -4116,6 +4171,44 @@ TEST(cli_config_get_int) {
     PASS();
 }
 
+/* Another process commits to _config.db all the time (usage rows, the
+ * store_meta memo, the sweep). A setting read that meets such a commit must
+ * wait for it, not return the default: the multi-process stress test
+ * (scripts/branch-index-stress.py) saw index runs park with
+ * branch_index_keep 8 although 1 was configured. */
+TEST(cli_config_read_waits_for_writer) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_config_set(cfg, "branch_index_keep", "1");
+    cbm_config_set(cfg, "cache_expiry", "false");
+    cbm_config_close(cfg);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/_config.db", tmpdir);
+    sqlite3 *writer = NULL;
+    ASSERT_EQ(sqlite3_open(path, &writer), SQLITE_OK);
+    /* An exclusive lock is what a reader meets during a writer's commit. */
+    ASSERT_EQ(sqlite3_exec(writer, "BEGIN EXCLUSIVE;", NULL, NULL, NULL), SQLITE_OK);
+    std::thread release([writer] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        (void)sqlite3_exec(writer, "COMMIT;", NULL, NULL, NULL);
+    });
+    cfg = cbm_config_open(tmpdir);
+    int keep = cbm_config_get_int(cfg, "branch_index_keep", 8);
+    bool enabled = cbm_config_get_bool(cfg, "cache_expiry", true);
+    release.join();
+    sqlite3_close(writer);
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    ASSERT_EQ(keep, 1);
+    ASSERT_FALSE(enabled);
+    PASS();
+}
+
 TEST(cli_config_delete) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
@@ -4521,6 +4614,91 @@ TEST(cli_index_enumeration_skips_internal_cache_dbs) {
     PASS();
 }
 
+/* cbm_cmd_cache with stderr captured into err (truncated to n-1). */
+static int cli_cache_capture(int argc, char **argv, char *err, size_t n) {
+    err[0] = '\0';
+    char path[512];
+    char *dir = th_mktempdir("cbm_cli_cache_err");
+    if (!dir) {
+        return -100;
+    }
+    char dir_copy[256];
+    snprintf(dir_copy, sizeof(dir_copy), "%s", dir);
+    snprintf(path, sizeof(path), "%s/stderr.txt", dir_copy);
+    FILE *f = fopen(path, "wb+");
+    if (!f) {
+        th_rmtree(dir_copy);
+        return -100;
+    }
+    fflush(stderr);
+    int saved = dup(2);
+    dup2(fileno(f), 2);
+    int rc = cbm_cmd_cache(argc, argv);
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    rewind(f);
+    size_t got = fread(err, 1, n - 1, f);
+    err[got] = '\0';
+    fclose(f);
+    th_rmtree(dir_copy);
+    return rc;
+}
+
+/* `cache` argument checks: --now takes a whole positive epoch (not "abc",
+ * which used to preview at the real time), `restore` without an argument
+ * prints usage (not "unknown cache command"), and a preview of a cache with
+ * no _config.db finds nothing to sweep, succeeds and creates nothing. */
+TEST(cli_cache_argument_checks) {
+    char *made = th_mktempdir("cbm_cli_cache_args");
+    ASSERT_NOT_NULL(made);
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s", made);
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char a_expire[] = "expire";
+    char a_dry[] = "--dry-run";
+    char a_now[] = "--now";
+    char a_abc[] = "abc";
+    char a_partial[] = "12x";
+    char a_restore[] = "restore";
+    char err[2048];
+
+    char *bad_now[] = {a_expire, a_dry, a_now, a_abc};
+    int rc_abc = cli_cache_capture(4, bad_now, err, sizeof(err));
+    bool abc_named = strstr(err, "--now") != NULL;
+    char *partial_now[] = {a_expire, a_dry, a_now, a_partial};
+    int rc_partial = cli_cache_capture(4, partial_now, err, sizeof(err));
+
+    char *restore[] = {a_restore};
+    int rc_restore = cli_cache_capture(1, restore, err, sizeof(err));
+    bool restore_usage = strstr(err, "Usage:") != NULL && strstr(err, "unknown") == NULL;
+
+    char *preview[] = {a_expire, a_dry};
+    int rc_preview = cli_cache_capture(2, preview, err, sizeof(err));
+    char cfgdb[512];
+    snprintf(cfgdb, sizeof(cfgdb), "%s/_config.db", cache);
+    bool created = cbm_file_exists(cfgdb);
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(cache);
+    ASSERT_NEQ(rc_abc, 0);
+    ASSERT_TRUE(abc_named);
+    ASSERT_NEQ(rc_partial, 0);
+    ASSERT_NEQ(rc_restore, 0);
+    ASSERT_TRUE(restore_usage);
+    ASSERT_EQ(rc_preview, 0);
+    ASSERT_FALSE(created);
+    PASS();
+}
+
 TEST(cli_remove_indexes_respects_lease) {
     char root[256] = "/tmp/cbm_cleanup_lease_XXXXXX";
     ASSERT(cbm_mkdtemp(root));
@@ -4766,6 +4944,7 @@ SUITE(cli) {
     RUN_TEST(cli_uninstall_help_changes_nothing);
     RUN_TEST(cli_stdin_gate_schema_shapes);
     RUN_TEST(cli_stdin_kind_classifies_file_and_pipe);
+    RUN_TEST(cli_cache_argument_checks);
     RUN_TEST(cli_build_args_json_array_flag_accepts_json_literal);
     RUN_TEST(cli_build_args_json_array_flag_checks_item_type);
     RUN_TEST(cli_sha256_matches_fips_vectors);
@@ -4848,6 +5027,7 @@ SUITE(cli) {
     /* Dry-run lifecycle (2 tests) */
     RUN_TEST(cli_install_dry_run);
     RUN_TEST(cli_uninstall_dry_run);
+    RUN_TEST(cli_uninstall_dry_run_keeps_parked_slots);
 
     /* Full lifecycle (1 test — cli_test.go) */
     RUN_TEST(cli_install_and_uninstall);
@@ -4951,6 +5131,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_get_set);
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);
+    RUN_TEST(cli_config_read_waits_for_writer);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
 

@@ -7,6 +7,10 @@
 #include "../src/foundation/platform.h"
 #include "../src/foundation/dump_verify.h"
 #include "../src/foundation/system_info_internal.h"
+#include "../src/foundation/compat_fs.h"
+#include "../src/store/store.h"
+#include "test_helpers.h"
+#include <pipeline/branch_slots.h> /* cbm_branch_root_key */
 #include <stdlib.h>
 #include <unistd.h>
 #if !defined(_WIN32)
@@ -715,6 +719,355 @@ TEST(regex_estimate_counts_brackets_and_escapes_literally) {
     PASS();
 }
 
+/* A path past MAX_PATH (260) works through every file helper and through
+ * SQLite. A branch slot named after a long branch is that long (about 340
+ * characters under the cache), and on Windows the wide APIs refuse such a
+ * path unless it is given in the extended-length form. Elsewhere the same
+ * steps run as an ordinary check: each component stays under NAME_MAX. */
+/* cbm_readdir calls an entry a directory only when it is one: a link to a
+ * directory is a link, so a walker that deletes never descends through it.
+ * (The DT_UNKNOWN and Windows-junction cases this guards cannot be staged on
+ * a local POSIX filesystem; they share the code path checked here.) */
+TEST(platform_readdir_reports_links_as_not_dirs) {
+    char *made = th_mktempdir("cbm_readdir_kind");
+    ASSERT_NOT_NULL(made);
+    char dir[512];
+    char file[512];
+    snprintf(dir, sizeof(dir), "%s/real", made);
+    snprintf(file, sizeof(file), "%s/plain", made);
+    ASSERT_TRUE(cbm_mkdir_p(dir, 0755));
+    FILE *f = cbm_fopen(file, "wb");
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(fclose(f), 0);
+#ifndef _WIN32
+    char lnk[512];
+    snprintf(lnk, sizeof(lnk), "%s/linked", made);
+    ASSERT_EQ(symlink(dir, lnk), 0);
+    ASSERT_TRUE(cbm_is_dir(lnk)); /* follows: what the walkers must not trust */
+#endif
+
+    int seen_real = 0;
+    int seen_plain = 0;
+    int seen_linked = 0;
+    cbm_dir_t *d = cbm_opendir(made);
+    ASSERT_NOT_NULL(d);
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (strcmp(ent->name, "real") == 0) {
+            seen_real++;
+            ASSERT_TRUE(ent->is_dir);
+        } else if (strcmp(ent->name, "plain") == 0) {
+            seen_plain++;
+            ASSERT_FALSE(ent->is_dir);
+        } else if (strcmp(ent->name, "linked") == 0) {
+            seen_linked++;
+            ASSERT_FALSE(ent->is_dir);
+        }
+    }
+    cbm_closedir(d);
+    ASSERT_EQ(seen_real, 1);
+    ASSERT_EQ(seen_plain, 1);
+#ifndef _WIN32
+    ASSERT_EQ(seen_linked, 1);
+#endif
+    th_rmtree(made);
+    PASS();
+}
+
+TEST(platform_file_helpers_long_path) {
+    char *made = th_mktempdir("cbm_longpath");
+    ASSERT_NOT_NULL(made);
+    char root[256];
+    snprintf(root, sizeof(root), "%s", made);
+    char d1[1024];
+    char d2[1024];
+    snprintf(d1, sizeof(d1), "%s/%0120d", root, 0);
+    snprintf(d2, sizeof(d2), "%s/%0120d", d1, 1);
+    ASSERT_GT(strlen(d2), 260);
+    ASSERT_TRUE(cbm_mkdir_p(d2, 0755));
+    ASSERT_TRUE(cbm_is_dir(d2));
+
+    char file[1024];
+    char moved[1024];
+    snprintf(file, sizeof(file), "%s/%060d.bin", d2, 2);
+    snprintf(moved, sizeof(moved), "%s/%060d.bin", d2, 3);
+    FILE *f = cbm_fopen(file, "wb");
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(fwrite("hello", 1, 5, f), 5);
+    ASSERT_EQ(fclose(f), 0);
+    ASSERT_TRUE(cbm_file_exists(file));
+    ASSERT_TRUE(cbm_is_regular_file(file));
+    ASSERT_EQ(cbm_file_size(file), 5);
+    cbm_stat_t st;
+    ASSERT_EQ(cbm_stat(file, &st), 0);
+    ASSERT_EQ((long long)st.st_size, 5);
+    ASSERT_GT((long long)st.st_mtime, 0);
+    ASSERT_EQ(cbm_rename_replace(file, moved), 0);
+    ASSERT_FALSE(cbm_file_exists(file));
+    ASSERT_TRUE(cbm_file_exists(moved));
+
+    int seen = 0;
+    cbm_dir_t *dir = cbm_opendir(d2);
+    ASSERT_NOT_NULL(dir);
+    for (cbm_dirent_t *e = cbm_readdir(dir); e; e = cbm_readdir(dir)) {
+        seen += strstr(moved, e->name) != NULL;
+    }
+    cbm_closedir(dir);
+    ASSERT_EQ(seen, 1);
+
+    /* SQLite: open (create), dump through its .tmp and rename, reopen. */
+    char db[1024];
+    char dump[1024];
+    snprintf(db, sizeof(db), "%s/%060d.db", d2, 4);
+    snprintf(dump, sizeof(dump), "%s/%060d.db", d2, 5);
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "longpath", "/x"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_dump_to_file(s, dump), CBM_STORE_OK);
+    cbm_store_close(s);
+    s = cbm_store_open_path_query(dump);
+    ASSERT_NOT_NULL(s);
+    cbm_store_close(s);
+
+    const char *files[] = {moved, db, dump};
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        (void)cbm_unlink(files[i]);
+        cbm_remove_db_sidecars(files[i]);
+        ASSERT_FALSE(cbm_file_exists(files[i]));
+    }
+    ASSERT_EQ(cbm_rmdir(d2), 0);
+    ASSERT_FALSE(cbm_is_dir(d2));
+    ASSERT_EQ(cbm_rmdir(d1), 0);
+    ASSERT_EQ(cbm_rmdir(root), 0);
+    PASS();
+}
+
+/* Windows: two spellings of one directory that differ in a non-ASCII
+ * letter's case are one checkout (the volume folds case by Unicode rules),
+ * and a junction to it is the same checkout too (the final path resolves
+ * it; the file identity backs that up). Same root, same slot key. */
+TEST(platform_root_matches_windows_unicode_case_and_junction) {
+#ifdef _WIN32
+    char *base = th_mktempdir("cbm_plat_root");
+    ASSERT_NOT_NULL(base);
+    char upper[600];
+    char lower[600];
+    snprintf(upper, sizeof(upper), "%s/\xc3\x84-repo", base); /* Ä-repo */
+    snprintf(lower, sizeof(lower), "%s/\xc3\xa4-repo", base); /* ä-repo */
+    ASSERT_TRUE(cbm_mkdir_p(upper, 0755));
+    ASSERT_TRUE(cbm_is_dir(lower)); /* the volume is case-insensitive */
+    ASSERT_TRUE(cbm_root_matches(upper, lower));
+    ASSERT_TRUE(cbm_root_matches(lower, upper));
+    char ka[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    char kb[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    ASSERT_TRUE(cbm_branch_root_key(upper, ka, sizeof(ka)));
+    ASSERT_TRUE(cbm_branch_root_key(lower, kb, sizeof(kb)));
+    ASSERT_STR_EQ(ka, kb);
+    /* A junction (no privilege needed, unlike a symlink) to an ASCII-named
+     * directory: the mklink command line goes through system() in the ANSI
+     * code page, which would garble a non-ASCII target. */
+    char plain[600];
+    snprintf(plain, sizeof(plain), "%s/plain-repo", base);
+    ASSERT_TRUE(cbm_mkdir_p(plain, 0755));
+    ASSERT_TRUE(cbm_branch_root_key(plain, ka, sizeof(ka)));
+    char link[600];
+    snprintf(link, sizeof(link), "%s/via-junction", base);
+    char cmd[2048];
+    char wl[600];
+    char wu[600];
+    snprintf(wl, sizeof(wl), "%s", link);
+    snprintf(wu, sizeof(wu), "%s", plain);
+    for (char *c = wl; *c; c++) {
+        if (*c == '/') {
+            *c = '\\';
+        }
+    }
+    for (char *c = wu; *c; c++) {
+        if (*c == '/') {
+            *c = '\\';
+        }
+    }
+    snprintf(cmd, sizeof(cmd), "cmd /c mklink /J \"%s\" \"%s\" >nul 2>&1", wl, wu);
+    if (system(cmd) == 0 && cbm_is_link(link)) {
+        ASSERT_TRUE(cbm_is_dir(link)); /* the target exists through it */
+        ASSERT_TRUE(cbm_root_matches(plain, link));
+        ASSERT_TRUE(cbm_root_matches(link, plain));
+        ASSERT_FALSE(cbm_root_matches(upper, link));
+        ASSERT_TRUE(cbm_branch_root_key(link, kb, sizeof(kb)));
+        ASSERT_STR_EQ(ka, kb);
+        (void)cbm_rmdir(link);
+    }
+    th_rmtree(base);
+#endif
+    PASS();
+}
+
+/* Windows: under a directory with NTFS per-directory case sensitivity,
+ * "Repo" and "repo" are two directories, and so two checkouts: their file
+ * identities decide, not the case-folded spelling. Skipped where the
+ * attribute cannot be set (fsutil needs the feature, sometimes admin). */
+TEST(platform_root_matches_windows_case_sensitive_dirs_differ) {
+#ifdef _WIN32
+    char *tmp = th_mktempdir("cbm_plat_cs");
+    ASSERT_NOT_NULL(tmp);
+    char base[300];
+    snprintf(base, sizeof(base), "%s", tmp);
+    char parent[400];
+    snprintf(parent, sizeof(parent), "%s\\cs", base);
+    ASSERT_TRUE(cbm_mkdir_p(parent, 0755));
+    char wp[400];
+    snprintf(wp, sizeof(wp), "%s", parent);
+    for (char *c = wp; *c; c++) {
+        if (*c == '/') {
+            *c = '\\';
+        }
+    }
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "fsutil file setCaseSensitiveInfo \"%s\" enable >nul 2>&1", wp);
+    if (system(cmd) != 0) {
+        th_rmtree(base);
+        SKIP_PLATFORM("per-directory case sensitivity cannot be enabled here");
+    }
+    char upper[500];
+    char lower[500];
+    char marker[600];
+    char other[600];
+    snprintf(upper, sizeof(upper), "%s\\Repo", parent);
+    snprintf(lower, sizeof(lower), "%s\\repo", parent);
+    snprintf(marker, sizeof(marker), "%s\\marker", upper);
+    snprintf(other, sizeof(other), "%s\\marker", lower);
+    ASSERT_TRUE(cbm_mkdir_p(upper, 0755));
+    ASSERT_TRUE(cbm_mkdir_p(lower, 0755));
+    ASSERT_EQ(th_write_file(marker, "x"), 0);
+    if (cbm_file_exists(other)) {
+        th_rmtree(base);
+        SKIP_PLATFORM("the directory still folds case");
+    }
+    ASSERT_FALSE(cbm_root_matches(upper, lower));
+    ASSERT_FALSE(cbm_root_matches(lower, upper));
+    ASSERT_TRUE(cbm_root_matches(upper, upper));
+    th_rmtree(base);
+#endif
+    PASS();
+}
+
+/* A relative root keeps every unresolved "..": "../../repo" is not "repo"
+ * (and not another checkout's identity), while a resolvable one still pops
+ * and an absolute path's leading ".." still folds to the root. */
+TEST(platform_root_normalize_keeps_unresolved_dotdot) {
+    char out[256];
+    /* Too small for a prefix and its terminator: refused, nothing written
+     * past the buffer (a UNC prefix used to write its NUL at out[2]). */
+    char tiny[4] = {'x', 'x', 'x', 'x'};
+    ASSERT_FALSE(cbm_root_normalize("//server/share", false, tiny, 2));
+    ASSERT_FALSE(cbm_root_normalize("//server/share", false, tiny, 3));
+    ASSERT_EQ(tiny[2], 'x');
+    ASSERT_EQ(tiny[3], 'x');
+    ASSERT_TRUE(cbm_root_normalize("../../repo", false, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "../../repo");
+    ASSERT_TRUE(cbm_root_normalize("a/../../repo", false, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "../repo");
+    ASSERT_TRUE(cbm_root_normalize("../a/../repo", false, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "../repo");
+    ASSERT_TRUE(cbm_root_normalize("/../../repo", false, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "/repo");
+    ASSERT_TRUE(cbm_root_normalize("/a/b/../../c", false, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "/c");
+    PASS();
+}
+
+/* A relative root that folds to nothing is the current directory, with a
+ * real identity -- never the empty string every such checkout would share. */
+TEST(platform_root_canonical_dot_is_cwd) {
+    char out[CBM_ROOT_MAX];
+    char cwd_out[CBM_ROOT_MAX];
+    char cwd[CBM_ROOT_MAX];
+    ASSERT_NOT_NULL(getcwd(cwd, sizeof(cwd)));
+    ASSERT_TRUE(cbm_root_canonical(cwd, cwd_out, sizeof(cwd_out)));
+    ASSERT_TRUE(cwd_out[0] != '\0');
+    ASSERT_TRUE(cbm_root_canonical(".", out, sizeof(out)));
+    ASSERT_STR_EQ(out, cwd_out);
+    ASSERT_TRUE(cbm_root_canonical("sub/..", out, sizeof(out)));
+    ASSERT_STR_EQ(out, cwd_out);
+    char ka[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    char kb[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    ASSERT_TRUE(cbm_branch_root_key(".", ka, sizeof(ka)));
+    ASSERT_TRUE(cbm_branch_root_key(cwd, kb, sizeof(kb)));
+    ASSERT_STR_EQ(ka, kb);
+    PASS();
+}
+
+/* A checkout's slot key is the same after the checkout is gone as while it
+ * existed, so cleanup addresses its slots: through a symlinked ancestor (the
+ * macOS /tmp case) and for a relative root. */
+TEST(platform_root_key_survives_removed_checkout) {
+#ifndef _WIN32
+    char *base = th_mktempdir("cbm_plat_rkey");
+    ASSERT_NOT_NULL(base);
+    char real_dir[512];
+    char link_dir[512];
+    snprintf(real_dir, sizeof(real_dir), "%s/real", base);
+    snprintf(link_dir, sizeof(link_dir), "%s/link", base);
+    ASSERT_TRUE(cbm_mkdir_p(real_dir, 0755));
+    ASSERT_EQ(symlink(real_dir, link_dir), 0);
+    char root[600];
+    snprintf(root, sizeof(root), "%s/repo", link_dir);
+    ASSERT_TRUE(cbm_mkdir_p(root, 0755));
+    char live[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    char gone[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    ASSERT_TRUE(cbm_branch_root_key(root, live, sizeof(live)));
+    ASSERT_EQ(rmdir(root), 0);
+    ASSERT_TRUE(cbm_branch_root_key(root, gone, sizeof(gone)));
+    ASSERT_STR_EQ(live, gone);
+
+    char old_cwd[1024];
+    ASSERT_NOT_NULL(getcwd(old_cwd, sizeof(old_cwd)));
+    ASSERT_EQ(chdir(link_dir), 0);
+    ASSERT_TRUE(cbm_mkdir_p("rel-repo", 0755));
+    ASSERT_TRUE(cbm_branch_root_key("rel-repo", live, sizeof(live)));
+    ASSERT_EQ(rmdir("rel-repo"), 0);
+    ASSERT_TRUE(cbm_branch_root_key("rel-repo", gone, sizeof(gone)));
+    ASSERT_EQ(chdir(old_cwd), 0);
+    ASSERT_STR_EQ(live, gone);
+
+    /* ".." after a symlink is applied after following it, as the
+     * filesystem does: base/real/hop -> base/other/sub, so
+     * base/real/hop/../repo is base/other/repo, not base/real/repo. */
+    char other_sub[600];
+    char other_repo[600];
+    char real_repo[600];
+    char hop[600];
+    snprintf(other_sub, sizeof(other_sub), "%s/other/sub", base);
+    snprintf(other_repo, sizeof(other_repo), "%s/other/repo", base);
+    snprintf(real_repo, sizeof(real_repo), "%s/repo", real_dir);
+    snprintf(hop, sizeof(hop), "%s/hop", real_dir);
+    ASSERT_TRUE(cbm_mkdir_p(other_sub, 0755));
+    ASSERT_TRUE(cbm_mkdir_p(other_repo, 0755));
+    ASSERT_TRUE(cbm_mkdir_p(real_repo, 0755));
+    ASSERT_EQ(symlink(other_sub, hop), 0);
+    char via[700];
+    snprintf(via, sizeof(via), "%s/../repo", hop);
+    ASSERT_TRUE(cbm_root_matches(via, other_repo));
+    ASSERT_FALSE(cbm_root_matches(via, real_repo));
+    /* The target gone, the other checkout still there: the vanished root
+     * keeps ITS key, never real/repo's. */
+    char k_via[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    char k_real[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    char k_other[CBM_BRANCH_ROOT_KEY_LEN + 1];
+    ASSERT_TRUE(cbm_branch_root_key(other_repo, k_other, sizeof(k_other)));
+    ASSERT_EQ(rmdir(other_repo), 0);
+    ASSERT_TRUE(cbm_branch_root_key(via, k_via, sizeof(k_via)));
+    ASSERT_TRUE(cbm_branch_root_key(real_repo, k_real, sizeof(k_real)));
+    ASSERT_STR_EQ(k_via, k_other);
+    ASSERT_TRUE(strcmp(k_via, k_real) != 0);
+    ASSERT_FALSE(cbm_root_matches(via, real_repo));
+    (void)unlink(hop);
+    (void)unlink(link_dir);
+    th_rmtree(base);
+#endif
+    PASS();
+}
+
 SUITE(platform) {
     RUN_TEST(regex_compile_refuses_oversized_expansion);
     RUN_TEST(regex_compile_accepts_expansion_under_budget);
@@ -732,6 +1085,13 @@ SUITE(platform) {
     RUN_TEST(platform_file_size);
     RUN_TEST(platform_mmap);
     RUN_TEST(platform_mmap_nonexistent);
+    RUN_TEST(platform_readdir_reports_links_as_not_dirs);
+    RUN_TEST(platform_root_matches_windows_unicode_case_and_junction);
+    RUN_TEST(platform_root_matches_windows_case_sensitive_dirs_differ);
+    RUN_TEST(platform_root_normalize_keeps_unresolved_dotdot);
+    RUN_TEST(platform_root_canonical_dot_is_cwd);
+    RUN_TEST(platform_root_key_survives_removed_checkout);
+    RUN_TEST(platform_file_helpers_long_path);
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);
     RUN_TEST(platform_default_workers_env_unset);

@@ -448,8 +448,14 @@ TEST(incr_purge_reports_bounded_progress_issue1300) {
     char *resp = index_repo();
     ASSERT(resp != NULL);
     free(resp);
-    /* More than 20 changed files, so one line per file would break the bound. */
+    /* More than 20 changed files, so one line per file would break the bound.
+     * CI's sparse clone has no tests/ or docs/, and fastapi/ alone holds only
+     * 20 top-level modules, so its subpackages are touched too. */
     reformat_files("fastapi", 30);
+    reformat_files("fastapi/dependencies", 30);
+    reformat_files("fastapi/openapi", 30);
+    reformat_files("fastapi/security", 30);
+    reformat_files("fastapi/middleware", 30);
     reformat_files("tests", 30);
     reformat_files("docs_src", 30);
 

@@ -38,7 +38,11 @@ jobs:
     # it, as one did on 2026-08-15. Raised for headroom; the arm/x86 gap itself
     # is unexplained and worth its own investigation, since nothing about this
     # suite should be architecture-sensitive by that factor.
-    timeout-minutes: 90
+    # 90 was hit too: arm took 87-88 min on 2026-09-29 and 2026-10-03, and the
+    # 2026-10-18 run was cancelled at 90 with no failure (extraction 23 min,
+    # c_lsp 13, py_lsp 12, store_search 9 on arm). At 150 the 2026-10-18 rerun
+    # passed in 143 min, so 240 leaves real headroom.
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

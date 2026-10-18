@@ -326,6 +326,10 @@ int cbm_remove_indexes(const char *home_dir);
 
 typedef struct cbm_config cbm_config_t;
 
+/* How long a config read or write waits for another process's commit on
+ * _config.db before it gives up (a read then returns its default). */
+#define CBM_CONFIG_BUSY_MS 2500
+
 /* Open the config store in the given cache directory.
  * Creates _config.db if it doesn't exist. Returns NULL on error. */
 cbm_config_t *cbm_config_open(const char *cache_dir);
@@ -352,6 +356,13 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
 #define CBM_CONFIG_AUTO_INDEX "auto_index"
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
+#define CBM_CONFIG_BRANCH_INDEX "branch_index"
+#define CBM_CONFIG_BRANCH_INDEX_KEEP "branch_index_keep"
+#define CBM_CONFIG_BRANCH_INDEX_BUDGET "branch_index_budget"
+#define CBM_CONFIG_CACHE_EXPIRY "cache_expiry"
+#define CBM_CONFIG_CACHE_EXPIRY_UNUSED_DAYS "cache_expiry_unused_days"
+#define CBM_CONFIG_CACHE_EXPIRY_ROOT_GRACE_DAYS "cache_expiry_root_grace_days"
+#define CBM_CONFIG_CACHE_EXPIRY_SLOT_DAYS "cache_expiry_slot_days"
 #define CBM_CONFIG_UI_LANG "ui-lang"
 
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
@@ -377,6 +388,10 @@ int cbm_cmd_update(int argc, char **argv);
 /* config: get/set/list/reset runtime config values. */
 int cbm_cmd_config(int argc, char **argv);
 
+/* `code-cortex-mcp cache expire [--dry-run] [--now EPOCH]`, `cache trash`,
+ * `cache restore <entry|project>` (mcp/cache_expiry.h). */
+int cbm_cmd_cache(int argc, char **argv);
+
 /* hook-augment: stdin-driven Claude Code PreToolUse augmenter.
  * Reads the hook JSON from stdin and emits hookSpecificOutput.additionalContext
  * with search_graph hits for Grep/Glob calls. NEVER blocks: every failure
@@ -399,6 +414,12 @@ char *cbm_definition_context_for_testing(const char *events, const char *symbol,
 char *cbm_request_symbol_for_testing(const char *request, bool automatic);
 /* SessionStart brief text from stored brief inputs JSON (NULL when unusable). */
 char *cbm_session_brief_format_for_testing(const char *project, const char *json);
+/* The real walk-ups with the hook's scan-free policy: SessionStart's text for
+ * cwd, and the Read coverage note for an absolute file path. */
+char *cbm_session_start_text_for_testing(const char *cwd);
+char *cbm_hook_coverage_walk_for_testing(const char *file_path);
+/* The Bash/Grep PreToolUse symbol walk-up from cwd for one token. */
+char *cbm_hook_symbol_walk_for_testing(const char *cwd, const char *token);
 /* UserPromptSubmit context seams. Candidates: code-looking prose tokens joined
  * by '\n'. Targets: "intent=<callers|->[,chain]" then one
  * "name|qualifier|hint,hint" line per target. Resolve: the node(s) the first

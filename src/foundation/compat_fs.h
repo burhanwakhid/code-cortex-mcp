@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <sys/stat.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,10 +25,12 @@ typedef struct cbm_dir cbm_dir_t;
 
 typedef struct {
     char name[CBM_DIRENT_NAME_MAX];
-    bool is_dir;
+    bool is_dir;          /* a real directory: never a symlink, junction or other
+                           * link to one, and resolved by lstat when the
+                           * filesystem reports DT_UNKNOWN */
     unsigned char d_type; /* DT_REG, DT_DIR, DT_LNK, etc. (POSIX only, 0 on Windows) */
     /* A symbolic link (POSIX DT_LNK) or a reparse point (a Windows junction or
-     * directory symbolic link, which also sets is_dir there). A walk that must
+     * directory symbolic link; is_dir stays false for it). A walk that must
      * stay inside the repository never follows one. */
     bool is_link;
 } cbm_dirent_t;
@@ -82,6 +85,26 @@ int cbm_db_lease_try_acquire(const char *db_path, cbm_db_lease_t **out);
 const char *cbm_db_lease_target(const cbm_db_lease_t *lease);
 void cbm_db_lease_release(cbm_db_lease_t *lease);
 
+/* Reader gate of an existing database file: a second lock file,
+ * <target>.read.lock, persistent like the lease's (NEVER unlink it). A
+ * connection that serves the live database holds it shared for its lifetime;
+ * whoever moves or deletes the file holds it exclusive across the move.
+ * Exclusive never waits; shared waits up to about 2 s for a move in progress.
+ * Returns 0, CBM_INDEX_BUSY (held the other way), or -1 (no such database, or
+ * no lock file can be opened). The lock is on its own file, never the .db:
+ * SQLite's POSIX locks there are per process, and closing any other
+ * descriptor of the file would drop them. Release with cbm_db_lease_release. */
+int cbm_db_read_gate_acquire(const char *db_path, bool exclusive, cbm_db_lease_t **out);
+
+/* Non-mutating probes of the two locks, for previews: whether the index
+ * lease of db_path is held (0 free, CBM_INDEX_BUSY held), and whether any
+ * reader holds its gate (0 none, CBM_INDEX_BUSY some). Neither creates a
+ * directory or a lock file: a lock file that does not exist is free, and
+ * an existing one is tried exclusively and let go at once. -1: cannot
+ * tell (the database path cannot be resolved). */
+int cbm_db_lease_probe(const char *db_path);
+int cbm_db_read_gate_probe(const char *db_path);
+
 /* Delete a file. Returns 0 on success. */
 int cbm_unlink(const char *path);
 /* Remove <db_path>-wal/-shm. Any path installing a fresh DB generation must
@@ -103,6 +126,26 @@ FILE *cbm_fopen(const char *path, const char *mode);
 
 /* Return true when a UTF-8 path names a regular file. */
 bool cbm_is_regular_file(const char *path);
+
+/* Return true when the path itself (not what it points to) is a link: a
+ * symlink on POSIX (lstat), any reparse point on Windows -- a directory
+ * junction, a directory or file symlink, a mount point. cbm_is_dir follows
+ * links on every platform, so a walker that classifies a path it built
+ * (rather than a cbm_readdir entry) must ask this before it descends. */
+bool cbm_is_link(const char *path);
+
+/* stat() by UTF-8 path; st_size and st_mtime (Unix seconds) as stat gives
+ * them. Windows goes through _wstat64, so non-ASCII paths and paths past
+ * MAX_PATH work there; POSIX is plain stat(). */
+#ifdef _WIN32
+typedef struct _stat64 cbm_stat_t;
+int cbm_stat(const char *path, cbm_stat_t *st);
+#else
+typedef struct stat cbm_stat_t;
+static inline int cbm_stat(const char *path, cbm_stat_t *st) {
+    return stat(path, st);
+}
+#endif
 
 /* Execute a command without shell interpretation.
  * argv is a NULL-terminated array: {"cmd", "arg1", "arg2", NULL}.

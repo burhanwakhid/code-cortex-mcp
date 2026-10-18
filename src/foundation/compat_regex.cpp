@@ -83,8 +83,7 @@ int translate_flags(int flags) {
 static_assert(sizeof(RegexState *) <= CBM_SZ_256,
               "cbm_regex_t opaque buffer too small for pointer");
 #else
-static_assert(sizeof(regex_t) <= CBM_SZ_256,
-              "cbm_regex_t opaque buffer too small for regex_t");
+static_assert(sizeof(regex_t) <= CBM_SZ_256, "cbm_regex_t opaque buffer too small for regex_t");
 #endif
 
 /* ── Compile-size guard (shared by both backends) ─────────────────

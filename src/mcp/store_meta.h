@@ -60,6 +60,12 @@ typedef struct cbm_store_meta_db cbm_store_meta_db_t;
  * callers that touch many rows (list_projects, the fallback scan) should keep
  * one handle for the whole operation. */
 cbm_store_meta_db_t *cbm_store_meta_open(void);
+/* cbm_store_meta_open for lookups only: _config.db opened read-only, never
+ * created, and no table dropped or created (cbm_store_meta_open replaces a
+ * v1 table and creates the current one). NULL when the file does not exist;
+ * a missing table reads as a miss. Writes through this handle fail. For a
+ * caller that promises to write nothing (the cache sweep's dry run). */
+cbm_store_meta_db_t *cbm_store_meta_open_readonly(void);
 void cbm_store_meta_close(cbm_store_meta_db_t *db);
 
 /* Reset `row` to "nothing known" for the file `db_path` at generation `gen`.

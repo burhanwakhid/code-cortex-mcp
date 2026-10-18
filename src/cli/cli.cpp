@@ -5,13 +5,17 @@
  * All functions accept explicit paths for testability.
  */
 #include "cli/cli.h"
+#include "store/store.h" /* cbm_store_sqlite_open */
 #include "foundation/compat.h"
 #include "foundation/subprocess.h" /* cbm_subprocess_run (cbm_warm_binary) */
 #include "foundation/platform.h"
 #include "foundation/constants.h"
 #include "foundation/sha256.h"
-#include "foundation/str_util.h" // cbm_is_project_index_db
+#include "foundation/str_util.h" // cbm_is_project_index_db, cbm_validate_project_name
 #include "mcp/mcp.h"             // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
+/* cbm_branch_slots_delete_all: an index reset drops parked branch indexes too. */
+#include "pipeline/branch_slots.h"
+#include "mcp/cache_expiry.h" /* cbm_cmd_cache */
 
 /* CLI buffer size constants. */
 enum {
@@ -3302,6 +3306,37 @@ static const char *get_cache_dir(const char *home_dir) {
     return buf;
 }
 
+/* Parked per-branch databases under <cache>/branches/<project>/ (they count
+ * as indexes for every prompt that offers to delete indexes, and outlive a
+ * missing <project>.db). print lists each. Returns the count. */
+static int parked_indexes(const char *cache_dir, bool print) {
+    char dir[CLI_BUF_1K];
+    snprintf(dir, sizeof(dir), "%s/branches", cache_dir);
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return 0;
+    }
+    int count = 0;
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (!ent->is_dir || !cbm_validate_project_name(ent->name)) {
+            continue;
+        }
+        char db_path[CLI_BUF_1K];
+        snprintf(db_path, sizeof(db_path), "%s/%s.db", cache_dir, ent->name);
+        cbm_branch_slot_info_t *slots = NULL;
+        int n = cbm_branch_slots_info(db_path, ent->name, NULL, &slots);
+        for (int i = 0; print && i < n; i++) {
+            printf("  %s/%s/%s (parked branch index, %lld MB)\n", dir, ent->name, slots[i].file,
+                   (long long)(slots[i].bytes / (1024 * 1024)));
+        }
+        cbm_branch_slots_free_info(slots, n);
+        count += n;
+    }
+    cbm_closedir(d);
+    return count;
+}
+
 int cbm_list_indexes(const char *home_dir) {
     const char *cache_dir = get_cache_dir(home_dir);
     if (!cache_dir) {
@@ -3322,13 +3357,77 @@ int cbm_list_indexes(const char *home_dir) {
         }
     }
     cbm_closedir(d);
-    return count;
+    return count + parked_indexes(cache_dir, true);
+}
+
+/* Parked databases whose project has no <project>.db any more (an
+ * interrupted rebuild, a manual delete): the scan above never reaches them.
+ * Each project is cleared under the lease of its would-be <project>.db, as
+ * index runs and delete_project take it, and only while that file is absent;
+ * a project being indexed right now keeps its slots. Returns how many
+ * parked databases it removed. */
+static int remove_orphan_branch_slots(const char *cache_dir) {
+    char dir[CLI_BUF_1K];
+    snprintf(dir, sizeof(dir), "%s/branches", cache_dir);
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return 0;
+    }
+    /* Collect first: clearing a project removes its directory, and changing
+     * a directory while reading it is unspecified on some platforms. */
+    int n = 0;
+    int cap = 0;
+    char **names = NULL;
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (!ent->is_dir || !cbm_validate_project_name(ent->name)) {
+            continue;
+        }
+        if (n == cap) {
+            int next_cap = cap ? cap * 2 : 8;
+            char **grown = (char **)realloc(names, (size_t)next_cap * sizeof(char *));
+            if (!grown) {
+                break;
+            }
+            names = grown;
+            cap = next_cap;
+        }
+        names[n] = strdup(ent->name);
+        if (!names[n]) {
+            break;
+        }
+        n++;
+    }
+    cbm_closedir(d);
+    int removed = 0;
+    for (int i = 0; i < n; i++) {
+        char path[CLI_BUF_1K];
+        snprintf(path, sizeof(path), "%s/%s.db", cache_dir, names[i]);
+        cbm_db_lease_t *lease = NULL;
+        if (cbm_db_lease_try_acquire(path, &lease) != 0) {
+            fprintf(stderr, "Keeping parked indexes of %s: database busy.\n", names[i]);
+        } else {
+            if (!cbm_file_exists(path)) {
+                removed += cbm_branch_slots_delete_all(path, names[i]);
+            }
+            cbm_db_lease_release(lease);
+        }
+        free(names[i]);
+    }
+    free(names);
+    return removed;
 }
 
 static int remove_indexes_in_dir(const char *cache_dir) {
     if (!cache_dir) {
         return 0;
     }
+    /* This cache's trash holds its expired databases; a legacy cache
+     * directory (migration) has none. The usage and memo rows live in
+     * _config.db, an internal store this scan keeps, so each removed
+     * database's rows are forgotten by hand. */
+    const char *current = cbm_resolve_cache_dir();
+    bool own_cache = current && strcmp(cache_dir, current) == 0;
 
     cbm_dir_t *d = cbm_opendir(cache_dir);
     if (!d) {
@@ -3354,9 +3453,13 @@ static int remove_indexes_in_dir(const char *cache_dir) {
             /* Also remove the old temporary generation, under the same lease. */
             char tmp_path[CLI_FIELD_1040];
             snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", target);
-            if (cbm_unlink(target) == 0) {
+            bool gone = cbm_unlink(target) == 0;
+            if (gone) {
                 cbm_unlink(tmp_path);
                 count++;
+                if (own_cache) {
+                    cbm_cache_usage_forget(path);
+                }
             }
             /* Remove the SQLite sidecars (-wal/-shm/-journal) of both the live
              * and the temporary generation (#2054). Idempotent and
@@ -3365,10 +3468,27 @@ static int remove_indexes_in_dir(const char *cache_dir) {
              * count is unchanged. */
             cbm_remove_db_sidecars(target);
             cbm_remove_db_sidecars(tmp_path);
+            /* Parked per-branch databases of the same project (branch_slots.h)
+             * live under branches/<project>/, outside this scan. */
+            char project[CLI_BUF_1K];
+            /* cbm_is_project_index_db guaranteed the ".db" suffix. */
+            snprintf(project, sizeof(project), "%.*s",
+                     (int)(strlen(ent->name) - (sizeof(".db") - 1)), ent->name);
+            /* Only with the main file gone: a project whose database could
+             * not be removed keeps its parked branches too. */
+            if (gone || !cbm_file_exists(target)) {
+                count += cbm_branch_slots_delete_all(target, project);
+            }
             cbm_db_lease_release(lease);
         }
     }
     cbm_closedir(d);
+    /* Parked databases whose <project>.db was already gone. Every parked
+     * database removed counts, as the prompts that led here counted them. */
+    count += remove_orphan_branch_slots(cache_dir);
+    if (own_cache) {
+        (void)cbm_cache_trash_remove_all();
+    }
     return count;
 }
 
@@ -3382,7 +3502,6 @@ int cbm_remove_indexes(const char *home_dir) {
 
 struct cbm_config {
     sqlite3 *db;
-    char get_buf[CLI_BUF_4K]; /* static buffer for cbm_config_get return values */
 };
 
 cbm_config_t *cbm_config_open(const char *cache_dir) {
@@ -3397,12 +3516,31 @@ cbm_config_t *cbm_config_open(const char *cache_dir) {
     mkdirp(cache_dir, DIR_PERMS);
 
     sqlite3 *db = NULL;
-    if (sqlite3_open(dbpath, &db) != SQLITE_OK) {
+    /* The long-path-aware open: on Windows a cache path past MAX_PATH. */
+    if (cbm_store_sqlite_open(dbpath, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) !=
+        SQLITE_OK) {
         if (db) {
             sqlite3_close(db);
         }
         return NULL;
     }
+    /* Other processes write _config.db all the time: usage rows (every hook
+     * and tool worker), the store_meta memo, the sweep's rows. A reader that
+     * meets one of those commits gets SQLITE_BUSY, and without a timeout a
+     * setting read then returned its default: an index run parked with
+     * branch_index_keep 8 instead of the configured 1, and a sweep could run
+     * with cache_expiry false or judge by the 90-day default a rule set to 0.
+     * Wait for the commit instead. */
+    sqlite3_busy_timeout(db, CBM_CONFIG_BUSY_MS);
+    /* WAL from the first open, as every index database in the cache is: in
+     * rollback mode a committing writer locks every reader and writer out,
+     * and many processes recording their use at once starved one another.
+     * Converting later needs every other connection gone, so it is done
+     * here, while a fresh cache has none; best effort and without waiting
+     * (a busy existing cache converts on a later open). */
+    sqlite3_busy_timeout(db, 0);
+    (void)sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+    sqlite3_busy_timeout(db, CBM_CONFIG_BUSY_MS);
 
     /* Create table if not exists */
     const char *sql = "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)";
@@ -3444,12 +3582,18 @@ const char *cbm_config_get(cbm_config_t *cfg, const char *key, const char *defau
     }
     sqlite3_bind_text(stmt, SQL_PARAM_1, key, SQL_NUL_TERM, cbm_sqlite_transient);
 
+    /* The value is returned from a per-thread buffer, not one in the handle:
+     * the server's auto-index and sweep threads read settings through the
+     * same handle as the main thread, and a shared buffer let one read's
+     * value replace another's before it was parsed. (SQLite serializes the
+     * connection itself.) */
+    static thread_local char get_buf[CLI_BUF_4K];
     const char *result = default_val;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         const char *val = (const char *)sqlite3_column_text(stmt, 0);
         if (val) {
-            snprintf(cfg->get_buf, sizeof(cfg->get_buf), "%s", val);
-            result = cfg->get_buf;
+            snprintf(get_buf, sizeof(get_buf), "%s", val);
+            result = get_buf;
         }
     }
     sqlite3_finalize(stmt);
@@ -3476,8 +3620,11 @@ int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val) {
         return default_val;
     }
     char *endptr;
-    long v = strtol(val, &endptr, CLI_STRTOL_BASE);
-    if (endptr == val || *endptr != '\0') {
+    errno = 0;
+    long long v = strtoll(val, &endptr, CLI_STRTOL_BASE);
+    /* Out of int's range is the default, never a wrapped value (a retention
+     * of 4294967297 days narrowed to 1). */
+    if (endptr == val || *endptr != '\0' || errno == ERANGE || v < INT_MIN || v > INT_MAX) {
         return default_val;
     }
     return (int)v;
@@ -3520,6 +3667,130 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
 
 /* ── Config CLI subcommand ────────────────────────────────────── */
 
+/* One line per item of a cache sweep. */
+static void cache_report(const cbm_cache_expiry_item_t *it, void *ud) {
+    bool dry = *(bool *)ud;
+    const char *verb =
+        it->kind == CBM_EXPIRE_PENDING ? "watch"
+        : it->skipped                  ? "kept"
+        : it->removed
+            ? (it->kind == CBM_EXPIRE_ROOT_GONE || it->kind == CBM_EXPIRE_UNUSED ? "trashed"
+                                                                                 : "removed")
+        : dry ? "would remove"
+              : "kept";
+    printf("  %-12s %-11s %-40s %8.1f MB  %s%s%s%s\n", verb, cbm_cache_expiry_kind_str(it->kind),
+           it->name, (double)it->bytes / (1024.0 * 1024.0), it->reason, it->skipped ? " [" : "",
+           it->skipped ? it->skipped : "", it->skipped ? "]" : "");
+}
+
+static void cache_usage(FILE *out) {
+    (void)fprintf(out,
+                  "Usage: code-cortex-mcp cache <command>\n\n"
+                  "Commands:\n"
+                  "  expire [--dry-run [--now EPOCH]]  Move stale indexes to the trash, drop old\n"
+                  "                                    parked branches and orphan files\n"
+                  "  trash                             List trashed indexes\n"
+                  "  restore <entry|project>           Put a trashed index back\n");
+}
+
+int cbm_cmd_cache(int argc, char **argv) {
+    if (argc < 1 || !argv) {
+        cache_usage(stdout);
+        return 0;
+    }
+    if (strcmp(argv[0], "expire") == 0) {
+        bool dry = false;
+        int64_t now = 0;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--dry-run") == 0 || strcmp(argv[i], "-n") == 0) {
+                dry = true;
+            } else if (strcmp(argv[i], "--now") == 0 && i + 1 < argc) {
+                /* The whole argument must be a positive epoch: strtoll stops
+                 * at the first non-digit, and "abc" (0) silently previewed at
+                 * the real time. */
+                const char *arg = argv[++i];
+                char *end = NULL;
+                errno = 0;
+                long long v = strtoll(arg, &end, 10);
+                if (!arg[0] || !end || *end != '\0' || errno != 0 || v <= 0) {
+                    (void)fprintf(stderr, "--now needs a positive epoch in seconds: %s\n", arg);
+                    return CLI_TRUE;
+                }
+                now = (int64_t)v;
+            } else {
+                (void)fprintf(stderr, "unknown option: %s\n", argv[i]);
+                return CLI_TRUE;
+            }
+        }
+        /* Another clock would also date the trash entries and the usage
+         * rows the sweep writes: a past one lets the next sweep purge them
+         * at once, a future one trashes everything. Previews only. */
+        if (now != 0 && !dry) {
+            (void)fprintf(stderr, "--now needs --dry-run\n");
+            return CLI_TRUE;
+        }
+        const char *cdir0 = cbm_resolve_cache_dir();
+        if (dry && (!cdir0 || !cbm_is_dir(cdir0))) {
+            printf("Cache expiry preview: no cache directory yet, nothing to sweep\n");
+            return 0; /* a preview creates nothing, the cache included */
+        }
+        /* A cache with no _config.db is one the sweep refuses to judge (a
+         * fresh or foreign directory), so there is nothing it would do: the
+         * preview says so and succeeds, and creates nothing. */
+        if (dry) {
+            char cfgdb[CLI_BUF_1K];
+            int n = snprintf(cfgdb, sizeof(cfgdb), "%s/_config.db", cdir0);
+            if (n > 0 && (size_t)n < sizeof(cfgdb) && !cbm_file_exists(cfgdb)) {
+                printf("Cache expiry preview: %s has no _config.db, nothing to sweep\n", cdir0);
+                return 0;
+            }
+        }
+        cbm_cache_expiry_cfg_t cfg;
+        cbm_cache_expiry_cfg_load(&cfg, NULL);
+        cbm_cache_sweep_opts_t opts = {};
+        opts.now = now;
+        opts.dry_run = dry;
+        opts.report = cache_report;
+        opts.report_ud = &dry;
+        cbm_cache_sweep_result_t res;
+        const char *cdir = cbm_resolve_cache_dir();
+        printf("%s %s\n", dry ? "Cache expiry preview for" : "Cache expiry in",
+               cdir ? cdir : "(no cache directory)");
+        if (cbm_cache_expiry_sweep(&cfg, &opts, &res) != 0) {
+            (void)fprintf(stderr, "not swept: %s\n", res.refused_reason);
+            return CLI_TRUE;
+        }
+        printf("%s: %d index(es), %d parked branch(es), %d orphan file(s), %d trash "
+               "entr%s; %.1f MB; %d kept\n",
+               dry ? "Would remove" : "Removed", res.projects, res.slots, res.sidecars, res.purged,
+               res.purged == 1 ? "y" : "ies", (double)res.bytes / (1024.0 * 1024.0), res.skipped);
+        if (!dry && res.projects > 0) {
+            printf("Trashed indexes are deleted by the next sweep a day or more later; "
+                   "`code-cortex-mcp cache restore <project>` puts one back.\n");
+        }
+        return 0;
+    }
+    if (strcmp(argv[0], "trash") == 0) {
+        if (cbm_cache_trash_list(stdout) == 0) {
+            printf("  (trash is empty)\n");
+        }
+        return 0;
+    }
+    if (strcmp(argv[0], "restore") == 0 && argc < 2) {
+        (void)fprintf(stderr, "cache restore needs a trash entry or project name\n\n");
+        cache_usage(stderr);
+        return CLI_TRUE;
+    }
+    if (strcmp(argv[0], "restore") == 0) {
+        char msg[CLI_BUF_1K];
+        int rc = cbm_cache_trash_restore(argv[1], msg, sizeof(msg));
+        (void)fprintf(rc == 0 ? stdout : stderr, "%s\n", msg);
+        return rc == 0 ? 0 : CLI_TRUE;
+    }
+    (void)fprintf(stderr, "unknown cache command: %s\n", argv[0]);
+    return CLI_TRUE;
+}
+
 int cbm_cmd_config(int argc, char **argv) {
     /* NULL argv with a nonzero argc previously slipped past this guard and
      * dereferenced argv[0] below -- caught by the clang-analyzer lane. */
@@ -3537,6 +3808,20 @@ int cbm_cmd_config(int argc, char **argv) {
                "Max files for auto-indexing new projects");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_WATCH, "true",
                "Register background git watcher on session connect");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_BRANCH_INDEX, "true",
+               "Keep one index per git branch (park/restore on checkout)");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_BRANCH_INDEX_KEEP, "8",
+               "Parked branch indexes kept per project (oldest dropped)");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_BRANCH_INDEX_BUDGET, "2G",
+               "Disk budget of a project's parked branch indexes (0: no size cap)");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_CACHE_EXPIRY, "true",
+               "Daily sweep that moves stale indexes to the trash");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_CACHE_EXPIRY_UNUSED_DAYS, "90",
+               "Expire an index nothing used for this many days (0: never)");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_CACHE_EXPIRY_ROOT_GRACE_DAYS, "7",
+               "Expire an index whose checkout is gone this long (0: never)");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_CACHE_EXPIRY_SLOT_DAYS, "30",
+               "Drop a parked branch index not restored for this many days (0: never)");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
                "Pin graph UI language: en, zh, or auto");
         return 0;
@@ -3566,6 +3851,20 @@ int cbm_cmd_config(int argc, char **argv) {
                cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_WATCH,
                cbm_config_get(cfg, CBM_CONFIG_AUTO_WATCH, "true"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_BRANCH_INDEX,
+               cbm_config_get(cfg, CBM_CONFIG_BRANCH_INDEX, "true"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_BRANCH_INDEX_KEEP,
+               cbm_config_get(cfg, CBM_CONFIG_BRANCH_INDEX_KEEP, "8"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_BRANCH_INDEX_BUDGET,
+               cbm_config_get(cfg, CBM_CONFIG_BRANCH_INDEX_BUDGET, "2G"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_CACHE_EXPIRY,
+               cbm_config_get(cfg, CBM_CONFIG_CACHE_EXPIRY, "true"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_CACHE_EXPIRY_UNUSED_DAYS,
+               cbm_config_get(cfg, CBM_CONFIG_CACHE_EXPIRY_UNUSED_DAYS, "90"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_CACHE_EXPIRY_ROOT_GRACE_DAYS,
+               cbm_config_get(cfg, CBM_CONFIG_CACHE_EXPIRY_ROOT_GRACE_DAYS, "7"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_CACHE_EXPIRY_SLOT_DAYS,
+               cbm_config_get(cfg, CBM_CONFIG_CACHE_EXPIRY_SLOT_DAYS, "30"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
                cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto"));
     } else if (strcmp(argv[0], "get") == 0) {
@@ -4353,8 +4652,7 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
         if (!dry_run) {
             cbm_mkdir_p(sd, CLI_OCTAL_PERM);
         }
-        install_generic_agent_config("Junie", binary_path, cp, NULL, dry_run,
-                                     cbm_upsert_junie_mcp);
+        install_generic_agent_config("Junie", binary_path, cp, NULL, dry_run, cbm_upsert_junie_mcp);
     }
 }
 
@@ -4375,9 +4673,9 @@ static int cbm_install_agent_configs(const char *home, const char *binary_path, 
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 extern "C" int cbm_install_codex_agent_config_for_testing(const char *home,
-                                                           const char *binary_path);
+                                                          const char *binary_path);
 extern "C" int cbm_install_codex_agent_config_for_testing(const char *home,
-                                                           const char *binary_path) {
+                                                          const char *binary_path) {
     cbm_detected_agents_t agents;
     memset(&agents, 0, sizeof(agents));
     agents.codex = true;
@@ -4385,15 +4683,18 @@ extern "C" int cbm_install_codex_agent_config_for_testing(const char *home,
 }
 #endif
 
-/* Count .db files in the cache directory. */
+/* Count .db files in the cache directory, parked per-branch databases
+ * included: a project whose <project>.db is gone can still have those, and
+ * the install/uninstall/update prompts must not skip them. */
 static int count_db_indexes(const char *home) {
     const char *cache_dir = get_cache_dir(home);
     if (!cache_dir) {
         return 0;
     }
+    int parked = parked_indexes(cache_dir, false);
     cbm_dir_t *d = cbm_opendir(cache_dir);
     if (!d) {
-        return 0;
+        return parked;
     }
     int count = 0;
     cbm_dirent_t *ent;
@@ -4403,7 +4704,7 @@ static int count_db_indexes(const char *home) {
         }
     }
     cbm_closedir(d);
-    return count;
+    return count + parked;
 }
 
 /* Handle pre-existing indexes during (re)install (#607).
@@ -5035,7 +5336,7 @@ static bool uninstall_decide_index_deletion(const char *home, bool requested, bo
         return false;
     }
     if (dry_run) {
-        printf("(dry-run — indexes would be deleted)\n");
+        printf("(dry-run — indexes, parked branches and the cache trash would be deleted)\n");
         return false;
     }
     return true;

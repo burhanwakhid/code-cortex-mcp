@@ -102,6 +102,38 @@ int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *
 int cbm_store_get_format_version(cbm_store_t *s, int *out);
 int cbm_store_set_format_version(cbm_store_t *s, int version);
 
+/* The branch a database was built for is the project's Branch node
+ * (QN "<project>.__branch__.<slug>", see git_context.h). get copies its
+ * qualified name and display name (either buffer may be NULL) and returns
+ * CBM_STORE_NOT_FOUND when the graph has no Branch node. set rewrites that
+ * node in place — same id, so HAS_BRANCH keeps pointing at it — with the
+ * edge's properties (recreating the edge from the Project node when it is
+ * missing) and the node's full-text entry, in one transaction; an
+ * incremental run reuses the stored structure and would otherwise keep the
+ * branch of whichever run last rebuilt it. set WRITES. */
+int cbm_store_get_branch(cbm_store_t *s, const char *project, char *qn_buf, size_t qn_sz,
+                         char *name_buf, size_t name_sz);
+int cbm_store_set_branch(cbm_store_t *s, const char *project, const char *qn, const char *name,
+                         const char *props_json);
+/* SHA-256 over the project's (rel_path, source digest) rows in file_hashes,
+ * in path order: identical for identical indexed sources, different after
+ * any source change. Not mtimes. One indexed scan of file_hashes. */
+bool cbm_store_content_fingerprint(cbm_store_t *s, const char *project, char out[65]);
+
+/* get, with qualified name, display name and properties (any may be NULL)
+ * each in its own allocation, however long a branch name makes them. */
+int cbm_store_get_branch_dup(cbm_store_t *s, const char *project, char **qn, char **name,
+                             char **props);
+/* True when the project has a Branch node and it, and every HAS_BRANCH edge,
+ * already carry exactly these values, and the node has its HAS_BRANCH edge
+ * whenever a Project node exists (set would change nothing). */
+bool cbm_store_branch_is(cbm_store_t *s, const char *project, const char *qn, const char *name,
+                         const char *props_json);
+/* get, plus the node's properties: the git identity it was built from
+ * (cbm_git_context_props_json). */
+int cbm_store_get_branch_props(cbm_store_t *s, const char *project, char *qn_buf, size_t qn_sz,
+                               char *name_buf, size_t name_sz, char *props_buf, size_t props_sz);
+
 /* Get caller/callee names for a node (CALLS/HTTP_CALLS/ASYNC_CALLS edges).
  * Returns 0 on success. Caller must free each out_callers[i]/out_callees[i]
  * and the arrays themselves. */
@@ -228,11 +260,37 @@ cbm_store_t *cbm_store_open_memory(void);
 /* Open a file-backed database at the given path. Creates if needed. */
 cbm_store_t *cbm_store_open_path(const char *db_path);
 
+/* cbm_store_open_path, read-write, on an existing database only: NULL when
+ * there is no file at db_path, never an empty new one. */
+cbm_store_t *cbm_store_open_path_existing(const char *db_path);
+
 /* Open an existing file-backed database for querying only. Opened READ-ONLY
  * (no SQLITE_OPEN_CREATE, no write pragmas) so queries never mutate the DB and
  * work on a read-only file / filesystem. Returns NULL if the file does not
  * exist — never creates a new .db file. */
 cbm_store_t *cbm_store_open_path_query(const char *db_path);
+
+/* cbm_store_open_path_query on a project's live cache database, holding the
+ * file's reader gate (cbm_db_read_gate_acquire, shared) until close: the
+ * cache expiry sweep does not move a database a connection reads. The gate
+ * is taken before the open, so a database moved meanwhile is not found.
+ * NULL, too, when the gate stays held exclusive past its wait (a move in
+ * progress). */
+cbm_store_t *cbm_store_open_path_reader(const char *db_path);
+
+/* The reader gate for a store opened without one (the fallback scan learns
+ * which file it keeps only after reading it). False when the file left its
+ * path before the gate was taken (the connection reads a moved database),
+ * also when another file has taken that path since (a restore or re-index
+ * after the move: the open's device and inode no longer match the path's),
+ * or when the gate stays held exclusive past its wait (a move in progress). */
+bool cbm_store_hold_read_gate(cbm_store_t *s);
+
+/* The inode of the file this connection reads, as taken around its open.
+ * False when that is unknown: no inode on the platform (Windows), a path
+ * that could not be stat'ed, or a path that changed files during the open
+ * (the connection may then read either file). */
+bool cbm_store_open_inode(const cbm_store_t *s, uint64_t *ino);
 
 /* On-disk path of a file-backed store, or NULL for an in-memory (:memory:)
  * store. The returned pointer is owned by the store. */
@@ -280,8 +338,29 @@ cbm_store_t *cbm_store_open(const char *project);
 /* Close the store and free all resources. NULL-safe. */
 void cbm_store_close(cbm_store_t *s);
 
+/* Reset every statement still holding a read open. Cached statements are
+ * reset on their next use, not after the last row, so a long-lived connection
+ * otherwise keeps reading the snapshot of its last query and never sees a
+ * later in-place write (a Branch-node stamp, an ADR) by another connection.
+ * Call between requests only, never while a caller is stepping a statement. */
+void cbm_store_end_reads(cbm_store_t *s);
+
 /* Get the underlying sqlite3 handle (for testing only). */
 struct sqlite3 *cbm_store_get_db(cbm_store_t *s);
+
+/* sqlite3_open_v2 for a file path: on Windows a path past MAX_PATH goes in
+ * its extended-length form (\\?\...), which SQLite's VFS accepts but never
+ * adds. Every open of a cache database goes through this. */
+int cbm_store_sqlite_open(const char *path, struct sqlite3 **db, int flags);
+
+/* A read-only open for previews that must leave the cache as it was. A
+ * read-only connection to a WAL database still creates its -shm (and can
+ * create its -wal) when they are absent, as after a clean close; a WAL
+ * database without a -wal is opened immutable instead, which reads the main
+ * file alone and is exact then. One whose -wal exists opens read-only as
+ * cbm_store_sqlite_open does, since immutable would ignore committed frames
+ * (it may then rebuild a missing -shm, which SQLite can always recreate). */
+int cbm_store_sqlite_open_inspect(const char *path, struct sqlite3 **db);
 
 /* Get the last error message (static string, valid until next call). */
 const char *cbm_store_error(cbm_store_t *s);
@@ -336,6 +415,16 @@ int cbm_store_checkpoint(cbm_store_t *s);
  * processes truncate the DB file under live mappings). Exposed for
  * testability. */
 int64_t cbm_store_resolve_mmap_size(void);
+
+/* Resolve the journal_size_limit pragma applied to on-disk write
+ * connections (#1083) from CBM_SQLITE_JOURNAL_SIZE_LIMIT, in bytes.
+ * Defaults to 268435456 (256 MiB) when unset or malformed; a negative value
+ * gives -1 (no limit, SQLite's default). Exposed for testability. */
+int64_t cbm_store_resolve_journal_size_limit(void);
+
+/* The journal_size_limit of this connection, in bytes; -1 = unlimited. The
+ * pragma is per connection and not persisted. */
+int64_t cbm_store_journal_size_limit(cbm_store_t *s);
 
 /* ── Dump / Restore ─────────────────────────────────────────────── */
 

@@ -76,6 +76,9 @@ void cbm_watcher_stop(cbm_watcher_t *w);
 /* Return the number of projects in the watch list. */
 int cbm_watcher_watch_count(cbm_watcher_t *w);
 
+/* Whether project_name is currently watched (thread-safe). */
+bool cbm_watcher_is_watched(cbm_watcher_t *w, const char *project_name);
+
 /* Return a watched project's consecutive hard-index-failure count, or -1 when
  * it is not watched. Exposed so the failure state machine (increment on a
  * hard error, reset on success or cbm_watcher_touch) can be asserted directly

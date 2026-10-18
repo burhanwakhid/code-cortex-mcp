@@ -64,7 +64,8 @@ echo ""
 echo "--- Scanning for raw network calls (must not exist) ---"
 
 NETWORK_FUNCS='[^a-z_]connect\(|[^a-z_]socket\(|[^a-z_]sendto\('
-if grep -rn -E "$NETWORK_FUNCS" "$ROOT/src/" --include='*.cpp' 2>/dev/null | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v 'test'; then
+# grep -rn prefixes "file:line:", so the comment filter skips past it.
+if grep -rn -E "$NETWORK_FUNCS" "$ROOT/src/" --include='*.cpp' 2>/dev/null | grep -v -E '^[^:]+:[0-9]+:[[:space:]]*(//|/?\*)' | grep -v 'test'; then
     echo "BLOCKED: Raw network calls found in src/."
     fail
 else
@@ -170,10 +171,11 @@ while IFS= read -r match; do
     file=$(echo "$match" | cut -d: -f1)
     relfile="${file#"$ROOT/"}"
     case "$relfile" in
-        src/cli/cli.cpp|src/store/store.cpp|src/pipeline/*.cpp|src/foundation/log.cpp|src/foundation/diagnostics.cpp|src/mcp/mcp.cpp|src/main.cpp)
+        src/cli/cli.cpp|src/store/store.cpp|src/pipeline/*.cpp|src/foundation/log.cpp|src/foundation/diagnostics.cpp|src/mcp/mcp.cpp|src/mcp/cache_expiry.cpp|src/main.cpp)
             ;; # Known safe (diagnostics.cpp: atomic .tmp+rename metrics dump to configured path;
                # main.cpp: supervised index worker writes its tool result to the parent-supplied
-               # response file from cbm_index_worker_response_out())
+               # response file from cbm_index_worker_response_out();
+               # cache_expiry.cpp: the EXPIRED note inside a cache-trash entry it just made)
         *)
             echo "REVIEW: ${match}"
             echo "  -> Unexpected fopen(\"w\") in ${relfile}"
