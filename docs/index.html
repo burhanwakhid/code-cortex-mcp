@@ -368,6 +368,10 @@
                 <p>Two runs over the same tree produce the same nodes, edges, IDs and properties, byte for byte, whatever order the workers finish in. Verified on eleven repositories. Diff two snapshots and only real code changes show up.</p>
             </div>
             <div class="feature">
+                <h3>One index per checkout and branch</h3>
+                <p>Each git worktree has its own graph. A branch switch parks the old branch's index and restores the new one, so switching back re-indexes only the changed files. Stale indexes expire to a restorable trash.</p>
+            </div>
+            <div class="feature">
                 <h3>Crash isolation</h3>
                 <p>A supervisor contains per-file crashes and hangs during indexing. A persistent worker answers tool calls with a per-tool deadline.</p>
             </div>

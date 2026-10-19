@@ -137,6 +137,9 @@ For a known call chain from `A` to `B`, use the bounded `trace_path` form above.
   pub-sub channels (`EMITS` / `LISTENS_ON`); `CROSS_*` edges across repositories.
 - **Infrastructure as code** — Dockerfiles, Kubernetes manifests, and Kustomize overlays
   as graph nodes.
+- **One index per checkout and branch** — each git worktree has its own graph; a branch
+  switch parks the old branch's index and restores the new one, so switching back re-indexes
+  only the changed files. A daily sweep moves stale indexes to a trash you can restore from.
 - **Reproducible index** — two full runs over the same tree produce the same graph: same
   nodes, edges, IDs and properties, byte for byte. Verified on 11 of the benchmark
   repositories.
@@ -337,6 +340,10 @@ code-cortex-mcp config set ui-lang en              # auto, en, or zh; default: a
 ```
 
 - **Storage** — `~/.cache/code-cortex-mcp/`; override with `CBM_CACHE_DIR`.
+- **Worktrees** — each checkout directory has its own index, and a linked git worktree is a
+  separate project. Inside a worktree or nested repository that is not indexed, queries do not
+  fall back to the parent checkout's graph; the SessionStart hook names the directory to index.
+  Indexing a checkout skips the linked worktrees inside it.
 - **Branches** — each git branch keeps its own index. When an index run finds the checkout on
   another branch, it parks the old branch's index under `branches/<project>/` in the cache and
   restores the new branch's index if one is parked, so only the files that differ are re-indexed.

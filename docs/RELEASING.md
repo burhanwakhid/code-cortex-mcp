@@ -13,7 +13,7 @@ them by hand, in the same commit, before you tag.
    the same lint, test, build and smoke jobs again. A red Dry Run is a red
    release.
 2. Choose the version. Each upstream sync so far has taken one minor step:
-   `v0.15.0`, `v0.16.0`, `v0.17.0`, `v0.20.0`.
+   `v0.15.0`, `v0.16.0`, `v0.17.0`, `v0.20.0`, `v0.22.0`, `v0.23.0`.
 3. Set the version in `server.json`. Change the `version` field and all five
    `identifier` download URLs, which contain the tag name.
 4. Set the version in `UPSTREAM_SYNC.md`. Change the **Fork release** field in
