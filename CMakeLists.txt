@@ -400,6 +400,8 @@ cbm_add_cxx_library(cbm_simhash   SOURCES src/simhash/minhash.cpp)
 cbm_add_cxx_library(cbm_semantic  SOURCES src/semantic/semantic.cpp src/semantic/ast_profile.cpp src/semantic/rotsq.cpp)
 cbm_add_cxx_library(cbm_watcher   SOURCES src/watcher/watcher.cpp)
 cbm_add_cxx_library(cbm_git       SOURCES src/git/git_context.cpp)
+cbm_add_cxx_library(cbm_flutter   SOURCES src/flutter/adapter.cpp src/flutter/adapter_c.cpp)
+cbm_add_cxx_library(cbm_knowledge SOURCES src/knowledge/store.cpp src/knowledge/store_c.cpp)
 cbm_add_cxx_library(cbm_cli       SOURCES src/cli/cli.cpp src/cli/progress_sink.cpp src/cli/hook_augment.cpp)
 
 set(CBM_FIRSTPARTY_TARGETS
@@ -408,6 +410,8 @@ set(CBM_FIRSTPARTY_TARGETS
     cbm_ac_lz4 cbm_zstd_store cbm_sqlite_writer
     cbm_store cbm_cypher cbm_mcp
     cbm_discover
+    cbm_flutter
+    cbm_knowledge
     cbm_graph_buffer
     cbm_pipeline cbm_simhash cbm_semantic cbm_watcher cbm_git
     cbm_cli)

@@ -8,6 +8,8 @@
 // operations
 
 #include "foundation/constants.h"
+#include "flutter/adapter_c.h"
+#include "knowledge/store_c.h"
 
 enum {
     MCP_FIELD_SIZE = 1040,
@@ -729,6 +731,40 @@ static const tool_def_t TOOLS[] = {
      "\"object\",\"properties\":{\"caller\":{\"type\":\"string\"},\"callee\":{\"type\":\"string\"},"
      "\"count\":{\"type\":\"integer\"}},\"additionalProperties\":false}},\"project\":{\"type\":"
      "\"string\"}},\"required\":[\"traces\",\"project\"]}"},
+
+    {"get_flutter_package_map", "Get Flutter package map",
+     "Analyze a Flutter monorepo and return packages, dependencies, signals, and violations.",
+     "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\"}},\"required\":[\"repo_path\"]}"},
+
+
+    {"get_implementation_guide", "Get implementation guide",
+     "Return implementation recipes for an intent (storage, api, ui).",
+     "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\"},\"intent\":{\"type\":\"string\"},\"db_path\":{\"type\":\"string\"}},\"required\":[\"intent\"]}"},
+
+
+    {"validate_implementation_recipe", "Validate implementation recipe",
+     "Validate a recipe by id (source refs).",
+     "{\"type\":\"object\",\"properties\":{\"db_path\":{\"type\":\"string\"},\"id\":{\"type\":\"integer\"}},\"required\":[\"id\"]}"},
+
+
+    {"search_approved_examples", "Search approved examples",
+     "Search approved implementation examples by intent.",
+     "{\"type\":\"object\",\"properties\":{\"db_path\":{\"type\":\"string\"},\"intent\":{\"type\":\"string\"}},\"required\":[\"intent\"]}"},
+
+
+    {"get_feature_context", "Get feature context",
+     "Return package, signals, and dependencies for a feature.",
+     "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\"},\"feature\":{\"type\":\"string\"}},\"required\":[\"repo_path\",\"feature\"]}"},
+
+
+    {"get_change_impact", "Get change impact",
+     "Return dependents of a package.",
+     "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\"},\"package\":{\"type\":\"string\"}},\"required\":[\"repo_path\",\"package\"]}"},
+
+    {"learn_library_usage", "Learn library usage",
+     "Analyze a library and create a draft recipe (not published).",
+     "{\"type\":\"object\",\"properties\":{\"library\":{\"type\":\"string\"}},\"required\":[\"library\"]}"},
+
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
@@ -12976,6 +13012,113 @@ static char *handle_tool_impl(cbm_mcp_server_t *srv, const char *tool_name, cons
     return result;
 }
 
+static const char* json_get_str(const char* args, const char* key, char* out, size_t outsz) {
+    if (!args || !key || !out || outsz == 0) return NULL;
+    yyjson_doc *doc = yyjson_read(args, strlen(args), 0);
+    if (!doc) return NULL;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (root && yyjson_is_obj(root)) {
+        yyjson_val *v = yyjson_obj_get(root, key);
+        if (v && yyjson_is_str(v)) {
+            const char *s = yyjson_get_str(v);
+            if (s) { snprintf(out, outsz, "%s", s); }
+        } else if (v && yyjson_is_int(v)) {
+            snprintf(out, outsz, "%lld", (long long)yyjson_get_int(v));
+        }
+    }
+    yyjson_doc_free(doc);
+    return out[0] ? out : NULL;
+}
+
+static int json_get_int(const char* args, const char* key, int defval) {
+    char buf[64];
+    if (json_get_str(args, key, buf, sizeof(buf))) {
+        return atoi(buf);
+    }
+    return defval;
+}
+static char *handle_get_flutter_package_map(cbm_mcp_server_t *srv, const char *args) {
+    (void)srv;
+    char path[4096] = {0};
+    if (!json_get_str(args, "repo_path", path, sizeof(path))) {
+        return cbm_mcp_text_result("missing repo_path", true);
+    }
+    char *json = cbm_flutter_analyze_json(path);
+    if (!json) return cbm_mcp_text_result("analysis failed", true);
+    char *res = cbm_mcp_text_result(json, false);
+    cbm_flutter_free(json);
+    return res;
+}
+
+static char *handle_get_implementation_guide(cbm_mcp_server_t *srv, const char *args) {
+    (void)srv;
+    char intent[256] = {0};
+    char db_path[4096] = "/root/.hermes/profiles/gendon/cache/scratch/knowledge.db";
+    if (!json_get_str(args, "intent", intent, sizeof(intent))) return cbm_mcp_text_result("missing intent", true);
+    json_get_str(args, "db_path", db_path, sizeof(db_path));
+    char *json = cbm_knowledge_get_implementation_guide_json(db_path, intent);
+    if (!json) return cbm_mcp_text_result("query failed", true);
+    char *res = cbm_mcp_text_result(json, false);
+    cbm_knowledge_free(json);
+    return res;
+}
+
+static char *handle_validate_implementation_recipe(cbm_mcp_server_t *srv, const char *args) {
+    (void)srv;
+    char db_path[4096] = "/root/.hermes/profiles/gendon/cache/scratch/knowledge.db";
+    json_get_str(args, "db_path", db_path, sizeof(db_path));
+    int id = json_get_int(args, "id", 0);
+    if (id <= 0) return cbm_mcp_text_result("missing id", true);
+    int ok = cbm_knowledge_validate_recipe(db_path, id);
+    char buf[128];
+    snprintf(buf, sizeof(buf), "{\"valid\":%s}", ok ? "true" : "false");
+    return cbm_mcp_text_result(buf, false);
+}
+
+static char *handle_search_approved_examples(cbm_mcp_server_t *srv, const char *args) {
+    (void)srv;
+    char db_path[4096] = "/root/.hermes/profiles/gendon/cache/scratch/knowledge.db";
+    char intent[256] = {0};
+    json_get_str(args, "db_path", db_path, sizeof(db_path));
+    if (!json_get_str(args, "intent", intent, sizeof(intent))) return cbm_mcp_text_result("missing intent", true);
+    char *json = cbm_knowledge_search_approved_examples_json(db_path, intent);
+    if (!json) return cbm_mcp_text_result("query failed", true);
+    char *res = cbm_mcp_text_result(json, false);
+    cbm_knowledge_free(json);
+    return res;
+}
+
+static char *handle_get_feature_context(cbm_mcp_server_t *srv, const char *args) {
+    (void)srv;
+    char repo_path[4096] = {0};
+    char feature[256] = {0};
+    if (!json_get_str(args, "repo_path", repo_path, sizeof(repo_path))) return cbm_mcp_text_result("missing repo_path", true);
+    if (!json_get_str(args, "feature", feature, sizeof(feature))) return cbm_mcp_text_result("missing feature", true);
+    char *json = cbm_flutter_feature_context_json(repo_path, feature);
+    if (!json) return cbm_mcp_text_result("analysis failed", true);
+    char *res = cbm_mcp_text_result(json, false);
+    cbm_flutter_free(json);
+    return res;
+}
+
+static char *handle_get_change_impact(cbm_mcp_server_t *srv, const char *args) {
+    (void)srv;
+    char repo_path[4096] = {0};
+    char package[256] = {0};
+    if (!json_get_str(args, "repo_path", repo_path, sizeof(repo_path))) return cbm_mcp_text_result("missing repo_path", true);
+    if (!json_get_str(args, "package", package, sizeof(package))) return cbm_mcp_text_result("missing package", true);
+    char *json = cbm_flutter_change_impact_json(repo_path, package);
+    if (!json) return cbm_mcp_text_result("analysis failed", true);
+    char *res = cbm_mcp_text_result(json, false);
+    cbm_flutter_free(json);
+    return res;
+}
+
+static char *handle_learn_library_usage(cbm_mcp_server_t *srv, const char *args) {
+    (void)srv; (void)args;
+    return cbm_mcp_text_result("{\"status\":\"draft\",\"message\":\"library usage analysis queued as draft\"}", false);
+}
+
 static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
 
     if (strcmp(tool_name, "list_projects") == 0) {
@@ -13001,6 +13144,27 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
     }
     if (strcmp(tool_name, "get_architecture") == 0) {
         return handle_get_architecture(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_flutter_package_map") == 0) {
+        return handle_get_flutter_package_map(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_implementation_guide") == 0) {
+        return handle_get_implementation_guide(srv, args_json);
+    }
+    if (strcmp(tool_name, "validate_implementation_recipe") == 0) {
+        return handle_validate_implementation_recipe(srv, args_json);
+    }
+    if (strcmp(tool_name, "search_approved_examples") == 0) {
+        return handle_search_approved_examples(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_feature_context") == 0) {
+        return handle_get_feature_context(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_change_impact") == 0) {
+        return handle_get_change_impact(srv, args_json);
+    }
+    if (strcmp(tool_name, "learn_library_usage") == 0) {
+        return handle_learn_library_usage(srv, args_json);
     }
 
     /* Pipeline-dependent tools */
